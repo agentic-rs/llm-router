@@ -7,7 +7,7 @@ pub use tokn_core::AgentId;
 
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tokn_core::provider::ID_GITHUB_COPILOT;
 
@@ -190,6 +190,8 @@ pub struct ServerConfig {
   pub port: u16,
   #[serde(default)]
   pub route_mode: RouteMode,
+  #[serde(default)]
+  pub cors: CorsConfig,
 }
 
 impl Default for ServerConfig {
@@ -198,8 +200,62 @@ impl Default for ServerConfig {
       host: default_host(),
       port: default_port(),
       route_mode: RouteMode::default(),
+      cors: CorsConfig::default(),
     }
   }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CorsConfig {
+  #[serde(default)]
+  pub enabled: bool,
+  #[serde(default)]
+  pub allow_localhost: bool,
+  #[serde(default)]
+  pub allowed_origins: Vec<String>,
+}
+
+impl CorsConfig {
+  pub fn validate(&self) -> Result<()> {
+    if self.enabled && !self.allow_localhost && self.allowed_origins.is_empty() {
+      return error::CorsOriginsEmptySnafu.fail();
+    }
+    self.canonical_allowed_origins().map(|_| ())
+  }
+
+  pub fn canonical_allowed_origins(&self) -> Result<BTreeSet<String>> {
+    self
+      .allowed_origins
+      .iter()
+      .map(|origin| canonical_cors_origin(origin))
+      .collect()
+  }
+}
+
+fn canonical_cors_origin(origin: &str) -> Result<String> {
+  let parsed = reqwest::Url::parse(origin).map_err(|error| Error::InvalidCorsOrigin {
+    origin: origin.to_string(),
+    message: error.to_string(),
+  })?;
+  if !matches!(parsed.scheme(), "http" | "https") {
+    return Err(Error::InvalidCorsOrigin {
+      origin: origin.to_string(),
+      message: "scheme must be http or https".into(),
+    });
+  }
+  if parsed.host().is_none()
+    || !parsed.username().is_empty()
+    || parsed.password().is_some()
+    || parsed.path() != "/"
+    || parsed.query().is_some()
+    || parsed.fragment().is_some()
+  {
+    return Err(Error::InvalidCorsOrigin {
+      origin: origin.to_string(),
+      message: "expected only scheme, host, and optional port".into(),
+    });
+  }
+  Ok(parsed.origin().ascii_serialization())
 }
 
 fn default_host() -> String {
@@ -520,6 +576,7 @@ impl Config {
   }
 
   pub fn validate(&self) -> Result<()> {
+    self.server.cors.validate()?;
     self.proxy.validate()?;
     self.proxy_mode.validate()?;
     validate_model_families(&self.model_families)?;
@@ -963,6 +1020,73 @@ mod tests {
     .expect("config should deserialize");
 
     assert!(cfg.api_key.enabled);
+  }
+
+  #[test]
+  fn cors_defaults_to_disabled() {
+    let cors = &Config::default().server.cors;
+    assert!(!cors.enabled);
+    assert!(!cors.allow_localhost);
+    assert!(cors.allowed_origins.is_empty());
+  }
+
+  #[test]
+  fn enabled_cors_can_allow_localhost_without_exact_origins() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [server.cors]
+        enabled = true
+        allow_localhost = true
+      "#,
+    )
+    .expect("config should deserialize");
+
+    cfg.validate().unwrap();
+  }
+
+  #[test]
+  fn cors_origins_are_validated_and_canonicalized() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [server.cors]
+        enabled = true
+        allowed_origins = ["https://EXAMPLE.com:443", "http://localhost:3000"]
+      "#,
+    )
+    .expect("config should deserialize");
+
+    cfg.validate().unwrap();
+    assert_eq!(
+      cfg.server.cors.canonical_allowed_origins().unwrap(),
+      BTreeSet::from(["http://localhost:3000".into(), "https://example.com".into()])
+    );
+  }
+
+  #[test]
+  fn enabled_cors_requires_origins() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [server.cors]
+        enabled = true
+      "#,
+    )
+    .expect("config should deserialize");
+
+    assert!(matches!(cfg.validate(), Err(Error::CorsOriginsEmpty)));
+  }
+
+  #[test]
+  fn cors_rejects_urls_instead_of_origins() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [server.cors]
+        enabled = true
+        allowed_origins = ["https://example.com/app"]
+      "#,
+    )
+    .expect("config should deserialize");
+
+    assert!(matches!(cfg.validate(), Err(Error::InvalidCorsOrigin { .. })));
   }
 
   #[test]

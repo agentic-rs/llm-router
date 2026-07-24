@@ -52,6 +52,12 @@ pub enum Error {
   #[snafu(display("[proxy_mode].passthrough_hosts contains an invalid hostname: {host:?}"))]
   ProxyPassthroughHost { host: String },
 
+  #[snafu(display("[server.cors] must set allowed_origins or allow_localhost when CORS is enabled"))]
+  CorsOriginsEmpty,
+
+  #[snafu(display("[server.cors].allowed_origins contains an invalid origin {origin:?}: {message}"))]
+  InvalidCorsOrigin { origin: String, message: String },
+
   #[snafu(display("invalid header name in [copilot.extra_headers]: {name:?}"))]
   InvalidHeaderName { name: String },
 
