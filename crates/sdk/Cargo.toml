@@ -1,0 +1,32 @@
+[package]
+name = "tokn-sdk"
+version.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arc-swap.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+tokn-auth.workspace = true
+tokn-config.workspace = true
+tokn-core.workspace = true
+tokn-endpoint-chat-completions.workspace = true
+tokn-endpoint-messages.workspace = true
+tokn-endpoint-responses.workspace = true
+tokn-headers.workspace = true
+tokn-requests.workspace = true
+tokn-router.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true
+tokn-mock-server.workspace = true

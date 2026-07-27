@@ -17,6 +17,7 @@ members = [
   "crates/endpoint-messages",
   "crates/headers",
   "crates/router",
+  "crates/sdk",
   "crates/router-inspect",
   "crates/requests",
   "crates/accounts",
@@ -27,6 +28,7 @@ members = [
   "crates/provider-llama-cpp",
   "crates/provider-openai",
   "crates/provider-zai",
+  "bindings/python",
 ]
 resolver = "2"
 
@@ -56,6 +58,7 @@ tokn-endpoint-responses = { version = "0.2.1", path = "crates/endpoint-responses
 tokn-endpoint-messages = { version = "0.2.1", path = "crates/endpoint-messages" }
 tokn-headers = { version = "0.2.1", path = "crates/headers" }
 tokn-router = { version = "0.2.1", path = "crates/router" }
+tokn-sdk = { version = "0.2.1", path = "crates/sdk" }
 tokn-router-inspect = { version = "0.2.1", path = "crates/router-inspect" }
 tokn-requests = { version = "0.2.1", path = "crates/requests" }
 tokn-persistence = { version = "0.2.1", path = "crates/persistence" }
@@ -88,6 +91,8 @@ inquire = { version = "0.9", default-features = false, features = ["crossterm"] 
 jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
 notify = "8"
 parking_lot = "0.12"
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 rcgen = { version = "0.14", features = ["crypto", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "socks", "gzip", "brotli", "deflate", "zstd", "form"] }
 rustls-native-certs = "0.8"

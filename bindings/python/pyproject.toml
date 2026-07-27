@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tokn-sdk"
+version = "0.2.1"
+description = "Embedded Python SDK for routing LLM requests through tokn providers"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Typing :: Typed",
+]
+
+[tool.maturin]
+module-name = "tokn._native"
+python-source = "python"
+features = ["pyo3/extension-module"]
