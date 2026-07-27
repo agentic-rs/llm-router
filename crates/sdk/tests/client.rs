@@ -76,6 +76,38 @@ async fn typed_request_uses_configured_provider_and_returns_typed_response() {
 }
 
 #[tokio::test]
+async fn raw_request_and_client_lifecycle_use_explicit_paths() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let client = fixture.client();
+
+  assert_eq!(client.config_path(), fixture.config_path);
+  assert_eq!(client.auth_path(), fixture.auth_path);
+  client.reload().expect("reload SDK client");
+  let _ = client.responses();
+  let _ = client.messages();
+
+  let options = RequestOptions::default()
+    .with_profile("default")
+    .with_request_id("sdk-raw")
+    .with_session_id("session-raw")
+    .with_project_id("/tmp/sdk-project")
+    .with_initiator("sdk-test")
+    .with_header("x-sdk-test", "raw");
+  let error = client
+    .execute(
+      tokn_core::provider::Endpoint::ChatCompletions,
+      serde_json::to_value(chat_request()).expect("serialize chat request"),
+      options,
+    )
+    .await
+    .expect_err("unknown request profile should fail");
+  assert!(matches!(error, Error::UnknownProfile { profile } if profile == "default"));
+
+  mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn streaming_request_remains_a_live_byte_stream() {
   let mock = MockLlmServer::start(MockLlmConfig::default().with_route(MockRoute::chat_completions_stream())).await;
   let fixture = Fixture::new(mock.base_url());

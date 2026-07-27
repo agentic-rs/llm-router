@@ -131,3 +131,84 @@ impl StreamResponse {
       .map(|output| output.freeze())
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use futures_util::stream;
+  use serde::Deserialize;
+
+  fn raw_buffered(body: &'static [u8]) -> RawResponse {
+    RawResponse {
+      status: 201,
+      headers: HeaderMap::new(),
+      body: ResponseBody::Buffered(Bytes::from_static(body)),
+    }
+  }
+
+  fn raw_stream(chunks: Vec<std::io::Result<Bytes>>) -> RawResponse {
+    RawResponse {
+      status: 202,
+      headers: HeaderMap::new(),
+      body: ResponseBody::Stream(Box::pin(stream::iter(chunks))),
+    }
+  }
+
+  #[derive(Debug, Deserialize, PartialEq)]
+  struct Payload {
+    answer: u8,
+  }
+
+  #[test]
+  fn buffered_response_supports_bytes_json_and_debug_output() {
+    let raw = raw_buffered(br#"{"answer":42}"#);
+    assert!(format!("{raw:?}").contains("Buffered(13 bytes)"));
+
+    let response = raw.into_json::<Payload>().expect("deserialize buffered response");
+    assert_eq!(response.status, 201);
+    assert_eq!(response.data, Payload { answer: 42 });
+    assert!(format!("{response:?}").contains("answer: 42"));
+  }
+
+  #[test]
+  fn response_body_kind_mismatches_are_reported() {
+    let buffered_error = raw_buffered(b"{}")
+      .into_stream()
+      .expect_err("buffered body is not a stream");
+    assert!(matches!(buffered_error, Error::UnexpectedBuffered));
+
+    let stream_error = raw_stream(Vec::new())
+      .into_buffered()
+      .expect_err("stream body is not buffered");
+    assert!(matches!(stream_error, Error::UnexpectedStream));
+  }
+
+  #[test]
+  fn malformed_json_is_reported() {
+    let error = raw_buffered(b"{")
+      .into_json::<Payload>()
+      .expect_err("malformed response JSON should fail");
+    assert!(matches!(error, Error::DeserializeResponse { .. }));
+  }
+
+  #[tokio::test]
+  async fn stream_response_collects_chunks_and_propagates_errors() {
+    let response = raw_stream(vec![
+      Ok(Bytes::from_static(b"hello ")),
+      Ok(Bytes::from_static(b"world")),
+    ])
+    .into_stream()
+    .expect("stream response");
+    assert!(format!("{response:?}").contains("<byte stream>"));
+    assert_eq!(
+      response.bytes().await.expect("collect stream"),
+      Bytes::from_static(b"hello world")
+    );
+
+    let response = raw_stream(vec![Err(std::io::Error::other("stream failed"))])
+      .into_stream()
+      .expect("stream response");
+    let error = response.bytes().await.expect_err("stream error should propagate");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+  }
+}
