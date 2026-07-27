@@ -124,6 +124,39 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-features
 
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+
+      - name: Build Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --manifest-path bindings/python/Cargo.toml --out dist
+
+      - name: Install Python wheel
+        run: python -m pip install dist/*.whl
+
+      - name: Test Python SDK
+        run: python -m unittest discover -s bindings/python/tests
+
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -148,7 +181,10 @@ jobs:
           shared-key: workspace
 
       - name: Generate coverage report
-        run: cargo llvm-cov --locked --workspace --all-features --codecov --output-path codecov.json
+        run: >-
+          cargo llvm-cov --locked --workspace --all-features
+          --ignore-filename-regex 'bindings/python/src/lib\.rs'
+          --codecov --output-path codecov.json
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

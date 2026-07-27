@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY Cargo.toml ./
 COPY Cargo.lock ./
+COPY bindings ./bindings
 COPY crates ./crates
 
 RUN cargo build --locked --release --package tokn-gateway-cli --bin tokn-gateway

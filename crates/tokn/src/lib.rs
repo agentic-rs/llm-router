@@ -18,3 +18,4 @@ pub mod provider {
   pub use tokn_provider_zai as zai;
 }
 pub use tokn_router as router;
+pub use tokn_sdk as sdk;
