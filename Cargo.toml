@@ -30,6 +30,7 @@ members = [
   "crates/provider-zai",
   "bindings/python",
 ]
+default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
@@ -91,8 +92,6 @@ inquire = { version = "0.9", default-features = false, features = ["crossterm"] 
 jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
 notify = "8"
 parking_lot = "0.12"
-pyo3 = { version = "0.29", features = ["extension-module"] }
-pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 rcgen = { version = "0.14", features = ["crypto", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "socks", "gzip", "brotli", "deflate", "zstd", "form"] }
 rustls-native-certs = "0.8"
