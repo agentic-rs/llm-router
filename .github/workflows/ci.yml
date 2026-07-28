@@ -121,8 +121,7 @@ jobs:
         with:
           shared-key: workspace
 
-      - name: Check Python Cargo build on macOS
-        if: runner.os == 'macOS'
+      - name: Check Python Cargo build
         run: cargo build --locked --package tokn-python
 
       - name: Run tests
