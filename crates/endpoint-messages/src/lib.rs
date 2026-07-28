@@ -15,7 +15,7 @@ pub use content::{ContentBlock, ContentBlockDelta};
 pub use event::MessagesEvent;
 pub use message::Message;
 pub use parameters::{MessagesExtraParameters, MessagesRequestParameters};
-pub use request::{MessagesRequest, MessagesToolChoice, MessagesToolDef, SystemPrompt};
+pub use request::{MessagesRequest, MessagesToolChoice, MessagesToolDef, SystemPrompt, DEFAULT_MESSAGES_MAX_TOKENS};
 pub use response::MessagesResponse;
 pub use usage::MessagesUsage;
 

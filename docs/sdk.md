@@ -12,13 +12,52 @@ The `tokn-sdk` crate is the stable façade. It provides:
   `config.d` and `auth.d`;
 - atomic `reload()` of configuration and credentials;
 - default and per-request profile selection;
+- a provider-neutral generation builder with friendly text, reasoning, tool
+  call, usage, and streaming outputs;
+- owned, serializable requests that can be transformed or bound to a client
+  later;
 - typed clients for Responses, Chat Completions, and Messages;
 - a raw JSON request escape hatch;
 - buffered typed responses and live byte streams.
 
+The client-bound builder is the shortest path for a one-off request:
+
+```rust
+let response = client
+  .generate("smart")
+  .system("You are a Rust expert.")
+  .prompt("Explain this function.")
+  .send()
+  .await?;
+
+println!("{}", response.text);
+```
+
+Build a request without a client when it needs to be serialized, transformed,
+queued, or reused:
+
+```rust
+let request = GenerateRequest::builder("smart")
+  .prompt("Explain this function.")
+  .temperature(0.2)
+  .build()?;
+
+let serialized = serde_json::to_string(&request)?;
+let request: GenerateRequest = serde_json::from_str(&serialized)?;
+let response = client.send(&request).await?;
+```
+
+The same owned request can instead be rebound for fluent execution:
+
+```rust
+let response = request.bind(&client).send().await?;
+```
+
 The façade deliberately hides router `AppState`, account handles, and request
 pipeline stages. Those remain implementation details and can evolve without
-breaking SDK consumers.
+breaking SDK consumers. Provider-specific controls that do not have equivalent
+semantics across endpoints, such as reasoning configuration, remain available
+through the typed endpoint clients and raw JSON escape hatch.
 
 ## Python
 

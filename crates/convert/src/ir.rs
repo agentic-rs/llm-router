@@ -109,6 +109,39 @@ pub struct Usage {
   pub extras: BTreeMap<String, Value>,
 }
 
+impl Usage {
+  pub fn merge(&mut self, update: Self) {
+    if update.input_tokens.is_some() {
+      self.input_tokens = update.input_tokens;
+    }
+    if update.output_tokens.is_some() {
+      self.output_tokens = update.output_tokens;
+    }
+    if update.total_tokens.is_some() {
+      self.total_tokens = update.total_tokens;
+    }
+    if update.input_tokens_details.is_some() {
+      self.input_tokens_details = update.input_tokens_details;
+    }
+    if update.output_tokens_details.is_some() {
+      self.output_tokens_details = update.output_tokens_details;
+    }
+    self.extras.extend(update.extras);
+  }
+}
+
+/// Map cross-endpoint finish reasons to the closest Responses API terminal
+/// status and standard incomplete reason.
+pub fn responses_completion_status(finish_reason: Option<&str>) -> (&'static str, Option<&'static str>) {
+  match finish_reason {
+    Some("length" | "max_tokens" | "max_output_tokens") => ("incomplete", Some("max_output_tokens")),
+    Some("content_filter") => ("incomplete", Some("content_filter")),
+    Some("failed" | "error") => ("failed", None),
+    Some("cancelled") => ("cancelled", None),
+    _ => ("completed", None),
+  }
+}
+
 #[derive(Clone, Debug)]
 pub enum IrDelta {
   Text(String),
@@ -148,7 +181,13 @@ impl IrResponse {
         current.push_str(&arguments_delta);
         call.arguments = Value::String(current);
       }
-      IrDelta::Usage(usage) => self.usage = Some(usage),
+      IrDelta::Usage(usage) => {
+        if let Some(current) = &mut self.usage {
+          current.merge(usage);
+        } else {
+          self.usage = Some(usage);
+        }
+      }
       IrDelta::Finish(reason) => self.finish_reason = reason,
     }
   }
@@ -361,5 +400,28 @@ mod tests {
         "service_tier": "flex"
       })
     );
+  }
+
+  #[test]
+  fn response_accumulation_merges_split_usage_updates() {
+    let mut response = IrResponse::default();
+    response.push_delta(IrDelta::Usage(Usage {
+      input_tokens: Some(7),
+      extras: BTreeMap::from([("cache_creation_input_tokens".into(), json!(2))]),
+      ..Usage::default()
+    }));
+    response.push_delta(IrDelta::Usage(Usage {
+      output_tokens: Some(5),
+      total_tokens: Some(12),
+      extras: BTreeMap::from([("service_tier".into(), json!("standard"))]),
+      ..Usage::default()
+    }));
+
+    let usage = response.usage.expect("merged usage");
+    assert_eq!(usage.input_tokens, Some(7));
+    assert_eq!(usage.output_tokens, Some(5));
+    assert_eq!(usage.total_tokens, Some(12));
+    assert_eq!(usage.extras["cache_creation_input_tokens"], 2);
+    assert_eq!(usage.extras["service_tier"], "standard");
   }
 }

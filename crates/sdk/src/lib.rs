@@ -7,11 +7,16 @@
 mod client;
 mod endpoint;
 mod error;
+mod generate;
 mod response;
 
 pub use client::{Client, ClientBuilder, RequestOptions};
 pub use endpoint::{ChatCompletions, Messages, Responses};
 pub use error::{Error, Result};
+pub use generate::{
+  GenerateCall, GenerateEvent, GenerateRequest, GenerateRequestBuilder, GenerateResponse, GenerateStream, Message,
+  Role, TextStream, Tool, ToolCall, ToolChoice, Usage,
+};
 pub use response::{BufferedResponse, ByteStream, RawResponse, ResponseBody, StreamResponse};
 
 pub use tokn_core::provider::Endpoint;

@@ -30,6 +30,22 @@ pub enum Error {
     #[source]
     source: serde_json::Error,
   },
+  #[error("invalid generation request: {message}")]
+  InvalidGenerateRequest { message: String },
+  #[error("failed to build provider-neutral generation request")]
+  BuildGenerateRequest {
+    #[source]
+    source: tokn_convert::error::ConvertError,
+  },
+  #[error("generation request failed with HTTP status {status}: {body}")]
+  GenerateResponseStatus { status: u16, body: String },
+  #[error("generation stream failed: {message}")]
+  GenerateStream { message: String },
+  #[error("failed to deserialize generation stream event")]
+  DeserializeStreamEvent {
+    #[source]
+    source: serde_json::Error,
+  },
   #[error("request pipeline failed")]
   Pipeline {
     #[source]

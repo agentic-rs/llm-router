@@ -9,6 +9,10 @@ use crate::content::ContentBlock;
 use crate::message::Message;
 use crate::parameters::{MessagesExtraParameters, MessagesRequestParameters};
 
+/// Compatibility value used when a request converted to Messages does not
+/// specify the API's required `max_tokens` field.
+pub const DEFAULT_MESSAGES_MAX_TOKENS: u64 = 32_000;
+
 /// `system` accepts either a single string or an array of content
 /// blocks (typically `text` blocks).
 #[derive(Clone, Debug, Serialize, Deserialize)]
