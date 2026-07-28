@@ -121,6 +121,9 @@ jobs:
         with:
           shared-key: workspace
 
+      - name: Check Python Cargo build
+        run: cargo build --locked --package tokn-python
+
       - name: Run tests
         run: cargo test --locked --workspace --all-features
 
@@ -208,8 +211,8 @@ jobs:
         with:
           shared-key: workspace
 
-      - name: Build workspace
-        run: cargo build --locked --workspace --all-features
+      - name: Build default Rust workspace
+        run: cargo build --locked --all-features
 
   docker:
     runs-on: ubuntu-latest
