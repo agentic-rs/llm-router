@@ -27,6 +27,9 @@ print(response.text)
 Responses normalize text, reasoning, tool calls, token usage, and finish
 reasons across supported providers.
 
+The snippets below continue using the `client` created above. Snippets after
+the detached-request example also reuse its `request`.
+
 Build an owned request when it needs to be serialized, transformed, queued, or
 reused independently of a client:
 

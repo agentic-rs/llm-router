@@ -169,12 +169,7 @@ class _GenerateBuilder(Generic[_BuilderT]):
 
   def tool_choice(self, tool_choice: ToolChoice | str) -> _BuilderT:
     if isinstance(tool_choice, str):
-      known_choice = {
-        "auto": ToolChoice.AUTO,
-        "none": ToolChoice.NONE,
-        "required": ToolChoice.REQUIRED,
-      }.get(tool_choice)
-      tool_choice = known_choice or ToolChoice.named(tool_choice)
+      tool_choice = ToolChoice.from_dict(tool_choice)
     self._request.tool_choice = tool_choice
     return self._self()
 

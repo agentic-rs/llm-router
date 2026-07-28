@@ -68,6 +68,10 @@ public generation models are dependency-free Python dataclasses.
 The client-bound builder mirrors the Rust API:
 
 ```python
+from tokn import Client
+
+client = Client()
+
 response = await (
   client.generate("smart")
   .system("You are a Python expert.")
@@ -83,6 +87,9 @@ print(response.text)
 serialized, transformed, queued, and later sent or bound:
 
 ```python
+from tokn import Client, GenerateRequest, Message
+
+client = Client()
 request = GenerateRequest(
   model="smart",
   messages=[Message.user("Explain this function.")],

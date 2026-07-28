@@ -279,10 +279,10 @@ impl<S> ClosableStream<S> {
   }
 
   async fn close(&self) {
-    // The stream mutex is only held for short ownership transitions, never
-    // while polling the provider, so close cannot wait on an idle upstream.
-    let mut stream = self.stream.lock().await;
+    // Signal first so an idle poll releases the stream mutex before close
+    // waits to clear the underlying stream.
     self.close_tx.send_replace(true);
+    let mut stream = self.stream.lock().await;
     *stream = None;
   }
 }
@@ -292,27 +292,25 @@ where
   S: Stream<Item = Result<T, E>> + Unpin,
 {
   async fn next(&self) -> Option<Result<T, E>> {
-    // Serialize concurrent Python __anext__ calls without making close wait
-    // for the provider poll.
+    // Serialize concurrent Python __anext__ calls.
     let _next = self.next.lock().await;
     if self.is_closed() {
       return None;
     }
 
-    let mut stream = {
-      let mut stored = self.stream.lock().await;
-      if self.is_closed() {
-        *stored = None;
-        return None;
-      }
-      let Some(stream) = stored.take() else {
-        self.close_tx.send_replace(true);
-        return None;
-      };
-      stream
+    let mut close_rx = self.close_tx.subscribe();
+    let mut stored = self.stream.lock().await;
+    if self.is_closed() {
+      *stored = None;
+      return None;
+    }
+    let Some(stream) = stored.as_mut() else {
+      self.close_tx.send_replace(true);
+      return None;
     };
 
-    let mut close_rx = self.close_tx.subscribe();
+    // Poll through the stored stream so cancellation drops only the mutex
+    // guard, leaving the stream available to the next __anext__ call.
     let item = tokio::select! {
       biased;
       _ = wait_for_close(&mut close_rx) => return None,
@@ -320,27 +318,20 @@ where
     };
 
     if self.is_closed() {
+      *stored = None;
       return None;
     }
 
     match item {
-      Some(Ok(item)) => {
-        // This mutex also defines the ordering with close(): either the item
-        // is committed first, or close marks the stream closed first and the
-        // item is suppressed.
-        let mut stored = self.stream.lock().await;
-        if self.is_closed() {
-          return None;
-        }
-        *stored = Some(stream);
-        Some(Ok(item))
-      }
+      Some(Ok(item)) => Some(Ok(item)),
       Some(Err(error)) => {
-        self.close().await;
+        self.close_tx.send_replace(true);
+        *stored = None;
         Some(Err(error))
       }
       None => {
-        self.close().await;
+        self.close_tx.send_replace(true);
+        *stored = None;
         None
       }
     }
@@ -421,12 +412,16 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 
 fn api_status_error(message: String, status: u16, body: String) -> PyErr {
   let error = APIStatusError::new_err(message);
-  Python::attach(|py| {
+  Python::attach(|py| -> PyErr {
     let value = error.value(py);
-    let _ = value.setattr("status", status);
-    let _ = value.setattr("body", body);
-  });
-  error
+    if let Err(failure) = value
+      .setattr("status", status)
+      .and_then(|()| value.setattr("body", body))
+    {
+      return failure;
+    }
+    error
+  })
 }
 
 fn serialization_error(error: impl std::fmt::Display) -> PyErr {

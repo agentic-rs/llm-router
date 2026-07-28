@@ -100,7 +100,7 @@ def _models(
   output: list[_T] = []
   for item in items:
     if isinstance(item, model):
-      output.append(item)
+      output.append(deepcopy(item))
     else:
       output.append(model.from_dict(_mapping(item, name)))  # type: ignore[attr-defined]
   return output
@@ -668,6 +668,8 @@ class GenerateResponse:
 
 class GenerateEvent:
   """Base class for provider-neutral semantic streaming events."""
+
+  __slots__ = ()
 
   def to_dict(self) -> JsonObject:
     raise NotImplementedError

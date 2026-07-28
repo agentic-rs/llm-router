@@ -9,7 +9,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from tokn import (
   APIStatusError,
@@ -33,9 +33,9 @@ from tokn import (
 
 
 class ProviderHandler(BaseHTTPRequestHandler):
-  requests: list[dict[str, Any]] = []
-  idle_stream_started = threading.Event()
-  idle_stream_release = threading.Event()
+  requests: ClassVar[list[dict[str, Any]]] = []
+  idle_stream_started: ClassVar[threading.Event] = threading.Event()
+  idle_stream_release: ClassVar[threading.Event] = threading.Event()
 
   def do_POST(self) -> None:
     length = int(self.headers.get("content-length", "0"))
@@ -126,103 +126,61 @@ class ProviderHandler(BaseHTTPRequestHandler):
 
   def _handle_chat_stream(self, body: dict[str, Any]) -> None:
     serialized = json.dumps(body)
+    if "cancel pending read" in serialized:
+      self._send_delayed_sse(
+        [
+          self._chat_chunk({"content": "after cancel"}),
+          self._chat_chunk({}, finish_reason="stop"),
+          "[DONE]",
+        ]
+      )
+      return
     if "idle stream" in serialized:
       self._send_idle_sse()
       return
     if "semantic stream" in serialized:
       self._send_sse(
         [
-          json.dumps(
+          self._chat_chunk(
             {
-              "id": "chatcmpl-stream",
-              "model": "mock-model",
-              "choices": [
+              "role": "assistant",
+              "reasoning_content": "think",
+            }
+          ),
+          self._chat_chunk({"content": "hello"}),
+          self._chat_chunk(
+            {
+              "tool_calls": [
                 {
                   "index": 0,
-                  "delta": {
-                    "role": "assistant",
-                    "reasoning_content": "think",
+                  "id": "call_stream",
+                  "type": "function",
+                  "function": {
+                    "name": "lookup",
+                    "arguments": '{"query":',
                   },
-                  "finish_reason": None,
                 }
-              ],
+              ]
             }
           ),
-          json.dumps(
+          self._chat_chunk(
             {
-              "id": "chatcmpl-stream",
-              "model": "mock-model",
-              "choices": [
+              "tool_calls": [
                 {
                   "index": 0,
-                  "delta": {"content": "hello"},
-                  "finish_reason": None,
+                  "function": {"arguments": '"rust"}'},
                 }
-              ],
+              ]
             }
           ),
-          json.dumps(
-            {
-              "id": "chatcmpl-stream",
-              "model": "mock-model",
-              "choices": [
-                {
-                  "index": 0,
-                  "delta": {
-                    "tool_calls": [
-                      {
-                        "index": 0,
-                        "id": "call_stream",
-                        "type": "function",
-                        "function": {
-                          "name": "lookup",
-                          "arguments": '{"query":',
-                        },
-                      }
-                    ]
-                  },
-                  "finish_reason": None,
-                }
-              ],
-            }
-          ),
-          json.dumps(
-            {
-              "id": "chatcmpl-stream",
-              "model": "mock-model",
-              "choices": [
-                {
-                  "index": 0,
-                  "delta": {
-                    "tool_calls": [
-                      {
-                        "index": 0,
-                        "function": {"arguments": '"rust"}'},
-                      }
-                    ]
-                  },
-                  "finish_reason": None,
-                }
-              ],
-            }
-          ),
-          json.dumps(
-            {
-              "id": "chatcmpl-stream",
-              "model": "mock-model",
-              "choices": [
-                {
-                  "index": 0,
-                  "delta": {},
-                  "finish_reason": "tool_calls",
-                }
-              ],
-              "usage": {
-                "prompt_tokens": 3,
-                "completion_tokens": 5,
-                "total_tokens": 8,
-              },
-            }
+          self._chat_chunk(
+            {},
+            finish_reason="tool_calls",
+            usage={
+              "prompt_tokens": 3,
+              "completion_tokens": 5,
+              "total_tokens": 8,
+            },
           ),
           "[DONE]",
         ]
@@ -231,48 +189,34 @@ class ProviderHandler(BaseHTTPRequestHandler):
 
     self._send_sse(
       [
-        json.dumps(
-          {
-            "id": "chatcmpl-stream",
-            "model": "mock-model",
-            "choices": [
-              {
-                "index": 0,
-                "delta": {"role": "assistant", "content": "hel"},
-                "finish_reason": None,
-              }
-            ],
-          }
-        ),
-        json.dumps(
-          {
-            "id": "chatcmpl-stream",
-            "model": "mock-model",
-            "choices": [
-              {
-                "index": 0,
-                "delta": {"content": "lo"},
-                "finish_reason": None,
-              }
-            ],
-          }
-        ),
-        json.dumps(
-          {
-            "id": "chatcmpl-stream",
-            "model": "mock-model",
-            "choices": [
-              {
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-              }
-            ],
-          }
-        ),
+        self._chat_chunk({"role": "assistant", "content": "hel"}),
+        self._chat_chunk({"content": "lo"}),
+        self._chat_chunk({}, finish_reason="stop"),
         "[DONE]",
       ]
     )
+
+  @staticmethod
+  def _chat_chunk(
+    delta: dict[str, Any],
+    *,
+    finish_reason: str | None = None,
+    usage: dict[str, int] | None = None,
+  ) -> str:
+    payload: dict[str, Any] = {
+      "id": "chatcmpl-stream",
+      "model": "mock-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": delta,
+          "finish_reason": finish_reason,
+        }
+      ],
+    }
+    if usage is not None:
+      payload["usage"] = usage
+    return json.dumps(payload)
 
   def _send_json(
     self,
@@ -302,6 +246,17 @@ class ProviderHandler(BaseHTTPRequestHandler):
     self.wfile.flush()
     type(self).idle_stream_started.set()
     type(self).idle_stream_release.wait(timeout=5)
+
+  def _send_delayed_sse(self, values: list[str]) -> None:
+    self.send_response(200)
+    self.send_header("content-type", "text/event-stream")
+    self.end_headers()
+    self.wfile.flush()
+    type(self).idle_stream_started.set()
+    type(self).idle_stream_release.wait(timeout=5)
+    payload = "".join(f"data: {value}\n\n" for value in values).encode()
+    self.wfile.write(payload)
+    self.wfile.flush()
 
   def log_message(self, format: str, *args: object) -> None:
     del format, args
@@ -364,6 +319,16 @@ class ModelTests(unittest.TestCase):
     changed.messages[0].content = "Changed copy."
     self.assertEqual(restored.messages[0].content, "Answer briefly.")
 
+    caller_message = Message.user("Caller-owned message.")
+    copied = GenerateRequest.from_dict(
+      {
+        "model": "smart",
+        "messages": [caller_message],
+      }
+    )
+    copied.messages[0].content = "Changed copied message."
+    self.assertEqual(caller_message.content, "Caller-owned message.")
+
   def test_models_and_typed_events_round_trip(self) -> None:
     usage = Usage(
       input_tokens=3,
@@ -406,9 +371,17 @@ class ModelTests(unittest.TestCase):
           ),
         ],
       ).validate()
+    with self.assertRaisesRegex(ValueError, "unknown tool choice"):
+      GenerateRequest.builder("smart").tool_choice("lookup")
 
 
 class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
+  server: ClassVar[ThreadingHTTPServer]
+  server_thread: ClassVar[threading.Thread]
+  root: ClassVar[tempfile.TemporaryDirectory[str]]
+  config_path: ClassVar[Path]
+  auth_path: ClassVar[Path]
+
   @classmethod
   def setUpClass(cls) -> None:
     cls.server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
@@ -508,6 +481,8 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
       response.usage,
       Usage(input_tokens=3, output_tokens=5, total_tokens=8),
     )
+    self.assertIsInstance(response.raw, dict)
+    assert isinstance(response.raw, dict)
     self.assertEqual(response.raw["status"], "completed")
 
     captured = self.last_request()
@@ -644,6 +619,40 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
           await pending
         except asyncio.CancelledError:
           pass
+
+  async def test_cancelled_pending_read_preserves_stream(self) -> None:
+    request = (
+      GenerateRequest.builder("llama-cpp/mock-model")
+      .prompt("cancel pending read")
+      .build()
+    )
+    stream = await self.client().stream(request)
+    pending = asyncio.create_task(stream.__anext__())
+
+    try:
+      started = await asyncio.to_thread(
+        ProviderHandler.idle_stream_started.wait,
+        1,
+      )
+      self.assertTrue(started)
+      await asyncio.sleep(0.05)
+      pending.cancel()
+      with self.assertRaises(asyncio.CancelledError):
+        await pending
+
+      ProviderHandler.idle_stream_release.set()
+
+      async def next_text_delta() -> TextDelta:
+        async for event in stream:
+          if isinstance(event, TextDelta):
+            return event
+        raise AssertionError("stream ended before yielding text")
+
+      event = await asyncio.wait_for(next_text_delta(), timeout=0.5)
+      self.assertEqual(event.text, "after cancel")
+    finally:
+      ProviderHandler.idle_stream_release.set()
+      await stream.aclose()
 
   async def test_stream_errors_are_typed_and_terminal(self) -> None:
     request = (
