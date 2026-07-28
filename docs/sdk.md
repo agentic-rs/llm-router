@@ -62,12 +62,43 @@ through the typed endpoint clients and raw JSON escape hatch.
 ## Python
 
 The `bindings/python` package is a mixed Python/Rust package built with
-Maturin and PyO3. Its public API accepts and returns ordinary Python mappings,
-while its native module owns an `Arc<tokn_sdk::Client>`.
+Maturin and PyO3. Its native module owns an `Arc<tokn_sdk::Client>`, while the
+public generation models are dependency-free Python dataclasses.
 
-Python endpoint calls are `async`. Streaming calls return an async iterator of
-bytes so SSE framing is preserved exactly. Python never reads or interprets
-credential files itself.
+The client-bound builder mirrors the Rust API:
+
+```python
+response = await (
+  client.generate("smart")
+  .system("You are a Python expert.")
+  .prompt("Explain this function.")
+  .temperature(0.2)
+  .send()
+)
+
+print(response.text)
+```
+
+`GenerateRequest` is owned and independent from a client, so it can be
+serialized, transformed, queued, and later sent or bound:
+
+```python
+request = GenerateRequest(
+  model="smart",
+  messages=[Message.user("Explain this function.")],
+)
+
+serialized = request.to_json()
+request = GenerateRequest.from_json(serialized).with_changes(
+  max_output_tokens=128,
+)
+response = await client.send(request)
+```
+
+`client.stream(request)` yields typed semantic events and
+`client.stream_text(request)` yields only text deltas. The endpoint clients
+remain available as raw mapping and byte-stream escape hatches. All calls are
+`async`; Python never reads or interprets credential files itself.
 
 ## Node.js and Bun
 
