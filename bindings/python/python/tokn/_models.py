@@ -26,6 +26,7 @@ JsonObject = dict[str, JsonValue]
 HeaderValue = str | list[str]
 
 _T = TypeVar("_T")
+_U64_MAX = 2**64 - 1
 
 
 def _json_dumps(value: object) -> str:
@@ -195,6 +196,175 @@ class Role(str, Enum):
   @classmethod
   def from_json(cls, value: str) -> Role:
     return cls.from_dict(json.loads(value))
+
+
+class ReasoningMode(str, Enum):
+  """Provider-neutral reasoning modes understood by supported backends."""
+
+  ENABLED = "enabled"
+  DISABLED = "disabled"
+  ADAPTIVE = "adaptive"
+
+
+class ReasoningEffort(str, Enum):
+  """Common reasoning-effort levels across supported providers."""
+
+  MINIMAL = "minimal"
+  LOW = "low"
+  MEDIUM = "medium"
+  HIGH = "high"
+  XHIGH = "xhigh"
+  MAX = "max"
+
+
+class ReasoningSummary(str, Enum):
+  """Common reasoning-summary levels across supported providers."""
+
+  AUTO = "auto"
+  CONCISE = "concise"
+  DETAILED = "detailed"
+
+
+def _string_enum_value(value: str | Enum) -> str:
+  if isinstance(value, Enum):
+    enum_value = value.value
+    if isinstance(enum_value, str):
+      return enum_value
+  return cast(str, value)
+
+
+def _optional_reasoning_mode(
+  data: Mapping[str, Any],
+  name: str,
+) -> ReasoningMode | None:
+  value = _optional_string(data, name)
+  if value is None:
+    return None
+  try:
+    return ReasoningMode(value)
+  except ValueError as error:
+    raise ValueError(f"unknown reasoning mode '{value}'") from error
+
+
+def _optional_reasoning_effort(
+  data: Mapping[str, Any],
+  name: str,
+) -> ReasoningEffort | str | None:
+  value = _optional_string(data, name)
+  if value is None:
+    return None
+  try:
+    return ReasoningEffort(value)
+  except ValueError:
+    return value
+
+
+def _optional_reasoning_summary(
+  data: Mapping[str, Any],
+  name: str,
+) -> ReasoningSummary | str | None:
+  value = _optional_string(data, name)
+  if value is None:
+    return None
+  try:
+    return ReasoningSummary(value)
+  except ValueError:
+    return value
+
+
+@dataclass(slots=True)
+class ReasoningOptions:
+  """Portable reasoning controls with provider-specific validation deferred."""
+
+  mode: ReasoningMode | Literal["enabled", "disabled", "adaptive"] | None = None
+  effort: ReasoningEffort | str | None = None
+  budget_tokens: int | None = None
+  summary: ReasoningSummary | str | None = None
+
+  def validate(self) -> None:
+    if (
+      self.mode is None
+      and self.effort is None
+      and self.budget_tokens is None
+      and self.summary is None
+    ):
+      raise ValueError("reasoning options cannot be empty")
+
+    for name, value in (
+      ("mode", self.mode),
+      ("effort", self.effort),
+      ("summary", self.summary),
+    ):
+      if value is not None and (
+        not isinstance(value, str) or not value.strip()
+      ):
+        raise ValueError(f"reasoning {name} must be a non-empty string")
+
+    if self.budget_tokens is not None and (
+      isinstance(self.budget_tokens, bool)
+      or not isinstance(self.budget_tokens, int)
+      or self.budget_tokens <= 0
+      or self.budget_tokens > _U64_MAX
+    ):
+      raise ValueError(
+        f"reasoning budget_tokens must be a positive integer no greater than {_U64_MAX}"
+      )
+
+    mode = (
+      _string_enum_value(self.mode)
+      if self.mode is not None
+      else None
+    )
+    if mode not in {
+      None,
+      ReasoningMode.ENABLED.value,
+      ReasoningMode.DISABLED.value,
+      ReasoningMode.ADAPTIVE.value,
+    }:
+      raise ValueError(f"unknown reasoning mode '{mode}'")
+    if mode == ReasoningMode.DISABLED.value and (
+      self.effort is not None
+      or self.budget_tokens is not None
+      or self.summary is not None
+    ):
+      raise ValueError(
+        "disabled reasoning cannot set effort, budget_tokens, or summary"
+      )
+    if (
+      mode == ReasoningMode.ADAPTIVE.value
+      and self.budget_tokens is not None
+    ):
+      raise ValueError(
+        "adaptive reasoning cannot set budget_tokens"
+      )
+
+  def to_dict(self) -> JsonObject:
+    data: JsonObject = {}
+    if self.mode is not None:
+      data["mode"] = _string_enum_value(self.mode)
+    if self.effort is not None:
+      data["effort"] = _string_enum_value(self.effort)
+    if self.budget_tokens is not None:
+      data["budget_tokens"] = self.budget_tokens
+    if self.summary is not None:
+      data["summary"] = _string_enum_value(self.summary)
+    return data
+
+  @classmethod
+  def from_dict(cls, data: Mapping[str, Any]) -> ReasoningOptions:
+    return cls(
+      mode=_optional_reasoning_mode(data, "mode"),
+      effort=_optional_reasoning_effort(data, "effort"),
+      budget_tokens=_optional_int(data, "budget_tokens"),
+      summary=_optional_reasoning_summary(data, "summary"),
+    )
+
+  def to_json(self) -> str:
+    return _json_dumps(self.to_dict())
+
+  @classmethod
+  def from_json(cls, value: str) -> ReasoningOptions:
+    return cls.from_dict(_json_loads_object(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,6 +637,8 @@ class GenerateRequest:
   max_output_tokens: int | None = None
   options: RequestOptions = field(default_factory=RequestOptions)
   extras: JsonObject = field(default_factory=dict)
+  top_k: int | None = None
+  reasoning: ReasoningOptions | None = None
 
   @classmethod
   def builder(cls, model: str) -> GenerateRequestBuilder:
@@ -526,12 +698,41 @@ class GenerateRequest:
         or not math.isfinite(value)
       ):
         raise ValueError(f"{name} must be finite")
+    if self.top_p is not None and not 0 <= self.top_p <= 1:
+      raise ValueError("top_p must be between 0 and 1")
     if self.max_output_tokens is not None and (
       isinstance(self.max_output_tokens, bool)
       or not isinstance(self.max_output_tokens, int)
       or self.max_output_tokens <= 0
+      or self.max_output_tokens > _U64_MAX
     ):
-      raise ValueError("max_output_tokens must be greater than zero")
+      raise ValueError(
+        f"max_output_tokens must be between 1 and {_U64_MAX}"
+      )
+    if self.top_k is not None and (
+      isinstance(self.top_k, bool)
+      or not isinstance(self.top_k, int)
+      or self.top_k < 0
+      or self.top_k > _U64_MAX
+    ):
+      raise ValueError(
+        f"top_k must be a non-negative integer no greater than {_U64_MAX}"
+      )
+    if self.reasoning is not None:
+      self.reasoning.validate()
+      conflicting = sorted(
+        {
+          "reasoning",
+          "thinking",
+          "reasoning_effort",
+          "output_config",
+        }.intersection(self.extras)
+      )
+      if conflicting:
+        names = ", ".join(conflicting)
+        raise ValueError(
+          f"typed reasoning conflicts with extras keys: {names}"
+        )
     if any(not tool.name.strip() for tool in self.tools):
       raise ValueError("tool names cannot be empty")
     if any(not isinstance(tool.parameters, Mapping) for tool in self.tools):
@@ -555,8 +756,12 @@ class GenerateRequest:
       data["temperature"] = self.temperature
     if self.top_p is not None:
       data["top_p"] = self.top_p
+    if self.top_k is not None:
+      data["top_k"] = self.top_k
     if self.max_output_tokens is not None:
       data["max_output_tokens"] = self.max_output_tokens
+    if self.reasoning is not None:
+      data["reasoning"] = self.reasoning.to_dict()
     if not self.options.is_empty:
       data["options"] = self.options.to_dict()
     if self.extras:
@@ -568,6 +773,7 @@ class GenerateRequest:
     choice = data.get("tool_choice")
     options = data.get("options", {})
     extras = data.get("extras", {})
+    reasoning = data.get("reasoning")
     if not isinstance(extras, Mapping):
       raise TypeError("extras must be a mapping")
     return cls(
@@ -584,6 +790,16 @@ class GenerateRequest:
         else RequestOptions.from_dict(_mapping(options, "options"))
       ),
       extras=deepcopy(dict(extras)),
+      top_k=_optional_int(data, "top_k"),
+      reasoning=(
+        None
+        if reasoning is None
+        else ReasoningOptions.from_dict(
+          reasoning.to_dict()
+          if isinstance(reasoning, ReasoningOptions)
+          else _mapping(reasoning, "reasoning")
+        )
+      ),
     )
 
   def to_json(self) -> str:
@@ -788,6 +1004,10 @@ __all__ = [
   "Message",
   "OtherEvent",
   "ReasoningDelta",
+  "ReasoningEffort",
+  "ReasoningMode",
+  "ReasoningOptions",
+  "ReasoningSummary",
   "RequestOptions",
   "Role",
   "TextDelta",

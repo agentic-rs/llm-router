@@ -33,6 +33,73 @@ let response = client
 println!("{}", response.text);
 ```
 
+Generation controls use provider-neutral names and are mapped after the route
+selects an upstream endpoint:
+
+```rust
+use tokn_sdk::{
+  GenerateRequest, ReasoningEffort, ReasoningMode, ReasoningSummary,
+};
+
+let openai_request = GenerateRequest::builder("gpt-5")
+  .prompt("Solve this step by step.")
+  .max_tokens(2048)
+  .reasoning_effort(ReasoningEffort::High)
+  .reasoning_summary(ReasoningSummary::Auto)
+  .build()?;
+
+let llama_request = GenerateRequest::builder("local-llama")
+  .prompt("Compare these implementations.")
+  .top_p(0.9)
+  .top_k(40)
+  .max_tokens(2048)
+  .build()?;
+
+let claude_request = GenerateRequest::builder("claude-sonnet-4.6")
+  .prompt("Plan this migration.")
+  .max_tokens(2048)
+  .reasoning_mode(ReasoningMode::Adaptive)
+  .reasoning_effort(ReasoningEffort::High)
+  .build()?;
+```
+
+`max_tokens()` is an alias for the neutral `max_output_tokens()` control.
+Managed routes serialize that limit as `max_output_tokens` for Responses,
+`max_completion_tokens` for OpenAI Chat Completions, and `max_tokens` for
+other Chat Completions or Messages routes. Codex account
+routes reject an explicit limit because that backend does not preserve it.
+The examples assume those selectors route to OpenAI Responses, llama.cpp Chat
+Completions, and Copilot's Claude Chat Completions fallback; use selectors from
+your own configuration.
+`top_p()` remains portable across compatible routes and is validated in the
+inclusive range 0 through 1. Responses supports reasoning effort and summary
+but not `top_k` or an enabled/adaptive mode. Typed `top_k` is currently
+supported on llama.cpp Chat Completions; llama.cpp has no portable reasoning
+control. Known non-reasoning models reject typed reasoning locally.
+
+DeepSeek exposes only `high` and `max` effort. The SDK rejects compatibility
+aliases that DeepSeek would otherwise silently promote; it also rejects
+`temperature` or `top_p` when DeepSeek thinking would ignore them. Claude
+supports adaptive reasoning on 4.6 and newer models but not a reasoning
+summary. Manual Claude reasoning requires `ReasoningMode::Enabled`, an
+explicit `max_tokens()` limit, a budget of at least 1024 tokens, and
+`budget_tokens < max_tokens`; manual mode is rejected on 4.7 and newer models,
+while adaptive mode is rejected on 4.5 and older models. Claude effort is also
+checked against the selected model generation—for example, Sonnet 4.5 has no
+effort control, Opus 4.5 supports through `high`, 4.6 supports through `max`,
+and current Opus 4.7 supports `xhigh`. Incompatible sampling values are
+rejected while Claude thinking is enabled, as are explicit sampling controls
+on Claude generations that do not accept them.
+
+Unsupported explicit controls fail clearly after routing rather than being
+silently dropped or reinterpreted. Raw endpoint clients remain the escape
+hatch for an exact provider wire shape.
+
+`passthrough` and `switch` profiles preserve the generated Responses payload
+verbatim, so they reject typed `top_k` and reasoning controls that would
+require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
+the provider-neutral control API.
+
 Build a request without a client when it needs to be serialized, transformed,
 queued, or reused:
 
@@ -55,9 +122,8 @@ let response = request.bind(&client).send().await?;
 
 The façade deliberately hides router `AppState`, account handles, and request
 pipeline stages. Those remain implementation details and can evolve without
-breaking SDK consumers. Provider-specific controls that do not have equivalent
-semantics across endpoints, such as reasoning configuration, remain available
-through the typed endpoint clients and raw JSON escape hatch.
+breaking SDK consumers. Typed endpoint clients and raw JSON remain available
+when an exact endpoint wire shape is required.
 
 ## Python
 
@@ -82,6 +148,50 @@ response = await (
 
 print(response.text)
 ```
+
+Python exposes the same neutral generation controls:
+
+```python
+from tokn import (
+  GenerateRequest,
+  ReasoningEffort,
+  ReasoningMode,
+  ReasoningSummary,
+)
+
+openai_request = (
+  GenerateRequest.builder("gpt-5")
+  .prompt("Solve this step by step.")
+  .max_tokens(2048)
+  .reasoning_effort(ReasoningEffort.HIGH)
+  .reasoning_summary(ReasoningSummary.AUTO)
+  .build()
+)
+
+llama_request = (
+  GenerateRequest.builder("local-llama")
+  .prompt("Compare these implementations.")
+  .top_p(0.9)
+  .top_k(40)
+  .max_tokens(2048)
+  .build()
+)
+
+claude_request = (
+  GenerateRequest.builder("claude-sonnet-4.6")
+  .prompt("Plan this migration.")
+  .max_tokens(2048)
+  .reasoning_mode(ReasoningMode.ADAPTIVE)
+  .reasoning_effort(ReasoningEffort.HIGH)
+  .build()
+)
+```
+
+As in Rust, `max_tokens()` aliases `max_output_tokens()`. Reasoning modes,
+summaries, and `top_k` remain provider- and model-dependent; the three examples
+deliberately keep each request to controls its route can represent.
+Unsupported explicit controls fail clearly after routing. Use the raw endpoint
+clients when the application needs to control the exact wire representation.
 
 `GenerateRequest` is owned and independent from a client, so it can be
 serialized, transformed, queued, and later sent or bound:

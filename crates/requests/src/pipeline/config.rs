@@ -17,7 +17,7 @@
 use serde_json::Value;
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
-use tokn_core::AgentId;
+use tokn_core::{generation::GenerationOptions, AgentId};
 
 /// Caller-supplied per-run config bag. Cloned cheaply (the inner map is
 /// owned, but [`PipelineCtx`] holds it behind an `Arc`).
@@ -25,6 +25,7 @@ use tokn_core::AgentId;
 pub struct RunConfig {
   inner: BTreeMap<SmolStr, Value>,
   agent_id: Option<AgentId>,
+  generation_options: Option<GenerationOptions>,
 }
 
 impl RunConfig {
@@ -48,8 +49,12 @@ impl RunConfig {
     self.agent_id.as_ref()
   }
 
+  pub fn generation_options(&self) -> Option<&GenerationOptions> {
+    self.generation_options.as_ref()
+  }
+
   pub fn is_empty(&self) -> bool {
-    self.inner.is_empty() && self.agent_id.is_none()
+    self.inner.is_empty() && self.agent_id.is_none() && self.generation_options.is_none()
   }
 
   pub fn len(&self) -> usize {
@@ -61,6 +66,7 @@ impl RunConfig {
 pub struct RunConfigBuilder {
   inner: BTreeMap<SmolStr, Value>,
   agent_id: Option<AgentId>,
+  generation_options: Option<GenerationOptions>,
 }
 
 impl RunConfigBuilder {
@@ -91,10 +97,16 @@ impl RunConfigBuilder {
     self
   }
 
+  pub fn with_generation_options(mut self, generation_options: GenerationOptions) -> Self {
+    self.generation_options = Some(generation_options);
+    self
+  }
+
   pub fn build(self) -> RunConfig {
     RunConfig {
       inner: self.inner,
       agent_id: self.agent_id,
+      generation_options: self.generation_options,
     }
   }
 }
@@ -123,5 +135,15 @@ mod tests {
   fn default_is_empty() {
     let cfg = RunConfig::new();
     assert!(cfg.is_empty());
+  }
+
+  #[test]
+  fn carries_typed_generation_options_outside_the_generic_bag() {
+    let options = GenerationOptions::new().with_top_k(40);
+    let cfg = RunConfig::builder().with_generation_options(options.clone()).build();
+
+    assert_eq!(cfg.generation_options(), Some(&options));
+    assert_eq!(cfg.len(), 0);
+    assert!(!cfg.is_empty());
   }
 }

@@ -19,6 +19,9 @@ pub use generate::{
 };
 pub use response::{BufferedResponse, ByteStream, RawResponse, ResponseBody, StreamResponse};
 
+pub use tokn_core::generation::{
+  GenerationOptions, GenerationOptionsError, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary,
+};
 pub use tokn_core::provider::Endpoint;
 pub use tokn_endpoint_chat_completions as chat_completions;
 pub use tokn_endpoint_messages as messages;

@@ -8,6 +8,7 @@ from typing import (
   AsyncIterator,
   Generic,
   Iterable,
+  Literal,
   Mapping,
   TypeVar,
   cast,
@@ -19,6 +20,10 @@ from ._models import (
   GenerateRequest,
   GenerateResponse,
   Message,
+  ReasoningEffort,
+  ReasoningMode,
+  ReasoningOptions,
+  ReasoningSummary,
   RequestOptions,
   Tool,
   ToolCall,
@@ -181,9 +186,61 @@ class _GenerateBuilder(Generic[_BuilderT]):
     self._request.top_p = top_p
     return self._self()
 
+  def top_k(self, top_k: int) -> _BuilderT:
+    self._request.top_k = top_k
+    return self._self()
+
   def max_output_tokens(self, max_output_tokens: int) -> _BuilderT:
     self._request.max_output_tokens = max_output_tokens
     return self._self()
+
+  def max_tokens(self, max_tokens: int) -> _BuilderT:
+    """Alias for the provider-neutral ``max_output_tokens`` control."""
+
+    return self.max_output_tokens(max_tokens)
+
+  def reasoning(self, options: ReasoningOptions) -> _BuilderT:
+    if not isinstance(options, ReasoningOptions):
+      raise TypeError("reasoning options must be ReasoningOptions")
+    self._request.reasoning = ReasoningOptions.from_dict(options.to_dict())
+    return self._self()
+
+  def reasoning_mode(
+    self,
+    mode: ReasoningMode | Literal["enabled", "disabled", "adaptive"],
+  ) -> _BuilderT:
+    self._reasoning_options().mode = mode
+    return self._self()
+
+  def reasoning_enabled(self, enabled: bool) -> _BuilderT:
+    if not isinstance(enabled, bool):
+      raise TypeError("reasoning enabled must be a bool")
+    return self.reasoning_mode(
+      ReasoningMode.ENABLED if enabled else ReasoningMode.DISABLED
+    )
+
+  def reasoning_effort(
+    self,
+    effort: ReasoningEffort | str,
+  ) -> _BuilderT:
+    self._reasoning_options().effort = effort
+    return self._self()
+
+  def reasoning_budget_tokens(self, budget_tokens: int) -> _BuilderT:
+    self._reasoning_options().budget_tokens = budget_tokens
+    return self._self()
+
+  def reasoning_summary(
+    self,
+    summary: ReasoningSummary | str,
+  ) -> _BuilderT:
+    self._reasoning_options().summary = summary
+    return self._self()
+
+  def _reasoning_options(self) -> ReasoningOptions:
+    if self._request.reasoning is None:
+      self._request.reasoning = ReasoningOptions()
+    return self._request.reasoning
 
   def options(self, options: RequestOptions) -> _BuilderT:
     self._request.options = RequestOptions.from_dict(options.to_dict())
