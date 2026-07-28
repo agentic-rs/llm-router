@@ -112,7 +112,7 @@ fn terminal_reason(
         })
       }),
     Endpoint::Messages => match value.get("type").and_then(serde_json::Value::as_str) {
-      Some("message_stop") => Some(None),
+      Some("message_stop") => Some(Some("stop".into())),
       Some("message_delta") => value
         .pointer("/delta/stop_reason")
         .filter(|reason| !reason.is_null())
@@ -363,6 +363,18 @@ mod tests {
       let event = t.finish().unwrap().pop().expect("terminal event");
       assert_eq!(event.event.as_deref(), Some("response.completed"));
     }
+  }
+
+  #[test]
+  fn bare_messages_stop_defaults_to_stop_reason() {
+    let mut t = EndpointTranslator::new(Endpoint::Messages, Endpoint::ChatCompletions);
+
+    let finish = t
+      .transform(SseEvent::json(Some("message_stop"), json!({"type": "message_stop"})))
+      .unwrap();
+
+    assert_eq!(finish.len(), 1);
+    assert_eq!(finish[0].json.as_ref().unwrap()["choices"][0]["finish_reason"], "stop");
   }
 
   #[test]

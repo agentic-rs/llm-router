@@ -1,10 +1,9 @@
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStream, Eventsource};
 use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
 use tokn_convert::ir::IrDelta;
 use tokn_convert::sse::SseAccumulator;
 use tokn_core::provider::Endpoint;
@@ -47,50 +46,80 @@ pub type GenerateStream = BoxStream<'static, Result<GenerateEvent>>;
 /// A convenience stream containing only generated text deltas.
 pub type TextStream = BoxStream<'static, Result<String>>;
 
+struct EventParseState {
+  events: EventStream<crate::ByteStream>,
+  accumulator: SseAccumulator,
+  pending: VecDeque<Result<GenerateEvent>>,
+  stop_after_pending: bool,
+}
+
+impl EventParseState {
+  fn new(bytes: crate::ByteStream) -> Self {
+    Self {
+      events: bytes.eventsource(),
+      accumulator: SseAccumulator::new(Endpoint::Responses),
+      pending: VecDeque::new(),
+      stop_after_pending: false,
+    }
+  }
+
+  fn enqueue(&mut self, results: Vec<Result<GenerateEvent>>, terminal: bool) {
+    self.stop_after_pending |= terminal;
+    for result in results {
+      let failed = result.is_err();
+      self.pending.push_back(result);
+      if failed {
+        self.stop_after_pending = true;
+        break;
+      }
+    }
+  }
+
+  fn fail(&mut self, error: Error) {
+    self.enqueue(vec![Err(error)], true);
+  }
+}
+
 pub(super) fn parse_events(bytes: crate::ByteStream) -> GenerateStream {
-  let mut accumulator = SseAccumulator::new(Endpoint::Responses);
-  let terminal = Arc::new(AtomicBool::new(false));
-  let terminal_in_stream = terminal.clone();
-  let parsed = bytes.eventsource().map(move |result| match result {
-    Ok(event) if event.data.trim().is_empty() => Vec::new(),
-    Ok(event) if event.data.trim() == "[DONE]" => {
-      terminal_in_stream.store(true, Ordering::Relaxed);
-      Vec::new()
-    }
-    Ok(event) => match serde_json::from_str::<Value>(&event.data) {
-      Ok(value) => {
-        if matches!(
-          value.get("type").and_then(Value::as_str),
-          Some("response.completed" | "response.incomplete" | "response.failed" | "response.cancelled" | "error")
-        ) {
-          terminal_in_stream.store(true, Ordering::Relaxed);
+  stream::unfold(EventParseState::new(bytes), |mut state| async move {
+    loop {
+      if let Some(result) = state.pending.pop_front() {
+        return Some((result, state));
+      }
+      if state.stop_after_pending {
+        return None;
+      }
+
+      match state.events.next().await {
+        Some(Ok(event)) if event.data.trim().is_empty() => {}
+        Some(Ok(event)) if event.data.trim() == "[DONE]" => {
+          state.stop_after_pending = true;
         }
-        results_from_value(&mut accumulator, value)
-      }
-      Err(source) => {
-        terminal_in_stream.store(true, Ordering::Relaxed);
-        vec![Err(Error::DeserializeStreamEvent { source })]
-      }
-    },
-    Err(error) => {
-      terminal_in_stream.store(true, Ordering::Relaxed);
-      vec![Err(Error::GenerateStream {
-        message: error.to_string(),
-      })]
-    }
-  });
-  parsed
-    .chain(stream::once(async move {
-      if terminal.load(Ordering::Relaxed) {
-        Vec::new()
-      } else {
-        vec![Err(Error::GenerateStream {
+        Some(Ok(event)) => match serde_json::from_str::<Value>(&event.data) {
+          Ok(value) => {
+            let terminal = is_terminal_value(&value);
+            let results = results_from_value(&mut state.accumulator, value);
+            state.enqueue(results, terminal);
+          }
+          Err(source) => state.fail(Error::DeserializeStreamEvent { source }),
+        },
+        Some(Err(error)) => state.fail(Error::GenerateStream {
+          message: error.to_string(),
+        }),
+        None => state.fail(Error::GenerateStream {
           message: "generation stream ended before a terminal event".into(),
-        })]
+        }),
       }
-    }))
-    .flat_map(stream::iter)
-    .boxed()
+    }
+  })
+  .boxed()
+}
+
+fn is_terminal_value(value: &Value) -> bool {
+  matches!(
+    value.get("type").and_then(Value::as_str),
+    Some("response.completed" | "response.incomplete" | "response.failed" | "response.cancelled" | "error")
+  )
 }
 
 pub(super) fn text_only(events: GenerateStream) -> TextStream {
@@ -262,6 +291,70 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn semantic_errors_are_terminal() {
+    let body = sse([
+      serde_json::json!({
+        "type": "response.failed",
+        "response": {
+          "status": "failed",
+          "error": {"message": "provider failed"}
+        }
+      }),
+      serde_json::json!({
+        "type": "response.output_text.delta",
+        "delta": "must not be emitted"
+      }),
+    ]);
+    let mut events = parse_events(byte_stream(body));
+
+    assert!(matches!(
+      events.next().await,
+      Some(Err(Error::GenerateStream { message })) if message == "provider failed"
+    ));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn decode_errors_are_terminal() {
+    let body = format!(
+      "data: not-json\n\n{}",
+      sse([serde_json::json!({
+        "type": "response.output_text.delta",
+        "delta": "must not be emitted"
+      })])
+    );
+    let mut events = parse_events(byte_stream(body));
+
+    assert!(matches!(
+      events.next().await,
+      Some(Err(Error::DeserializeStreamEvent { .. }))
+    ));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn transport_errors_are_terminal() {
+    let trailing = sse([serde_json::json!({
+      "type": "response.output_text.delta",
+      "delta": "must not be emitted"
+    })]);
+    let bytes: crate::ByteStream = Box::pin(stream::iter([
+      Err(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset",
+      )),
+      Ok(Bytes::from(trailing)),
+    ]));
+    let mut events = parse_events(bytes);
+
+    assert!(matches!(
+      events.next().await,
+      Some(Err(Error::GenerateStream { message })) if message.contains("connection reset")
+    ));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
   async fn incomplete_streams_keep_usage_and_finish_reason() {
     let body = sse([serde_json::json!({
       "type": "response.incomplete",
@@ -332,6 +425,34 @@ mod tests {
         } if reason == "cancelled"
       )
     }));
+  }
+
+  #[tokio::test]
+  async fn successful_terminal_events_finish_without_polling_later_events() {
+    let body = sse([
+      serde_json::json!({
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": []
+        }
+      }),
+      serde_json::json!({
+        "type": "response.output_text.delta",
+        "delta": "must not be emitted"
+      }),
+    ]);
+    let events = parse_events(byte_stream(body))
+      .try_collect::<Vec<_>>()
+      .await
+      .expect("completed terminal event should end the stream");
+
+    assert_eq!(
+      events,
+      vec![GenerateEvent::Completed {
+        finish_reason: Some("stop".into())
+      }]
+    );
   }
 
   #[tokio::test]

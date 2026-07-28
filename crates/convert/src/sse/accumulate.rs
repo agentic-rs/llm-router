@@ -15,6 +15,11 @@ struct ResponsesState {
 }
 
 #[derive(Default)]
+struct MessagesState {
+  tool_arguments_seen: BTreeMap<usize, bool>,
+}
+
+#[derive(Default)]
 struct ResponseOutputItem {
   item_type: Option<String>,
   id: Option<String>,
@@ -37,6 +42,7 @@ pub struct SseAccumulator {
   endpoint: Endpoint,
   response: IrResponse,
   responses: ResponsesState,
+  messages: MessagesState,
 }
 
 impl SseAccumulator {
@@ -45,6 +51,7 @@ impl SseAccumulator {
       endpoint,
       response: IrResponse::default(),
       responses: ResponsesState::default(),
+      messages: MessagesState::default(),
     }
   }
 
@@ -57,7 +64,7 @@ impl SseAccumulator {
       Endpoint::Responses => self.delta_from_responses_event(value),
       Endpoint::Messages => {
         self.observe_messages_event(value);
-        crate::value::messages::delta_from_messages_event(value)
+        self.delta_from_messages_event(value)
       }
     };
     for delta in deltas.iter().cloned() {
@@ -153,6 +160,45 @@ impl SseAccumulator {
     if self.responses.model.is_none() {
       self.responses.model = message.get("model").and_then(Value::as_str).map(str::to_string);
     }
+  }
+
+  fn delta_from_messages_event(&mut self, value: &Value) -> Vec<IrDelta> {
+    let mut deltas = crate::value::messages::delta_from_messages_event(value);
+    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+    match value.get("type").and_then(Value::as_str) {
+      Some("content_block_start")
+        if value
+          .get("content_block")
+          .and_then(|block| block.get("type"))
+          .and_then(Value::as_str)
+          == Some("tool_use") =>
+      {
+        let arguments_seen = deltas
+          .iter()
+          .any(|delta| matches!(delta, IrDelta::ToolCall { arguments_delta, .. } if !arguments_delta.is_empty()));
+        self.messages.tool_arguments_seen.insert(index, arguments_seen);
+      }
+      Some("content_block_delta") => {
+        let arguments_seen = deltas
+          .iter()
+          .any(|delta| matches!(delta, IrDelta::ToolCall { arguments_delta, .. } if !arguments_delta.is_empty()));
+        if arguments_seen {
+          self.messages.tool_arguments_seen.insert(index, true);
+        }
+      }
+      Some("content_block_stop") if self.messages.tool_arguments_seen.remove(&index) == Some(false) => {
+        deltas.push(IrDelta::ToolCall {
+          index,
+          id: None,
+          name: None,
+          arguments_delta: "{}".into(),
+        });
+      }
+      _ => {}
+    }
+
+    deltas
   }
 
   fn observe_responses_response(&mut self, value: &Value) {
@@ -306,4 +352,73 @@ pub async fn accumulate(endpoint: Endpoint, resp: reqwest::Response) -> Result<I
     acc.push_value(value);
   }
   Ok(acc.finish())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+
+  fn messages_tool_start(input: Value) -> Value {
+    json!({
+      "type": "content_block_start",
+      "index": 0,
+      "content_block": {
+        "type": "tool_use",
+        "id": "toolu_1",
+        "name": "lookup",
+        "input": input
+      }
+    })
+  }
+
+  #[test]
+  fn messages_empty_tool_input_is_synthesized_when_the_block_closes() {
+    let mut accumulator = SseAccumulator::new(Endpoint::Messages);
+
+    let start = accumulator.push_value(&messages_tool_start(json!({})));
+    assert!(matches!(
+      start.as_slice(),
+      [IrDelta::ToolCall { arguments_delta, .. }] if arguments_delta.is_empty()
+    ));
+
+    let stop = accumulator.push_value(&json!({
+      "type": "content_block_stop",
+      "index": 0
+    }));
+    assert!(matches!(
+      stop.as_slice(),
+      [IrDelta::ToolCall { arguments_delta, .. }] if arguments_delta == "{}"
+    ));
+
+    let response = accumulator.finish();
+    assert_eq!(response.tool_calls[0].id.as_deref(), Some("toolu_1"));
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    assert_eq!(response.tool_calls[0].arguments, json!("{}"));
+  }
+
+  #[test]
+  fn messages_empty_tool_start_does_not_prefix_streamed_arguments() {
+    let mut accumulator = SseAccumulator::new(Endpoint::Messages);
+
+    accumulator.push_value(&messages_tool_start(json!({})));
+    for partial_json in [r#"{"query":"#, r#""rust"}"#] {
+      accumulator.push_value(&json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "input_json_delta",
+          "partial_json": partial_json
+        }
+      }));
+    }
+    let stop = accumulator.push_value(&json!({
+      "type": "content_block_stop",
+      "index": 0
+    }));
+
+    assert!(stop.is_empty());
+    let response = accumulator.finish();
+    assert_eq!(response.tool_calls[0].arguments, json!(r#"{"query":"rust"}"#));
+  }
 }

@@ -42,11 +42,15 @@ let request = GenerateRequest::builder("smart")
   .temperature(0.2)
   .build()?;
 
-let json = serde_json::to_string(&request)?;
-let response = request.clone().bind(&client).send().await?;
-
-// Or keep the request detached and pass a borrow directly.
+let serialized = serde_json::to_string(&request)?;
+let request: GenerateRequest = serde_json::from_str(&serialized)?;
 let response = client.send(&request).await?;
+```
+
+The same owned request can instead be rebound for fluent execution:
+
+```rust
+let response = request.bind(&client).send().await?;
 ```
 
 The façade deliberately hides router `AppState`, account handles, and request

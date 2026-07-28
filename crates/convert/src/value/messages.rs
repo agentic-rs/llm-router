@@ -83,28 +83,25 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
     "messages".into(),
     Value::Array(req.messages.iter().map(message_to_messages).collect()),
   );
-  if !req.tools.is_empty() {
-    let tools: Vec<Value> = req
-      .tools
-      .iter()
-      .filter(|t| t.get("function").and_then(Value::as_object).is_some())
-      .map(crate::tools::tool_to_messages)
-      .collect();
-    if !tools.is_empty() {
-      out.insert("tools".into(), Value::Array(tools));
+  let tools: Vec<Value> = req
+    .tools
+    .iter()
+    .filter(|t| t.get("function").and_then(Value::as_object).is_some())
+    .map(crate::tools::tool_to_messages)
+    .collect();
+  if !tools.is_empty() {
+    out.insert("tools".into(), Value::Array(tools));
+
+    let mut tool_choice = req.tool_choice.as_ref().map(crate::tools::tool_choice_to_messages);
+    if let Some(parallel_tool_calls) = req.extras.get("parallel_tool_calls").and_then(Value::as_bool) {
+      let choice = tool_choice.get_or_insert_with(|| json!({"type": "auto"}));
+      if let Some(choice) = choice.as_object_mut() {
+        choice.insert("disable_parallel_tool_use".into(), Value::Bool(!parallel_tool_calls));
+      }
     }
-  }
-  let mut tool_choice = req.tool_choice.as_ref().map(crate::tools::tool_choice_to_messages);
-  let mut mapped_parallel_tool_calls = false;
-  if let Some(parallel_tool_calls) = req.extras.get("parallel_tool_calls").and_then(Value::as_bool) {
-    let choice = tool_choice.get_or_insert_with(|| json!({"type": "auto"}));
-    if let Some(choice) = choice.as_object_mut() {
-      choice.insert("disable_parallel_tool_use".into(), Value::Bool(!parallel_tool_calls));
-      mapped_parallel_tool_calls = true;
+    if let Some(tool_choice) = tool_choice {
+      out.insert("tool_choice".into(), tool_choice);
     }
-  }
-  if let Some(tool_choice) = tool_choice {
-    out.insert("tool_choice".into(), tool_choice);
   }
   insert_opt_f64(&mut out, "temperature", req.sampling.temperature);
   insert_opt_f64(&mut out, "top_p", req.sampling.top_p);
@@ -122,7 +119,7 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
     out.insert("stream".into(), Value::Bool(true));
   }
   for (k, v) in &req.extras {
-    if k == "parallel_tool_calls" && mapped_parallel_tool_calls {
+    if k == "parallel_tool_calls" {
       continue;
     }
     out.entry(k.clone()).or_insert_with(|| v.clone());
@@ -226,7 +223,11 @@ pub fn delta_from_messages_event(v: &Value) -> Vec<IrDelta> {
           index: v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
           id: content_block.get("id").and_then(Value::as_str).map(str::to_string),
           name: content_block.get("name").and_then(Value::as_str).map(str::to_string),
-          arguments_delta: String::new(),
+          arguments_delta: content_block
+            .get("input")
+            .filter(|input| !matches!(input, Value::Object(object) if object.is_empty()))
+            .map(Value::to_string)
+            .unwrap_or_default(),
         });
       }
     }
@@ -615,6 +616,10 @@ mod tests {
       "model": "claude-test",
       "messages": [{ "role": "user", "content": "Find it" }],
       "max_tokens": 128,
+      "tools": [{
+        "name": "lookup",
+        "input_schema": { "type": "object" }
+      }],
       "tool_choice": {
         "type": "auto",
         "disable_parallel_tool_use": true
@@ -639,6 +644,23 @@ mod tests {
       })
     );
     assert!(round_trip.get("parallel_tool_calls").is_none());
+  }
+
+  #[test]
+  fn messages_omits_tool_controls_when_no_tools_can_be_converted() {
+    let request = IrRequest {
+      model: "claude-test".into(),
+      tools: vec![json!({"type": "web_search"})],
+      tool_choice: Some(json!("auto")),
+      extras: BTreeMap::from([("parallel_tool_calls".into(), json!(false))]),
+      ..IrRequest::default()
+    };
+
+    let body = request_to_value(&request).expect("render Messages request");
+
+    assert!(body.get("tools").is_none());
+    assert!(body.get("tool_choice").is_none());
+    assert!(body.get("parallel_tool_calls").is_none());
   }
 
   #[test]
@@ -697,7 +719,7 @@ mod tests {
   }
 
   #[test]
-  fn messages_tool_start_emits_identity_for_empty_input_call() {
+  fn messages_tool_start_emits_identity_and_complete_input() {
     let start = json!({
       "type": "content_block_start",
       "index": 2,
@@ -705,7 +727,7 @@ mod tests {
         "type": "tool_use",
         "id": "toolu_123",
         "name": "lookup",
-        "input": {}
+        "input": { "query": "rust" }
       }
     });
 
@@ -722,26 +744,18 @@ mod tests {
         assert_eq!(*index, 2);
         assert_eq!(id.as_deref(), Some("toolu_123"));
         assert_eq!(name.as_deref(), Some("lookup"));
-        assert!(arguments_delta.is_empty());
+        assert_eq!(arguments_delta, r#"{"query":"rust"}"#);
       }
       other => panic!("expected tool call delta, got {other:?}"),
     }
 
-    let arguments = json!({
-      "type": "content_block_delta",
-      "index": 2,
-      "delta": {
-        "type": "input_json_delta",
-        "partial_json": "{}"
-      }
-    });
     let mut response = IrResponse::default();
-    for delta in deltas.into_iter().chain(delta_from_messages_event(&arguments)) {
+    for delta in deltas {
       response.push_delta(delta);
     }
 
     assert_eq!(response.tool_calls[2].id.as_deref(), Some("toolu_123"));
     assert_eq!(response.tool_calls[2].name, "lookup");
-    assert_eq!(response.tool_calls[2].arguments, json!("{}"));
+    assert_eq!(response.tool_calls[2].arguments, json!(r#"{"query":"rust"}"#));
   }
 }

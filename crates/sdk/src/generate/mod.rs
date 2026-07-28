@@ -179,9 +179,8 @@ impl GenerateRequest {
       stream,
       extras: self.extras.clone(),
     };
-    let mut body = tokn_convert::value::responses::request_to_value(&request)
+    let body = tokn_convert::value::responses::request_to_value(&request)
       .map_err(|source| Error::BuildGenerateRequest { source })?;
-    body["stream"] = Value::Bool(stream);
     Ok(body)
   }
 }
