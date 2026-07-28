@@ -5,7 +5,7 @@
 //! (its `*.done` events) before the next item's `output_item.added` is sent.
 
 use super::event::SseEvent;
-use crate::ir::IrDelta;
+use crate::ir::{IrDelta, Usage};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,7 +63,7 @@ pub struct ResponsesEmitter {
   created_emitted: bool,
   in_progress_emitted: bool,
   finished: bool,
-  usage: Option<Value>,
+  usage: Option<Usage>,
   finish_reason: Option<String>,
 }
 
@@ -143,11 +143,15 @@ impl ResponsesEmitter {
       "status": status,
       "model": self.model,
       "output": if completed { Value::Array(self.closed.clone()) } else { Value::Array(Vec::new()) },
-      "usage": self.usage.clone().unwrap_or(Value::Null),
+      "usage": self.usage.as_ref().map(crate::ir::usage_to_io).unwrap_or(Value::Null),
     });
     if completed {
       if let Some(obj) = response.as_object_mut() {
         obj.insert("completed_at".into(), json!(self.created_at));
+        let (_, incomplete_reason) = crate::ir::responses_completion_status(self.finish_reason.as_deref());
+        if let Some(reason) = incomplete_reason {
+          obj.insert("incomplete_details".into(), json!({"reason": reason}));
+        }
       }
     }
     response
@@ -172,7 +176,11 @@ impl ResponsesEmitter {
           self.handle_tool_call(*index, id.clone(), name.clone(), arguments_delta, &mut out);
         }
         IrDelta::Usage(usage) => {
-          self.usage = Some(crate::ir::usage_to_io(usage));
+          if let Some(current) = &mut self.usage {
+            current.merge(usage.clone());
+          } else {
+            self.usage = Some(usage.clone());
+          }
         }
         IrDelta::Finish(reason) => {
           self.finish_reason = reason.clone();
@@ -409,12 +417,19 @@ impl ResponsesEmitter {
     self.ensure_started(&mut out);
     self.close_current(&mut out);
     let seq = self.next_seq();
+    let (status, _) = crate::ir::responses_completion_status(self.finish_reason.as_deref());
+    let event_type = match status {
+      "incomplete" => "response.incomplete",
+      "failed" => "response.failed",
+      "cancelled" => "response.cancelled",
+      _ => "response.completed",
+    };
     out.push(SseEvent::json(
-      Some("response.completed"),
+      Some(event_type),
       json!({
-        "type": "response.completed",
+        "type": event_type,
         "sequence_number": seq,
-        "response": self.response_snapshot("completed", true),
+        "response": self.response_snapshot(status, true),
       }),
     ));
     out
@@ -476,6 +491,11 @@ impl ResponsesEmitter {
         arguments,
         ..
       } => {
+        let arguments = if arguments.trim().is_empty() {
+          "{}".to_string()
+        } else {
+          arguments
+        };
         let seq = self.next_seq();
         out.push(SseEvent::json(
           Some("response.function_call_arguments.done"),
@@ -546,5 +566,85 @@ impl ResponsesEmitter {
         self.closed.push(final_item);
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn merges_split_usage_before_terminal_event() {
+    let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
+    emitter.emit(&[IrDelta::Usage(Usage {
+      input_tokens: Some(7),
+      ..Usage::default()
+    })]);
+    emitter.emit(&[IrDelta::Usage(Usage {
+      output_tokens: Some(5),
+      total_tokens: Some(12),
+      ..Usage::default()
+    })]);
+
+    let completed = emitter
+      .finish()
+      .into_iter()
+      .find(|event| event.event.as_deref() == Some("response.completed"))
+      .and_then(|event| event.json)
+      .expect("completed event");
+
+    assert_eq!(completed["response"]["usage"]["input_tokens"], 7);
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 5);
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 12);
+  }
+
+  #[test]
+  fn length_finish_emits_incomplete_terminal_event() {
+    let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
+    emitter.emit(&[IrDelta::Finish(Some("length".into()))]);
+
+    let terminal = emitter.finish().pop().expect("terminal event");
+
+    assert_eq!(terminal.event.as_deref(), Some("response.incomplete"));
+    let value = terminal.json.expect("terminal JSON");
+    assert_eq!(value["response"]["status"], "incomplete");
+    assert_eq!(value["response"]["incomplete_details"]["reason"], "max_output_tokens");
+  }
+
+  #[test]
+  fn cancelled_finish_emits_cancelled_terminal_event() {
+    let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
+    emitter.emit(&[IrDelta::Finish(Some("cancelled".into()))]);
+
+    let terminal = emitter.finish().pop().expect("terminal event");
+
+    assert_eq!(terminal.event.as_deref(), Some("response.cancelled"));
+    assert_eq!(terminal.json.unwrap()["response"]["status"], "cancelled");
+  }
+
+  #[test]
+  fn empty_function_arguments_are_closed_as_an_empty_object() {
+    let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
+    emitter.emit(&[IrDelta::ToolCall {
+      index: 0,
+      id: Some("call_1".into()),
+      name: Some("ping".into()),
+      arguments_delta: String::new(),
+    }]);
+
+    let events = emitter.finish();
+    let arguments_done = events
+      .iter()
+      .find(|event| event.event.as_deref() == Some("response.function_call_arguments.done"))
+      .and_then(|event| event.json.as_ref())
+      .expect("arguments done event");
+    let item_done = events
+      .iter()
+      .find(|event| event.event.as_deref() == Some("response.output_item.done"))
+      .and_then(|event| event.json.as_ref())
+      .expect("output item done event");
+
+    assert_eq!(arguments_done["arguments"], "{}");
+    assert_eq!(item_done["item"]["arguments"], "{}");
   }
 }

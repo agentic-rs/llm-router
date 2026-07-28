@@ -10,12 +10,11 @@ use smol_str::SmolStr;
 use std::sync::Arc;
 use tokn_access::AccessContext;
 use tokn_accounts::routing::{route_mode_as_str, ResolveError};
+use tokn_convert::value::messages::DEFAULT_MESSAGES_MAX_TOKENS;
 use tokn_core::event::Event as CoreEvent;
 use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEvent, RequestEventPayload};
 use tokn_requests::pipeline::error::RequestsError;
 use tracing::instrument;
-
-const DEFAULT_MESSAGES_MAX_TOKENS: u64 = 32_000;
 
 async fn handle(
   state: AppState,

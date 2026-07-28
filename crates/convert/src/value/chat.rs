@@ -70,7 +70,7 @@ pub fn request_from_value(v: &Value) -> Result<IrRequest> {
         .map(Vec::as_slice)
         .unwrap_or(&[]),
     ),
-    tool_choice: obj.get("tool_choice").cloned(),
+    tool_choice: obj.get("tool_choice").map(crate::tools::normalise_tool_choice),
     sampling: Sampling {
       temperature: obj.get("temperature").and_then(Value::as_f64),
       top_p: obj.get("top_p").and_then(Value::as_f64),
@@ -96,7 +96,7 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
     messages.push(json!({ "role": "system", "content": system }));
   }
   for msg in &req.messages {
-    messages.push(message_to_chat(msg));
+    messages.extend(message_to_chat(msg));
   }
   out.insert("messages".into(), Value::Array(messages));
   if !req.tools.is_empty() {
@@ -113,7 +113,11 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
       out.insert("tools".into(), Value::Array(tools));
     }
   }
-  insert_opt(&mut out, "tool_choice", req.tool_choice.clone());
+  insert_opt(
+    &mut out,
+    "tool_choice",
+    req.tool_choice.as_ref().map(crate::tools::tool_choice_to_chat),
+  );
   insert_opt_f64(&mut out, "temperature", req.sampling.temperature);
   insert_opt_f64(&mut out, "top_p", req.sampling.top_p);
   insert_opt_u64(&mut out, "max_tokens", req.sampling.max_output_tokens);
@@ -314,10 +318,19 @@ pub fn chunk_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish:
 }
 
 fn message_from_value(msg: &Value, role: &str) -> Result<IrMessage> {
+  let tool_call_id = msg.get("tool_call_id").and_then(Value::as_str).map(str::to_string);
+  let content = if role == "tool" {
+    vec![ContentPart::ToolResult {
+      id: tool_call_id.clone(),
+      content: msg.get("content").cloned().unwrap_or(Value::Null),
+    }]
+  } else {
+    content_from_chat(msg.get("content"))
+  };
   Ok(IrMessage {
     role: Role::from_wire(role),
-    content: content_from_chat(msg.get("content")),
-    tool_call_id: msg.get("tool_call_id").and_then(Value::as_str).map(str::to_string),
+    content,
+    tool_call_id,
     name: msg.get("name").and_then(Value::as_str).map(str::to_string),
     raw: None,
   })
@@ -341,19 +354,48 @@ fn part_from_chat(v: &Value) -> ContentPart {
   }
 }
 
-fn message_to_chat(msg: &IrMessage) -> Value {
+fn message_to_chat(msg: &IrMessage) -> Vec<Value> {
+  let mut messages: Vec<_> = msg
+    .content
+    .iter()
+    .filter_map(|part| match part {
+      ContentPart::ToolResult { id, content } => Some(json!({
+        "role": "tool",
+        "tool_call_id": id.as_ref().or(msg.tool_call_id.as_ref()).cloned().unwrap_or_default(),
+        "content": tool_result_text(content),
+      })),
+      _ => None,
+    })
+    .collect();
+  let remaining: Vec<_> = msg
+    .content
+    .iter()
+    .filter(|part| !matches!(part, ContentPart::ToolResult { .. }))
+    .collect();
+  if remaining.is_empty() && !messages.is_empty() {
+    return messages;
+  }
+
   let mut out = Map::new();
-  out.insert("role".into(), Value::String(msg.role.as_str().to_string()));
-  if let Some(id) = &msg.tool_call_id {
-    out.insert("tool_call_id".into(), Value::String(id.clone()));
+  let role = if messages.is_empty() {
+    msg.role.as_str()
+  } else {
+    // Messages-style tool results share a user turn with any follow-up
+    // content. Chat Completions requires the results to be separate `tool`
+    // messages, followed by the remaining content in a `user` message.
+    Role::User.as_str()
+  };
+  out.insert("role".into(), Value::String(role.to_string()));
+  if role == Role::Tool.as_str() {
+    if let Some(id) = &msg.tool_call_id {
+      out.insert("tool_call_id".into(), Value::String(id.clone()));
+    }
   }
   if let Some(name) = &msg.name {
     out.insert("name".into(), Value::String(name.clone()));
   }
-  let text = text_from_parts(&msg.content);
-  out.insert("content".into(), Value::String(text));
-  let tool_calls: Vec<_> = msg
-    .content
+  out.insert("content".into(), content_to_chat(&remaining));
+  let tool_calls: Vec<_> = remaining
     .iter()
     .filter_map(|p| match p {
       ContentPart::ToolCall { call } => Some(call),
@@ -365,10 +407,52 @@ fn message_to_chat(msg: &IrMessage) -> Value {
   if !tool_calls.is_empty() {
     out.insert("tool_calls".into(), Value::Array(tool_calls));
   }
-  if let Some(reasoning) = reasoning_from_parts(&msg.content) {
+  let reasoning = remaining
+    .iter()
+    .filter_map(|part| match part {
+      ContentPart::Reasoning { text } => Some(text.as_str()),
+      _ => None,
+    })
+    .collect::<Vec<_>>()
+    .join("");
+  if !reasoning.is_empty() {
     out.insert("reasoning_content".into(), Value::String(reasoning));
   }
-  Value::Object(out)
+  messages.push(Value::Object(out));
+  messages
+}
+
+fn content_to_chat(parts: &[&ContentPart]) -> Value {
+  if parts.iter().any(|part| matches!(part, ContentPart::Raw { .. })) {
+    return Value::Array(
+      parts
+        .iter()
+        .filter_map(|part| match part {
+          ContentPart::Text { text } => Some(json!({ "type": "text", "text": text })),
+          ContentPart::Raw { value } => Some(value.clone()),
+          _ => None,
+        })
+        .collect(),
+    );
+  }
+
+  Value::String(
+    parts
+      .iter()
+      .filter_map(|part| match part {
+        ContentPart::Text { text } => Some(text.as_str()),
+        _ => None,
+      })
+      .collect::<Vec<_>>()
+      .join(""),
+  )
+}
+
+fn tool_result_text(content: &Value) -> String {
+  content
+    .as_str()
+    .map(str::to_string)
+    .unwrap_or_else(|| serde_json::to_string(content).unwrap_or_default())
 }
 
 fn tool_call_from_chat(v: &Value) -> ToolCall {
@@ -419,5 +503,81 @@ pub(crate) fn args_to_string(args: &Value) -> String {
 fn insert_opt(out: &mut Map<String, Value>, key: &str, value: Option<Value>) {
   if let Some(value) = value {
     out.insert(key.into(), value);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn request_to_value_preserves_all_tool_results_and_sibling_content() {
+    let request = IrRequest {
+      model: "test-model".into(),
+      system: None,
+      messages: vec![IrMessage {
+        role: Role::User,
+        content: vec![
+          ContentPart::ToolResult {
+            id: Some("call_1".into()),
+            content: json!("first result"),
+          },
+          ContentPart::ToolResult {
+            id: Some("call_2".into()),
+            content: json!({ "value": 2 }),
+          },
+          ContentPart::Text {
+            text: "Now compare them.".into(),
+          },
+          ContentPart::Raw {
+            value: json!({
+              "type": "image_url",
+              "image_url": { "url": "https://example.invalid/chart.png" }
+            }),
+          },
+        ],
+        tool_call_id: None,
+        name: None,
+        raw: None,
+      }],
+      tools: Vec::new(),
+      tool_choice: None,
+      sampling: Sampling::default(),
+      reasoning: None,
+      stream: false,
+      extras: BTreeMap::new(),
+    };
+
+    let body = request_to_value(&request).expect("request should render");
+    let messages = body["messages"].as_array().expect("messages");
+
+    assert_eq!(messages.len(), 3);
+    assert_eq!(
+      messages[0],
+      json!({
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "first result",
+      })
+    );
+    assert_eq!(
+      messages[1],
+      json!({
+        "role": "tool",
+        "tool_call_id": "call_2",
+        "content": "{\"value\":2}",
+      })
+    );
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(
+      messages[2]["content"],
+      json!([
+        { "type": "text", "text": "Now compare them." },
+        {
+          "type": "image_url",
+          "image_url": { "url": "https://example.invalid/chart.png" }
+        }
+      ])
+    );
   }
 }

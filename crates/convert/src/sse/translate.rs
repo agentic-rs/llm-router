@@ -7,36 +7,143 @@ use crate::ir::IrDelta;
 use crate::provider::Endpoint;
 
 pub struct EndpointTranslator {
+  from: Endpoint,
   acc: SseAccumulator,
   emit: EmitState,
+  terminal_seen: bool,
+  finished: bool,
 }
 
 impl EndpointTranslator {
   pub fn new(from: Endpoint, to: Endpoint) -> Self {
     Self {
+      from,
       acc: SseAccumulator::new(from),
       emit: EmitState::new(to),
+      terminal_seen: false,
+      finished: false,
     }
+  }
+
+  fn finish_once(&mut self) -> Result<Vec<SseEvent>> {
+    if self.finished {
+      return Ok(Vec::new());
+    }
+    self.finished = true;
+    if !self.terminal_seen {
+      return Err(ConvertError::sse("upstream stream ended before a terminal event"));
+    }
+    self.emit.update_metadata(self.acc.metadata());
+    Ok(self.emit.finish())
   }
 }
 
 impl EventTransformer for EndpointTranslator {
   fn transform(&mut self, event: SseEvent) -> Result<Vec<SseEvent>> {
+    if self.finished {
+      return Ok(Vec::new());
+    }
     if event.is_done() {
-      return Ok(self.emit.finish());
+      let infer_responses_finish =
+        !self.terminal_seen && matches!(self.from, Endpoint::Responses) && self.acc.responses_has_tool_call();
+      self.terminal_seen = true;
+      let mut out = if infer_responses_finish {
+        self.emit.emit(&[IrDelta::Finish(Some("tool_calls".into()))])
+      } else {
+        Vec::new()
+      };
+      out.extend(self.finish_once()?);
+      return Ok(out);
     }
     let value = event
       .json
       .as_ref()
       .ok_or_else(|| ConvertError::sse("expected JSON SSE payload"))?;
-    let deltas = self.acc.push_value(value);
+    let mut deltas = self.acc.push_value(value);
+    let terminal_reason = terminal_reason(self.from, value, &self.acc, &deltas);
+    if let Some(reason) = terminal_reason {
+      if self.terminal_seen {
+        deltas.retain(|delta| !matches!(delta, IrDelta::Finish(_)));
+      } else {
+        self.terminal_seen = true;
+        let mut finish_seen = false;
+        for delta in &mut deltas {
+          if let IrDelta::Finish(current) = delta {
+            *current = reason.clone();
+            finish_seen = true;
+          }
+        }
+        if !finish_seen {
+          deltas.push(IrDelta::Finish(reason));
+        }
+      }
+    } else if deltas.iter().any(|delta| matches!(delta, IrDelta::Finish(_))) {
+      if self.terminal_seen {
+        deltas.retain(|delta| !matches!(delta, IrDelta::Finish(_)));
+      } else {
+        self.terminal_seen = true;
+      }
+    }
     self.emit.update_metadata(self.acc.metadata());
     Ok(self.emit.emit(&deltas))
   }
 
   fn finish(&mut self) -> Result<Vec<SseEvent>> {
-    self.emit.update_metadata(self.acc.metadata());
-    Ok(self.emit.finish())
+    self.finish_once()
+  }
+}
+
+fn terminal_reason(
+  endpoint: Endpoint,
+  value: &serde_json::Value,
+  acc: &SseAccumulator,
+  deltas: &[IrDelta],
+) -> Option<Option<String>> {
+  match endpoint {
+    Endpoint::ChatCompletions => value
+      .get("choices")
+      .and_then(serde_json::Value::as_array)
+      .and_then(|choices| {
+        choices.iter().find_map(|choice| {
+          choice
+            .get("finish_reason")
+            .filter(|reason| !reason.is_null())
+            .map(|reason| reason.as_str().map(str::to_string))
+        })
+      }),
+    Endpoint::Messages => match value.get("type").and_then(serde_json::Value::as_str) {
+      Some("message_stop") => Some(None),
+      Some("message_delta") => value
+        .pointer("/delta/stop_reason")
+        .filter(|reason| !reason.is_null())
+        .map(|reason| {
+          deltas
+            .iter()
+            .find_map(|delta| match delta {
+              IrDelta::Finish(reason) => Some(reason.clone()),
+              _ => None,
+            })
+            .unwrap_or_else(|| reason.as_str().map(str::to_string))
+        }),
+      _ => None,
+    },
+    Endpoint::Responses => match value.get("type").and_then(serde_json::Value::as_str) {
+      Some("response.completed") => Some(Some(acc.responses_completed_finish_reason(Some(value)).into())),
+      Some("response.incomplete") => Some(Some(
+        value
+          .pointer("/response/incomplete_details/reason")
+          .and_then(serde_json::Value::as_str)
+          .map(|reason| match reason {
+            "max_output_tokens" => "length",
+            other => other,
+          })
+          .unwrap_or("incomplete")
+          .to_string(),
+      )),
+      Some("response.failed" | "error") => Some(Some("failed".into())),
+      Some("response.cancelled") => Some(Some("cancelled".into())),
+      _ => None,
+    },
   }
 }
 
@@ -209,6 +316,114 @@ mod tests {
   }
 
   #[test]
+  fn clean_eof_without_an_upstream_terminal_is_an_error() {
+    let mut t = EndpointTranslator::new(Endpoint::ChatCompletions, Endpoint::Responses);
+    t.transform(chat_text_chunk("chatcmpl-x", "gpt-5", "partial")).unwrap();
+
+    let error = t.finish().expect_err("truncated stream must not become completed");
+
+    assert!(matches!(
+      error,
+      ConvertError::Sse { message } if message.contains("before a terminal event")
+    ));
+    assert!(t.finish().unwrap().is_empty());
+  }
+
+  #[test]
+  fn chat_finish_reason_allows_clean_eof() {
+    let mut t = EndpointTranslator::new(Endpoint::ChatCompletions, Endpoint::Responses);
+    t.transform(SseEvent::json(
+      None,
+      json!({
+        "id": "chatcmpl-x",
+        "model": "gpt-5",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+      }),
+    ))
+    .unwrap();
+
+    let terminal = t.finish().unwrap().pop().expect("terminal event");
+
+    assert_eq!(terminal.event.as_deref(), Some("response.completed"));
+    assert!(t.finish().unwrap().is_empty());
+  }
+
+  #[test]
+  fn messages_stop_events_allow_clean_eof() {
+    for (event_type, terminal) in [
+      (
+        "message_delta",
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+      ),
+      ("message_stop", json!({"type": "message_stop"})),
+    ] {
+      let mut t = EndpointTranslator::new(Endpoint::Messages, Endpoint::Responses);
+      t.transform(SseEvent::json(Some(event_type), terminal)).unwrap();
+
+      let event = t.finish().unwrap().pop().expect("terminal event");
+      assert_eq!(event.event.as_deref(), Some("response.completed"));
+    }
+  }
+
+  #[test]
+  fn messages_stop_does_not_duplicate_message_delta_finish() {
+    let mut t = EndpointTranslator::new(Endpoint::Messages, Endpoint::ChatCompletions);
+
+    let finish = t
+      .transform(SseEvent::json(
+        Some("message_delta"),
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+      ))
+      .unwrap();
+    assert_eq!(finish.len(), 1);
+    assert_eq!(
+      finish[0].json.as_ref().unwrap()["choices"][0]["finish_reason"],
+      "tool_calls"
+    );
+
+    let duplicate = t
+      .transform(SseEvent::json(Some("message_stop"), json!({"type": "message_stop"})))
+      .unwrap();
+    assert!(duplicate.is_empty());
+
+    let done = t.finish().unwrap();
+    assert_eq!(done.len(), 1);
+    assert!(done[0].is_done());
+  }
+
+  #[test]
+  fn responses_terminal_statuses_survive_fallback_conversion() {
+    for (kind, response, expected, status) in [
+      (
+        "response.incomplete",
+        json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}),
+        "response.incomplete",
+        "incomplete",
+      ),
+      (
+        "response.failed",
+        json!({"status": "failed", "error": {"message": "provider failed"}}),
+        "response.failed",
+        "failed",
+      ),
+      (
+        "response.cancelled",
+        json!({"status": "cancelled"}),
+        "response.cancelled",
+        "cancelled",
+      ),
+    ] {
+      let mut t = EndpointTranslator::new(Endpoint::Responses, Endpoint::Responses);
+      t.transform(SseEvent::json(Some(kind), json!({"type": kind, "response": response})))
+        .unwrap();
+
+      let event = t.finish().unwrap().pop().expect("terminal event");
+      assert_eq!(event.event.as_deref(), Some(expected));
+      assert_eq!(event.json.as_ref().unwrap()["response"]["status"], status);
+    }
+  }
+
+  #[test]
   fn responses_to_chat_translates_resp_md_style_reasoning_text_and_tool_arguments() {
     let mut t = EndpointTranslator::new(Endpoint::Responses, Endpoint::ChatCompletions);
 
@@ -360,6 +575,77 @@ mod tests {
   }
 
   #[test]
+  fn responses_to_chat_uses_observed_tool_item_for_terminal_finish_reason() {
+    for item_type in ["function_call", "custom_tool_call"] {
+      let mut t = EndpointTranslator::new(Endpoint::Responses, Endpoint::ChatCompletions);
+
+      t.transform(SseEvent::json(
+        Some("response.output_item.added"),
+        json!({
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "id": "tool_1",
+            "call_id": "call_1",
+            "type": item_type,
+            "status": "in_progress",
+            "name": "lookup"
+          }
+        }),
+      ))
+      .unwrap();
+
+      let terminal = t
+        .transform(SseEvent::json(
+          Some("response.completed"),
+          json!({
+            "type": "response.completed",
+            "response": {
+              "id": "resp_1",
+              "status": "completed"
+            }
+          }),
+        ))
+        .unwrap();
+
+      assert_eq!(
+        terminal[0].json.as_ref().unwrap()["choices"][0]["finish_reason"],
+        "tool_calls",
+        "item type {item_type}"
+      );
+    }
+  }
+
+  #[test]
+  fn responses_to_chat_uses_terminal_output_for_tool_finish_reason() {
+    let mut t = EndpointTranslator::new(Endpoint::Responses, Endpoint::ChatCompletions);
+
+    let terminal = t
+      .transform(SseEvent::json(
+        Some("response.completed"),
+        json!({
+          "type": "response.completed",
+          "response": {
+            "id": "resp_1",
+            "status": "completed",
+            "output": [{
+              "type": "function_call",
+              "call_id": "call_1",
+              "name": "lookup",
+              "arguments": "{}"
+            }]
+          }
+        }),
+      ))
+      .unwrap();
+
+    assert_eq!(
+      terminal[0].json.as_ref().unwrap()["choices"][0]["finish_reason"],
+      "tool_calls"
+    );
+  }
+
+  #[test]
   fn responses_to_chat_supports_reasoning_summary_text_events() {
     let mut t = EndpointTranslator::new(Endpoint::Responses, Endpoint::ChatCompletions);
 
@@ -479,7 +765,7 @@ mod tests {
       ))
       .unwrap(),
     );
-    events.extend(t.finish().unwrap());
+    events.extend(t.transform(SseEvent::done()).unwrap());
 
     let kinds = collect_event_types(&events);
     assert_eq!(
@@ -564,7 +850,7 @@ mod tests {
       ))
       .unwrap(),
     );
-    events.extend(t.finish().unwrap());
+    events.extend(t.transform(SseEvent::done()).unwrap());
 
     let kinds = collect_event_types(&events);
     assert_eq!(
@@ -619,7 +905,7 @@ mod tests {
       ))
       .unwrap(),
     );
-    events.extend(t.finish().unwrap());
+    events.extend(t.transform(SseEvent::done()).unwrap());
 
     let kinds = collect_event_types(&events);
     assert_eq!(
@@ -680,7 +966,7 @@ mod tests {
       ))
       .unwrap(),
     );
-    events.extend(t.finish().unwrap());
+    events.extend(t.transform(SseEvent::done()).unwrap());
 
     let kinds = collect_event_types(&events);
     assert_eq!(
@@ -725,7 +1011,7 @@ mod tests {
       ))
       .unwrap(),
     );
-    events.extend(t.finish().unwrap());
+    events.extend(t.transform(SseEvent::done()).unwrap());
 
     let kinds = collect_event_types(&events);
     assert_eq!(
@@ -774,7 +1060,7 @@ mod tests {
       ))
       .unwrap(),
     );
-    events.extend(t.finish().unwrap());
+    events.extend(t.transform(SseEvent::done()).unwrap());
 
     let kinds = collect_event_types(&events);
     assert_eq!(
@@ -821,7 +1107,7 @@ mod tests {
       ))
       .unwrap(),
     );
-    events.extend(t.finish().unwrap());
+    events.extend(t.transform(SseEvent::done()).unwrap());
 
     let kinds = collect_event_types(&events);
     assert_eq!(

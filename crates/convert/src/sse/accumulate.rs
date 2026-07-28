@@ -67,7 +67,14 @@ impl SseAccumulator {
   }
 
   pub fn finish(self) -> IrResponse {
-    self.response
+    let mut response = self.response;
+    if matches!(self.endpoint, Endpoint::Responses)
+      && response.finish_reason.is_none()
+      && self.responses.has_tool_call()
+    {
+      response.finish_reason = Some("tool_calls".into());
+    }
+    response
   }
 
   pub fn metadata(&self) -> SseMetadata {
@@ -77,17 +84,43 @@ impl SseAccumulator {
     }
   }
 
+  pub fn responses_completed_finish_reason(&self, value: Option<&Value>) -> &'static str {
+    if value
+      .and_then(|event| event.get("response"))
+      .is_some_and(crate::value::responses::response_has_tool_call_output)
+      || self.responses.has_tool_call()
+    {
+      "tool_calls"
+    } else {
+      "stop"
+    }
+  }
+
+  pub fn responses_has_tool_call(&self) -> bool {
+    self.responses.has_tool_call()
+  }
+
   fn delta_from_responses_event(&mut self, value: &Value) -> Vec<IrDelta> {
     self.observe_responses_response(value);
     self.observe_responses_output_item(value);
     self.observe_responses_part(value);
     let mut deltas = crate::value::responses::delta_from_responses_event(value);
     self.observe_responses_deltas(value, &deltas);
+    if matches!(value.get("type").and_then(Value::as_str), Some("response.completed")) {
+      let reason = self.responses_completed_finish_reason(Some(value));
+      for delta in &mut deltas {
+        if let IrDelta::Finish(current) = delta {
+          *current = Some(reason.into());
+        }
+      }
+    }
     for delta in &mut deltas {
       if let IrDelta::ToolCall { index, id, name, .. } = delta {
         if let Some(item) = self.responses.output_items.get(index) {
-          if id.is_none() {
-            *id = item.call_id.clone().or_else(|| item.id.clone());
+          if item.call_id.is_some() {
+            *id = item.call_id.clone();
+          } else if id.is_none() {
+            *id = item.id.clone();
           }
           if name.is_none() {
             *name = item.name.clone();
@@ -133,7 +166,11 @@ impl SseAccumulator {
       self.responses.model = response.get("model").and_then(Value::as_str).map(str::to_string);
     }
     if let Some(usage) = crate::ir::usage_from_openai(response) {
-      self.response.usage = Some(usage);
+      if let Some(current) = &mut self.response.usage {
+        current.merge(usage);
+      } else {
+        self.response.usage = Some(usage);
+      }
     }
   }
 
@@ -241,6 +278,15 @@ impl SseAccumulator {
         _ => {}
       }
     }
+  }
+}
+
+impl ResponsesState {
+  fn has_tool_call(&self) -> bool {
+    self
+      .output_items
+      .values()
+      .any(|item| matches!(item.item_type.as_deref(), Some("function_call" | "custom_tool_call")))
   }
 }
 

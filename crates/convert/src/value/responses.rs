@@ -50,7 +50,7 @@ pub fn request_from_value(v: &Value) -> Result<IrRequest> {
         .map(Vec::as_slice)
         .unwrap_or(&[]),
     ),
-    tool_choice: obj.get("tool_choice").cloned(),
+    tool_choice: obj.get("tool_choice").map(crate::tools::normalise_tool_choice),
     sampling: Sampling {
       temperature: obj.get("temperature").and_then(Value::as_f64),
       top_p: obj.get("top_p").and_then(Value::as_f64),
@@ -85,7 +85,7 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
     );
   }
   if let Some(v) = &req.tool_choice {
-    out.insert("tool_choice".into(), v.clone());
+    out.insert("tool_choice".into(), crate::tools::tool_choice_to_responses(v));
   }
   insert_opt_f64(&mut out, "temperature", req.sampling.temperature);
   insert_opt_f64(&mut out, "top_p", req.sampling.top_p);
@@ -193,6 +193,20 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
       }
     }
   }
+  let finish_reason = match v.get("status").and_then(Value::as_str) {
+    Some("incomplete") => v
+      .pointer("/incomplete_details/reason")
+      .and_then(Value::as_str)
+      .map(|reason| match reason {
+        "max_output_tokens" => "length".to_string(),
+        other => other.to_string(),
+      })
+      .or_else(|| Some("incomplete".into())),
+    Some("completed") if response_has_tool_call_output(v) => Some("tool_calls".into()),
+    Some("completed") => Some("stop".into()),
+    Some(status) => Some(status.to_string()),
+    None => None,
+  };
   Ok(IrResponse {
     id: v.get("id").and_then(Value::as_str).map(str::to_string),
     model: v.get("model").and_then(Value::as_str).map(str::to_string),
@@ -200,7 +214,7 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
     content,
     tool_calls,
     usage: crate::ir::usage_from_openai(v),
-    finish_reason: v.get("status").and_then(Value::as_str).map(str::to_string),
+    finish_reason,
     extras: BTreeMap::new(),
   })
 }
@@ -229,16 +243,20 @@ pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
       "status": "completed",
     }));
   }
+  let (status, incomplete_reason) = responses_completion_status(resp.finish_reason.as_deref());
   let mut out = json!({
     "id": id,
     "object": "response",
-    "status": "completed",
+    "status": status,
     "model": resp.model.clone().unwrap_or_default(),
     "output": output,
     "output_text": text_from_parts(&resp.content),
   });
   if let Some(usage) = &resp.usage {
     out["usage"] = usage_to_io(usage);
+  }
+  if let Some(reason) = incomplete_reason {
+    out["incomplete_details"] = json!({"reason": reason});
   }
   Ok(out)
 }
@@ -274,11 +292,31 @@ pub fn delta_from_responses_event(v: &Value) -> Vec<IrDelta> {
           out.push(IrDelta::Usage(usage));
         }
       }
-      out.push(IrDelta::Finish(Some("stop".into())));
+      let reason = v.get("response").map(completed_finish_reason).unwrap_or("stop");
+      out.push(IrDelta::Finish(Some(reason.into())));
     }
     _ => {}
   }
   out
+}
+
+pub(crate) fn response_has_tool_call_output(response: &Value) -> bool {
+  response.get("output").and_then(Value::as_array).is_some_and(|output| {
+    output.iter().any(|item| {
+      matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+      )
+    })
+  })
+}
+
+pub(crate) fn completed_finish_reason(response: &Value) -> &'static str {
+  if response_has_tool_call_output(response) {
+    "tool_calls"
+  } else {
+    "stop"
+  }
 }
 
 pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Vec<(String, Value)> {
@@ -365,14 +403,13 @@ fn input_to_messages(input: &Value) -> Result<(Vec<String>, Vec<IrMessage>)> {
       Some("function_call_output") => {
         flush_pending_assistant(&mut messages, &mut pending_assistant);
         let call_id = item.get("call_id").and_then(Value::as_str).map(str::to_string);
-        let output = item
-          .get("output")
-          .and_then(Value::as_str)
-          .unwrap_or_default()
-          .to_string();
+        let output = item.get("output").cloned().unwrap_or(Value::Null);
         messages.push(IrMessage {
           role: Role::Tool,
-          content: vec![ContentPart::Text { text: output }],
+          content: vec![ContentPart::ToolResult {
+            id: call_id.clone(),
+            content: output,
+          }],
           tool_call_id: call_id,
           name: None,
           raw: None,
@@ -481,14 +518,28 @@ fn part_from_responses(v: &Value) -> ContentPart {
 }
 
 fn message_to_responses_input_items(msg: &IrMessage) -> Vec<Value> {
-  if msg.role == Role::Tool {
+  let mut items: Vec<_> = msg
+    .content
+    .iter()
+    .filter_map(|part| match part {
+      ContentPart::ToolResult { id, content } => Some(json!({
+        "type": "function_call_output",
+        "call_id": id.as_ref().or(msg.tool_call_id.as_ref()).cloned().unwrap_or_default(),
+        "output": tool_result_output(content),
+      })),
+      _ => None,
+    })
+    .collect();
+  let has_tool_results = !items.is_empty();
+  if msg.role == Role::Tool && !has_tool_results {
     return vec![json!({
       "type": "function_call_output",
       "call_id": msg.tool_call_id.clone().unwrap_or_default(),
       "output": text_from_parts(&msg.content),
     })];
   }
-  let text_type = match msg.role {
+  let role = if has_tool_results { &Role::User } else { &msg.role };
+  let text_type = match role {
     Role::Assistant => "output_text",
     _ => "input_text",
   };
@@ -501,20 +552,31 @@ fn message_to_responses_input_items(msg: &IrMessage) -> Vec<Value> {
       _ => None,
     })
     .collect();
-  let mut items = Vec::new();
-  if !parts.is_empty() || !matches!(msg.role, Role::Assistant) {
-    items.push(json!({ "role": msg.role.as_str(), "content": parts }));
+  let tool_calls: Vec<_> = msg
+    .content
+    .iter()
+    .filter_map(|part| match part {
+      ContentPart::ToolCall { call } => Some(json!({
+        "type": "function_call",
+        "call_id": call.id.clone().unwrap_or_default(),
+        "name": call.name,
+        "arguments": args_to_string(&call.arguments),
+      })),
+      _ => None,
+    })
+    .collect();
+  if !parts.is_empty() || (!has_tool_results && tool_calls.is_empty() && !matches!(msg.role, Role::Assistant)) {
+    items.push(json!({ "role": role.as_str(), "content": parts }));
   }
-  items.extend(msg.content.iter().filter_map(|p| match p {
-    ContentPart::ToolCall { call } => Some(json!({
-      "type": "function_call",
-      "call_id": call.id.clone().unwrap_or_default(),
-      "name": call.name,
-      "arguments": args_to_string(&call.arguments),
-    })),
-    _ => None,
-  }));
+  items.extend(tool_calls);
   items
+}
+
+fn tool_result_output(content: &Value) -> String {
+  content
+    .as_str()
+    .map(str::to_string)
+    .unwrap_or_else(|| serde_json::to_string(content).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -634,6 +696,79 @@ mod tests {
     assert_eq!(body["input"][0]["call_id"], "call_1");
     assert_eq!(body["input"][0]["output"], "tool result");
     assert!(body["input"][0].get("role").is_none());
+  }
+
+  #[test]
+  fn request_to_value_preserves_all_tool_results_and_sibling_content() {
+    let req = IrRequest {
+      model: "gpt-5.4".into(),
+      system: None,
+      messages: vec![IrMessage {
+        role: Role::User,
+        content: vec![
+          ContentPart::ToolResult {
+            id: Some("call_1".into()),
+            content: json!("first result"),
+          },
+          ContentPart::ToolResult {
+            id: Some("call_2".into()),
+            content: json!({ "value": 2 }),
+          },
+          ContentPart::Text {
+            text: "Now compare them.".into(),
+          },
+          ContentPart::Raw {
+            value: json!({
+              "type": "input_image",
+              "image_url": "https://example.invalid/chart.png"
+            }),
+          },
+        ],
+        tool_call_id: None,
+        name: None,
+        raw: None,
+      }],
+      tools: Vec::new(),
+      tool_choice: None,
+      sampling: Sampling::default(),
+      reasoning: None,
+      stream: false,
+      extras: Default::default(),
+    };
+
+    let body = request_to_value(&req).expect("request should render");
+    let input = body["input"].as_array().expect("input items");
+
+    assert_eq!(input.len(), 3);
+    assert_eq!(
+      input[0],
+      json!({
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "first result",
+      })
+    );
+    assert_eq!(
+      input[1],
+      json!({
+        "type": "function_call_output",
+        "call_id": "call_2",
+        "output": "{\"value\":2}",
+      })
+    );
+    assert_eq!(
+      input[2],
+      json!({
+        "role": "user",
+        "content": [
+          { "type": "input_text", "text": "Now compare them." },
+          {
+            "type": "input_image",
+            "image_url": "https://example.invalid/chart.png"
+          }
+        ],
+      })
+    );
   }
 
   #[test]

@@ -20,20 +20,31 @@ use crate::{Error, Result};
 
 const EVENT_BUS_CAPACITY: usize = 256;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RequestOptions {
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub profile: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub request_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub session_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub project_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub initiator: Option<String>,
   /// Additional inbound headers made available to provider persona and
   /// overlay normalization. Managed routes do not forward arbitrary headers
   /// verbatim.
+  #[serde(skip_serializing_if = "Vec::is_empty")]
   pub headers: Vec<(String, String)>,
 }
 
 impl RequestOptions {
+  pub fn is_empty(&self) -> bool {
+    self == &Self::default()
+  }
+
   pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
     self.profile = Some(profile.into());
     self

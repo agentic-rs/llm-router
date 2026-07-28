@@ -84,6 +84,81 @@ pub fn normalise_tools(tools: &[Value]) -> Vec<Value> {
   tools.iter().map(normalise_tool).collect()
 }
 
+/// Normalize a tool choice to the Chat Completions representation used by the
+/// IR: string modes or `{type:"function", function:{name}}`.
+pub fn normalise_tool_choice(value: &Value) -> Value {
+  if let Some(mode) = value.as_str() {
+    return Value::String(mode.to_string());
+  }
+  let Some(object) = value.as_object() else {
+    return value.clone();
+  };
+  match object.get("type").and_then(Value::as_str) {
+    Some("auto") if has_only_keys(object, &["type"]) => Value::String("auto".into()),
+    Some("none") if has_only_keys(object, &["type"]) => Value::String("none".into()),
+    Some("any" | "required") if has_only_keys(object, &["type"]) => Value::String("required".into()),
+    Some("tool") if has_only_keys(object, &["type", "name"]) => object
+      .get("name")
+      .and_then(Value::as_str)
+      .map(named_tool_choice)
+      .unwrap_or_else(|| value.clone()),
+    Some("function") => {
+      if object.get("function").and_then(Value::as_object).is_some() {
+        value.clone()
+      } else if has_only_keys(object, &["type", "name"]) {
+        object
+          .get("name")
+          .and_then(Value::as_str)
+          .map(named_tool_choice)
+          .unwrap_or_else(|| value.clone())
+      } else {
+        value.clone()
+      }
+    }
+    _ => value.clone(),
+  }
+}
+
+fn has_only_keys(object: &Map<String, Value>, allowed: &[&str]) -> bool {
+  object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn named_tool_choice(name: &str) -> Value {
+  json!({"type": "function", "function": {"name": name}})
+}
+
+fn named_tool_choice_name(value: &Value) -> Option<&str> {
+  value
+    .get("function")
+    .and_then(Value::as_object)
+    .and_then(|function| function.get("name"))
+    .and_then(Value::as_str)
+}
+
+pub fn tool_choice_to_chat(value: &Value) -> Value {
+  normalise_tool_choice(value)
+}
+
+pub fn tool_choice_to_responses(value: &Value) -> Value {
+  let choice = normalise_tool_choice(value);
+  named_tool_choice_name(&choice)
+    .map(|name| json!({"type": "function", "name": name}))
+    .unwrap_or(choice)
+}
+
+pub fn tool_choice_to_messages(value: &Value) -> Value {
+  let choice = normalise_tool_choice(value);
+  if let Some(name) = named_tool_choice_name(&choice) {
+    return json!({"type": "tool", "name": name});
+  }
+  match choice.as_str() {
+    Some("auto") => json!({"type": "auto"}),
+    Some("none") => json!({"type": "none"}),
+    Some("required") => json!({"type": "any"}),
+    _ => choice,
+  }
+}
+
 /// Convert a canonical (chat-shape) tool entry to Responses shape:
 /// `{type:"function", name, description?, parameters?, strict?}`. Non-function
 /// entries are returned untouched.
@@ -200,5 +275,31 @@ mod tests {
     assert_eq!(m["name"], "foo");
     assert_eq!(m["input_schema"], json!({ "type": "object" }));
     assert!(m.get("type").is_none());
+  }
+
+  #[test]
+  fn tool_choice_round_trips_across_dialects() {
+    let canonical = normalise_tool_choice(&json!({"type": "tool", "name": "lookup"}));
+    assert_eq!(canonical, json!({"type": "function", "function": {"name": "lookup"}}));
+    assert_eq!(
+      tool_choice_to_responses(&canonical),
+      json!({"type": "function", "name": "lookup"})
+    );
+    assert_eq!(
+      tool_choice_to_messages(&canonical),
+      json!({"type": "tool", "name": "lookup"})
+    );
+    assert_eq!(tool_choice_to_messages(&json!("required")), json!({"type": "any"}));
+  }
+
+  #[test]
+  fn tool_choice_normalization_preserves_extension_fields() {
+    for choice in [
+      json!({"type": "auto", "disable_parallel_tool_use": true}),
+      json!({"type": "tool", "name": "lookup", "provider_extension": "keep"}),
+      json!({"type": "function", "name": "lookup", "provider_extension": "keep"}),
+    ] {
+      assert_eq!(normalise_tool_choice(&choice), choice);
+    }
   }
 }

@@ -4,6 +4,8 @@ use crate::ir::*;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
+pub use tokn_endpoint_messages::DEFAULT_MESSAGES_MAX_TOKENS;
+
 const REQUEST_KEYS: &[&str] = &[
   "model",
   "system",
@@ -29,6 +31,11 @@ pub fn request_from_value(v: &Value) -> Result<IrRequest> {
   let obj = v
     .as_object()
     .ok_or_else(|| ConvertError::bad_shape("body", "expected object"))?;
+  let (tool_choice, parallel_tool_calls) = messages_tool_choice_from_value(obj.get("tool_choice"));
+  let mut extras = extras_from_object(obj, REQUEST_KEYS);
+  if let Some(parallel_tool_calls) = parallel_tool_calls {
+    extras.insert("parallel_tool_calls".into(), Value::Bool(parallel_tool_calls));
+  }
   let messages = obj
     .get("messages")
     .and_then(Value::as_array)
@@ -51,7 +58,7 @@ pub fn request_from_value(v: &Value) -> Result<IrRequest> {
         .map(Vec::as_slice)
         .unwrap_or(&[]),
     ),
-    tool_choice: obj.get("tool_choice").cloned(),
+    tool_choice,
     sampling: Sampling {
       temperature: obj.get("temperature").and_then(Value::as_f64),
       top_p: obj.get("top_p").and_then(Value::as_f64),
@@ -62,7 +69,7 @@ pub fn request_from_value(v: &Value) -> Result<IrRequest> {
     },
     reasoning: obj.get("thinking").cloned(),
     stream: obj.get("stream").and_then(Value::as_bool).unwrap_or(false),
-    extras: extras_from_object(obj, REQUEST_KEYS),
+    extras,
   })
 }
 
@@ -87,14 +94,26 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
       out.insert("tools".into(), Value::Array(tools));
     }
   }
-  if let Some(v) = &req.tool_choice {
-    out.insert("tool_choice".into(), v.clone());
+  let mut tool_choice = req.tool_choice.as_ref().map(crate::tools::tool_choice_to_messages);
+  let mut mapped_parallel_tool_calls = false;
+  if let Some(parallel_tool_calls) = req.extras.get("parallel_tool_calls").and_then(Value::as_bool) {
+    let choice = tool_choice.get_or_insert_with(|| json!({"type": "auto"}));
+    if let Some(choice) = choice.as_object_mut() {
+      choice.insert("disable_parallel_tool_use".into(), Value::Bool(!parallel_tool_calls));
+      mapped_parallel_tool_calls = true;
+    }
+  }
+  if let Some(tool_choice) = tool_choice {
+    out.insert("tool_choice".into(), tool_choice);
   }
   insert_opt_f64(&mut out, "temperature", req.sampling.temperature);
   insert_opt_f64(&mut out, "top_p", req.sampling.top_p);
-  insert_opt_u64(&mut out, "max_tokens", req.sampling.max_output_tokens);
+  out.insert(
+    "max_tokens".into(),
+    Value::from(req.sampling.max_output_tokens.unwrap_or(DEFAULT_MESSAGES_MAX_TOKENS)),
+  );
   if let Some(v) = &req.sampling.stop {
-    out.insert("stop_sequences".into(), v.clone());
+    out.insert("stop_sequences".into(), stop_sequences_to_messages(v));
   }
   if let Some(v) = &req.reasoning {
     out.insert("thinking".into(), v.clone());
@@ -103,6 +122,9 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
     out.insert("stream".into(), Value::Bool(true));
   }
   for (k, v) in &req.extras {
+    if k == "parallel_tool_calls" && mapped_parallel_tool_calls {
+      continue;
+    }
     out.entry(k.clone()).or_insert_with(|| v.clone());
   }
   Ok(Value::Object(out))
@@ -148,7 +170,10 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
       output_tokens_details: None,
       extras: usage_extras(u, &["input_tokens", "output_tokens"]),
     }),
-    finish_reason: v.get("stop_reason").and_then(Value::as_str).map(str::to_string),
+    finish_reason: v
+      .get("stop_reason")
+      .and_then(Value::as_str)
+      .map(finish_reason_from_messages),
     extras: BTreeMap::new(),
   })
 }
@@ -176,7 +201,7 @@ pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
     "role": "assistant",
     "model": resp.model.clone().unwrap_or_default(),
     "content": content,
-    "stop_reason": resp.finish_reason.clone().unwrap_or_else(|| "end_turn".into()),
+    "stop_reason": finish_reason_to_messages(resp.finish_reason.as_deref()),
     "stop_sequence": null,
   });
   if let Some(usage) = &resp.usage {
@@ -192,6 +217,19 @@ pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
 pub fn delta_from_messages_event(v: &Value) -> Vec<IrDelta> {
   let mut out = Vec::new();
   match v.get("type").and_then(Value::as_str) {
+    Some("content_block_start") => {
+      if let Some(content_block) = v
+        .get("content_block")
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+      {
+        out.push(IrDelta::ToolCall {
+          index: v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
+          id: content_block.get("id").and_then(Value::as_str).map(str::to_string),
+          name: content_block.get("name").and_then(Value::as_str).map(str::to_string),
+          arguments_delta: String::new(),
+        });
+      }
+    }
     Some("content_block_delta") => {
       if let Some(delta) = v.get("delta") {
         match delta.get("type").and_then(Value::as_str) {
@@ -225,7 +263,7 @@ pub fn delta_from_messages_event(v: &Value) -> Vec<IrDelta> {
         .and_then(|d| d.get("stop_reason"))
         .and_then(Value::as_str)
       {
-        out.push(IrDelta::Finish(Some(stop.to_string())));
+        out.push(IrDelta::Finish(Some(finish_reason_from_messages(stop))));
       }
       if let Some(u) = v.get("usage") {
         out.push(IrDelta::Usage(Usage {
@@ -285,7 +323,7 @@ pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish
       )),
       IrDelta::Finish(reason) => events.push((
         "message_delta".into(),
-        json!({ "type": "message_delta", "delta": { "stop_reason": reason.clone().unwrap_or_else(|| "end_turn".into()), "stop_sequence": null } }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": finish_reason_to_messages(reason.as_deref()), "stop_sequence": null } }),
       )),
     }
   }
@@ -359,7 +397,16 @@ fn part_from_messages(v: &Value) -> ContentPart {
 
 fn message_to_messages(msg: &IrMessage) -> Value {
   let content: Vec<_> = msg.content.iter().map(part_to_messages).collect();
-  json!({ "role": msg.role.as_str(), "content": content })
+  let role = if msg
+    .content
+    .iter()
+    .any(|part| matches!(part, ContentPart::ToolResult { .. }))
+  {
+    "user"
+  } else {
+    msg.role.as_str()
+  };
+  json!({ "role": role, "content": content })
 }
 
 fn part_to_messages(part: &ContentPart) -> Value {
@@ -394,6 +441,49 @@ fn system_to_string(system: Option<&Value>) -> Option<String> {
     }
     _ => None,
   }
+}
+
+fn stop_sequences_to_messages(stop: &Value) -> Value {
+  match stop {
+    Value::String(_) => Value::Array(vec![stop.clone()]),
+    _ => stop.clone(),
+  }
+}
+
+fn messages_tool_choice_from_value(tool_choice: Option<&Value>) -> (Option<Value>, Option<bool>) {
+  let Some(tool_choice) = tool_choice else {
+    return (None, None);
+  };
+  let mut canonical = tool_choice.clone();
+  let parallel_tool_calls = canonical
+    .as_object_mut()
+    .and_then(|choice| choice.remove("disable_parallel_tool_use"))
+    .and_then(|disabled| disabled.as_bool())
+    .map(|disabled| !disabled);
+  (
+    Some(crate::tools::normalise_tool_choice(&canonical)),
+    parallel_tool_calls,
+  )
+}
+
+fn finish_reason_from_messages(reason: &str) -> String {
+  match reason {
+    "end_turn" | "stop_sequence" => "stop",
+    "max_tokens" => "length",
+    "tool_use" => "tool_calls",
+    other => other,
+  }
+  .to_string()
+}
+
+fn finish_reason_to_messages(reason: Option<&str>) -> String {
+  match reason {
+    None | Some("stop" | "end_turn" | "stop_sequence") => "end_turn",
+    Some("length" | "max_tokens" | "max_output_tokens") => "max_tokens",
+    Some("tool_calls" | "tool_use") => "tool_use",
+    Some(other) => other,
+  }
+  .to_string()
 }
 
 #[allow(dead_code)]
@@ -435,5 +525,223 @@ mod tests {
         "cache_read_input_tokens": 3
       }))
     );
+  }
+
+  #[test]
+  fn tool_results_use_user_role_and_tool_result_blocks() {
+    let request = IrRequest {
+      model: "claude-test".into(),
+      system: None,
+      messages: vec![IrMessage {
+        role: Role::Tool,
+        content: vec![ContentPart::ToolResult {
+          id: Some("call_1".into()),
+          content: Value::String("tool output".into()),
+        }],
+        tool_call_id: Some("call_1".into()),
+        name: None,
+        raw: None,
+      }],
+      tools: Vec::new(),
+      tool_choice: None,
+      sampling: Sampling::default(),
+      reasoning: None,
+      stream: false,
+      extras: BTreeMap::new(),
+    };
+
+    let body = request_to_value(&request).expect("render Messages request");
+
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(
+      body["messages"][0]["content"][0],
+      json!({
+        "type": "tool_result",
+        "tool_use_id": "call_1",
+        "content": "tool output"
+      })
+    );
+  }
+
+  #[test]
+  fn messages_request_defaults_required_max_tokens() {
+    let request = IrRequest {
+      model: "claude-test".into(),
+      ..IrRequest::default()
+    };
+
+    let body = request_to_value(&request).expect("render Messages request");
+
+    assert_eq!(body["max_tokens"], DEFAULT_MESSAGES_MAX_TOKENS);
+  }
+
+  #[test]
+  fn messages_request_normalizes_scalar_stop_sequence() {
+    let request = IrRequest {
+      model: "claude-test".into(),
+      sampling: Sampling {
+        stop: Some(json!("DONE")),
+        ..Sampling::default()
+      },
+      ..IrRequest::default()
+    };
+
+    let body = request_to_value(&request).expect("render Messages request");
+
+    assert_eq!(body["stop_sequences"], json!(["DONE"]));
+  }
+
+  #[test]
+  fn messages_request_preserves_array_and_raw_stop_sequences() {
+    for stop in [json!(["DONE", "STOP"]), json!({ "provider_extension": true })] {
+      let request = IrRequest {
+        model: "claude-test".into(),
+        sampling: Sampling {
+          stop: Some(stop.clone()),
+          ..Sampling::default()
+        },
+        ..IrRequest::default()
+      };
+
+      let body = request_to_value(&request).expect("render Messages request");
+
+      assert_eq!(body["stop_sequences"], stop);
+    }
+  }
+
+  #[test]
+  fn messages_tool_choice_extensions_round_trip_and_translate() {
+    let body = json!({
+      "model": "claude-test",
+      "messages": [{ "role": "user", "content": "Find it" }],
+      "max_tokens": 128,
+      "tool_choice": {
+        "type": "auto",
+        "disable_parallel_tool_use": true
+      }
+    });
+
+    let request = request_from_value(&body).expect("parse Messages request");
+
+    assert_eq!(request.tool_choice, Some(json!("auto")));
+    assert_eq!(request.extras.get("parallel_tool_calls"), Some(&json!(false)));
+
+    let responses = crate::value::responses::request_to_value(&request).expect("render Responses request");
+    assert_eq!(responses["tool_choice"], "auto");
+    assert_eq!(responses["parallel_tool_calls"], false);
+
+    let round_trip = request_to_value(&request).expect("render Messages request");
+    assert_eq!(
+      round_trip["tool_choice"],
+      json!({
+        "type": "auto",
+        "disable_parallel_tool_use": true
+      })
+    );
+    assert!(round_trip.get("parallel_tool_calls").is_none());
+  }
+
+  #[test]
+  fn messages_finish_reasons_use_canonical_ir_values() {
+    for (messages_reason, canonical_reason) in [
+      ("end_turn", "stop"),
+      ("stop_sequence", "stop"),
+      ("max_tokens", "length"),
+      ("tool_use", "tool_calls"),
+    ] {
+      let body = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [],
+        "stop_reason": messages_reason
+      });
+
+      let response = response_from_value(&body).expect("parse Messages response");
+      assert_eq!(response.finish_reason.as_deref(), Some(canonical_reason));
+
+      let deltas = delta_from_messages_event(&json!({
+        "type": "message_delta",
+        "delta": { "stop_reason": messages_reason }
+      }));
+      assert!(matches!(
+        deltas.as_slice(),
+        [IrDelta::Finish(Some(reason))] if reason == canonical_reason
+      ));
+    }
+  }
+
+  #[test]
+  fn canonical_finish_reasons_render_as_messages_values() {
+    for (canonical_reason, messages_reason) in [
+      ("stop", "end_turn"),
+      ("length", "max_tokens"),
+      ("tool_calls", "tool_use"),
+    ] {
+      let response = IrResponse {
+        finish_reason: Some(canonical_reason.into()),
+        ..IrResponse::default()
+      };
+      let body = response_to_value(&response).expect("render Messages response");
+      assert_eq!(body["stop_reason"], messages_reason);
+
+      let events = events_from_deltas(
+        "msg_1",
+        "claude-test",
+        &[IrDelta::Finish(Some(canonical_reason.into()))],
+        false,
+      );
+      assert_eq!(events[0].1["delta"]["stop_reason"], messages_reason);
+    }
+  }
+
+  #[test]
+  fn messages_tool_start_emits_identity_for_empty_input_call() {
+    let start = json!({
+      "type": "content_block_start",
+      "index": 2,
+      "content_block": {
+        "type": "tool_use",
+        "id": "toolu_123",
+        "name": "lookup",
+        "input": {}
+      }
+    });
+
+    let deltas = delta_from_messages_event(&start);
+
+    assert_eq!(deltas.len(), 1);
+    match &deltas[0] {
+      IrDelta::ToolCall {
+        index,
+        id,
+        name,
+        arguments_delta,
+      } => {
+        assert_eq!(*index, 2);
+        assert_eq!(id.as_deref(), Some("toolu_123"));
+        assert_eq!(name.as_deref(), Some("lookup"));
+        assert!(arguments_delta.is_empty());
+      }
+      other => panic!("expected tool call delta, got {other:?}"),
+    }
+
+    let arguments = json!({
+      "type": "content_block_delta",
+      "index": 2,
+      "delta": {
+        "type": "input_json_delta",
+        "partial_json": "{}"
+      }
+    });
+    let mut response = IrResponse::default();
+    for delta in deltas.into_iter().chain(delta_from_messages_event(&arguments)) {
+      response.push_delta(delta);
+    }
+
+    assert_eq!(response.tool_calls[2].id.as_deref(), Some("toolu_123"));
+    assert_eq!(response.tool_calls[2].name, "lookup");
+    assert_eq!(response.tool_calls[2].arguments, json!("{}"));
   }
 }
