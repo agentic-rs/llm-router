@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
 use tokn_config::Config;
 use tokn_core::event::EventBus;
+use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RequestEndpoint;
 use tokn_headers::keys::{ACCEPT, CONTENT_TYPE};
@@ -170,10 +171,67 @@ impl Client {
   }
 
   pub async fn execute(&self, endpoint: Endpoint, body: Value, options: RequestOptions) -> Result<RawResponse> {
+    self
+      .execute_with_generation_options(endpoint, body, options, None)
+      .await
+  }
+
+  pub(crate) async fn execute_generation(
+    &self,
+    endpoint: Endpoint,
+    body: Value,
+    options: RequestOptions,
+    generation_options: GenerationOptions,
+  ) -> Result<RawResponse> {
+    let generation_options = (!generation_options.is_empty()).then_some(generation_options);
+    self
+      .execute_with_generation_options(endpoint, body, options, generation_options)
+      .await
+  }
+
+  async fn execute_with_generation_options(
+    &self,
+    endpoint: Endpoint,
+    body: Value,
+    options: RequestOptions,
+    mut generation_options: Option<GenerationOptions>,
+  ) -> Result<RawResponse> {
     let snapshot = self.snapshot.load_full();
     let policy = select_policy(&snapshot, options.profile.as_deref())?;
+    let verbatim_mode = match policy.mode {
+      tokn_config::RouteMode::Passthrough => Some("passthrough"),
+      tokn_config::RouteMode::Switch => Some("switch"),
+      _ => None,
+    };
+    if let (Some(mode), Some(generation)) = (verbatim_mode, generation_options.as_ref()) {
+      if generation.top_k.is_some() || generation.reasoning.is_some() {
+        return Err(Error::InvalidGenerateRequest {
+          message: format!(
+            "typed top_k and reasoning controls require a managed route; profile mode '{mode}' forwards the generated Responses payload verbatim"
+          ),
+        });
+      }
+      if let Some(max_output_tokens) = generation.max_output_tokens {
+        let wire_limit = body.get("max_output_tokens").and_then(Value::as_u64);
+        if endpoint != Endpoint::Responses || wire_limit != Some(max_output_tokens) {
+          return Err(Error::InvalidGenerateRequest {
+            message: format!(
+              "typed max_output_tokens cannot be lowered in profile mode '{mode}'; the verbatim request must already contain the matching Responses field"
+            ),
+          });
+        }
+      }
+      // The friendly generator already rendered a Responses-native output
+      // limit into `body`. Do not carry the same intent into a verbatim stage,
+      // where out-of-band controls are deliberately rejected.
+      generation_options = None;
+    }
     let raw = raw_request(endpoint, body, &options)?;
-    let config = RunConfig::builder().with_agent_id_opt(policy.agent_id.clone()).build();
+    let mut config = RunConfig::builder().with_agent_id_opt(policy.agent_id.clone());
+    if let Some(generation_options) = generation_options {
+      config = config.with_generation_options(generation_options);
+    }
+    let config = config.build();
     let pipeline = match policy.mode {
       tokn_config::RouteMode::Passthrough => &policy.passthrough_pipeline,
       tokn_config::RouteMode::Switch => &policy.switch_pipeline,

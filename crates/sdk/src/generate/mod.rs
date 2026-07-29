@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use tokn_convert::ir::{
   ContentPart as IrContentPart, IrMessage, IrRequest, Role as IrRole, Sampling, ToolCall as IrToolCall,
 };
+use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary};
 use tokn_core::provider::Endpoint;
 use tokn_requests::pipeline::error::RequestsError;
 
@@ -37,7 +38,11 @@ pub struct GenerateRequest {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub top_p: Option<f64>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub top_k: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub max_output_tokens: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub reasoning: Option<ReasoningOptions>,
   #[serde(default, skip_serializing_if = "RequestOptions::is_empty")]
   pub options: RequestOptions,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -56,7 +61,9 @@ impl GenerateRequest {
         tool_choice: None,
         temperature: None,
         top_p: None,
+        top_k: None,
         max_output_tokens: None,
+        reasoning: None,
         options: RequestOptions::default(),
         extras: BTreeMap::new(),
       },
@@ -124,10 +131,33 @@ impl GenerateRequest {
     }
     validate_finite("temperature", self.temperature)?;
     validate_finite("top_p", self.top_p)?;
+    if self.top_p.is_some_and(|top_p| !(0.0..=1.0).contains(&top_p)) {
+      return Err(Error::InvalidGenerateRequest {
+        message: "top_p must be between 0 and 1".into(),
+      });
+    }
     if self.max_output_tokens == Some(0) {
       return Err(Error::InvalidGenerateRequest {
         message: "max_output_tokens must be greater than zero".into(),
       });
+    }
+    self
+      .generation_options()
+      .validate()
+      .map_err(|error| Error::InvalidGenerateRequest {
+        message: error.to_string(),
+      })?;
+    if self.reasoning.is_some() {
+      const CONFLICTING_EXTRAS: &[&str] = &["reasoning", "thinking", "reasoning_effort", "output_config"];
+      if let Some(name) = CONFLICTING_EXTRAS
+        .iter()
+        .copied()
+        .find(|name| self.extras.contains_key(*name))
+      {
+        return Err(Error::InvalidGenerateRequest {
+          message: format!("typed reasoning conflicts with extras['{name}']"),
+        });
+      }
     }
     if self.tools.iter().any(|tool| tool.name.trim().is_empty()) {
       return Err(Error::InvalidGenerateRequest {
@@ -145,6 +175,14 @@ impl GenerateRequest {
       });
     }
     Ok(())
+  }
+
+  fn generation_options(&self) -> GenerationOptions {
+    GenerationOptions {
+      max_output_tokens: self.max_output_tokens,
+      top_k: self.top_k,
+      reasoning: self.reasoning.clone(),
+    }
   }
 
   fn responses_body(&self, stream: bool) -> Result<Value> {
@@ -491,8 +529,67 @@ macro_rules! generate_builder_methods {
         self
       }
 
+      pub fn top_k(mut self, top_k: u64) -> Self {
+        self.request.top_k = Some(top_k);
+        self
+      }
+
       pub fn max_output_tokens(mut self, max_output_tokens: u64) -> Self {
         self.request.max_output_tokens = Some(max_output_tokens);
+        self
+      }
+
+      /// Alias for [`Self::max_output_tokens`].
+      pub fn max_tokens(self, max_tokens: u64) -> Self {
+        self.max_output_tokens(max_tokens)
+      }
+
+      pub fn reasoning(mut self, reasoning: ReasoningOptions) -> Self {
+        self.request.reasoning = Some(reasoning);
+        self
+      }
+
+      pub fn reasoning_mode(mut self, mode: ReasoningMode) -> Self {
+        self
+          .request
+          .reasoning
+          .get_or_insert_with(ReasoningOptions::default)
+          .mode = Some(mode);
+        self
+      }
+
+      pub fn reasoning_enabled(self, enabled: bool) -> Self {
+        self.reasoning_mode(if enabled {
+          ReasoningMode::Enabled
+        } else {
+          ReasoningMode::Disabled
+        })
+      }
+
+      pub fn reasoning_effort(mut self, effort: impl Into<ReasoningEffort>) -> Self {
+        self
+          .request
+          .reasoning
+          .get_or_insert_with(ReasoningOptions::default)
+          .effort = Some(effort.into());
+        self
+      }
+
+      pub fn reasoning_budget_tokens(mut self, budget_tokens: u64) -> Self {
+        self
+          .request
+          .reasoning
+          .get_or_insert_with(ReasoningOptions::default)
+          .budget_tokens = Some(budget_tokens);
+        self
+      }
+
+      pub fn reasoning_summary(mut self, summary: impl Into<ReasoningSummary>) -> Self {
+        self
+          .request
+          .reasoning
+          .get_or_insert_with(ReasoningOptions::default)
+          .summary = Some(summary.into());
         self
       }
 
@@ -583,7 +680,12 @@ impl Client {
     let request = request.borrow();
     let body = request.responses_body(false)?;
     let response = self
-      .execute(Endpoint::Responses, body, request.options.clone())
+      .execute_generation(
+        Endpoint::Responses,
+        body,
+        request.options.clone(),
+        request.generation_options(),
+      )
       .await
       .map_err(map_generation_error)?
       .into_buffered()?;
@@ -597,7 +699,12 @@ impl Client {
     let request = request.borrow();
     let body = request.responses_body(true)?;
     let response = self
-      .execute(Endpoint::Responses, body, request.options.clone())
+      .execute_generation(
+        Endpoint::Responses,
+        body,
+        request.options.clone(),
+        request.generation_options(),
+      )
       .await
       .map_err(map_generation_error)?;
     ensure_raw_success(&response)?;
@@ -615,13 +722,18 @@ fn map_generation_error(error: Error) -> Error {
   let Error::Pipeline { source } = error else {
     return error;
   };
-  if let RequestsError::UpstreamStatus { status, body } = source.inner() {
-    return Error::GenerateResponseStatus {
+  match source.inner() {
+    RequestsError::UpstreamStatus { status, body } => Error::GenerateResponseStatus {
       status: *status,
       body: body.clone(),
-    };
+    },
+    RequestsError::InvalidGenerationOptions { .. } | RequestsError::UnsupportedGenerationControl { .. } => {
+      Error::InvalidGenerateRequest {
+        message: source.inner().to_string(),
+      }
+    }
+    _ => Error::Pipeline { source },
   }
-  Error::Pipeline { source }
 }
 
 fn ensure_raw_success(response: &crate::RawResponse) -> Result<()> {
@@ -659,14 +771,31 @@ mod tests {
       .system("Be concise.")
       .prompt("Hello")
       .temperature(0.2)
+      .top_p(0.9)
+      .top_k(0)
+      .reasoning_mode(ReasoningMode::Enabled)
+      .reasoning_effort(ReasoningEffort::High)
+      .reasoning_budget_tokens(4096)
+      .reasoning_summary(ReasoningSummary::Auto)
       .request_id("request-1")
       .build()
       .expect("build request");
+    let value = serde_json::to_value(&request).expect("serialize request value");
+    assert_eq!(value["top_k"], 0);
+    assert_eq!(
+      value["reasoning"],
+      serde_json::json!({
+        "mode": "enabled",
+        "effort": "high",
+        "budget_tokens": 4096,
+        "summary": "auto"
+      })
+    );
     let serialized = serde_json::to_string(&request).expect("serialize request");
     let request: GenerateRequest = serde_json::from_str(&serialized).expect("deserialize request");
     let request = request
       .into_builder()
-      .max_output_tokens(128)
+      .max_tokens(128)
       .build()
       .expect("transform request");
 
@@ -676,8 +805,44 @@ mod tests {
       vec![Message::system("Be concise."), Message::user("Hello")]
     );
     assert_eq!(request.temperature, Some(0.2));
+    assert_eq!(request.top_p, Some(0.9));
+    assert_eq!(request.top_k, Some(0));
     assert_eq!(request.max_output_tokens, Some(128));
+    assert_eq!(
+      request.reasoning,
+      Some(
+        ReasoningOptions::new()
+          .with_mode(ReasoningMode::Enabled)
+          .with_effort(ReasoningEffort::High)
+          .with_budget_tokens(4096)
+          .with_summary(ReasoningSummary::Auto)
+      )
+    );
     assert_eq!(request.options.request_id.as_deref(), Some("request-1"));
+  }
+
+  #[test]
+  fn typed_generation_controls_are_carried_out_of_band() {
+    let request = GenerateRequest::builder("smart")
+      .prompt("Hello")
+      .max_tokens(128)
+      .top_k(40)
+      .reasoning_effort("high")
+      .build()
+      .expect("build request");
+
+    let body = request.responses_body(false).expect("build Responses body");
+
+    assert!(body.get("top_k").is_none());
+    assert!(body.get("reasoning").is_none());
+    assert_eq!(body["max_output_tokens"], 128);
+    assert_eq!(
+      request.generation_options(),
+      GenerationOptions::new()
+        .with_max_output_tokens(128)
+        .with_top_k(40)
+        .with_reasoning(ReasoningOptions::new().with_effort(ReasoningEffort::High))
+    );
   }
 
   #[test]
@@ -719,6 +884,13 @@ mod tests {
 
     let error = GenerateRequest::builder("smart")
       .prompt("hello")
+      .top_p(1.1)
+      .build()
+      .expect_err("top_p outside its probability range should fail");
+    assert!(matches!(error, Error::InvalidGenerateRequest { .. }));
+
+    let error = GenerateRequest::builder("smart")
+      .prompt("hello")
       .message(Message::user("invalid").with_tool_call(ToolCall::new("lookup", serde_json::json!({})).id("call_1")))
       .build()
       .expect_err("user tool call should fail");
@@ -736,6 +908,29 @@ mod tests {
       .tool(Tool::function("lookup", Value::Null))
       .build()
       .expect_err("tool schema must be an object");
+    assert!(matches!(error, Error::InvalidGenerateRequest { .. }));
+
+    let error = GenerateRequest::builder("smart")
+      .prompt("hello")
+      .reasoning(ReasoningOptions::new())
+      .build()
+      .expect_err("empty reasoning options should fail");
+    assert!(matches!(error, Error::InvalidGenerateRequest { .. }));
+
+    let error = GenerateRequest::builder("smart")
+      .prompt("hello")
+      .reasoning_enabled(false)
+      .reasoning_effort("high")
+      .build()
+      .expect_err("disabled reasoning with effort should fail");
+    assert!(matches!(error, Error::InvalidGenerateRequest { .. }));
+
+    let error = GenerateRequest::builder("smart")
+      .prompt("hello")
+      .reasoning_effort("high")
+      .extra("reasoning_effort", Value::String("low".into()))
+      .build()
+      .expect_err("typed reasoning must not conflict with raw reasoning extras");
     assert!(matches!(error, Error::InvalidGenerateRequest { .. }));
   }
 }

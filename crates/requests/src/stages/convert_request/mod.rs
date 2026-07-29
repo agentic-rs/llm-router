@@ -16,6 +16,7 @@
 //! [`Send`]: crate::pipeline::stages::SendStage
 
 mod default;
+mod generation;
 mod noop;
 mod passthrough;
 

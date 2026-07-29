@@ -9,18 +9,21 @@
 //!    from the account's upstream endpoint, run `tokn_convert` to
 //!    translate the JSON shape (e.g. Responses → Chat). Pass-through is
 //!    free when both endpoints match.
-//! 3. **Provider [`InputTransformer`]** — give the provider a final
+//! 3. **Generation controls** — lower the SDK's typed, provider-neutral
+//!    generation controls into the selected endpoint/provider dialect.
+//! 4. **Provider [`InputTransformer`]** — give the provider a final
 //!    say (e.g. inject the `thinking` block for `glm-4.6`).
-//! 4. **Serialize + re-encode** — produce `debug_outbound_body` (the
+//! 5. **Serialize + re-encode** — produce `debug_outbound_body` (the
 //!    uncompressed JSON, useful for logs and tests) and
 //!    `upstream_wire_body` (re-compressed with the same codec the
 //!    inbound used, when any). When the body hasn't changed and an
 //!    encoding was present, we keep the original wire bytes to avoid
-//!    a needless de/re-compress round-trip.
+//!    a needless re-compress.
 //!
 //! Failures map to permanent [`PipelineError`]s — the upstream body
 //! shape isn't going to change between retries.
 
+use super::generation::{ensure_model_supports_reasoning, lower_generation_options};
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, RequestsError};
@@ -45,11 +48,39 @@ impl ConvertRequestStage for DefaultConvertRequest {
   ) -> Result<ConvertedRequest, PipelineError> {
     let inbound_endpoint = require_resolved_endpoint(ctx, resolved, Stage::ConvertRequest)?;
     let upstream_endpoint = require_upstream_endpoint(ctx, resolved, Stage::ConvertRequest)?;
+    let generation_options = ctx.config.generation_options();
+    if let Some(options) = generation_options {
+      options
+        .validate()
+        .map_err(|source| perm(RequestsError::InvalidGenerationOptions { source }))?;
+      ensure_model_supports_reasoning(
+        upstream_endpoint,
+        resolved.account_handle.provider.info().id.as_str(),
+        resolved
+          .account_handle
+          .provider
+          .model_info(resolved.upstream_model.as_str())
+          .map(|info| info.capabilities.reasoning),
+        options,
+      )
+      .map_err(perm)?;
+    }
     let mut upstream_body = rewrite_model(&extracted.body_json, resolved.upstream_model.as_str());
 
     if upstream_endpoint != inbound_endpoint {
       upstream_body = tokn_convert::convert_request(inbound_endpoint, upstream_endpoint, &upstream_body)
         .map_err(|source| perm(RequestsError::RequestConversion { source }))?;
+    }
+
+    if let Some(options) = generation_options {
+      lower_generation_options(
+        &mut upstream_body,
+        upstream_endpoint,
+        resolved.account_handle.provider.info().id.as_str(),
+        resolved.upstream_model.as_str(),
+        options,
+      )
+      .map_err(perm)?;
     }
 
     if let Some(transformer) = resolved.account_handle.provider.input_transformer() {

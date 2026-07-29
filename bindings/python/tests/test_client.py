@@ -18,6 +18,11 @@ from tokn import (
   GenerateRequest,
   Message,
   ReasoningDelta,
+  ReasoningEffort,
+  ReasoningMode,
+  ReasoningOptions,
+  ReasoningSummary,
+  RequestError,
   RequestOptions,
   Role,
   StreamError,
@@ -298,10 +303,17 @@ class ModelTests(unittest.TestCase):
       ],
       tool_choice=ToolChoice.named("lookup"),
       temperature=0.2,
+      top_k=40,
       options=RequestOptions(
         profile="fast",
         request_id="python-detached",
         headers=[("x-sdk-test", "detached")],
+      ),
+      reasoning=ReasoningOptions(
+        mode=ReasoningMode.ENABLED,
+        effort=ReasoningEffort.XHIGH,
+        budget_tokens=4096,
+        summary=ReasoningSummary.AUTO,
       ),
     )
 
@@ -315,6 +327,16 @@ class ModelTests(unittest.TestCase):
     self.assertEqual(changed.messages[2].tool_calls[0], call)
     self.assertEqual(changed.tools[0].description, "Look up a value")
     self.assertEqual(changed.tool_choice, ToolChoice.named("lookup"))
+    self.assertEqual(changed.top_k, 40)
+    self.assertEqual(
+      changed.reasoning,
+      ReasoningOptions(
+        mode=ReasoningMode.ENABLED,
+        effort=ReasoningEffort.XHIGH,
+        budget_tokens=4096,
+        summary=ReasoningSummary.AUTO,
+      ),
+    )
     self.assertEqual(changed.options.request_id, "python-detached")
     changed.messages[0].content = "Changed copy."
     self.assertEqual(restored.messages[0].content, "Answer briefly.")
@@ -349,6 +371,89 @@ class ModelTests(unittest.TestCase):
     self.assertEqual(restored_event, event)
     self.assertEqual(ToolChoice.from_json('"required"'), ToolChoice.REQUIRED)
 
+  def test_reasoning_options_and_builders_round_trip(self) -> None:
+    options = ReasoningOptions(
+      mode=ReasoningMode.ENABLED,
+      effort=ReasoningEffort.XHIGH,
+      budget_tokens=4096,
+      summary=ReasoningSummary.AUTO,
+    )
+    options.validate()
+    self.assertEqual(
+      options.to_dict(),
+      {
+        "mode": "enabled",
+        "effort": "xhigh",
+        "budget_tokens": 4096,
+        "summary": "auto",
+      },
+    )
+    self.assertEqual(ReasoningOptions.from_json(options.to_json()), options)
+
+    custom = ReasoningOptions.from_dict(
+      {
+        "mode": "enabled",
+        "effort": "provider_effort",
+        "summary": "provider_summary",
+      }
+    )
+    custom.validate()
+    self.assertEqual(custom.mode, ReasoningMode.ENABLED)
+    self.assertEqual(custom.effort, "provider_effort")
+    self.assertEqual(custom.summary, "provider_summary")
+
+    request = (
+      GenerateRequest.builder("smart")
+      .prompt("Think carefully.")
+      .top_k(0)
+      .max_tokens(512)
+      .reasoning_mode(ReasoningMode.ENABLED)
+      .reasoning_effort("provider_effort")
+      .reasoning_budget_tokens(2048)
+      .reasoning_summary(ReasoningSummary.CONCISE)
+      .build()
+    )
+    self.assertEqual(request.top_k, 0)
+    self.assertEqual(request.max_output_tokens, 512)
+    self.assertEqual(
+      request.reasoning,
+      ReasoningOptions(
+        mode=ReasoningMode.ENABLED,
+        effort="provider_effort",
+        budget_tokens=2048,
+        summary=ReasoningSummary.CONCISE,
+      ),
+    )
+
+    detached_options = ReasoningOptions(effort=ReasoningEffort.HIGH)
+    detached = (
+      GenerateRequest.builder("smart")
+      .prompt("Use detached options.")
+      .reasoning(detached_options)
+      .build()
+    )
+    detached_options.effort = ReasoningEffort.LOW
+    assert detached.reasoning is not None
+    self.assertEqual(detached.reasoning.effort, ReasoningEffort.HIGH)
+
+    disabled = (
+      GenerateRequest.builder("smart")
+      .prompt("Do not reason.")
+      .reasoning_enabled(False)
+      .build()
+    )
+    self.assertEqual(
+      disabled.reasoning,
+      ReasoningOptions(mode=ReasoningMode.DISABLED),
+    )
+
+    invalid_enabled: Any = 1
+    with self.assertRaisesRegex(
+      TypeError,
+      "reasoning enabled must be a bool",
+    ):
+      GenerateRequest.builder("smart").reasoning_enabled(invalid_enabled)
+
   def test_detached_validation_fails_before_execution(self) -> None:
     with self.assertRaisesRegex(ValueError, "model cannot be empty"):
       GenerateRequest(model=" ", messages=[Message.user("hello")]).validate()
@@ -373,6 +478,117 @@ class ModelTests(unittest.TestCase):
       ).validate()
     with self.assertRaisesRegex(ValueError, "unknown tool choice"):
       GenerateRequest.builder("smart").tool_choice("lookup")
+
+  def test_generation_control_validation(self) -> None:
+    GenerateRequest(
+      model="smart",
+      messages=[Message.user("hello")],
+      top_k=0,
+    ).validate()
+
+    for top_k in (-1, True):
+      with self.subTest(top_k=top_k):
+        with self.assertRaisesRegex(ValueError, "top_k must be"):
+          GenerateRequest(
+            model="smart",
+            messages=[Message.user("hello")],
+            top_k=top_k,
+          ).validate()
+
+    for top_p in (-0.1, 1.1):
+      with self.subTest(top_p=top_p):
+        with self.assertRaisesRegex(ValueError, "top_p must be between"):
+          GenerateRequest(
+            model="smart",
+            messages=[Message.user("hello")],
+            top_p=top_p,
+          ).validate()
+
+    with self.assertRaisesRegex(ValueError, "top_k"):
+      GenerateRequest(
+        model="smart",
+        messages=[Message.user("hello")],
+        top_k=2**64,
+      ).validate()
+    with self.assertRaisesRegex(ValueError, "max_output_tokens"):
+      GenerateRequest(
+        model="smart",
+        messages=[Message.user("hello")],
+        max_output_tokens=2**64,
+      ).validate()
+
+    for options in (
+      ReasoningOptions(mode=" "),
+      ReasoningOptions(effort=" "),
+      ReasoningOptions(summary=" "),
+    ):
+      with self.subTest(options=options):
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+          options.validate()
+
+    with self.assertRaisesRegex(ValueError, "cannot be empty"):
+      ReasoningOptions().validate()
+
+    with self.assertRaisesRegex(ValueError, "unknown reasoning mode"):
+      ReasoningOptions(mode="provider_mode").validate()
+
+    with self.assertRaisesRegex(ValueError, "unknown reasoning mode"):
+      ReasoningOptions.from_dict({"mode": "provider_mode"})
+
+    for budget_tokens in (0, True, 2**64):
+      with self.subTest(budget_tokens=budget_tokens):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+          ReasoningOptions(
+            budget_tokens=budget_tokens,
+          ).validate()
+
+    for options in (
+      ReasoningOptions(
+        mode=ReasoningMode.DISABLED,
+        effort=ReasoningEffort.LOW,
+      ),
+      ReasoningOptions(
+        mode=ReasoningMode.DISABLED,
+        budget_tokens=1024,
+      ),
+      ReasoningOptions(
+        mode=ReasoningMode.DISABLED,
+        summary=ReasoningSummary.AUTO,
+      ),
+    ):
+      with self.subTest(options=options):
+        with self.assertRaisesRegex(
+          ValueError,
+          "disabled reasoning cannot set",
+        ):
+          options.validate()
+
+    with self.assertRaisesRegex(
+      ValueError,
+      "adaptive reasoning cannot set budget_tokens",
+    ):
+      ReasoningOptions(
+        mode=ReasoningMode.ADAPTIVE,
+        budget_tokens=1024,
+      ).validate()
+
+    for conflicting_key in (
+      "reasoning",
+      "thinking",
+      "reasoning_effort",
+      "output_config",
+    ):
+      with self.subTest(conflicting_key=conflicting_key):
+        with self.assertRaisesRegex(
+          ValueError,
+          "typed reasoning conflicts with extras",
+        ):
+          GenerateRequest(
+            model="smart",
+            messages=[Message.user("hello")],
+            extras={conflicting_key: {}},
+            reasoning=ReasoningOptions(effort=ReasoningEffort.HIGH),
+          ).validate()
 
 
 class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
@@ -455,7 +671,8 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
       .tool_choice(ToolChoice.named("lookup"))
       .temperature(0.2)
       .top_p(0.9)
-      .max_output_tokens(64)
+      .top_k(40)
+      .max_tokens(64)
       .request_id("python-bound")
       .send()
     )
@@ -503,8 +720,43 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
     )
     self.assertEqual(body["temperature"], 0.2)
     self.assertEqual(body["top_p"], 0.9)
+    self.assertEqual(body["top_k"], 40)
     self.assertEqual(body["max_tokens"], 64)
     self.assertFalse(body.get("stream", False))
+
+  async def test_openai_generation_lowers_reasoning_and_output_limit(self) -> None:
+    response = await (
+      self.client()
+      .generate("openai/gpt-5")
+      .prompt("Think carefully.")
+      .max_tokens(1024)
+      .reasoning_effort(ReasoningEffort.HIGH)
+      .reasoning_summary(ReasoningSummary.AUTO)
+      .send()
+    )
+
+    self.assertEqual(response.text, "mock answer")
+    captured = self.last_request()
+    self.assertEqual(captured["path"], "/responses")
+    body = captured["body"]
+    self.assertEqual(body["model"], "gpt-5")
+    self.assertEqual(body["max_output_tokens"], 1024)
+    self.assertEqual(
+      body["reasoning"],
+      {"effort": "high", "summary": "auto"},
+    )
+
+  async def test_unsupported_top_k_surfaces_as_request_error(self) -> None:
+    with self.assertRaisesRegex(RequestError, "top_k"):
+      await (
+        self.client()
+        .generate("openai/gpt-5")
+        .prompt("Reject unsupported sampling.")
+        .top_k(40)
+        .send()
+      )
+
+    self.assertFalse(ProviderHandler.requests)
 
   async def test_detached_request_can_send_or_bind(self) -> None:
     client = self.client()

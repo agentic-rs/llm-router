@@ -4,7 +4,10 @@ use std::fs;
 use tempfile::TempDir;
 use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 use tokn_sdk::chat_completions::{ChatRequest, ChatResponse};
-use tokn_sdk::{Client, Error, GenerateEvent, GenerateRequest, Message, RequestOptions, Tool, ToolCall, ToolChoice};
+use tokn_sdk::{
+  Client, Error, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary, RequestOptions, Tool,
+  ToolCall, ToolChoice,
+};
 
 struct Fixture {
   _root: TempDir,
@@ -22,10 +25,21 @@ impl Fixture {
   }
 
   fn with_account(base_url: &str, provider: &str, credentials: &str) -> Self {
+    Self::with_account_and_mode(base_url, provider, credentials, "exact")
+  }
+
+  fn with_account_and_mode(base_url: &str, provider: &str, credentials: &str, mode: &str) -> Self {
     let root = tempfile::tempdir().expect("create SDK fixture directory");
     let config_path = root.path().join("config.toml");
     let auth_path = root.path().join("auth.yaml");
-    fs::write(&config_path, "[defaults]\nmode = \"exact\"\n").expect("write SDK config");
+    let default_provider = matches!(mode, "passthrough" | "switch")
+      .then(|| format!("default_provider_id = \"{provider}\"\n"))
+      .unwrap_or_default();
+    fs::write(
+      &config_path,
+      format!("[defaults]\nmode = \"{mode}\"\n{default_provider}"),
+    )
+    .expect("write SDK config");
     fs::write(
       &auth_path,
       format!(
@@ -95,6 +109,9 @@ async fn friendly_request_uses_native_responses_provider_when_available() {
   let response = client
     .generate("openai/gpt-5")
     .prompt("use the native responses endpoint")
+    .max_tokens(1024)
+    .reasoning_effort(ReasoningEffort::High)
+    .reasoning_summary(ReasoningSummary::Auto)
     .tool(
       Tool::function(
         "lookup",
@@ -113,7 +130,52 @@ async fn friendly_request_uses_native_responses_provider_when_available() {
   let outbound: serde_json::Value = serde_json::from_slice(&captured.body).expect("parse upstream body");
   assert_eq!(outbound["model"], "gpt-5");
   assert_eq!(outbound["input"][0]["role"], "user");
+  assert_eq!(outbound["max_output_tokens"], 1024);
+  assert_eq!(outbound["reasoning"]["effort"], "high");
+  assert_eq!(outbound["reasoning"]["summary"], "auto");
   assert_eq!(outbound["tool_choice"], json!({"type": "function", "name": "lookup"}));
+
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn friendly_reasoning_rejects_known_non_reasoning_model_locally() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::openai(mock.base_url());
+  let client = fixture.client();
+
+  let error = client
+    .generate("openai/gpt-4o")
+    .prompt("Do not send an unsupported reasoning control.")
+    .reasoning_effort(ReasoningEffort::High)
+    .send()
+    .await
+    .expect_err("known non-reasoning model should fail locally");
+
+  assert!(
+    matches!(error, Error::InvalidGenerateRequest { message } if message.contains("known not to support reasoning"))
+  );
+  assert!(mock.last_request().is_none());
+
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn friendly_unsupported_top_k_is_an_invalid_request() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::openai(mock.base_url());
+  let client = fixture.client();
+
+  let error = client
+    .generate("openai/gpt-5")
+    .prompt("Do not send unsupported top-k sampling.")
+    .top_k(40)
+    .send()
+    .await
+    .expect_err("unsupported top_k should fail locally");
+
+  assert!(matches!(error, Error::InvalidGenerateRequest { message } if message.contains("top_k")));
+  assert!(mock.last_request().is_none());
 
   mock.shutdown().await;
 }
@@ -135,6 +197,7 @@ async fn detached_generation_request_round_trips_transforms_and_uses_mock_provid
   let request: GenerateRequest = serde_json::from_str(&serialized).expect("deserialize detached request");
   let request = request
     .into_builder()
+    .top_k(40)
     .max_output_tokens(64)
     .build()
     .expect("transform detached request");
@@ -158,11 +221,59 @@ async fn detached_generation_request_round_trips_transforms_and_uses_mock_provid
     json!({"role": "user", "content": "hello from a detached request"})
   );
   assert_eq!(outbound["temperature"], 0.2);
+  assert_eq!(outbound["top_k"], 40);
   assert_eq!(outbound["max_tokens"], 64);
   assert!(!outbound
     .get("stream")
     .and_then(serde_json::Value::as_bool)
     .unwrap_or(false));
+
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn typed_generation_controls_reject_verbatim_profile_modes() {
+  for mode in ["passthrough", "switch"] {
+    let fixture = Fixture::with_account_and_mode("http://127.0.0.1:1", "llama-cpp", "", mode);
+    let client = fixture.client();
+
+    let error = client
+      .generate("llama-cpp/mock-model")
+      .prompt("do not silently drop controls")
+      .top_k(40)
+      .send()
+      .await
+      .expect_err("verbatim mode should reject typed generation controls");
+
+    assert!(
+      matches!(error, Error::InvalidGenerateRequest { message } if message.contains(mode)),
+      "unexpected error for {mode}"
+    );
+  }
+}
+
+#[tokio::test]
+async fn max_tokens_is_already_wire_native_in_verbatim_profile_modes() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+
+  for mode in ["passthrough", "switch"] {
+    let fixture = Fixture::with_account_and_mode(mock.base_url(), "openai", "    api_key: test-key\n", mode);
+    let client = fixture.client();
+
+    let response = client
+      .generate("gpt-5")
+      .prompt("preserve this native Responses limit")
+      .max_tokens(64)
+      .send()
+      .await
+      .expect("wire-native output limit should not require lowering");
+
+    assert_eq!(response.text, "mock response");
+    let captured = mock.last_request().expect("upstream request captured");
+    assert_eq!(captured.path, "/responses");
+    let outbound: serde_json::Value = serde_json::from_slice(&captured.body).expect("parse upstream body");
+    assert_eq!(outbound["max_output_tokens"], 64);
+  }
 
   mock.shutdown().await;
 }

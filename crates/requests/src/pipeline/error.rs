@@ -58,6 +58,21 @@ pub enum RequestsError {
   #[snafu(display("request conversion failed: {source}"))]
   RequestConversion { source: ConvertError },
 
+  #[snafu(display("invalid generation options: {source}"))]
+  InvalidGenerationOptions {
+    source: tokn_core::generation::GenerationOptionsError,
+  },
+
+  #[snafu(display(
+    "generation control `{control}` is not supported by provider `{provider_id}` on {endpoint}: {reason}"
+  ))]
+  UnsupportedGenerationControl {
+    control: &'static str,
+    provider_id: SmolStr,
+    endpoint: Endpoint,
+    reason: &'static str,
+  },
+
   #[snafu(display("provider input_transformer failed: {source}"))]
   ProviderInputTransformer { source: tokn_core::provider::Error },
 
