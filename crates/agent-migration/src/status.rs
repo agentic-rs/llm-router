@@ -1,6 +1,5 @@
 use crate::adapter::{adapter_for, source_provider_id, supported_agents, ProviderRoute};
 use crate::adapters::opencode::projected_config_matches;
-use crate::jsonc::read_jsonc;
 #[cfg(test)]
 use crate::projection::SHARED_PROVIDER_ID;
 use crate::projection::{compile_opencode_publications, AgentConfigProjection};
@@ -63,10 +62,21 @@ pub fn show_agent(
   agent: AgentId,
 ) -> Result<AgentStatus> {
   let (cfg, config_path) = Config::load(gateway_config_path)?;
+  show_agent_with_config(&cfg, &config_path, gateway_auth_path, agent_home, agent)
+}
+
+/// Inspect one agent using an already-loaded effective gateway configuration.
+pub fn show_agent_with_config(
+  cfg: &Config,
+  config_path: &Path,
+  gateway_auth_path: Option<&Path>,
+  agent_home: Option<&Path>,
+  agent: AgentId,
+) -> Result<AgentStatus> {
   let auth_path = resolve_gateway_auth_path(gateway_auth_path)?;
-  let store = AuthStore::load(Some(&auth_path), Some(&config_path))?;
+  let store = AuthStore::load(Some(&auth_path), Some(config_path))?;
   let home = resolve_home(agent_home)?;
-  status_for_agent(&cfg, &store, &config_path, &home, agent)
+  status_for_agent(cfg, &store, config_path, &home, agent)
 }
 
 fn status_for_agent(
@@ -236,9 +246,6 @@ fn config_points_at_gateway(config_path: &Path, agent: &AgentId, cfg: &Config, s
   };
   match agent {
     AgentId::Opencode => {
-      if read_jsonc(config_path).is_err() {
-        return false;
-      }
       let Ok(raw) = std::fs::read_to_string(config_path) else {
         return false;
       };
@@ -318,7 +325,7 @@ fn with_opencode_projection<T>(
 
   let (accounts, publication_routes, credential_routes) = match binding.account_source {
     AgentAccountSource::Main => {
-      let effective_accounts = effective_main_accounts(cfg, store);
+      let effective_accounts = crate::effective_main_accounts(cfg, store).cloned().collect::<Vec<_>>();
       let provider_scope = provider_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
       if provider_scope
         .iter()
@@ -332,19 +339,11 @@ fn with_opencode_projection<T>(
         .into_iter()
         .filter(|account| provider_scope.contains(account.provider.as_str()))
         .collect::<Vec<_>>();
-      let default_provider = is_verbatim_mode(mode)
-        .then(|| {
-          binding
-            .provider
-            .as_deref()
-            .ok_or_else(|| anyhow!("OpenCode verbatim binding has no desired provider"))
-        })
-        .transpose()?;
       let routes: Vec<ProviderRoute> = provider_ids
         .iter()
         .map(|provider| ProviderRoute {
           source_provider_id: crate::adapters::opencode::source_namespace_for_gateway(provider).to_string(),
-          gateway_provider_id: default_provider.unwrap_or(provider).to_string(),
+          gateway_provider_id: provider.to_string(),
           account_id: String::new(),
           profile: profile_name.to_string(),
           base_url: target_base_url.clone(),
@@ -363,7 +362,7 @@ fn with_opencode_projection<T>(
       if accounts.is_empty() {
         return Err(anyhow!("OpenCode agent-account binding has no enabled linked accounts"));
       }
-      if is_verbatim_mode(mode) {
+      if mode.is_verbatim() {
         for provider in accounts
           .iter()
           .map(|account| account.provider.as_str())
@@ -452,7 +451,7 @@ fn materialized_profile_matches_binding(
     if profile.accounts.is_some() {
       return false;
     }
-    if is_verbatim_mode(mode) {
+    if mode.is_verbatim() {
       let Some(provider) = binding.provider.as_deref() else {
         return false;
       };
@@ -480,7 +479,7 @@ fn materialized_profile_matches_binding(
   let expected_account_ids = Some(accounts.iter().map(|account| account.id.as_str()).collect());
   let expected_provider_ids: Option<BTreeSet<&str>> =
     Some(accounts.iter().map(|account| account.provider.as_str()).collect());
-  let default_provider_matches = if is_verbatim_mode(mode) {
+  let default_provider_matches = if mode.is_verbatim() {
     profile.default_provider_id.as_deref().is_some_and(|provider| {
       expected_provider_ids
         .as_ref()
@@ -503,53 +502,9 @@ fn linked_agent_accounts<'a>(store: &'a AuthStore, agent: &AgentId) -> Vec<&'a t
     .collect()
 }
 
-fn effective_main_provider_ids<'a>(cfg: &Config, store: &'a AuthStore) -> BTreeSet<&'a str> {
-  store
-    .accounts
-    .iter()
-    .filter(|account| account.enabled)
-    .filter(|account| {
-      cfg
-        .defaults
-        .providers
-        .as_ref()
-        .map(|providers| providers.contains(&account.provider))
-        .unwrap_or(true)
-    })
-    .filter(|account| {
-      cfg
-        .defaults
-        .accounts
-        .as_ref()
-        .map(|accounts| accounts.contains(&account.id))
-        .unwrap_or(true)
-    })
+fn effective_main_provider_ids<'a>(cfg: &'a Config, store: &'a AuthStore) -> BTreeSet<&'a str> {
+  crate::effective_main_accounts(cfg, store)
     .map(|account| account.provider.as_str())
-    .collect()
-}
-
-fn effective_main_accounts(cfg: &Config, store: &AuthStore) -> Vec<Account> {
-  store
-    .accounts
-    .iter()
-    .filter(|account| account.enabled)
-    .filter(|account| {
-      cfg
-        .defaults
-        .providers
-        .as_ref()
-        .map(|providers| providers.contains(&account.provider))
-        .unwrap_or(true)
-    })
-    .filter(|account| {
-      cfg
-        .defaults
-        .accounts
-        .as_ref()
-        .map(|accounts| accounts.contains(&account.id))
-        .unwrap_or(true)
-    })
-    .cloned()
     .collect()
 }
 
@@ -576,10 +531,6 @@ fn materialized_provider_profile_matches_binding(
       && option_string_set(profile.providers.as_deref()) == Some(BTreeSet::from([provider]))
       && option_string_set(profile.accounts.as_deref()) == Some(account_ids.clone())
   })
-}
-
-fn is_verbatim_mode(mode: RouteMode) -> bool {
-  matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
 }
 
 fn codex_config_matches(doc: &toml_edit::DocumentMut, expected_base_url: &str) -> bool {
@@ -662,12 +613,10 @@ mod tests {
     account_ids: &[&str],
   ) -> Config {
     let mut cfg = Config::default();
-    let provider_filter = (account_source != AgentAccountSource::Main || !is_verbatim_mode(mode))
+    let provider_filter = (account_source != AgentAccountSource::Main || !mode.is_verbatim())
       .then(|| vec![tokn_core::provider::ID_OPENAI.to_string()]);
     let profile_providers = match account_source {
-      AgentAccountSource::Main if is_verbatim_mode(mode) => {
-        default_provider_id.map(|provider| vec![provider.to_string()])
-      }
+      AgentAccountSource::Main if mode.is_verbatim() => default_provider_id.map(|provider| vec![provider.to_string()]),
       AgentAccountSource::Main => provider_filter.clone(),
       AgentAccountSource::Agent if account_ids.is_empty() => Some(vec![tokn_core::provider::ID_OPENAI.to_string()]),
       AgentAccountSource::Agent => Some(
@@ -684,7 +633,7 @@ mod tests {
         mode: Some(mode),
         profile: Some("work".into()),
         account_source,
-        provider: (account_source == AgentAccountSource::Main && is_verbatim_mode(mode)).then(|| {
+        provider: (account_source == AgentAccountSource::Main && mode.is_verbatim()).then(|| {
           default_provider_id
             .expect("raw main binding needs a provider")
             .to_string()

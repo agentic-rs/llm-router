@@ -103,28 +103,29 @@ impl OpenCodePreflight {
   }
 
   fn validate_auth_override(&self) -> Result<()> {
-    if self.account_source == AgentAccountSource::Agent && std::env::var_os("OPENCODE_AUTH_CONTENT").is_some() {
+    if self.account_source != AgentAccountSource::Agent {
+      return Ok(());
+    }
+    if std::env::var_os("OPENCODE_AUTH_CONTENT").is_some() {
       bail!(
         "cannot link OpenCode-owned accounts while OPENCODE_AUTH_CONTENT is set: OpenCode would keep using the environment credential while Tokn migrates {}; unset the override or link with --use-main-accounts",
         opencode_data_root(&self.home).join("auth.json").display()
       );
     }
-    if self.account_source == AgentAccountSource::Agent {
-      let auth_path = opencode_data_root(&self.home).join("auth.json");
-      if auth_path.exists() {
-        let raw =
-          fs::read_to_string(&auth_path).with_context(|| format!("reading OpenCode auth {}", auth_path.display()))?;
-        let auth: JsonValue =
-          serde_json::from_str(&raw).with_context(|| format!("parsing OpenCode auth {}", auth_path.display()))?;
-        if auth
-          .as_object()
-          .is_some_and(|auth| auth.values().any(is_well_known_auth))
-        {
-          bail!(
-            "cannot link OpenCode-owned accounts while {} contains a wellknown auth record because its remote config cannot be migrated safely; remove that record or link with --use-main-accounts",
-            auth_path.display()
-          );
-        }
+    let auth_path = opencode_data_root(&self.home).join("auth.json");
+    if auth_path.exists() {
+      let raw =
+        fs::read_to_string(&auth_path).with_context(|| format!("reading OpenCode auth {}", auth_path.display()))?;
+      let auth: JsonValue =
+        serde_json::from_str(&raw).with_context(|| format!("parsing OpenCode auth {}", auth_path.display()))?;
+      if auth
+        .as_object()
+        .is_some_and(|auth| auth.values().any(is_well_known_auth))
+      {
+        bail!(
+          "cannot link OpenCode-owned accounts while {} contains a wellknown auth record because its remote config cannot be migrated safely; remove that record or link with --use-main-accounts",
+          auth_path.display()
+        );
       }
     }
     Ok(())
@@ -546,11 +547,16 @@ fn collect_markdown_paths(
       .file_type()
       .with_context(|| format!("reading file type for global OpenCode path '{}'", path.display()))?;
     let metadata = if file_type.is_symlink() {
-      Some(
-        entry
-          .metadata()
-          .with_context(|| format!("following global OpenCode Markdown symlink '{}'", path.display()))?,
-      )
+      match fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+          continue;
+        }
+        Err(error) => {
+          return Err(error)
+            .with_context(|| format!("following global OpenCode Markdown symlink '{}'", path.display()));
+        }
+      }
     } else {
       None
     };
@@ -758,6 +764,48 @@ mod tests {
       assert!(diagnostic_mentions_markdown_path(&message, &path), "{message}");
     }
     assert!(message.contains("model 'openai/gpt-5' -> 'tokn-router/gpt-5'"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn scans_symlinked_markdown_files_and_directories_without_following_cycles() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let file_target = write_markdown(temp.path(), "fixtures/file.md", "---\nmodel: openai/gpt-5\n---\n");
+    let file_link = temp.path().join(".config/opencode/agent/linked.md");
+    fs::create_dir_all(file_link.parent().unwrap()).unwrap();
+    symlink(&file_target, &file_link).unwrap();
+
+    let directory_target = temp.path().join("fixtures/tree");
+    let nested_target = write_markdown(
+      temp.path(),
+      "fixtures/tree/nested/reviewer.md",
+      "---\nmodel: openai/gpt-5\n---\n",
+    );
+    symlink(&directory_target, directory_target.join("cycle")).unwrap();
+    let directory_link = temp.path().join(".config/opencode/command/linked");
+    fs::create_dir_all(directory_link.parent().unwrap()).unwrap();
+    symlink(&directory_target, &directory_link).unwrap();
+    let nested_link = directory_link.join(nested_target.strip_prefix(&directory_target).unwrap());
+    symlink(
+      temp.path().join("fixtures/missing.md"),
+      directory_link.with_extension("missing"),
+    )
+    .unwrap();
+
+    let preflight = preflight(
+      temp.path(),
+      RouteMode::Route,
+      vec![route("openai", "openai", false)],
+      vec![publication(SHARED_PROVIDER_ID, &["gpt-5"])],
+      vec![rule("openai", SHARED_PROVIDER_ID, None)],
+    );
+
+    let error = preflight.validate().unwrap_err();
+    let message = error.to_string();
+    assert!(diagnostic_mentions_markdown_path(&message, &file_link), "{message}");
+    assert!(diagnostic_mentions_markdown_path(&message, &nested_link), "{message}");
   }
 
   #[test]

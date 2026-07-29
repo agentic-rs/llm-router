@@ -4,8 +4,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
 use tokn_agent_migration::{
-  apply_reconcile, import_accounts, list_agents, plan_reconcile, show_agent, unlink, unlink_with_legacy_root,
-  AgentProfileLayout, AgentStatus, ImportRequest, ReconcilePlan, ReconcileRequest, UnlinkRequest,
+  apply_reconcile, import_accounts, list_agents, plan_reconcile, show_agent_with_config, unlink,
+  unlink_with_legacy_root, AgentProfileLayout, AgentStatus, ImportRequest, ReconcilePlan, ReconcileRequest,
+  UnlinkRequest,
 };
 use tokn_config::{AgentAccountSource, Config, RouteMode};
 use tokn_core::AgentId;
@@ -124,7 +125,7 @@ fn list(cfg_path: Option<PathBuf>) -> Result<()> {
 
 fn show(cfg_path: Option<PathBuf>, args: AgentTargetArgs) -> Result<()> {
   let (cfg, resolved_config_path) = Config::load(cfg_path.as_deref())?;
-  let status = show_agent(Some(&resolved_config_path), None, None, args.agent)?;
+  let status = show_agent_with_config(&cfg, &resolved_config_path, None, None, args.agent)?;
   let displayed_config_path = cfg_path.as_ref().map(|_| resolved_config_path.as_path());
   print_status(&status, displayed_config_path, cfg.api_key.enabled);
   Ok(())
@@ -326,7 +327,7 @@ fn print_status(status: &AgentStatus, gateway_config_path: Option<&Path>, api_ke
       if let Some(provider) = binding.provider.as_deref() {
         println!("  provider: {provider}");
       }
-      if binding.account_source == AgentAccountSource::Main && !is_verbatim_mode(binding.mode) {
+      if binding.account_source == AgentAccountSource::Main && !binding.mode.is_verbatim() {
         println!(
           "  provider_filter: {}",
           binding
@@ -380,10 +381,10 @@ fn drift_hint(agent: &AgentId, gateway_config_path: Option<&Path>, api_key_enabl
   }
   match gateway_config_path {
     Some(path) => format!(
-      "hint: run `tokn-router agent sync {agent}` with the global `--config` path set to {} to review and repair drift",
+      "hint: run `tokn-gateway agent sync {agent}` with the global `--config` path set to {} to review and repair drift",
       path.display()
     ),
-    None => format!("hint: run `tokn-router agent sync {agent}` to review and repair drift"),
+    None => format!("hint: run `tokn-gateway agent sync {agent}` to review and repair drift"),
   }
 }
 
@@ -412,7 +413,7 @@ fn print_plan(kind: &str, plan: &ReconcilePlan) {
   if let Some(agent_auth) = &plan.agent_auth_path {
     println!("agent_auth_source: {}", agent_auth.display());
   }
-  if plan.account_source == AgentAccountSource::Main && !is_verbatim_mode(plan.binding_mode) {
+  if plan.account_source == AgentAccountSource::Main && !plan.binding_mode.is_verbatim() {
     println!(
       "provider_filter: {}",
       plan
@@ -469,10 +470,6 @@ fn route_mode_as_str(mode: RouteMode) -> &'static str {
     RouteMode::Route => "route",
     RouteMode::Fuzzy => "fuzzy",
   }
-}
-
-fn is_verbatim_mode(mode: RouteMode) -> bool {
-  matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
 }
 
 fn profile_layout(mode: RouteMode, account_source: AgentAccountSource) -> AgentProfileLayout {
@@ -674,7 +671,11 @@ mod tests {
         Some(Path::new("/tmp/router config/user's.toml")),
         false
       ),
-      "hint: run `tokn-router agent sync opencode` with the global `--config` path set to /tmp/router config/user's.toml to review and repair drift"
+      "hint: run `tokn-gateway agent sync opencode` with the global `--config` path set to /tmp/router config/user's.toml to review and repair drift"
+    );
+    assert_eq!(
+      drift_hint(&AgentId::Opencode, None, false),
+      "hint: run `tokn-gateway agent sync opencode` to review and repair drift"
     );
   }
 

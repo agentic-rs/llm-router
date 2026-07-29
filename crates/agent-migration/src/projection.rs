@@ -84,7 +84,7 @@ pub(crate) fn compile_opencode_publications(
     .filter(|(_, catalogue)| catalogue.models.is_empty())
     .map(|(provider_id, _)| provider_id.clone())
     .collect();
-  let (publications, model_reference_rules) = if is_verbatim_mode(mode) {
+  let (publications, model_reference_rules) = if mode.is_verbatim() {
     compile_pinned_publications(previous_mode, previous_provider_ids, routes, &catalogues)?
   } else {
     compile_shared_publication(
@@ -164,7 +164,7 @@ fn provider_catalogues(
       .default_models
       .iter()
       .filter(|model| is_generation_model(model))
-      .filter(|model| !is_verbatim_mode(mode) || provider.has_endpoint(&model.id, endpoint))
+      .filter(|model| !mode.is_verbatim() || provider.has_endpoint(&model.id, endpoint))
       .map(|model| {
         (
           model.id.clone(),
@@ -212,7 +212,7 @@ fn provider_catalogues(
       .filter(|_| publish_static_models)
       .filter(is_generation_model)
       .filter(|model| {
-        !is_verbatim_mode(mode)
+        !mode.is_verbatim()
           || tokn_core::provider::match_endpoint_rule(
             descriptor.model_endpoint_rules.unwrap_or_default(),
             &model.id,
@@ -305,7 +305,7 @@ fn compile_shared_publication(
     )?;
   }
   add_shared_known_model_rejections(&mut rules, mode, previous_mode, routes, catalogues)?;
-  if previous_mode.is_some_and(is_verbatim_mode) {
+  if previous_mode.is_some_and(RouteMode::is_verbatim) {
     let current_provider_ids = routes
       .iter()
       .map(|route| route.gateway_provider_id.as_str())
@@ -455,7 +455,7 @@ fn compile_pinned_publications(
         }
       }
     }
-    None if previous_mode.is_some_and(is_verbatim_mode) && publications.len() == 1 => {
+    None if previous_mode.is_some_and(RouteMode::is_verbatim) && publications.len() == 1 => {
       let target_provider_id = publications
         .keys()
         .next()
@@ -660,7 +660,7 @@ fn add_shared_known_model_rejections(
         )?;
       }
 
-      if previous_mode.is_some_and(is_verbatim_mode) {
+      if previous_mode.is_some_and(RouteMode::is_verbatim) {
         insert_reference_rule(
           rules,
           ModelReferenceRule {
@@ -803,10 +803,6 @@ fn insert_reference_rule(rules: &mut Vec<ModelReferenceRule>, rule: ModelReferen
 
 fn pinned_provider_id(provider_id: &str) -> String {
   format!("{SHARED_PROVIDER_ID}-{provider_id}")
-}
-
-fn is_verbatim_mode(mode: RouteMode) -> bool {
-  matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
 }
 
 pub(crate) fn publication_ids(publications: &[ProviderPublication]) -> BTreeSet<&str> {

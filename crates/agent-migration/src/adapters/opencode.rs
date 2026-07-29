@@ -99,6 +99,9 @@ impl AgentAdapter for OpencodeAdapter {
 
 fn opencode_config_path(home: &Path) -> PathBuf {
   let root = crate::opencode_markdown::opencode_config_root(home);
+  // OpenCode merges the legacy config.json first, then opencode.json, then
+  // opencode.jsonc. Manage the highest-precedence modern file and leave the
+  // legacy file as a validated secondary source.
   let jsonc = root.join(OPENCODE_CONFIG_JSONC);
   if jsonc.exists() {
     return jsonc;
@@ -959,6 +962,7 @@ mod tests {
   use super::*;
   use crate::projection::compile_opencode_publications;
   use std::collections::BTreeMap;
+  use std::fs;
   use tokn_config::RouteMode;
   use tokn_core::provider::Endpoint;
 
@@ -1066,6 +1070,24 @@ mod tests {
     let output = root.to_string();
     let json = crate::jsonc::parse_jsonc(&output, path)?;
     Ok((output, json))
+  }
+
+  #[test]
+  fn config_path_uses_the_highest_precedence_modern_opencode_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::opencode_markdown::opencode_config_root(temp.path());
+    fs::create_dir_all(&root).unwrap();
+    let legacy = root.join("config.json");
+    let json = root.join(OPENCODE_CONFIG_JSON);
+    let jsonc = root.join(OPENCODE_CONFIG_JSONC);
+
+    assert_eq!(opencode_config_path(temp.path()), jsonc);
+    fs::write(&legacy, "{}").unwrap();
+    assert_eq!(opencode_config_path(temp.path()), jsonc);
+    fs::write(&json, "{}").unwrap();
+    assert_eq!(opencode_config_path(temp.path()), json);
+    fs::write(&jsonc, "{}").unwrap();
+    assert_eq!(opencode_config_path(temp.path()), jsonc);
   }
 
   #[test]

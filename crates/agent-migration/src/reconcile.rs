@@ -56,7 +56,7 @@ pub enum AgentProfileLayout {
 
 impl AgentProfileLayout {
   pub fn for_binding(mode: RouteMode, account_source: AgentAccountSource) -> Self {
-    if !is_verbatim_mode(mode) {
+    if !mode.is_verbatim() {
       Self::Single
     } else if account_source == AgentAccountSource::Main {
       Self::SinglePinned
@@ -141,7 +141,7 @@ impl ReconcilePlan {
 
   /// Provider IDs injected into the agent's own model picker/configuration.
   pub fn injected_provider_ids(&self) -> Vec<String> {
-    if self.agent == AgentId::Opencode && is_verbatim_mode(self.binding_mode) {
+    if self.agent == AgentId::Opencode && self.binding_mode.is_verbatim() {
       return self
         .gateway_provider_ids()
         .into_iter()
@@ -508,7 +508,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
       None,
       None,
       Vec::new(),
-      effective_main_accounts(&cfg, &store),
+      crate::effective_main_accounts(&cfg, &store).cloned().collect(),
       BTreeSet::new(),
     )
   } else {
@@ -613,7 +613,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
     &main_accounts,
   )?;
   let publication_accounts = if account_source == AgentAccountSource::Main {
-    let publication_provider_ids = if is_verbatim_mode(binding_mode) {
+    let publication_provider_ids = if binding_mode.is_verbatim() {
       vec![main_default_provider_id
         .as_ref()
         .expect("main-account verbatim mode resolves a default provider")
@@ -634,12 +634,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
       &transferred_source_providers,
       adapter.default_provider_id(),
     )?,
-    AgentAccountSource::Main => main_provider_routes(
-      &cfg,
-      binding_profile.as_deref(),
-      &published_provider_ids,
-      main_default_provider_id.as_deref(),
-    ),
+    AgentAccountSource::Main => main_provider_routes(&cfg, binding_profile.as_deref(), &published_provider_ids),
   };
   let provider_routes = match account_source {
     AgentAccountSource::Agent => provider_routes(
@@ -649,12 +644,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
       &transferred_source_providers,
       adapter.default_provider_id(),
     )?,
-    AgentAccountSource::Main => main_provider_routes(
-      &cfg,
-      binding_profile.as_deref(),
-      &published_provider_ids,
-      main_default_provider_id.as_deref(),
-    ),
+    AgentAccountSource::Main => main_provider_routes(&cfg, binding_profile.as_deref(), &published_provider_ids),
   };
   let default_provider_id = materialized_default_provider(
     binding_mode,
@@ -664,7 +654,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
     adapter.default_provider_id(),
   );
   validate_binding_profile(&cfg, &request.agent, binding_profile.as_deref(), existing_binding)?;
-  if is_verbatim_mode(binding_mode) {
+  if binding_mode.is_verbatim() {
     validate_provider_route_profiles(&cfg, &request.agent, &provider_routes)?;
   }
   validate_verbatim_provider_routes(&request.agent, adapter.as_ref(), binding_mode, &provider_routes)?;
@@ -1954,17 +1944,12 @@ fn provider_routes(
   Ok(routes)
 }
 
-fn main_provider_routes(
-  cfg: &Config,
-  binding_profile: Option<&str>,
-  provider_ids: &[String],
-  default_provider_id: Option<&str>,
-) -> Vec<ProviderRoute> {
+fn main_provider_routes(cfg: &Config, binding_profile: Option<&str>, provider_ids: &[String]) -> Vec<ProviderRoute> {
   provider_ids
     .iter()
     .map(|gateway_provider_id| ProviderRoute {
       source_provider_id: crate::adapters::opencode::source_namespace_for_gateway(gateway_provider_id).to_string(),
-      gateway_provider_id: default_provider_id.unwrap_or(gateway_provider_id).to_string(),
+      gateway_provider_id: gateway_provider_id.to_string(),
       account_id: String::new(),
       profile: binding_profile.unwrap_or_default().to_string(),
       base_url: gateway_profile_base_url(cfg, binding_profile),
@@ -1987,7 +1972,7 @@ fn resolve_main_provider_filter(
   if account_source != AgentAccountSource::Main {
     return Ok(None);
   }
-  if is_verbatim_mode(mode) {
+  if mode.is_verbatim() {
     if explicit_provider_ids.is_some_and(|provider_ids| !provider_ids.is_empty()) {
       bail!("--provider-filter is not valid with --mode passthrough or switch; use --provider <id>");
     }
@@ -2011,31 +1996,6 @@ fn resolve_main_provider_filter(
   Ok((!provider_filter.is_empty()).then(|| provider_filter.into_iter().collect()))
 }
 
-fn effective_main_accounts(cfg: &Config, store: &AuthStore) -> Vec<Account> {
-  store
-    .accounts
-    .iter()
-    .filter(|account| account.enabled)
-    .filter(|account| {
-      cfg
-        .defaults
-        .providers
-        .as_ref()
-        .map(|providers| providers.contains(&account.provider))
-        .unwrap_or(true)
-    })
-    .filter(|account| {
-      cfg
-        .defaults
-        .accounts
-        .as_ref()
-        .map(|accounts| accounts.contains(&account.id))
-        .unwrap_or(true)
-    })
-    .cloned()
-    .collect()
-}
-
 fn materialize_main_provider_ids(
   account_source: AgentAccountSource,
   mode: RouteMode,
@@ -2046,7 +2006,7 @@ fn materialize_main_provider_ids(
   if account_source != AgentAccountSource::Main {
     return Ok(Vec::new());
   }
-  if is_verbatim_mode(mode) {
+  if mode.is_verbatim() {
     let default_provider_id = default_provider_id.expect("main-account verbatim mode resolves a default provider");
     if !accounts.iter().any(|account| account.provider == default_provider_id) {
       bail!(
@@ -2095,7 +2055,7 @@ fn previous_materialized_provider_ids(
   if let Some(providers) = profile.providers.as_ref().filter(|providers| !providers.is_empty()) {
     return Some(providers.clone());
   }
-  if previous_mode.is_some_and(is_verbatim_mode) {
+  if previous_mode.is_some_and(RouteMode::is_verbatim) {
     return profile
       .default_provider_id
       .as_ref()
@@ -2268,10 +2228,6 @@ fn previous_materialized_account_source(
   })
 }
 
-fn is_verbatim_mode(mode: RouteMode) -> bool {
-  matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
-}
-
 fn resolve_main_default_provider(
   cfg: &Config,
   previous_materialized_profile: Option<&str>,
@@ -2280,10 +2236,10 @@ fn resolve_main_default_provider(
   account_source: AgentAccountSource,
   explicit_provider: Option<&str>,
 ) -> Result<Option<String>> {
-  if explicit_provider.is_some() && (account_source != AgentAccountSource::Main || !is_verbatim_mode(mode)) {
+  if explicit_provider.is_some() && (account_source != AgentAccountSource::Main || !mode.is_verbatim()) {
     bail!("--provider is only valid with --use-main-accounts and --mode passthrough or switch");
   }
-  if account_source != AgentAccountSource::Main || !is_verbatim_mode(mode) {
+  if account_source != AgentAccountSource::Main || !mode.is_verbatim() {
     return Ok(None);
   }
   let desired_provider = existing_binding.and_then(|binding| binding.provider.as_deref());
@@ -2313,7 +2269,7 @@ fn materialized_default_provider(
   provider_routes: &[ProviderRoute],
   adapter_default_provider_id: &str,
 ) -> Option<String> {
-  if !is_verbatim_mode(mode) {
+  if !mode.is_verbatim() {
     return None;
   }
   if account_source == AgentAccountSource::Main {
@@ -2333,7 +2289,7 @@ fn validate_verbatim_provider_routes(
   mode: RouteMode,
   routes: &[ProviderRoute],
 ) -> Result<()> {
-  if !is_verbatim_mode(mode) {
+  if !mode.is_verbatim() {
     return Ok(());
   }
   let endpoint = adapter.switch_endpoint();
@@ -2556,7 +2512,7 @@ fn upsert_agent_and_profiles(
   provider_routes: &[ProviderRoute],
   fallback_provider_id: &str,
 ) -> Result<()> {
-  let default_provider_id = is_verbatim_mode(mode).then_some(fallback_provider_id);
+  let default_provider_id = mode.is_verbatim().then_some(fallback_provider_id);
   let write = AgentProfileWrite {
     agent,
     profile,
@@ -2622,7 +2578,7 @@ fn edit_agent_and_profiles(doc: &mut toml_edit::DocumentMut, write: &AgentProfil
   if let Some(profile) = write.profile {
     validate_profile_item_owner(doc, profile, write.agent)?;
     upsert_profile_item(doc, profile, write);
-    if is_verbatim_mode(write.mode) && !write.provider_routes.is_empty() {
+    if write.mode.is_verbatim() && !write.provider_routes.is_empty() {
       remove_agent_profiles(doc, profile, write.agent);
       upsert_provider_route_profiles(doc, write.agent, write.mode, write.provider_routes)?;
     } else {
@@ -2688,7 +2644,7 @@ fn upsert_profile_item(doc: &mut toml_edit::DocumentMut, profile: &str, write: &
   }
 
   if write.account_source == AgentAccountSource::Main {
-    if is_verbatim_mode(write.mode) {
+    if write.mode.is_verbatim() {
       let default_provider_id = write.default_provider_id.expect("verbatim main profile has a provider");
       profile_item["providers"] = array_value(&[default_provider_id.to_string()]);
     } else if !write.materialized_provider_ids.is_empty() {
@@ -2746,7 +2702,7 @@ fn upsert_provider_route_profiles(
     let item = profiles[route.profile.as_str()].or_insert(toml_edit::table());
     item["mode"] = toml_edit::value(route_mode_as_str(mode));
     item["agent_id"] = toml_edit::value(agent.as_str());
-    if is_verbatim_mode(mode) {
+    if mode.is_verbatim() {
       item["default_provider_id"] = toml_edit::value(route.gateway_provider_id.as_str());
     } else if let Some(table) = item.as_table_mut() {
       table.remove("default_provider_id");
@@ -2933,12 +2889,7 @@ mod tests {
   #[test]
   fn main_codex_route_uses_opencodes_openai_source_namespace() {
     let cfg = Config::default();
-    let routes = main_provider_routes(
-      &cfg,
-      Some("opencode"),
-      &[tokn_core::provider::ID_CODEX.to_string()],
-      None,
-    );
+    let routes = main_provider_routes(&cfg, Some("opencode"), &[tokn_core::provider::ID_CODEX.to_string()]);
 
     assert_eq!(routes.len(), 1);
     assert_eq!(routes[0].source_provider_id, tokn_core::provider::ID_OPENAI);
@@ -4517,7 +4468,7 @@ accounts = ["opencode-openai"]
           profile: None,
           mode: Some(mode),
           account_source: Some(AgentAccountSource::Main),
-          default_provider_id: is_verbatim_mode(mode).then(|| tokn_core::provider::ID_OPENAI.into()),
+          default_provider_id: mode.is_verbatim().then(|| tokn_core::provider::ID_OPENAI.into()),
           provider_filter: None,
           gateway_config_path: Some(gateway_config_path.clone()),
           agent_home: Some(agent_home.clone()),
