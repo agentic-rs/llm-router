@@ -2924,6 +2924,12 @@ fn default_gateway_auth_path() -> Result<PathBuf> {
 mod tests {
   use super::*;
 
+  fn diagnostic_starts_with_path(message: &str, expected: &Path, marker: &str) -> bool {
+    message
+      .split_once(marker)
+      .is_some_and(|(actual, _)| same_path(Path::new(actual), expected))
+  }
+
   #[test]
   fn main_codex_route_uses_opencodes_openai_source_namespace() {
     let cfg = Config::default();
@@ -3613,7 +3619,10 @@ port = 4141
     .expect_err("global Markdown selections must be migrated before credential transfer");
 
     let message = error.to_string();
-    assert!(message.contains(markdown_path.to_str().unwrap()));
+    assert!(
+      crate::opencode_markdown::diagnostic_mentions_markdown_path(&message, &markdown_path),
+      "{message}"
+    );
     assert!(message.contains("openai/gpt-5"));
     assert!(message.contains("tokn-router/gpt-5"));
   }
@@ -6127,8 +6136,12 @@ providers = ["anthropic"]
     })
     .unwrap_err();
 
-    assert!(error.to_string().contains(&opencode_config_path.display().to_string()));
-    assert!(error.to_string().contains("rollback would overwrite"));
+    let message = error.to_string();
+    assert!(
+      diagnostic_starts_with_path(&message, &opencode_config_path, " changed after the link or sync"),
+      "{message}"
+    );
+    assert!(message.contains("rollback would overwrite"));
     assert_eq!(std::fs::read(&opencode_config_path).unwrap(), edited_config);
     assert_eq!(std::fs::read(&opencode_auth_path).unwrap(), linked_auth);
     assert_eq!(std::fs::read(&gateway_auth_shard_path).unwrap(), linked_shard);
@@ -6185,7 +6198,12 @@ providers = ["anthropic"]
     })
     .unwrap_err();
 
-    assert!(error.to_string().contains(&opencode_config_path.display().to_string()));
+    let message = error.to_string();
+    assert!(
+      diagnostic_starts_with_path(&message, &opencode_config_path, " changed after the link or sync"),
+      "{message}"
+    );
+    assert!(message.contains("rollback would overwrite"));
     assert_eq!(std::fs::read(&opencode_config_path).unwrap(), edited_config);
     assert_eq!(std::fs::read(&fragment_path).unwrap(), linked_fragment);
     let manifest = manifest::read_manifest(&manifest_path).unwrap();

@@ -482,6 +482,20 @@ fn same_path(left: &Path, right: &Path) -> bool {
       .is_some_and(|(left, right)| left == right)
 }
 
+#[cfg(test)]
+pub(crate) fn diagnostic_mentions_markdown_path(message: &str, expected: &Path) -> bool {
+  message.lines().any(|line| {
+    let Some((location, _)) = line
+      .trim_start()
+      .strip_prefix("- ")
+      .and_then(|line| line.split_once(": model '"))
+    else {
+      return false;
+    };
+    same_path(Path::new(location), expected)
+  })
+}
+
 fn global_markdown_paths(home: &Path) -> Result<Vec<PathBuf>> {
   let mut paths = Vec::new();
   let mut visited = BTreeSet::new();
@@ -741,7 +755,7 @@ mod tests {
     let error = preflight.validate().unwrap_err();
     let message = error.to_string();
     for path in paths {
-      assert!(message.contains(path.to_str().unwrap()), "{message}");
+      assert!(diagnostic_mentions_markdown_path(&message, &path), "{message}");
     }
     assert!(message.contains("model 'openai/gpt-5' -> 'tokn-router/gpt-5'"));
   }
@@ -825,8 +839,9 @@ mod tests {
     );
 
     let error = preflight.validate().unwrap_err();
-    assert!(error.to_string().contains(path.to_str().unwrap()));
-    assert!(error.to_string().contains("stale"));
+    let message = error.to_string();
+    assert!(diagnostic_mentions_markdown_path(&message, &path), "{message}");
+    assert!(message.contains("stale"));
   }
 
   #[test]
