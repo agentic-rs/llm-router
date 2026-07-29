@@ -8,7 +8,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -307,13 +306,7 @@ impl AuthStore {
     let SourceSnapshot::Contents(contents) = self.source_snapshots.get(source)? else {
       return None;
     };
-    let digest = Sha256::digest(contents);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-      std::fmt::Write::write_fmt(&mut encoded, format_args!("{byte:02x}"))
-        .expect("writing a SHA-256 digest to a String cannot fail");
-    }
-    Some(encoded)
+    Some(tokn_core::util::digest::sha256_hex(contents))
   }
 
   /// Resolve a source to its backing path. A validated shard path can be

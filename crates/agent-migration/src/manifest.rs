@@ -1,7 +1,6 @@
 use crate::adapter::ProviderRoute;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 use tokn_core::AgentId;
 
@@ -457,12 +456,7 @@ pub(crate) fn set_applied_digest_for_path(files: &mut [FileBackup], path: &Path,
 }
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
-  let digest = Sha256::digest(bytes);
-  let mut encoded = String::with_capacity(digest.len() * 2);
-  for byte in digest {
-    std::fmt::Write::write_fmt(&mut encoded, format_args!("{byte:02x}")).expect("writing to a String cannot fail");
-  }
-  encoded
+  tokn_core::util::digest::sha256_hex(bytes)
 }
 
 pub(crate) fn restore_sensitive_path_from_backup(backup: &Path, destination: &Path) -> Result<()> {
