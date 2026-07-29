@@ -371,13 +371,17 @@ tokn-gateway agent import codex-cli|opencode [--yes]
 tokn-gateway agent link codex-cli|opencode [--profile NAME] [--mode MODE] [--yes]
 tokn-gateway agent link opencode --use-main-accounts [--mode passthrough|switch|exact|route|fuzzy] [--provider ID] [--provider-filter ID]... [--yes]
 tokn-gateway agent sync codex-cli|opencode|--all [--yes]
-tokn-gateway agent unlink codex-cli|opencode [--backup-id ID]
+tokn-gateway agent unlink codex-cli|opencode [--backup-id ID] [--yes]
 tokn-gateway migration [--commit|--rollback]
 tokn-gateway update
 tokn-gateway smoke provider|model|send ...
 ```
 
-Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`.
+Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`. A
+fresh link defaults to `route`; a relink or sync preserves the binding's
+current mode when `--mode` is omitted. `exact` requires an agent that can
+encode provider-qualified model IDs and is currently supported only by
+OpenCode.
 
 `agent link` writes its binding and generated profile to
 `config.d/<agent>.toml`, so the primary config remains untouched. When a normal
@@ -413,16 +417,25 @@ OpenCode publication follows the route mode. `route` and `fuzzy` publish one
 provider but publishes provider-qualified model IDs such as
 `tokn-router/deepseek/deepseek-chat`. `switch` and `passthrough` publish pinned
 providers such as `tokn-router-openai`, backed by provider-specific profiles.
-The generated profiles are the runtime materialization of
-`[agents.opencode].mode`; a mismatch is configuration drift. Providers without
-a static model catalogue remain usable with an existing custom selection, but
-cannot add discoverable entries to OpenCode's model picker and produce a link
-warning. Agent-owned links also check global OpenCode agent and command
-Markdown files before transferring credentials. A `model` frontmatter entry
-that still names a transferred provider blocks the link and reports its
-generated replacement. Project-local `.opencode` Markdown files cannot be
-discovered by a global link, so update those model references to the generated
-`tokn-router` namespace manually; the link plan prints this reminder.
+The provider/profile layout is derived rather than configured independently:
+normalized modes use one shared profile, raw main-account modes use one pinned
+profile, and raw agent-owned modes use one profile per provider. The generated
+profiles are the runtime materialization of `[agents.opencode].mode`; a
+mismatch is configuration drift. Providers without a static model catalogue
+remain usable with an existing custom selection, but cannot add discoverable
+entries to OpenCode's model picker and produce a link warning.
+
+Generated agent clients currently use a non-secret sentinel API key. Therefore
+link and sync reject every managed mode when `[api_key].enabled = true`;
+disable gateway API-key enforcement or use `passthrough` until agent-scoped
+client-key provisioning is supported.
+
+Agent-owned links also check global OpenCode agent and command Markdown files
+before transferring credentials. A `model` frontmatter entry that still names
+a transferred provider blocks the link and reports its generated replacement.
+Project-local `.opencode` Markdown files cannot be discovered by a global link,
+so update those model references to the generated `tokn-router` namespace
+manually; the link plan prints this reminder.
 
 ## Proxy Mode
 

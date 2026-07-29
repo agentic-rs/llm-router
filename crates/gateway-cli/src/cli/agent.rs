@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use tokn_agent_migration::{
-  apply_reconcile, import_accounts, list_agents, plan_reconcile, show_agent, unlink, AgentStatus, ImportRequest,
-  ReconcilePlan, ReconcileRequest, UnlinkRequest,
+  apply_reconcile, import_accounts, list_agents, plan_reconcile, show_agent, unlink, AgentProfileLayout, AgentStatus,
+  ImportRequest, ReconcilePlan, ReconcileRequest, UnlinkRequest,
 };
 use tokn_config::{AgentAccountSource, Config, RouteMode};
 use tokn_core::AgentId;
@@ -46,6 +46,9 @@ pub struct AgentLinkArgs {
   pub target: AgentTargetArgs,
   #[arg(long)]
   pub profile: Option<String>,
+  /// Gateway routing mode. Fresh links default to `route`; relinks preserve
+  /// their current mode when this option is omitted. `exact` requires an agent
+  /// that can encode provider-qualified model IDs (currently OpenCode).
   #[arg(long, value_parser = parse_route_mode)]
   pub mode: Option<RouteMode>,
   /// Leave the agent's credentials untouched and use the gateway's existing
@@ -91,6 +94,9 @@ pub struct AgentUnlinkArgs {
   /// Timestamp or full manifest path. Defaults to the latest manifest for the agent.
   #[arg(long)]
   pub backup_id: Option<String>,
+  /// Apply the unlink without an interactive confirmation.
+  #[arg(long)]
+  pub yes: bool,
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, cmd: AgentCmd) -> Result<()> {
@@ -157,22 +163,40 @@ fn sync(cfg_path: Option<PathBuf>, args: AgentSyncArgs) -> Result<()> {
     "Syncing: {}",
     agents.iter().map(AgentId::to_string).collect::<Vec<_>>().join(", ")
   );
-  if !args.yes && !confirm("Apply this agent sync?")? {
-    println!("Sync cancelled.");
-    return Ok(());
-  }
 
-  for agent in agents {
+  for (index, agent) in agents.into_iter().enumerate() {
     let plan = plan_reconcile(sync_reconcile_request(cfg_path.clone(), agent.clone()))?;
     print_plan("sync", &plan);
-    let report = apply_reconcile(plan)?;
-    println!("synced {} -> {}", agent, report.manifest_path.display());
+    if !args.yes && !confirm(&format!("Apply this sync plan for {agent}?"))? {
+      if index == 0 {
+        println!("Sync cancelled.");
+      } else {
+        println!("Sync stopped before {agent}; previously confirmed agents remain synchronized.");
+      }
+      return Ok(());
+    }
+    apply_sync_plan(plan)?;
   }
+  Ok(())
+}
+
+fn apply_sync_plan(plan: ReconcilePlan) -> Result<()> {
+  let agent = plan.agent.clone();
+  let report = apply_reconcile(plan)?;
+  println!("synced {} -> {}", agent, report.manifest_path.display());
   Ok(())
 }
 
 fn unlink_cmd(args: AgentUnlinkArgs) -> Result<()> {
   let agent = args.target.agent;
+  let backup = args.backup_id.as_deref().unwrap_or("latest active manifest");
+  println!("Agent unlink request");
+  println!("agent: {agent}");
+  println!("backup: {backup}");
+  if !args.yes && !confirm(&format!("Restore {agent} from {backup}?"))? {
+    println!("Unlink cancelled.");
+    return Ok(());
+  }
   let report = unlink(UnlinkRequest {
     agent: agent.clone(),
     backup_id: args.backup_id,
@@ -249,18 +273,18 @@ fn print_list_row(status: &AgentStatus) {
     })
     .unwrap_or_else(|| "unbound".into());
   let detected = if status.detected { "detected" } else { "missing" };
-  let drift = if status.binding.is_some() && !status.drifted {
-    "drifted"
-  } else {
-    "ok"
+  let sync = match (&status.binding, status.link_in_sync) {
+    (None, _) => "unmanaged",
+    (Some(_), true) => "ok",
+    (Some(_), false) => "drifted",
   };
   println!(
-    "{}\tdetected={}\tbinding={}\timported={}\tconfig={}",
+    "{}\tdetected={}\tbinding={}\timported={}\tlink={}",
     status.agent,
     detected,
     binding,
     status.imported_account_ids.len(),
-    drift
+    sync
   );
 }
 
@@ -276,10 +300,14 @@ fn print_status(status: &AgentStatus) {
       println!("  profile: {}", binding.profile.as_deref().unwrap_or("(defaults)"));
       println!("  mode: {}", route_mode_as_str(binding.mode));
       println!("  account_source: {}", account_source_as_str(binding.account_source));
+      println!(
+        "  profile_layout: {}",
+        profile_layout(binding.mode, binding.account_source)
+      );
       if let Some(provider) = binding.provider.as_deref() {
         println!("  provider: {provider}");
       }
-      if binding.account_source == AgentAccountSource::Main {
+      if binding.account_source == AgentAccountSource::Main && !is_verbatim_mode(binding.mode) {
         println!(
           "  provider_filter: {}",
           binding
@@ -313,7 +341,13 @@ fn print_status(status: &AgentStatus) {
       println!("  - {id}");
     }
   }
-  println!("config_in_sync: {}", status.drifted);
+  println!("link_in_sync: {}", status.link_in_sync);
+  if status.binding.is_some() && !status.link_in_sync {
+    println!(
+      "hint: run `tokn-gateway agent sync {}` to review and repair drift",
+      status.agent
+    );
+  }
 }
 
 fn print_plan(kind: &str, plan: &ReconcilePlan) {
@@ -322,6 +356,7 @@ fn print_plan(kind: &str, plan: &ReconcilePlan) {
   println!("profile: {}", plan.binding_profile.as_deref().unwrap_or("(defaults)"));
   println!("mode: {}", route_mode_as_str(plan.binding_mode));
   println!("account_source: {}", account_source_as_str(plan.account_source));
+  println!("profile_layout: {}", plan.profile_layout());
   if let Some(provider) = plan.provider.as_deref() {
     println!("provider: {provider}");
   }
@@ -337,17 +372,22 @@ fn print_plan(kind: &str, plan: &ReconcilePlan) {
   } else {
     println!("gateway_auth: unchanged");
   }
-  if plan.account_source == AgentAccountSource::Main {
+  if let Some(agent_auth) = &plan.agent_auth_path {
+    println!("agent_auth_source: {}", agent_auth.display());
+  }
+  if plan.account_source == AgentAccountSource::Main && !is_verbatim_mode(plan.binding_mode) {
     println!(
       "provider_filter: {}",
       plan
         .provider_filter
         .as_deref()
+        .filter(|providers| !providers.is_empty())
         .map(|providers| providers.join(", "))
         .unwrap_or_else(|| "(all effective providers)".into())
     );
-    print_string_list("published_providers", &plan.published_provider_ids);
   }
+  print_string_list("gateway_provider_scope", &plan.gateway_provider_ids());
+  print_string_list("injected_agent_providers", &plan.injected_provider_ids());
   if !plan.providers_without_models.is_empty() {
     println!(
       "warning: OpenCode has no static model catalogue for {}; existing custom selections are preserved when safe, but these providers will not add models to the picker",
@@ -392,6 +432,14 @@ fn route_mode_as_str(mode: RouteMode) -> &'static str {
     RouteMode::Route => "route",
     RouteMode::Fuzzy => "fuzzy",
   }
+}
+
+fn is_verbatim_mode(mode: RouteMode) -> bool {
+  matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
+}
+
+fn profile_layout(mode: RouteMode, account_source: AgentAccountSource) -> AgentProfileLayout {
+  AgentProfileLayout::for_binding(mode, account_source)
 }
 
 fn requested_account_source(use_main_accounts: bool) -> Option<AgentAccountSource> {
@@ -550,5 +598,34 @@ mod tests {
     .expect_err("raw provider and normalized filter must conflict");
 
     assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+  }
+
+  #[test]
+  fn unlink_accepts_non_interactive_confirmation() {
+    let cli = Cli::try_parse_from(["tokn-router", "agent", "unlink", "opencode", "--yes"]).unwrap();
+    let Cmd::Agent(AgentCmd::Unlink(args)) = cli.cmd else {
+      panic!("expected agent unlink command");
+    };
+
+    assert!(args.yes);
+  }
+
+  #[test]
+  fn profile_layout_is_derived_from_mode_and_account_source() {
+    for mode in [RouteMode::Route, RouteMode::Fuzzy, RouteMode::Exact] {
+      for source in [AgentAccountSource::Agent, AgentAccountSource::Main] {
+        assert_eq!(profile_layout(mode, source), AgentProfileLayout::Single);
+      }
+    }
+    for mode in [RouteMode::Switch, RouteMode::Passthrough] {
+      assert_eq!(
+        profile_layout(mode, AgentAccountSource::Main),
+        AgentProfileLayout::SinglePinned
+      );
+      assert_eq!(
+        profile_layout(mode, AgentAccountSource::Agent),
+        AgentProfileLayout::PerProvider
+      );
+    }
   }
 }
