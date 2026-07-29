@@ -72,6 +72,7 @@ pub(crate) fn try_lock_agent_in(dir: &Path, agent: &AgentId) -> Result<AgentMigr
   let path = dir.join(format!(".{}.lock", agent.as_str()));
   let file = std::fs::OpenOptions::new()
     .create(true)
+    .truncate(false)
     .read(true)
     .write(true)
     .open(&path)
