@@ -2,10 +2,10 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokn_agent_migration::{
-  apply_reconcile, import_accounts, list_agents, plan_reconcile, show_agent, unlink, AgentProfileLayout, AgentStatus,
-  ImportRequest, ReconcilePlan, ReconcileRequest, UnlinkRequest,
+  apply_reconcile, import_accounts, list_agents, plan_reconcile, show_agent, unlink, unlink_with_legacy_root,
+  AgentProfileLayout, AgentStatus, ImportRequest, ReconcilePlan, ReconcileRequest, UnlinkRequest,
 };
 use tokn_config::{AgentAccountSource, Config, RouteMode};
 use tokn_core::AgentId;
@@ -94,6 +94,10 @@ pub struct AgentUnlinkArgs {
   /// Timestamp or full manifest path. Defaults to the latest manifest for the agent.
   #[arg(long)]
   pub backup_id: Option<String>,
+  /// Original working directory used by a legacy link whose manifest contains
+  /// relative paths. Modern manifests never require this option.
+  #[arg(long)]
+  pub legacy_root: Option<PathBuf>,
   /// Apply the unlink without an interactive confirmation.
   #[arg(long)]
   pub yes: bool,
@@ -119,8 +123,10 @@ fn list(cfg_path: Option<PathBuf>) -> Result<()> {
 }
 
 fn show(cfg_path: Option<PathBuf>, args: AgentTargetArgs) -> Result<()> {
-  let status = show_agent(cfg_path.as_deref(), None, None, args.agent)?;
-  print_status(&status);
+  let (cfg, resolved_config_path) = Config::load(cfg_path.as_deref())?;
+  let status = show_agent(Some(&resolved_config_path), None, None, args.agent)?;
+  let displayed_config_path = cfg_path.as_ref().map(|_| resolved_config_path.as_path());
+  print_status(&status, displayed_config_path, cfg.api_key.enabled);
   Ok(())
 }
 
@@ -188,19 +194,32 @@ fn apply_sync_plan(plan: ReconcilePlan) -> Result<()> {
 }
 
 fn unlink_cmd(args: AgentUnlinkArgs) -> Result<()> {
-  let agent = args.target.agent;
-  let backup = args.backup_id.as_deref().unwrap_or("latest active manifest");
+  let AgentUnlinkArgs {
+    target,
+    backup_id,
+    legacy_root,
+    yes,
+  } = args;
+  let agent = target.agent;
+  let backup = backup_id.as_deref().unwrap_or("latest active manifest");
   println!("Agent unlink request");
   println!("agent: {agent}");
   println!("backup: {backup}");
-  if !args.yes && !confirm(&format!("Restore {agent} from {backup}?"))? {
+  if let Some(root) = &legacy_root {
+    println!("legacy_root: {}", root.display());
+  }
+  if !yes && !confirm(&format!("Restore {agent} from {backup}?"))? {
     println!("Unlink cancelled.");
     return Ok(());
   }
-  let report = unlink(UnlinkRequest {
+  let request = UnlinkRequest {
     agent: agent.clone(),
-    backup_id: args.backup_id,
-  })?;
+    backup_id,
+  };
+  let report = match legacy_root.as_deref() {
+    Some(root) => unlink_with_legacy_root(request, root)?,
+    None => unlink(request)?,
+  };
   println!("Rolling back {} from {}", agent, report.timestamp);
   for action in report.actions {
     match action {
@@ -288,7 +307,7 @@ fn print_list_row(status: &AgentStatus) {
   );
 }
 
-fn print_status(status: &AgentStatus) {
+fn print_status(status: &AgentStatus, gateway_config_path: Option<&Path>, api_key_enabled: bool) {
   println!("agent: {}", status.agent);
   println!("supported: {}", status.supported);
   println!("detected: {}", status.detected);
@@ -343,10 +362,28 @@ fn print_status(status: &AgentStatus) {
   }
   println!("link_in_sync: {}", status.link_in_sync);
   if status.binding.is_some() && !status.link_in_sync {
-    println!(
-      "hint: run `tokn-gateway agent sync {}` to review and repair drift",
-      status.agent
-    );
+    println!("{}", drift_hint(&status.agent, gateway_config_path, api_key_enabled));
+  }
+}
+
+fn drift_hint(agent: &AgentId, gateway_config_path: Option<&Path>, api_key_enabled: bool) -> String {
+  if api_key_enabled {
+    return match gateway_config_path {
+      Some(path) => format!(
+        "hint: disable `[api_key].enabled` in {} before syncing; generated agent client keys are not supported yet",
+        path.display()
+      ),
+      None => {
+        "hint: disable `[api_key].enabled` before syncing; generated agent client keys are not supported yet".into()
+      }
+    };
+  }
+  match gateway_config_path {
+    Some(path) => format!(
+      "hint: run `tokn-router agent sync {agent}` with the global `--config` path set to {} to review and repair drift",
+      path.display()
+    ),
+    None => format!("hint: run `tokn-router agent sync {agent}` to review and repair drift"),
   }
 }
 
@@ -608,6 +645,49 @@ mod tests {
     };
 
     assert!(args.yes);
+  }
+
+  #[test]
+  fn unlink_accepts_an_explicit_legacy_manifest_root() {
+    let cli = Cli::try_parse_from([
+      "tokn-router",
+      "agent",
+      "unlink",
+      "opencode",
+      "--legacy-root",
+      "/original/link/root",
+      "--yes",
+    ])
+    .unwrap();
+    let Cmd::Agent(AgentCmd::Unlink(args)) = cli.cmd else {
+      panic!("expected agent unlink command");
+    };
+
+    assert_eq!(args.legacy_root.as_deref(), Some(Path::new("/original/link/root")));
+  }
+
+  #[test]
+  fn drift_hint_preserves_custom_config_scope_without_shell_specific_quoting() {
+    assert_eq!(
+      drift_hint(
+        &AgentId::Opencode,
+        Some(Path::new("/tmp/router config/user's.toml")),
+        false
+      ),
+      "hint: run `tokn-router agent sync opencode` with the global `--config` path set to /tmp/router config/user's.toml to review and repair drift"
+    );
+  }
+
+  #[test]
+  fn drift_hint_explains_when_api_key_enforcement_blocks_sync() {
+    assert_eq!(
+      drift_hint(
+        &AgentId::Opencode,
+        Some(Path::new("/tmp/router/config.toml")),
+        true
+      ),
+      "hint: disable `[api_key].enabled` in /tmp/router/config.toml before syncing; generated agent client keys are not supported yet"
+    );
   }
 
   #[test]

@@ -13,15 +13,29 @@ const CONFIG_FILENAMES: [&str; 3] = ["config.json", "opencode.json", "opencode.j
 const MARKDOWN_COLLECTION_DIRS: [&str; 6] = ["agent", "agents", "command", "commands", "mode", "modes"];
 
 pub(crate) fn opencode_config_root(home: &Path) -> PathBuf {
-  absolute_xdg_home("XDG_CONFIG_HOME")
+  scoped_xdg_home(home, "XDG_CONFIG_HOME")
     .unwrap_or_else(|| home.join(".config"))
     .join("opencode")
 }
 
 pub(crate) fn opencode_data_root(home: &Path) -> PathBuf {
-  absolute_xdg_home("XDG_DATA_HOME")
+  scoped_xdg_home(home, "XDG_DATA_HOME")
     .unwrap_or_else(|| home.join(".local/share"))
     .join("opencode")
+}
+
+/// XDG variables describe the current process user. Combining them with an
+/// alternate agent home could make a caller inspect or rewrite the current
+/// user's OpenCode installation instead of the requested home.
+fn scoped_xdg_home(home: &Path, name: &str) -> Option<PathBuf> {
+  let current_home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+  xdg_home_for_agent_home(home, current_home.as_deref(), absolute_xdg_home(name))
+}
+
+fn xdg_home_for_agent_home(home: &Path, current_home: Option<&Path>, xdg_home: Option<PathBuf>) -> Option<PathBuf> {
+  current_home
+    .filter(|current_home| same_path(home, current_home))
+    .and(xdg_home)
 }
 
 fn absolute_xdg_home(name: &str) -> Option<PathBuf> {
@@ -877,5 +891,21 @@ mod tests {
     assert_eq!(absolute_xdg_home("TOKN_TEST_XDG_THAT_IS_NOT_SET"), None);
     assert!(opencode_config_root(home).ends_with("opencode"));
     assert!(opencode_data_root(home).ends_with("opencode"));
+  }
+
+  #[test]
+  fn alternate_agent_home_does_not_inherit_process_xdg_paths() {
+    let current_home = Path::new("/users/current");
+    let alternate_home = Path::new("/users/alternate");
+    let xdg_home = PathBuf::from("/xdg/config");
+
+    assert_eq!(
+      xdg_home_for_agent_home(current_home, Some(current_home), Some(xdg_home.clone())),
+      Some(xdg_home)
+    );
+    assert_eq!(
+      xdg_home_for_agent_home(alternate_home, Some(current_home), Some(PathBuf::from("/xdg/config"))),
+      None
+    );
   }
 }

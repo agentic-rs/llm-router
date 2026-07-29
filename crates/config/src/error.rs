@@ -86,3 +86,44 @@ impl From<anyhow::Error> for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Failure from an exact-preimage configuration edit.
+///
+/// This is separate from [`Error`] so adding conflict detection does not add a
+/// variant to that existing public error enum.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GuardedEditError {
+  Changed { path: PathBuf },
+  Config(Error),
+}
+
+impl std::fmt::Display for GuardedEditError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Changed { path } => write!(
+        formatter,
+        "config `{}` changed before it could be edited; retry the operation",
+        path.display()
+      ),
+      Self::Config(source) => source.fmt(formatter),
+    }
+  }
+}
+
+impl std::error::Error for GuardedEditError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::Changed { .. } => None,
+      Self::Config(source) => Some(source),
+    }
+  }
+}
+
+impl From<Error> for GuardedEditError {
+  fn from(source: Error) -> Self {
+    Self::Config(source)
+  }
+}
+
+pub type GuardedEditResult<T> = std::result::Result<T, GuardedEditError>;

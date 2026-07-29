@@ -8,6 +8,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -295,6 +296,24 @@ impl AuthStore {
   /// Return every currently loaded credential path in stable source order.
   pub fn source_paths(&self) -> Vec<PathBuf> {
     self.source_paths.values().cloned().collect()
+  }
+
+  /// Return the SHA-256 digest of the exact bytes loaded or most recently
+  /// written for a credential source.
+  ///
+  /// This supports conflict-safe migration checkpoints without exposing
+  /// credential contents or adopting a later filesystem mutation.
+  pub fn source_sha256(&self, source: &AuthSource) -> Option<String> {
+    let SourceSnapshot::Contents(contents) = self.source_snapshots.get(source)? else {
+      return None;
+    };
+    let digest = Sha256::digest(contents);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+      std::fmt::Write::write_fmt(&mut encoded, format_args!("{byte:02x}"))
+        .expect("writing a SHA-256 digest to a String cannot fail");
+    }
+    Some(encoded)
   }
 
   /// Resolve a source to its backing path. A validated shard path can be
@@ -609,6 +628,27 @@ mod tests {
     assert_eq!(loaded.accounts.len(), 2);
     assert_eq!(loaded.accounts[0].id, "a1");
     assert_eq!(loaded.accounts[1].id, "a2");
+  }
+
+  #[test]
+  fn source_digest_tracks_exact_saved_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&path), None).unwrap();
+    store.upsert(sample_account("a1"));
+    store.save().unwrap();
+    let first = store.source_sha256(&AuthSource::Main).unwrap();
+
+    store.get_mut("a1").unwrap().label = Some("updated".into());
+    store.save().unwrap();
+    let second = store.source_sha256(&AuthSource::Main).unwrap();
+    let reloaded = AuthStore::load(Some(&path), None).unwrap();
+
+    assert_ne!(first, second);
+    assert_eq!(
+      reloaded.source_sha256(&AuthSource::Main).as_deref(),
+      Some(second.as_str())
+    );
   }
 
   #[test]

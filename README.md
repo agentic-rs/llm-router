@@ -371,7 +371,7 @@ tokn-gateway agent import codex-cli|opencode [--yes]
 tokn-gateway agent link codex-cli|opencode [--profile NAME] [--mode MODE] [--yes]
 tokn-gateway agent link opencode --use-main-accounts [--mode passthrough|switch|exact|route|fuzzy] [--provider ID] [--provider-filter ID]... [--yes]
 tokn-gateway agent sync codex-cli|opencode|--all [--yes]
-tokn-gateway agent unlink codex-cli|opencode [--backup-id ID] [--yes]
+tokn-gateway agent unlink codex-cli|opencode [--backup-id ID] [--legacy-root PATH] [--yes]
 tokn-gateway migration [--commit|--rollback]
 tokn-gateway update
 tokn-gateway smoke provider|model|send ...
@@ -384,7 +384,9 @@ encode provider-qualified model IDs and is currently supported only by
 OpenCode.
 
 `agent link` writes its binding and generated profile to
-`config.d/<agent>.toml`, so the primary config remains untouched. When a normal
+`config.d/<agent>.toml`, so the primary config remains untouched. Tokn owns
+that generated fragment and checks its planned preimage during link and sync;
+do not edit it concurrently while either command is running. When a normal
 agent-owned link transfers credentials, its matching `auth.d/<agent>.yaml`
 fragment forms a separately backed up and restored credential bundle; the shared
 root `auth.yaml` stays unchanged. An agent-owned link requires at least one
@@ -411,6 +413,12 @@ CLI does not yet support main-account links because its credential bootstrap
 would need to be changed. An existing link keeps its account source; unlink it
 before linking again with a different source. To move a pre-`auth.d` imported
 link, unlink it first so its local credentials are restored, then link it again.
+Manifests written by older versions may contain paths relative to the directory
+where the link command ran. Unlink refuses to guess that directory; pass the
+original directory explicitly with `--legacy-root`. The directory itself no
+longer needs to exist. A legacy chain containing more than one relative-path
+manifest is refused because each link or sync invocation may have used a
+different working directory and one root cannot resolve that chain safely.
 
 OpenCode publication follows the route mode. `route` and `fuzzy` publish one
 `tokn-router` provider with a deduplicated model list. `exact` uses the same
@@ -426,9 +434,10 @@ remain usable with an existing custom selection, but cannot add discoverable
 entries to OpenCode's model picker and produce a link warning.
 
 Generated agent clients currently use a non-secret sentinel API key. Therefore
-link and sync reject every managed mode when `[api_key].enabled = true`;
-disable gateway API-key enforcement or use `passthrough` until agent-scoped
-client-key provisioning is supported.
+link and sync reject every mode when `[api_key].enabled = true`, including
+`passthrough`, because it would bypass the requested client-authentication
+boundary. Disable gateway API-key enforcement before linking until
+agent-scoped client-key provisioning is supported.
 
 Agent-owned links also check global OpenCode agent and command Markdown files
 before transferring credentials. A `model` frontmatter entry that still names

@@ -224,7 +224,7 @@ fn config_points_at_gateway(config_path: &Path, agent: &AgentId, cfg: &Config, s
   if mode == RouteMode::Exact && !adapter.supports_exact_mode() {
     return false;
   }
-  if cfg.api_key.enabled && mode != RouteMode::Passthrough {
+  if cfg.api_key.enabled {
     return false;
   }
   if !materialized_profile_matches_binding(cfg, store, agent, binding, mode) {
@@ -1525,7 +1525,7 @@ wire_api = "responses"
       config_with_opencode_binding(RouteMode::Passthrough, AgentAccountSource::Main, Some("deepseek"), &[]);
     passthrough.api_key.enabled = true;
     write_synced_opencode_config(&config_path, &passthrough, &store);
-    assert!(config_points_at_gateway(
+    assert!(!config_points_at_gateway(
       &config_path,
       &AgentId::Opencode,
       &passthrough,

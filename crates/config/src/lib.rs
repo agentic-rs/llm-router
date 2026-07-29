@@ -1,7 +1,7 @@
 pub mod error;
 pub mod paths;
 
-pub use error::{Error, Result};
+pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
 pub use tokn_core::AgentId;
 
@@ -15,6 +15,28 @@ pub const DEFAULT_PORT: u16 = 4141;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PROXY_PORT: u16 = 4142;
 pub const DEFAULT_PROVIDER: &str = ID_GITHUB_COPILOT;
+
+#[derive(Clone, Copy)]
+enum ConfigEditPreimage<'a> {
+  Missing,
+  Contents(&'a [u8]),
+}
+
+impl<'a> ConfigEditPreimage<'a> {
+  fn from_expected(expected: Option<&'a [u8]>) -> Self {
+    match expected {
+      Some(contents) => Self::Contents(contents),
+      None => Self::Missing,
+    }
+  }
+
+  fn matches(self, current: Option<&[u8]>) -> bool {
+    match self {
+      Self::Missing => current.is_none(),
+      Self::Contents(expected) => current == Some(expected),
+    }
+  }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -681,6 +703,18 @@ impl Config {
   where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
   {
+    Self::edit_in_place_with_contents(path, f).map(drop)
+  }
+
+  /// Edit, validate, and atomically write a config file, returning the exact
+  /// serialized contents passed to the writer.
+  ///
+  /// Callers that maintain conflict-safe post-image checkpoints can hash this
+  /// value without rereading a path that another process may have changed.
+  pub fn edit_in_place_with_contents<F>(path: &Path, f: F) -> Result<String>
+  where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+  {
     let raw = if path.exists() {
       std::fs::read_to_string(path).context(error::ReadSnafu {
         path: path.to_path_buf(),
@@ -688,6 +722,55 @@ impl Config {
     } else {
       String::new()
     };
+    let serialised = Self::serialise_edit(path, raw, f)?;
+    write_config_contents(path, &serialised)?;
+    Ok(serialised)
+  }
+
+  /// Edit, validate, and atomically write a config file guarded by an exact
+  /// preimage, returning the exact serialized contents passed to the writer.
+  ///
+  /// `None` requires the file to remain missing. `Some(bytes)` requires the
+  /// file to be present with those exact bytes. The preimage is checked before
+  /// the edit closure is invoked and again after the replacement is staged.
+  ///
+  /// A missing preimage is installed with create-if-absent semantics. For an
+  /// existing file, portable filesystems do not offer content-based
+  /// compare-and-swap; callers must serialize cooperating writers and must not
+  /// externally edit the generated file concurrently with the final
+  /// check-and-rename window.
+  pub fn edit_in_place_with_contents_if_unchanged<F>(
+    path: &Path,
+    expected: Option<&[u8]>,
+    f: F,
+  ) -> GuardedEditResult<String>
+  where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+  {
+    let expected = ConfigEditPreimage::from_expected(expected);
+    let current = read_optional_config_bytes(path)?;
+    if !expected.matches(current.as_deref()) {
+      return Err(GuardedEditError::Changed {
+        path: path.to_path_buf(),
+      });
+    }
+    let raw = match current {
+      Some(contents) => String::from_utf8(contents).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+      })?,
+      None => String::new(),
+    };
+    let serialised = Self::serialise_edit(path, raw, f)?;
+    ensure_config_parent(path)?;
+    write_atomic_guarded(path, &serialised, expected)?;
+    Ok(serialised)
+  }
+
+  fn serialise_edit<F>(path: &Path, raw: String, f: F) -> Result<String>
+  where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+  {
     let mut doc: toml_edit::DocumentMut = raw.parse().context(error::ParseEditSnafu {
       path: path.to_path_buf(),
     })?;
@@ -710,12 +793,32 @@ impl Config {
       section: "[defaults]/[profiles]",
       source: Box::new(e),
     })?;
-    if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent).context(error::CreateDirSnafu {
-        path: parent.to_path_buf(),
-      })?;
-    }
-    write_atomic(path, &serialised)
+    Ok(serialised)
+  }
+}
+
+fn ensure_config_parent(path: &Path) -> Result<()> {
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent).context(error::CreateDirSnafu {
+      path: parent.to_path_buf(),
+    })?;
+  }
+  Ok(())
+}
+
+fn write_config_contents(path: &Path, contents: &str) -> Result<()> {
+  ensure_config_parent(path)?;
+  write_atomic(path, contents)
+}
+
+fn read_optional_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+  match std::fs::read(path) {
+    Ok(contents) => Ok(Some(contents)),
+    Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(source) => Err(Error::Read {
+      path: path.to_path_buf(),
+      source,
+    }),
   }
 }
 
@@ -1018,6 +1121,65 @@ fn is_proxy_host(s: &str) -> bool {
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+  let tmp = stage_atomic_write(path, contents)?;
+  std::fs::rename(&tmp, path).context(error::RenameSnafu {
+    from: tmp,
+    to: path.to_path_buf(),
+  })
+}
+
+fn write_atomic_guarded(path: &Path, contents: &str, expected: ConfigEditPreimage<'_>) -> GuardedEditResult<()> {
+  let tmp = stage_atomic_write(path, contents)?;
+  commit_staged_atomic_write_guarded(path, tmp, expected)
+}
+
+fn commit_staged_atomic_write_guarded(
+  path: &Path,
+  tmp: PathBuf,
+  expected: ConfigEditPreimage<'_>,
+) -> GuardedEditResult<()> {
+  let current = read_optional_config_bytes(path)?;
+  if !expected.matches(current.as_deref()) {
+    let _ = std::fs::remove_file(&tmp);
+    return Err(GuardedEditError::Changed {
+      path: path.to_path_buf(),
+    });
+  }
+
+  match expected {
+    ConfigEditPreimage::Missing => match std::fs::hard_link(&tmp, path) {
+      Ok(()) => {
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+      }
+      Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+        let _ = std::fs::remove_file(&tmp);
+        Err(GuardedEditError::Changed {
+          path: path.to_path_buf(),
+        })
+      }
+      Err(source) => {
+        let _ = std::fs::remove_file(&tmp);
+        Err(
+          Error::Write {
+            path: path.to_path_buf(),
+            source,
+          }
+          .into(),
+        )
+      }
+    },
+    ConfigEditPreimage::Contents(_) => {
+      std::fs::rename(&tmp, path).context(error::RenameSnafu {
+        from: tmp,
+        to: path.to_path_buf(),
+      })?;
+      Ok(())
+    }
+  }
+}
+
+fn stage_atomic_write(path: &Path, contents: &str) -> Result<PathBuf> {
   let tmp = path.with_extension("toml.tmp");
   std::fs::write(&tmp, contents).context(error::WriteSnafu { path: tmp.clone() })?;
   #[cfg(unix)]
@@ -1026,11 +1188,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let perm = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&tmp, perm).context(error::SetPermissionsSnafu { path: tmp.clone() })?;
   }
-  std::fs::rename(&tmp, path).context(error::RenameSnafu {
-    from: tmp.clone(),
-    to: path.to_path_buf(),
-  })?;
-  Ok(())
+  Ok(tmp)
 }
 
 #[cfg(test)]
@@ -1604,5 +1762,113 @@ profile = "opencode"
       paths::agent_config_fragment_path(&primary, "opencode"),
       dir.path().join("work.d/opencode.toml")
     );
+  }
+
+  #[test]
+  fn guarded_edit_rejects_changed_present_contents_before_invoking_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let current = b"[server]\nport = 5151\n";
+    std::fs::write(&path, current).unwrap();
+    let invoked = std::cell::Cell::new(false);
+
+    let error = Config::edit_in_place_with_contents_if_unchanged(&path, Some(b"[server]\nport = 4141\n"), |_| {
+      invoked.set(true);
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert!(!invoked.get());
+    assert_eq!(std::fs::read(&path).unwrap(), current);
+  }
+
+  #[test]
+  fn guarded_edit_rejects_file_created_after_missing_preimage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let created = b"[server]\nport = 5151\n";
+    std::fs::write(&path, created).unwrap();
+    let invoked = std::cell::Cell::new(false);
+
+    let error = Config::edit_in_place_with_contents_if_unchanged(&path, None, |_| {
+      invoked.set(true);
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert!(!invoked.get());
+    assert_eq!(std::fs::read(&path).unwrap(), created);
+  }
+
+  #[test]
+  fn guarded_edit_rechecks_the_preimage_after_invoking_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"[server]\nport = 4141\n";
+    let concurrent = b"[server]\nport = 6262\n";
+    std::fs::write(&path, initial).unwrap();
+
+    let error = Config::edit_in_place_with_contents_if_unchanged(&path, Some(initial), |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      std::fs::write(&path, concurrent).unwrap();
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+  }
+
+  #[test]
+  fn guarded_commit_rechecks_after_staging_without_overwriting_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"[server]\nport = 4141\n";
+    let concurrent = b"[server]\nport = 6262\n";
+    std::fs::write(&path, initial).unwrap();
+    let staged = stage_atomic_write(&path, "[server]\nport = 5151\n").unwrap();
+    std::fs::write(&path, concurrent).unwrap();
+
+    let error =
+      commit_staged_atomic_write_guarded(&path, staged.clone(), ConfigEditPreimage::Contents(initial)).unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+    assert!(!staged.exists());
+  }
+
+  #[test]
+  fn guarded_edit_writes_and_returns_exact_contents_when_preimage_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"# preserved comment\n[server]\nport = 4141\n";
+    std::fs::write(&path, initial).unwrap();
+
+    let written = Config::edit_in_place_with_contents_if_unchanged(&path, Some(initial), |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    assert!(written.contains("# preserved comment"));
+    assert!(written.contains("port = 5151"));
+  }
+
+  #[test]
+  fn guarded_edit_writes_and_returns_exact_contents_when_preimage_remains_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested/config.toml");
+
+    let written = Config::edit_in_place_with_contents_if_unchanged(&path, None, |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    assert!(written.contains("port = 5151"));
   }
 }
