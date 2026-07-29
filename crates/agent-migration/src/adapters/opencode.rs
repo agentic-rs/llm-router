@@ -1191,6 +1191,55 @@ mod tests {
   }
 
   #[test]
+  fn compiled_pinned_catalogue_preserves_custom_models_across_safe_relinks() {
+    let provider_id = tokn_core::provider::ID_LLAMA_CPP;
+    let generated_provider_id = format!("{SHARED_PROVIDER_ID}-{provider_id}");
+    let routes = [route(
+      provider_id,
+      provider_id,
+      "",
+      "http://127.0.0.1:4141/opencode-llama-cpp/v1",
+    )];
+
+    for (previous_mode, previous_provider_id, selected) in [
+      (RouteMode::Route, provider_id, "tokn-router/organization/custom-model"),
+      (
+        RouteMode::Switch,
+        tokn_core::provider::ID_OPENAI,
+        "tokn-router-openai/organization/custom-model",
+      ),
+    ] {
+      let plan = compile_opencode_publications(
+        RouteMode::Switch,
+        Some(previous_mode),
+        Some(&[previous_provider_id.to_string()]),
+        BASE_URL,
+        &[],
+        &routes,
+        Endpoint::ChatCompletions,
+      )
+      .unwrap();
+      let (_, json) = rewrite_transition(
+        &format!(r#"{{"model": "{selected}"}}"#),
+        Some(previous_mode),
+        RouteMode::Switch,
+        &plan.publications,
+        &plan.model_reference_rules,
+      )
+      .unwrap();
+
+      assert_eq!(
+        json["model"],
+        format!("{generated_provider_id}/organization/custom-model")
+      );
+      assert_eq!(
+        json["provider"][generated_provider_id.as_str()]["models"]["organization/custom-model"]["name"],
+        "organization/custom-model"
+      );
+    }
+  }
+
+  #[test]
   fn compiled_normalized_catalogue_rejects_unknown_models_for_static_providers() {
     let provider_id = tokn_core::provider::ID_OPENAI;
     let routes = [route(provider_id, provider_id, "", BASE_URL)];
@@ -1384,6 +1433,49 @@ mod tests {
     assert!(error
       .to_string()
       .contains("is not present in the generated gateway model catalogue"));
+  }
+
+  #[test]
+  fn exact_main_routes_with_a_shared_source_namespace_leave_direct_selections_untouched() {
+    let mut routes = [
+      route(
+        tokn_core::provider::ID_OPENAI,
+        tokn_core::provider::ID_OPENAI,
+        "",
+        BASE_URL,
+      ),
+      route(
+        tokn_core::provider::ID_OPENAI,
+        tokn_core::provider::ID_CODEX,
+        "",
+        BASE_URL,
+      ),
+    ];
+    for route in &mut routes {
+      route.transfer_source_auth = false;
+    }
+    let plan = compile_opencode_publications(
+      RouteMode::Exact,
+      None,
+      None,
+      BASE_URL,
+      &[],
+      &routes,
+      Endpoint::ChatCompletions,
+    )
+    .unwrap();
+
+    let (_, json) = rewrite_transition(
+      r#"{"model": "openai/gpt-5"}"#,
+      None,
+      RouteMode::Exact,
+      &plan.publications,
+      &plan.model_reference_rules,
+    )
+    .unwrap();
+
+    assert_eq!(json["model"], "openai/gpt-5");
+    assert!(json["provider"][SHARED_PROVIDER_ID]["models"]["openai/gpt-5"].is_object());
   }
 
   #[test]

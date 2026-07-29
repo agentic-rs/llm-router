@@ -115,17 +115,17 @@ fn validate_route_provider_ids(routes: &[ProviderRoute], mode: RouteMode) -> Res
     }
   }
   if mode == RouteMode::Exact {
-    let mut gateways_by_source = BTreeMap::<&str, BTreeSet<&str>>::new();
-    for route in routes {
-      gateways_by_source
-        .entry(&route.source_provider_id)
-        .or_default()
-        .insert(&route.gateway_provider_id);
-    }
-    if let Some((source_provider_id, gateway_provider_ids)) = gateways_by_source
-      .into_iter()
-      .find(|(_, gateway_provider_ids)| gateway_provider_ids.len() > 1)
-    {
+    let ambiguous_sources = ambiguous_source_provider_ids(routes);
+    if let Some(source_provider_id) = ambiguous_sources.iter().find(|source_provider_id| {
+      routes.iter().any(|route| {
+        route.source_provider_id == **source_provider_id && (route.transfer_source_auth || !route.account_id.is_empty())
+      })
+    }) {
+      let gateway_provider_ids = routes
+        .iter()
+        .filter(|route| route.source_provider_id == **source_provider_id)
+        .map(|route| route.gateway_provider_id.as_str())
+        .collect::<BTreeSet<_>>();
       bail!(
         "OpenCode source provider '{source_provider_id}' represents multiple gateway providers ({}) and cannot be relinked unambiguously in exact mode; select one with --provider-filter",
         gateway_provider_ids.into_iter().collect::<Vec<_>>().join(", ")
@@ -265,7 +265,15 @@ fn compile_shared_publication(
     }
   }
   let mut rules = Vec::new();
+  let ambiguous_sources = ambiguous_source_provider_ids(routes);
   for route in routes {
+    if mode == RouteMode::Exact && ambiguous_sources.contains(route.source_provider_id.as_str()) {
+      // Main-account routes may share an OpenCode source namespace (OpenAI and
+      // Codex both use `openai`). Their generated exact model ids are
+      // gateway-qualified, but an existing direct source selection is
+      // inherently ambiguous and must not be rewritten.
+      continue;
+    }
     insert_reference_rule(
       &mut rules,
       ModelReferenceRule {
@@ -413,6 +421,7 @@ fn compile_pinned_publications(
         .next()
         .expect("single publication has a key")
         .clone();
+      let allow_missing_model = pinned_publication_allows_unknown_models(routes, catalogues, &target_provider_id);
       insert_reference_rule(
         &mut rules,
         ModelReferenceRule {
@@ -420,7 +429,7 @@ fn compile_pinned_publications(
           source_model_match: ModelReferenceMatch::Any,
           target_provider_id,
           target_model_prefix: None,
-          allow_missing_model: false,
+          allow_missing_model,
         },
       )?;
     }
@@ -452,6 +461,7 @@ fn compile_pinned_publications(
         .next()
         .expect("single publication has a key")
         .clone();
+      let allow_missing_model = pinned_publication_allows_unknown_models(routes, catalogues, &target_provider_id);
       for previous_provider_id in previous_provider_ids.unwrap_or_default() {
         let source_provider_id = pinned_provider_id(previous_provider_id);
         if source_provider_id == target_provider_id {
@@ -464,7 +474,7 @@ fn compile_pinned_publications(
             source_model_match: ModelReferenceMatch::Any,
             target_provider_id: target_provider_id.clone(),
             target_model_prefix: None,
-            allow_missing_model: false,
+            allow_missing_model,
           },
         )?;
       }
@@ -487,6 +497,22 @@ fn same_provider_scope(previous_provider_ids: Option<&[String]>, routes: &[Provi
     .map(|route| route.gateway_provider_id.as_str())
     .collect::<BTreeSet<_>>();
   previous == current
+}
+
+fn ambiguous_source_provider_ids(routes: &[ProviderRoute]) -> BTreeSet<&str> {
+  let mut gateways_by_source = BTreeMap::<&str, BTreeSet<&str>>::new();
+  for route in routes {
+    gateways_by_source
+      .entry(&route.source_provider_id)
+      .or_default()
+      .insert(&route.gateway_provider_id);
+  }
+  gateways_by_source
+    .into_iter()
+    .filter_map(|(source_provider_id, gateway_provider_ids)| {
+      (gateway_provider_ids.len() > 1).then_some(source_provider_id)
+    })
+    .collect()
 }
 
 fn is_generation_model(model: &tokn_core::provider::ModelInfo) -> bool {
@@ -549,6 +575,17 @@ fn catalogue_allows_unknown_models(catalogues: &BTreeMap<String, ProviderCatalog
     .is_some_and(|catalogue| catalogue.allows_unknown_models)
 }
 
+fn pinned_publication_allows_unknown_models(
+  routes: &[ProviderRoute],
+  catalogues: &BTreeMap<String, ProviderCatalogue>,
+  target_provider_id: &str,
+) -> bool {
+  routes
+    .iter()
+    .find(|route| pinned_provider_id(&route.gateway_provider_id) == target_provider_id)
+    .is_some_and(|route| catalogue_allows_unknown_models(catalogues, &route.gateway_provider_id))
+}
+
 fn add_unique_catalogue_model_rules(
   rules: &mut Vec<ModelReferenceRule>,
   catalogues: &BTreeMap<String, ProviderCatalogue>,
@@ -586,21 +623,24 @@ fn add_shared_known_model_rejections(
   routes: &[ProviderRoute],
   catalogues: &BTreeMap<String, ProviderCatalogue>,
 ) -> Result<()> {
+  let ambiguous_sources = ambiguous_source_provider_ids(routes);
   for route in routes {
     let Some(catalogue) = catalogues.get(&route.gateway_provider_id) else {
       continue;
     };
     for model_id in unpublished_model_ids(catalogue) {
-      insert_reference_rule(
-        rules,
-        ModelReferenceRule {
-          source_provider_id: route.source_provider_id.clone(),
-          source_model_match: ModelReferenceMatch::Exact(model_id.clone()),
-          target_provider_id: SHARED_PROVIDER_ID.to_string(),
-          target_model_prefix: (mode == RouteMode::Exact).then(|| route.gateway_provider_id.clone()),
-          allow_missing_model: false,
-        },
-      )?;
+      if mode != RouteMode::Exact || !ambiguous_sources.contains(route.source_provider_id.as_str()) {
+        insert_reference_rule(
+          rules,
+          ModelReferenceRule {
+            source_provider_id: route.source_provider_id.clone(),
+            source_model_match: ModelReferenceMatch::Exact(model_id.clone()),
+            target_provider_id: SHARED_PROVIDER_ID.to_string(),
+            target_model_prefix: (mode == RouteMode::Exact).then(|| route.gateway_provider_id.clone()),
+            allow_missing_model: false,
+          },
+        )?;
+      }
 
       let current_shared_model_id = if mode == RouteMode::Exact {
         format!("{}/{model_id}", route.gateway_provider_id)
@@ -856,17 +896,15 @@ mod tests {
   }
 
   #[test]
-  fn exact_rejects_gateway_providers_that_share_one_opencode_namespace() {
-    let accounts = [
-      account("openai", ID_OPENAI),
-      account("codex", tokn_core::provider::ID_CODEX),
-    ];
+  fn exact_allows_credentialless_gateway_providers_that_share_one_opencode_namespace() {
+    let codex_provider_id = tokn_core::provider::ID_CODEX;
+    let accounts = [account("openai", ID_OPENAI), account("codex", codex_provider_id)];
     let routes = [
       route(ID_OPENAI, ID_OPENAI, "opencode"),
-      route(ID_OPENAI, tokn_core::provider::ID_CODEX, "opencode"),
+      route(ID_OPENAI, codex_provider_id, "opencode"),
     ];
 
-    let error = compile_opencode_publications(
+    let plan = compile_opencode_publications(
       RouteMode::Exact,
       None,
       None,
@@ -875,10 +913,48 @@ mod tests {
       &routes,
       Endpoint::ChatCompletions,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("represents multiple gateway providers"));
-    assert!(error.to_string().contains("--provider-filter"));
+    let publication = &plan.publications[0];
+    assert!(publication.models.contains_key("openai/gpt-5"));
+    assert!(publication.models.keys().any(|model_id| model_id.starts_with("codex/")));
+    assert!(!plan
+      .model_reference_rules
+      .iter()
+      .any(|rule| rule.source_provider_id == ID_OPENAI));
+    for gateway_provider_id in [ID_OPENAI, codex_provider_id] {
+      assert!(plan.model_reference_rules.iter().any(|rule| {
+        rule.source_provider_id == SHARED_PROVIDER_ID
+          && rule.source_model_match == ModelReferenceMatch::Prefix(gateway_provider_id.to_string())
+          && rule.target_model_prefix.as_deref() == Some(gateway_provider_id)
+      }));
+    }
+  }
+
+  #[test]
+  fn exact_rejects_agent_owned_or_transferred_ambiguous_source_namespaces() {
+    for (account_id, transfer_source_auth) in [("agent-account", false), ("", true)] {
+      let mut routes = [
+        route(ID_OPENAI, ID_OPENAI, "opencode"),
+        route(ID_OPENAI, tokn_core::provider::ID_CODEX, "opencode"),
+      ];
+      routes[0].account_id = account_id.to_string();
+      routes[0].transfer_source_auth = transfer_source_auth;
+
+      let error = compile_opencode_publications(
+        RouteMode::Exact,
+        None,
+        None,
+        "http://127.0.0.1:4141/opencode/v1",
+        &[],
+        &routes,
+        Endpoint::ChatCompletions,
+      )
+      .unwrap_err();
+
+      assert!(error.to_string().contains("represents multiple gateway providers"));
+      assert!(error.to_string().contains("--provider-filter"));
+    }
   }
 
   #[test]
@@ -1265,6 +1341,55 @@ mod tests {
         && rule.target_provider_id == "tokn-router-openai"
         && !rule.allow_missing_model
     }));
+  }
+
+  #[test]
+  fn pinned_relinks_preserve_custom_models_for_an_open_target_catalogue() {
+    let provider_id = tokn_core::provider::ID_LLAMA_CPP;
+    let routes = [route(provider_id, provider_id, "opencode")];
+    let generated_provider_id = pinned_provider_id(provider_id);
+
+    for previous_mode in [RouteMode::Route, RouteMode::Fuzzy] {
+      for mode in [RouteMode::Switch, RouteMode::Passthrough] {
+        let plan = compile_opencode_publications(
+          mode,
+          Some(previous_mode),
+          Some(&[provider_id.to_string()]),
+          "http://127.0.0.1:4141/opencode/v1",
+          &[],
+          &routes,
+          Endpoint::ChatCompletions,
+        )
+        .unwrap();
+
+        assert!(plan.model_reference_rules.iter().any(|rule| {
+          rule.source_provider_id == SHARED_PROVIDER_ID
+            && rule.source_model_match == ModelReferenceMatch::Any
+            && rule.target_provider_id == generated_provider_id
+            && rule.allow_missing_model
+        }));
+      }
+    }
+
+    for previous_mode in [RouteMode::Switch, RouteMode::Passthrough] {
+      let plan = compile_opencode_publications(
+        RouteMode::Switch,
+        Some(previous_mode),
+        Some(&[ID_OPENAI.to_string()]),
+        "http://127.0.0.1:4141/opencode/v1",
+        &[],
+        &routes,
+        Endpoint::ChatCompletions,
+      )
+      .unwrap();
+
+      assert!(plan.model_reference_rules.iter().any(|rule| {
+        rule.source_provider_id == pinned_provider_id(ID_OPENAI)
+          && rule.source_model_match == ModelReferenceMatch::Any
+          && rule.target_provider_id == generated_provider_id
+          && rule.allow_missing_model
+      }));
+    }
   }
 
   #[test]
