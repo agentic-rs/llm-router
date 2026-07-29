@@ -1,13 +1,16 @@
-export type ToknErrorCode =
-  | "configuration_error"
-  | "authentication_error"
-  | "request_error"
-  | "api_status_error"
-  | "stream_error"
-  | "serialization_error"
-  | "cancelled"
-  | "client_closed"
-  | "internal_error";
+const ERROR_CODES = [
+  "configuration_error",
+  "authentication_error",
+  "request_error",
+  "api_status_error",
+  "stream_error",
+  "serialization_error",
+  "cancelled",
+  "client_closed",
+  "internal_error",
+] as const;
+
+export type ToknErrorCode = (typeof ERROR_CODES)[number];
 
 export interface ToknErrorOptions extends ErrorOptions {
   readonly status?: number;
@@ -99,17 +102,7 @@ interface NativeErrorPayload {
 }
 
 const NATIVE_ERROR_PREFIX = "TOKN_ERROR:";
-const ERROR_CODES = new Set<ToknErrorCode>([
-  "configuration_error",
-  "authentication_error",
-  "request_error",
-  "api_status_error",
-  "stream_error",
-  "serialization_error",
-  "cancelled",
-  "client_closed",
-  "internal_error",
-]);
+const ERROR_CODE_SET: ReadonlySet<string> = new Set(ERROR_CODES);
 
 function isNativeErrorPayload(value: unknown): value is NativeErrorPayload {
   if (typeof value !== "object" || value === null) {
@@ -118,7 +111,7 @@ function isNativeErrorPayload(value: unknown): value is NativeErrorPayload {
   const payload = value as Record<string, unknown>;
   return (
     typeof payload["code"] === "string" &&
-    ERROR_CODES.has(payload["code"] as ToknErrorCode) &&
+    ERROR_CODE_SET.has(payload["code"]) &&
     typeof payload["message"] === "string" &&
     (payload["status"] === undefined || typeof payload["status"] === "number") &&
     (payload["body"] === undefined || typeof payload["body"] === "string")
@@ -145,6 +138,17 @@ function payloadFromNativeError(error: unknown): NativeErrorPayload | undefined 
   }
 }
 
+function fallbackNativeErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "native SDK operation failed";
+  }
+  const prefixIndex = error.message.indexOf(NATIVE_ERROR_PREFIX);
+  if (prefixIndex === -1) {
+    return error.message;
+  }
+  return error.message.slice(0, prefixIndex).trimEnd() || "native SDK operation failed";
+}
+
 export function fromNativeError(error: unknown): ToknError {
   if (error instanceof ToknError) {
     return error;
@@ -152,8 +156,7 @@ export function fromNativeError(error: unknown): ToknError {
 
   const payload = payloadFromNativeError(error);
   if (payload === undefined) {
-    const message = error instanceof Error ? error.message : "native SDK operation failed";
-    return new InternalError(message, { cause: error });
+    return new InternalError(fallbackNativeErrorMessage(error), { cause: error });
   }
 
   const options: ToknErrorOptions = {

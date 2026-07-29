@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
 
+import { ConfigurationError } from "./errors.js";
+
 export interface NativeCancellation {
   readonly aborted: boolean;
   cancel(): void;
@@ -75,24 +77,40 @@ function isNativeBinding(value: unknown): value is NativeBinding {
   );
 }
 
+function validateNativeBinding(value: unknown): NativeBinding {
+  if (!isNativeBinding(value)) {
+    throw new ConfigurationError("the native @tokn/sdk binding does not expose the expected API");
+  }
+
+  let abiVersion: number;
+  try {
+    abiVersion = value.nativeAbiVersion();
+  } catch (cause) {
+    throw new ConfigurationError("failed to read the native @tokn/sdk binding ABI version", { cause });
+  }
+  if (abiVersion !== 1) {
+    throw new ConfigurationError("the native @tokn/sdk binding uses an unsupported ABI version");
+  }
+  return value;
+}
+
 export function getNativeBinding(): NativeBinding {
   if (bindingOverride !== undefined) {
-    return bindingOverride;
+    return validateNativeBinding(bindingOverride);
   }
   if (loadedBinding !== undefined) {
     return loadedBinding;
   }
 
   const require = createRequire(import.meta.url);
-  const candidate: unknown = require("../_native.cjs");
-  if (!isNativeBinding(candidate)) {
-    throw new TypeError("the native @tokn/sdk binding does not expose the expected API");
+  let candidate: unknown;
+  try {
+    candidate = require("../_native.cjs");
+  } catch (cause) {
+    throw new ConfigurationError("failed to load the native @tokn/sdk binding", { cause });
   }
-  if (candidate.nativeAbiVersion() !== 1) {
-    throw new TypeError("the native @tokn/sdk binding uses an unsupported ABI version");
-  }
-  loadedBinding = candidate;
-  return candidate;
+  loadedBinding = validateNativeBinding(candidate);
+  return loadedBinding;
 }
 
 export function setNativeBindingForTests(binding: NativeBinding | undefined): void {

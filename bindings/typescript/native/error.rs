@@ -5,8 +5,11 @@ use tokn_sdk::Error as SdkError;
 
 const ERROR_PREFIX: &str = "TOKN_ERROR:";
 
+pub(crate) const API_STATUS_ERROR: &str = "api_status_error";
+pub(crate) const AUTHENTICATION_ERROR: &str = "authentication_error";
 pub(crate) const CANCELLED: &str = "cancelled";
 pub(crate) const CLIENT_CLOSED: &str = "client_closed";
+pub(crate) const CONFIGURATION_ERROR: &str = "configuration_error";
 pub(crate) const INTERNAL_ERROR: &str = "internal_error";
 pub(crate) const REQUEST_ERROR: &str = "request_error";
 pub(crate) const SERIALIZATION_ERROR: &str = "serialization_error";
@@ -27,16 +30,16 @@ pub(crate) fn native_error(code: &'static str, message: impl Into<String>) -> Na
 }
 
 pub(crate) fn api_status_error(message: String, status: u16, body: String) -> NapiError {
-  structured_error("api_status_error", message, Some(status), Some(body))
+  structured_error(API_STATUS_ERROR, message, Some(status), Some(body))
 }
 
 pub(crate) fn sdk_error(error: SdkError) -> NapiError {
   let message = error_chain(&error);
   match error {
     SdkError::LoadConfig { .. } | SdkError::BuildEngine { .. } | SdkError::UnknownProfile { .. } => {
-      native_error("configuration_error", message)
+      native_error(CONFIGURATION_ERROR, message)
     }
-    SdkError::LoadCredentials { .. } => native_error("authentication_error", message),
+    SdkError::LoadCredentials { .. } => native_error(AUTHENTICATION_ERROR, message),
     SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }
     | SdkError::Pipeline { .. }
@@ -70,7 +73,7 @@ fn structured_error(code: &'static str, message: String, status: Option<u16>, bo
   };
   let encoded = serde_json::to_string(&payload).unwrap_or_else(|error| {
     format!(
-      r#"{{"code":"internal_error","message":"failed to serialize native error: {}"}}"#,
+      r#"{{"code":"{INTERNAL_ERROR}","message":"failed to serialize native error: {}"}}"#,
       escape_json_string(&error.to_string())
     )
   });

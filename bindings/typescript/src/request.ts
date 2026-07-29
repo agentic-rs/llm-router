@@ -150,6 +150,8 @@ function normalizeReasoning(value: ReasoningOptions | undefined): ReasoningOptio
   if (mode !== undefined && (typeof mode !== "string" || !REASONING_MODES.has(mode))) {
     fail(`unknown reasoning mode '${String(mode)}'`);
   }
+  // Effort and summary vocabularies are provider-extensible; known values are
+  // represented in the public types, while any non-empty custom string is valid.
   const effort = optionalString(value.effort, "reasoning.effort");
   const summary = optionalString(value.summary, "reasoning.summary");
   const budgetTokens =

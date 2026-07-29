@@ -1,7 +1,7 @@
 import { SerializationError } from "./errors.js";
 import type { JsonObject, JsonValue } from "./types.js";
 
-function assertJson(value: unknown, path: string, seen: Set<object>): asserts value is JsonValue {
+function assertJson(value: unknown, path: string, seen: Set<object>): void {
   if (value === null || typeof value === "string" || typeof value === "boolean") {
     return;
   }
@@ -30,6 +30,9 @@ function assertJson(value: unknown, path: string, seen: Set<object>): asserts va
       throw new SerializationError(`${path} must contain only plain objects and arrays`);
     }
     for (const [key, item] of Object.entries(value)) {
+      if (item === undefined) {
+        continue;
+      }
       assertJson(item, `${path}.${key}`, seen);
     }
   } finally {

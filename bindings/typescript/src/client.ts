@@ -48,6 +48,12 @@ function clientOptionsJson(options: ClientOptions): string {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new RequestError("client options must be an object");
   }
+  const unknownOption = Object.keys(options).find(
+    (name) => name !== "config_path" && name !== "auth_path" && name !== "profile",
+  );
+  if (unknownOption !== undefined) {
+    throw new RequestError(`unknown client option '${unknownOption}'`);
+  }
   for (const [name, value] of [
     ["config_path", options.config_path],
     ["auth_path", options.auth_path],
@@ -57,7 +63,14 @@ function clientOptionsJson(options: ClientOptions): string {
       throw new RequestError(`${name} must be a non-empty string`);
     }
   }
-  return serializeJson(options, "client options");
+  return serializeJson(
+    {
+      ...(options.config_path === undefined ? {} : { config_path: options.config_path }),
+      ...(options.auth_path === undefined ? {} : { auth_path: options.auth_path }),
+      ...(options.profile === undefined ? {} : { profile: options.profile }),
+    },
+    "client options",
+  );
 }
 
 function splitRawOptions(options: RawRequestOptions): {

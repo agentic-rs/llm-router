@@ -337,7 +337,7 @@ pub fn native_abi_version() -> u32 {
 fn parse_endpoint(endpoint: &str) -> Result<Endpoint> {
   match endpoint {
     "responses" => Ok(Endpoint::Responses),
-    "chat_completions" | "chat-completions" | "chat" => Ok(Endpoint::ChatCompletions),
+    "chat_completions" => Ok(Endpoint::ChatCompletions),
     "messages" => Ok(Endpoint::Messages),
     _ => Err(native_error(REQUEST_ERROR, format!("unknown endpoint '{endpoint}'"))),
   }

@@ -112,6 +112,27 @@ test("request validation catches values JavaScript cannot represent safely", () 
   );
 });
 
+test("JSON serialization omits undefined object properties but rejects undefined array entries", () => {
+  const requestWithOptionalProperty = createRequest({
+    model: "smart",
+    prompt: "hello",
+    extras: { metadata: undefined } as never,
+  });
+  assert.equal(requestWithOptionalProperty.extras, undefined);
+
+  assert.throws(
+    () =>
+      createRequest({
+        model: "smart",
+        prompt: "hello",
+        extras: { items: [undefined] } as never,
+      }),
+    (error: unknown) =>
+      error instanceof SerializationError &&
+      error.message === "extras.items[0] contains a value that JSON cannot represent",
+  );
+});
+
 test("malformed JavaScript containers produce stable request errors", () => {
   const malformed = [
     { model: "smart", prompt: "hello", tools: {} },
@@ -140,5 +161,32 @@ test("typed reasoning rejects ambiguous extras", () => {
     (error: unknown) =>
       error instanceof RequestError &&
       error.message === "typed reasoning conflicts with extras['reasoning_effort']",
+  );
+});
+
+test("reasoning accepts non-empty provider-specific effort and summary values", () => {
+  const value = createRequest({
+    model: "smart",
+    prompt: "hello",
+    reasoning: {
+      effort: "provider_effort",
+      summary: "provider_summary",
+    },
+  });
+
+  assert.deepEqual(value.reasoning, {
+    effort: "provider_effort",
+    summary: "provider_summary",
+  });
+  assert.throws(
+    () =>
+      createRequest({
+        model: "smart",
+        prompt: "hello",
+        reasoning: { effort: " " },
+      }),
+    (error: unknown) =>
+      error instanceof RequestError &&
+      error.message === "reasoning.effort must be a non-empty string",
   );
 });

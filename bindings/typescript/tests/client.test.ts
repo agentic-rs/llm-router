@@ -6,6 +6,9 @@ import {
   CancelledError,
   Client,
   ClientClosedError,
+  ConfigurationError,
+  InternalError,
+  RequestError,
   SerializationError,
   type GenerateEvent,
   type JsonValue,
@@ -219,6 +222,41 @@ test("Client.create is async and exposes resolved source paths", async () => {
   });
 });
 
+test("Client.create rejects unknown options before calling native code", async () => {
+  const native = new FakeClient();
+  const binding = fakeBinding(native);
+  setNativeBindingForTests(binding);
+
+  await assert.rejects(
+    Client.create({ profile: "work", unexpected: true } as never),
+    (error: unknown) =>
+      error instanceof RequestError &&
+      error.message === "unknown client option 'unexpected'",
+  );
+  assert.deepEqual(binding.options, []);
+});
+
+test("native binding validation uses the public configuration error type", async () => {
+  setNativeBindingForTests({} as NativeBinding);
+  await assert.rejects(
+    Client.create(),
+    (error: unknown) =>
+      error instanceof ConfigurationError &&
+      error.message === "the native @tokn/sdk binding does not expose the expected API",
+  );
+
+  setNativeBindingForTests({
+    ...fakeBinding(new FakeClient()),
+    nativeAbiVersion: () => 2,
+  });
+  await assert.rejects(
+    Client.create(),
+    (error: unknown) =>
+      error instanceof ConfigurationError &&
+      error.message === "the native @tokn/sdk binding uses an unsupported ABI version",
+  );
+});
+
 test("reload delegates to the native client", async () => {
   const native = new FakeClient();
   setNativeBindingForTests(fakeBinding(native));
@@ -309,6 +347,21 @@ test("native status errors become stable public error classes", async () => {
       error.code === "api_status_error" &&
       error.status === 429 &&
       error.body === '{"error":"slow down"}',
+  );
+});
+
+test("malformed native error payloads are not exposed in fallback messages", async () => {
+  const native = new FakeClient();
+  native.generateError = new Error("native bridge failed: TOKN_ERROR:{not-json");
+  setNativeBindingForTests(fakeBinding(native));
+  const client = await Client.create();
+
+  await assert.rejects(
+    client.send({ model: "smart", prompt: "Hello" }),
+    (error: unknown) =>
+      error instanceof InternalError &&
+      error.message === "native bridge failed:" &&
+      !error.message.includes("TOKN_ERROR"),
   );
 });
 
