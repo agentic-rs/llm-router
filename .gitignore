@@ -2,3 +2,9 @@
 /vendor/
 __pycache__/
 *.py[cod]
+/bindings/typescript/dist/
+/bindings/typescript/node_modules/
+/bindings/typescript/npm/
+/bindings/typescript/_native.cjs
+/bindings/typescript/_native.d.ts
+/bindings/typescript/tokn_sdk.*.node

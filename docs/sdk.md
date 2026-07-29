@@ -219,17 +219,115 @@ remain available as raw mapping and byte-stream escape hatches. All calls are
 
 ## Node.js and Bun
 
-Node.js and Bun should share one N-API package backed by `tokn-sdk`; they
-should not implement routing or credential handling in TypeScript. The
-binding should follow the Python wire boundary:
+`bindings/typescript` is the ESM `@tokn/sdk` package for Node.js 22 and newer
+and Bun. Its TypeScript façade exposes plain JSON-compatible objects while a
+private N-API binding runs `tokn-sdk` in-process. TypeScript does not load
+configuration or credentials itself.
 
-- JSON-compatible request and response objects;
-- `Promise<Response>` for buffered calls;
-- an async iterable of `Uint8Array` for streams;
-- synchronous construction and `reload()`;
-- the same endpoint names and snake_case request-option fields.
+Create and close the client asynchronously:
 
-Use `napi-rs` with a dedicated Tokio runtime bridge. Publish platform-specific
-native packages behind one JavaScript package, and test the same package under
-both Node.js and Bun. This is the next language milestone after the Rust and
-Python APIs stabilize.
+```ts
+import { Client } from "@tokn/sdk";
+
+const client = await Client.create();
+
+try {
+  const response = await client
+    .generate("smart")
+    .system("You are a TypeScript expert.")
+    .prompt("Explain this function.")
+    .temperature(0.2)
+    .send();
+
+  console.log(response.text);
+} finally {
+  await client.close();
+}
+```
+
+The client-bound builder and detached request builder expose the same neutral
+controls as Rust and Python. Builder methods use normal TypeScript casing;
+every serializable field stays `snake_case`:
+
+```ts
+import { request } from "@tokn/sdk";
+
+const value = request("smart")
+  .prompt("Plan this migration.")
+  .topP(0.9)
+  .topK(40)
+  .maxTokens(2048)
+  .reasoningMode("adaptive")
+  .reasoningEffort("high")
+  .build();
+
+const serialized = JSON.stringify(value);
+const response = await client.send(JSON.parse(serialized));
+```
+
+Object input is also a first-class API:
+
+```ts
+const response = await client.send({
+  model: "smart",
+  prompt: "Explain this function.",
+  top_p: 0.9,
+  max_output_tokens: 256,
+  reasoning: {
+    effort: "high",
+    summary: "auto",
+  },
+});
+```
+
+`client.generateStream()` yields typed semantic events,
+`client.textStream()` yields text deltas, and raw endpoint streams yield
+`Uint8Array`. Streams are pull-based async iterables with explicit `close()`;
+breaking out of `for await` also closes them. Buffered calls and stream
+startup accept an `AbortSignal`, which cancels the Rust operation rather than
+only abandoning its JavaScript promise.
+
+The raw endpoint namespaces remain available for exact provider wire shapes:
+
+```ts
+const response = await client.chat.completions.create(
+  {
+    model: "smart",
+    messages: [{ role: "user", content: "Hello" }],
+  },
+  {
+    profile: "work",
+    request_id: crypto.randomUUID(),
+  },
+);
+```
+
+`Client.create()`, `reload()`, and `close()` are async so configuration I/O,
+credential loading, and shutdown never block the JavaScript event loop.
+Native failures are mapped to stable `ToknError` subclasses and codes;
+provider status failures also retain their HTTP status and response body.
+
+Build the package from the repository with:
+
+```sh
+cd bindings/typescript
+pnpm install --frozen-lockfile
+pnpm build
+pnpm test
+```
+
+The generated `_native.cjs` loader is private. The repository package is also
+marked private for now: it can be built and linked from a checkout, but it
+cannot be published accidentally before its platform artifacts are assembled.
+The eventual registry release will keep one public `@tokn/sdk` façade and use
+exact-version optional packages for Linux x64 glibc, macOS arm64, and Windows
+x64 MSVC.
+
+CI builds the native binding and runs the façade against it with Node.js 22
+and Bun 1.3.13 on all three platforms, plus Node.js 24 on Linux. The macOS
+artifact is built with an 11.0 deployment target, although the blocking
+runtime job currently runs on macOS 15. Before the private guard is removed,
+Linux release builds must pin and verify a glibc floor instead of treating
+`ubuntu-latest` as a compatibility guarantee, and CI must install-test the
+assembled root and platform tarballs with both runtimes. Publication is
+intentionally separate from the repository's existing CLI release workflow.
