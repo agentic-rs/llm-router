@@ -155,8 +155,20 @@ pub struct AgentConfig {
   pub profile: Option<String>,
   #[serde(default, skip_serializing_if = "is_agent_account_source")]
   pub account_source: AgentAccountSource,
-  /// Agent-side provider identifiers redirected to this binding when it uses
-  /// the gateway's main account pool.
+  /// Desired provider for a main-account `switch` or `passthrough` binding.
+  ///
+  /// The generated profile's `default_provider_id` is only the runtime
+  /// materialization of this value.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub provider: Option<String>,
+  /// Optional canonical gateway-provider filter used when this binding reads
+  /// from the main account pool. Omitted means every effective provider.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub provider_filter: Option<Vec<String>>,
+  /// Legacy agent-side provider namespaces redirected by this binding.
+  ///
+  /// This is retained for migration only. Unlike `provider_filter`, these
+  /// values do not identify providers in the gateway's main account pool.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub source_providers: Option<Vec<String>>,
   #[serde(default, skip_serializing_if = "is_false")]
@@ -592,10 +604,51 @@ impl Config {
       if let Some(profile) = agent.profile.as_deref() {
         validate_profile_name(profile)?;
       }
+      validate_provider_id(&format!("agents.{name}.provider"), agent.provider.as_deref())?;
+      validate_providers(
+        &format!("agents.{name}.provider_filter"),
+        agent.provider_filter.as_deref(),
+      )?;
       validate_providers(
         &format!("agents.{name}.source_providers"),
         agent.source_providers.as_deref(),
       )?;
+      if agent.provider.is_some() {
+        let mode = agent.mode.unwrap_or(RouteMode::Route);
+        if agent.account_source != AgentAccountSource::Main
+          || !matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
+        {
+          return error::InvalidAccountSnafu {
+            id: format!("agents.{name}.provider"),
+            message: String::from(
+              "provider is only valid with account_source = \"main\" and mode = \"passthrough\" or \"switch\"",
+            ),
+          }
+          .fail();
+        }
+        if agent.provider_filter.is_some() {
+          return error::InvalidAccountSnafu {
+            id: format!("agents.{name}.provider"),
+            message: String::from("provider and provider_filter are mutually exclusive"),
+          }
+          .fail();
+        }
+      }
+      if agent.provider_filter.is_some()
+        && (agent.account_source != AgentAccountSource::Main
+          || matches!(
+            agent.mode.unwrap_or(RouteMode::Route),
+            RouteMode::Passthrough | RouteMode::Switch
+          ))
+      {
+        return error::InvalidAccountSnafu {
+          id: format!("agents.{name}.provider_filter"),
+          message: String::from(
+            "provider_filter is only valid with account_source = \"main\" and mode = \"route\", \"fuzzy\", or \"exact\"",
+          ),
+        }
+        .fail();
+      }
     }
     for (name, profile) in &self.profiles {
       validate_profile_name(name)?;
@@ -1194,6 +1247,183 @@ mod tests {
     assert_eq!(agent.profile.as_deref(), Some("opencode"));
     assert!(agent.sync);
     cfg.validate().expect("agent config should validate");
+  }
+
+  #[test]
+  fn agents_preserve_provider_filter_and_legacy_source_providers_separately() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        account_source = "main"
+        provider_filter = ["openai"]
+        source_providers = ["openai", "deepseek"]
+      "#,
+    )
+    .expect("agent config should deserialize");
+
+    let agent = cfg.agents.get("opencode").expect("opencode agent");
+    assert_eq!(agent.provider_filter.as_deref(), Some(&["openai".to_string()][..]));
+    assert_eq!(
+      agent.source_providers.as_deref(),
+      Some(&["openai".to_string(), "deepseek".to_string()][..])
+    );
+    cfg.validate().expect("provider selections should validate");
+
+    let serialized = toml::to_string_pretty(&cfg).expect("config should serialize");
+    assert!(serialized.contains("provider_filter = ["));
+    assert!(serialized.contains("source_providers = ["));
+  }
+
+  #[test]
+  fn agents_preserve_a_raw_main_provider_as_binding_intent() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        mode = "switch"
+        account_source = "main"
+        provider = "openai"
+      "#,
+    )
+    .expect("agent config should deserialize");
+
+    let agent = cfg.agents.get("opencode").expect("opencode agent");
+    assert_eq!(agent.provider.as_deref(), Some("openai"));
+    cfg.validate().expect("raw main provider should validate");
+
+    let serialized = toml::to_string_pretty(&cfg).expect("config should serialize");
+    assert!(serialized.contains("provider = \"openai\""));
+  }
+
+  #[test]
+  fn agent_provider_rejects_invalid_topologies_and_provider_filters() {
+    for (config, expected) in [
+      (
+        r#"
+          [agents.opencode]
+          mode = "route"
+          account_source = "main"
+          provider = "openai"
+        "#,
+        "only valid",
+      ),
+      (
+        r#"
+          [agents.opencode]
+          mode = "switch"
+          provider = "openai"
+        "#,
+        "only valid",
+      ),
+      (
+        r#"
+          [agents.opencode]
+          mode = "switch"
+          account_source = "main"
+          provider = "openai"
+          provider_filter = ["openai"]
+        "#,
+        "mutually exclusive",
+      ),
+    ] {
+      let cfg: Config = toml::from_str(config).expect("agent config should deserialize before validation");
+      let error = cfg.validate().expect_err("invalid provider topology must fail");
+      assert!(error.to_string().contains("agents.opencode.provider"));
+      assert!(error.to_string().contains(expected));
+    }
+  }
+
+  #[test]
+  fn agent_provider_filter_rejects_invalid_topologies() {
+    for config in [
+      r#"
+        [agents.opencode]
+        provider_filter = ["openai"]
+      "#,
+      r#"
+        [agents.opencode]
+        mode = "switch"
+        account_source = "main"
+        provider_filter = ["openai"]
+      "#,
+    ] {
+      let cfg: Config = toml::from_str(config).expect("agent config should deserialize before validation");
+      let error = cfg.validate().expect_err("invalid provider filter topology must fail");
+      assert!(error.to_string().contains("agents.opencode.provider_filter"));
+      assert!(error.to_string().contains("only valid"));
+    }
+  }
+
+  #[test]
+  fn agent_provider_rejects_an_empty_id() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        mode = "switch"
+        account_source = "main"
+        provider = " "
+      "#,
+    )
+    .expect("agent config should deserialize before validation");
+
+    let error = cfg.validate().expect_err("empty provider must fail");
+    assert!(error.to_string().contains("agents.opencode.provider"));
+    assert!(error.to_string().contains("provider id must be non-empty"));
+  }
+
+  #[test]
+  fn legacy_source_providers_do_not_populate_provider_filter() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        source_providers = ["openai"]
+      "#,
+    )
+    .expect("legacy agent config should deserialize");
+
+    let agent = cfg.agents.get("opencode").expect("opencode agent");
+    assert_eq!(agent.provider_filter, None);
+    assert_eq!(agent.source_providers.as_deref(), Some(&["openai".to_string()][..]));
+
+    let serialized = toml::to_string_pretty(&cfg).expect("config should serialize");
+    assert!(!serialized.contains("provider_filter"));
+    assert!(serialized.contains("source_providers = ["));
+  }
+
+  #[test]
+  fn agents_validate_provider_filter_at_its_canonical_path() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        account_source = "main"
+        provider_filter = ["openai", " "]
+      "#,
+    )
+    .expect("agent config should deserialize before validation");
+
+    let err = cfg
+      .validate()
+      .expect_err("provider filter with an empty id must fail validation");
+    let message = err.to_string();
+    assert!(message.contains("agents.opencode.provider_filter"));
+    assert!(message.contains("provider ids must be non-empty"));
+  }
+
+  #[test]
+  fn agents_validate_legacy_source_providers_at_the_legacy_path() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        source_providers = ["openai", " "]
+      "#,
+    )
+    .expect("legacy agent config should deserialize before validation");
+
+    let err = cfg
+      .validate()
+      .expect_err("legacy source providers with an empty id must fail validation");
+    let message = err.to_string();
+    assert!(message.contains("agents.opencode.source_providers"));
+    assert!(message.contains("provider ids must be non-empty"));
   }
 
   #[test]
