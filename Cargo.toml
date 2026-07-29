@@ -29,6 +29,7 @@ members = [
   "crates/provider-openai",
   "crates/provider-zai",
   "bindings/python",
+  "bindings/typescript",
 ]
 default-members = ["crates/*"]
 resolver = "2"

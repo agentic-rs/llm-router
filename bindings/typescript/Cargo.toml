@@ -1,0 +1,22 @@
+[package]
+name = "tokn-typescript"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "tokn_sdk"
+crate-type = ["cdylib"]
+path = "native/lib.rs"
+
+[dependencies]
+futures-util.workspace = true
+napi = { version = "3.12.0", default-features = false, features = ["async", "dyn-symbols", "napi8"] }
+napi-derive = "3.6.1"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokn-sdk.workspace = true
+
+[build-dependencies]
+napi-build = "2.4.0"
