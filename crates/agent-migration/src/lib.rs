@@ -5,6 +5,8 @@ mod adapter;
 mod adapters;
 mod jsonc;
 mod manifest;
+mod opencode_markdown;
+mod projection;
 mod reconcile;
 mod status;
 

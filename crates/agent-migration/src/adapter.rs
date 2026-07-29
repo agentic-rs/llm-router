@@ -3,6 +3,7 @@
 //! lives behind the [`AgentAdapter`] trait; the rest of the crate is generic.
 
 use crate::adapters::{codex::CodexAdapter, opencode::OpencodeAdapter};
+use crate::projection::AgentConfigProjection;
 use crate::reconcile::PlannedEdit;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -65,16 +66,15 @@ pub trait AgentAdapter {
   /// modes must select a provider that supports this exact endpoint.
   fn switch_endpoint(&self) -> Endpoint;
 
+  /// Whether the agent can express provider-qualified model ids required by
+  /// exact routing. The default is conservative because a bare model would
+  /// make an exact profile unusable.
+  fn supports_exact_mode(&self) -> bool {
+    false
+  }
+
   /// Produce the edits that point the agent's own config at the gateway.
-  /// `removed_source_provider_ids` identifies previously generated provider
-  /// namespaces that are no longer linked and can be safely cleaned up.
-  fn rewrite_config(
-    &self,
-    home: &Path,
-    base_url: &str,
-    routes: &[ProviderRoute],
-    removed_source_provider_ids: &[String],
-  ) -> Result<Vec<PlannedEdit>>;
+  fn rewrite_config(&self, home: &Path, projection: &AgentConfigProjection<'_>) -> Result<Vec<PlannedEdit>>;
 
   /// Export the gateway-owned credentials back into the agent during unlink.
   fn restore_transferred_credentials(&self, _auth_path: &Path, _accounts: &[Account]) -> Result<()> {

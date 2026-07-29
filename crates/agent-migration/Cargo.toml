@@ -12,6 +12,7 @@ readme = "../../README.md"
 [dependencies]
 tokn-auth = { workspace = true }
 tokn-accounts = { workspace = true }
+tokn-catalogue = { workspace = true }
 tokn-config = { workspace = true }
 tokn-core = { workspace = true }
 tokn-provider-copilot = { workspace = true }
@@ -22,6 +23,7 @@ http = { workspace = true }
 jsonc-parser = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 time = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }

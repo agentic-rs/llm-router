@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokn_core::AgentId;
 
+pub(crate) struct AgentMigrationLock {
+  _file: std::fs::File,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MigrationManifest {
   pub version: u32,
@@ -58,11 +62,31 @@ pub(crate) fn manifest_path(timestamp: &str, agent: &AgentId) -> Result<PathBuf>
   Ok(manifest_dir()?.join(format!("{timestamp}-{}.json", agent.as_str())))
 }
 
+pub(crate) fn try_lock_agent(agent: &AgentId) -> Result<AgentMigrationLock> {
+  let dir = manifest_dir()?;
+  try_lock_agent_in(&dir, agent)
+}
+
+pub(crate) fn try_lock_agent_in(dir: &Path, agent: &AgentId) -> Result<AgentMigrationLock> {
+  std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+  let path = dir.join(format!(".{}.lock", agent.as_str()));
+  let file = std::fs::OpenOptions::new()
+    .create(true)
+    .read(true)
+    .write(true)
+    .open(&path)
+    .with_context(|| format!("opening agent migration lock {}", path.display()))?;
+  file
+    .try_lock()
+    .with_context(|| format!("another {} link, sync, or unlink is already in progress", agent))?;
+  Ok(AgentMigrationLock { _file: file })
+}
+
 pub(crate) fn resolve_manifest(agent: &AgentId, backup_id: Option<&str>) -> Result<PathBuf> {
   if let Some(id) = backup_id {
     let path = PathBuf::from(id);
     if path.exists() {
-      return Ok(path);
+      return std::path::absolute(&path).with_context(|| format!("resolving manifest path {}", path.display()));
     }
     let candidate = manifest_dir()?.join(if id.ends_with(".json") {
       id.to_string()
@@ -80,10 +104,14 @@ pub(crate) fn resolve_manifest(agent: &AgentId, backup_id: Option<&str>) -> Resu
 
 pub(crate) fn latest_active_manifest(agent: &AgentId) -> Result<Option<PathBuf>> {
   let dir = manifest_dir()?;
+  latest_active_manifest_in(&dir, agent)
+}
+
+fn latest_active_manifest_in(dir: &Path, agent: &AgentId) -> Result<Option<PathBuf>> {
   let suffix = format!("-{}.json", agent.as_str());
   let mut candidates = Vec::new();
   if dir.exists() {
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
       let entry = entry?;
       let path = entry.path();
       if path
@@ -99,7 +127,7 @@ pub(crate) fn latest_active_manifest(agent: &AgentId) -> Result<Option<PathBuf>>
   candidates.sort();
   for path in candidates.into_iter().rev() {
     let manifest = read_manifest(&path)?;
-    if manifest.completed && !manifest.unlinked {
+    if !manifest.unlinked {
       return Ok(Some(path));
     }
   }
@@ -396,5 +424,45 @@ mod tests {
     .unwrap();
 
     assert!(manifest.completed);
+  }
+
+  #[test]
+  fn incomplete_manifest_remains_active_until_it_is_unlinked() {
+    let dir = tempfile::tempdir().unwrap();
+    let older = dir.path().join("20260729T000000Z-opencode.json");
+    let pending = dir.path().join("20260729T000001Z-opencode.json");
+    let base = MigrationManifest {
+      version: 4,
+      completed: true,
+      agent: AgentId::Opencode,
+      timestamp: "20260729T000000Z".into(),
+      profile: Some("opencode".into()),
+      target_base_url: "http://127.0.0.1:4141/opencode/v1".into(),
+      gateway_auth_path: None,
+      gateway_auth_shard_path: None,
+      agent_auth_path: None,
+      provider_routes: Vec::new(),
+      previous_manifest: None,
+      unlinked: false,
+      credentials_handoff_complete: true,
+      imported_account_ids: Vec::new(),
+      files: Vec::new(),
+    };
+    write_manifest(&older, &base).unwrap();
+    write_manifest(
+      &pending,
+      &MigrationManifest {
+        completed: false,
+        timestamp: "20260729T000001Z".into(),
+        previous_manifest: Some(older),
+        ..base
+      },
+    )
+    .unwrap();
+
+    assert_eq!(
+      latest_active_manifest_in(dir.path(), &AgentId::Opencode).unwrap(),
+      Some(pending)
+    );
   }
 }

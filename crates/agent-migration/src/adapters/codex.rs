@@ -1,4 +1,5 @@
-use crate::adapter::{AgentAdapter, ProviderRoute};
+use crate::adapter::AgentAdapter;
+use crate::projection::AgentConfigProjection;
 use crate::reconcile::{annotate_imported_account, EditKind, PlannedEdit};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -43,13 +44,7 @@ impl AgentAdapter for CodexAdapter {
     tokn_core::provider::Endpoint::Responses
   }
 
-  fn rewrite_config(
-    &self,
-    home: &Path,
-    base_url: &str,
-    _routes: &[ProviderRoute],
-    _removed_source_provider_ids: &[String],
-  ) -> Result<Vec<PlannedEdit>> {
+  fn rewrite_config(&self, home: &Path, projection: &AgentConfigProjection<'_>) -> Result<Vec<PlannedEdit>> {
     let auth_path = self.auth_path(home);
     let config_path = self.config_path(home);
     let mut edits = Vec::new();
@@ -78,7 +73,7 @@ impl AgentAdapter for CodexAdapter {
     } else {
       (toml_edit::DocumentMut::new(), None)
     };
-    rewrite_config(&mut doc, base_url);
+    rewrite_config(&mut doc, projection.target_base_url);
     edits.push(PlannedEdit::new(config_path, EditKind::Toml(doc), true, config_source));
     Ok(edits)
   }
@@ -203,7 +198,17 @@ mod tests {
 
     let accounts = adapter.discover_accounts(dir.path(), "20260604T153012Z").unwrap();
     let edits = adapter
-      .rewrite_config(dir.path(), "http://127.0.0.1:4141/codex/v1", &[], &[])
+      .rewrite_config(
+        dir.path(),
+        &AgentConfigProjection {
+          target_base_url: "http://127.0.0.1:4141/codex/v1",
+          mode: tokn_config::RouteMode::Route,
+          previous_mode: None,
+          credential_routes: &[],
+          publications: &[],
+          model_reference_rules: &[],
+        },
+      )
       .unwrap();
 
     assert_eq!(accounts.len(), 1);
