@@ -21,7 +21,9 @@ pub struct AgentStatus {
   pub config_path: PathBuf,
   pub binding: Option<AgentBindingStatus>,
   pub imported_account_ids: Vec<String>,
-  pub drifted: bool,
+  /// Whether the materialized profiles, generated agent configuration,
+  /// credential boundary, and active manifest match the declarative binding.
+  pub link_in_sync: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,12 +78,12 @@ fn status_for_agent(
 ) -> Result<AgentStatus> {
   let supported = adapter_for(&agent).is_some();
   let adapter = adapter_for(&agent);
-  let (auth_path, config_path, detected, drifted) = if let Some(adapter) = adapter {
+  let (auth_path, config_path, detected, link_in_sync) = if let Some(adapter) = adapter {
     let auth_path = adapter.auth_path(home);
     let config_path = adapter.config_path(home);
     let detected = auth_path.exists() || config_path.exists();
-    let drifted = linked_config_points_at_gateway(&config_path, gateway_config_path, home, &agent, cfg, store);
-    (auth_path, config_path, detected, drifted)
+    let link_in_sync = linked_config_points_at_gateway(&config_path, gateway_config_path, home, &agent, cfg, store);
+    (auth_path, config_path, detected, link_in_sync)
   } else {
     let base = home.join(format!(".unsupported/{}", agent.as_str()));
     (base.join("auth"), base.join("config"), false, false)
@@ -104,7 +106,7 @@ fn status_for_agent(
     config_path,
     binding,
     imported_account_ids,
-    drifted,
+    link_in_sync,
   })
 }
 
@@ -123,6 +125,9 @@ fn linked_config_points_at_gateway(
     return false;
   }
   if !config_points_at_gateway(config_path, agent, cfg, store) {
+    return false;
+  }
+  if !opencode_source_auth_is_absent(home, agent, cfg, store) {
     return false;
   }
   if *agent != AgentId::Opencode {
@@ -210,6 +215,18 @@ fn config_points_at_gateway(config_path: &Path, agent: &AgentId, cfg: &Config, s
     return false;
   };
   let mode = binding.mode.unwrap_or(RouteMode::Route);
+  let Some(adapter) = adapter_for(agent) else {
+    return false;
+  };
+  if binding.account_source == AgentAccountSource::Main && !adapter.supports_main_accounts() {
+    return false;
+  }
+  if mode == RouteMode::Exact && !adapter.supports_exact_mode() {
+    return false;
+  }
+  if cfg.api_key.enabled && mode != RouteMode::Passthrough {
+    return false;
+  }
   if !materialized_profile_matches_binding(cfg, store, agent, binding, mode) {
     return false;
   }
@@ -236,6 +253,37 @@ fn config_points_at_gateway(config_path: &Path, agent: &AgentId, cfg: &Config, s
       .is_some_and(|doc| codex_config_matches(&doc, &expected)),
     _ => false,
   }
+}
+
+fn opencode_source_auth_is_absent(home: &Path, agent: &AgentId, cfg: &Config, store: &AuthStore) -> bool {
+  if *agent != AgentId::Opencode
+    || cfg
+      .agents
+      .get(agent.as_str())
+      .is_none_or(|binding| binding.account_source != AgentAccountSource::Agent)
+  {
+    return true;
+  }
+  let transferred_sources = linked_agent_accounts(store, agent)
+    .into_iter()
+    .filter_map(source_provider_id)
+    .collect::<BTreeSet<_>>();
+  if transferred_sources.is_empty() {
+    return true;
+  }
+  let auth_path = crate::opencode_markdown::opencode_data_root(home).join("auth.json");
+  if !auth_path.exists() {
+    return true;
+  }
+  let Ok(raw) = std::fs::read_to_string(&auth_path) else {
+    return false;
+  };
+  let Ok(auth) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    return false;
+  };
+  auth
+    .as_object()
+    .is_some_and(|auth| transferred_sources.iter().all(|provider| !auth.contains_key(*provider)))
 }
 
 fn with_opencode_projection<T>(
@@ -414,6 +462,7 @@ fn materialized_profile_matches_binding(
     let expected_provider_ids = binding
       .provider_filter
       .as_deref()
+      .filter(|providers| !providers.is_empty())
       .map(|providers| providers.iter().map(String::as_str).collect())
       .unwrap_or_else(|| effective_main_provider_ids(cfg, store));
     return binding.provider.is_none()
@@ -714,6 +763,7 @@ mod tests {
         backup: None,
         existed: false,
         created_by_migration: true,
+        applied_sha256: None,
       }],
     }
   }
@@ -1015,6 +1065,9 @@ accounts = ["opencode-openai"]
     cfg.agents.get_mut(AgentId::Opencode.as_str()).unwrap().provider_filter = None;
     cfg.profiles.get_mut("work").unwrap().providers = Some(vec!["deepseek".into(), "openai".into()]);
     write_synced_opencode_config(&config_path, &cfg, &store);
+    assert!(config_points_at_gateway(&config_path, &AgentId::Opencode, &cfg, &store));
+
+    cfg.agents.get_mut(AgentId::Opencode.as_str()).unwrap().provider_filter = Some(Vec::new());
     assert!(config_points_at_gateway(&config_path, &AgentId::Opencode, &cfg, &store));
 
     cfg.defaults.accounts = Some(vec!["main-openai".into()]);
@@ -1395,6 +1448,25 @@ wire_api = "responses"
     std::fs::write(&config_path, valid).unwrap();
     assert!(config_points_at_gateway(&config_path, &AgentId::CodexCli, &cfg, &store));
 
+    cfg.agents.get_mut(AgentId::CodexCli.as_str()).unwrap().account_source = AgentAccountSource::Main;
+    assert!(!config_points_at_gateway(
+      &config_path,
+      &AgentId::CodexCli,
+      &cfg,
+      &store
+    ));
+    cfg.agents.get_mut(AgentId::CodexCli.as_str()).unwrap().account_source = AgentAccountSource::Agent;
+    cfg.agents.get_mut(AgentId::CodexCli.as_str()).unwrap().mode = Some(RouteMode::Exact);
+    cfg.profiles.get_mut("work").unwrap().mode = Some(RouteMode::Exact);
+    assert!(!config_points_at_gateway(
+      &config_path,
+      &AgentId::CodexCli,
+      &cfg,
+      &store
+    ));
+    cfg.agents.get_mut(AgentId::CodexCli.as_str()).unwrap().mode = Some(RouteMode::Route);
+    cfg.profiles.get_mut("work").unwrap().mode = Some(RouteMode::Route);
+
     cfg.agents.get_mut(AgentId::CodexCli.as_str()).unwrap().profile = None;
     assert!(!config_points_at_gateway(
       &config_path,
@@ -1423,6 +1495,62 @@ wire_api = "responses"
       &cfg,
       &store
     ));
+  }
+
+  #[test]
+  fn generated_managed_clients_are_not_in_sync_with_api_key_enforcement() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("opencode.json");
+    let auth_path = dir.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+    store.upsert(sample_account("main-deepseek", "deepseek"));
+
+    let mut managed = config_with_opencode_binding(RouteMode::Route, AgentAccountSource::Main, None, &[]);
+    managed.api_key.enabled = true;
+    managed.profiles.get_mut("work").unwrap().providers = Some(vec!["deepseek".into()]);
+    managed
+      .agents
+      .get_mut(AgentId::Opencode.as_str())
+      .unwrap()
+      .provider_filter = Some(vec!["deepseek".into()]);
+    write_synced_opencode_config(&config_path, &managed, &store);
+    assert!(!config_points_at_gateway(
+      &config_path,
+      &AgentId::Opencode,
+      &managed,
+      &store
+    ));
+
+    let mut passthrough =
+      config_with_opencode_binding(RouteMode::Passthrough, AgentAccountSource::Main, Some("deepseek"), &[]);
+    passthrough.api_key.enabled = true;
+    write_synced_opencode_config(&config_path, &passthrough, &store);
+    assert!(config_points_at_gateway(
+      &config_path,
+      &AgentId::Opencode,
+      &passthrough,
+      &store
+    ));
+  }
+
+  #[test]
+  fn agent_owned_status_detects_reintroduced_opencode_source_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let auth_path = dir.path().join("gateway-auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+    let mut account = sample_account("opencode-openai", "openai");
+    mark_imported(&mut account, "openai");
+    store.upsert_in_shard(AgentId::Opencode.as_str(), account).unwrap();
+    let cfg = config_with_opencode_binding(RouteMode::Route, AgentAccountSource::Agent, None, &["opencode-openai"]);
+    let source_auth_path = crate::opencode_markdown::opencode_data_root(&home).join("auth.json");
+    std::fs::create_dir_all(source_auth_path.parent().unwrap()).unwrap();
+
+    std::fs::write(&source_auth_path, r#"{"anthropic":{"type":"api","key":"retained"}}"#).unwrap();
+    assert!(opencode_source_auth_is_absent(&home, &AgentId::Opencode, &cfg, &store));
+
+    std::fs::write(&source_auth_path, r#"{"openai":{"type":"api","key":"reconnected"}}"#).unwrap();
+    assert!(!opencode_source_auth_is_absent(&home, &AgentId::Opencode, &cfg, &store));
   }
 
   #[test]
