@@ -408,7 +408,6 @@ class ModelTests(unittest.TestCase):
       .top_k(0)
       .max_tokens(512)
       .reasoning_mode(ReasoningMode.ENABLED)
-      .reasoning_enabled(True)
       .reasoning_effort("provider_effort")
       .reasoning_budget_tokens(2048)
       .reasoning_summary(ReasoningSummary.CONCISE)
@@ -436,6 +435,24 @@ class ModelTests(unittest.TestCase):
     detached_options.effort = ReasoningEffort.LOW
     assert detached.reasoning is not None
     self.assertEqual(detached.reasoning.effort, ReasoningEffort.HIGH)
+
+    disabled = (
+      GenerateRequest.builder("smart")
+      .prompt("Do not reason.")
+      .reasoning_enabled(False)
+      .build()
+    )
+    self.assertEqual(
+      disabled.reasoning,
+      ReasoningOptions(mode=ReasoningMode.DISABLED),
+    )
+
+    invalid_enabled: Any = 1
+    with self.assertRaisesRegex(
+      TypeError,
+      "reasoning enabled must be a bool",
+    ):
+      GenerateRequest.builder("smart").reasoning_enabled(invalid_enabled)
 
   def test_detached_validation_fails_before_execution(self) -> None:
     with self.assertRaisesRegex(ValueError, "model cannot be empty"):

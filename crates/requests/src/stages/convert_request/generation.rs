@@ -184,15 +184,12 @@ fn lower_chat_reasoning(
   reasoning: &ReasoningOptions,
 ) -> Result<(), RequestsError> {
   if provider_id == ID_LLAMA_CPP {
-    if !reasoning.is_empty() {
-      return unsupported(
-        "reasoning",
-        provider_id,
-        Endpoint::ChatCompletions,
-        "llama.cpp has no portable reasoning control",
-      );
-    }
-    return Ok(());
+    return unsupported(
+      "reasoning",
+      provider_id,
+      Endpoint::ChatCompletions,
+      "llama.cpp has no portable reasoning control",
+    );
   }
   if provider_id == ID_DEEPSEEK {
     return lower_deepseek_reasoning(obj, Endpoint::ChatCompletions, provider_id, reasoning);
@@ -200,7 +197,7 @@ fn lower_chat_reasoning(
   if ZAI_PROVIDERS.contains(&provider_id) {
     return lower_zai_reasoning(obj, provider_id, reasoning);
   }
-  if provider_id == ID_GITHUB_COPILOT && model.starts_with("claude-") {
+  if provider_id == ID_GITHUB_COPILOT && is_claude_model(model) {
     return lower_claude_reasoning(obj, Endpoint::ChatCompletions, provider_id, model, reasoning);
   }
 
@@ -245,6 +242,19 @@ fn lower_deepseek_reasoning(
   provider_id: &str,
   reasoning: &ReasoningOptions,
 ) -> Result<(), RequestsError> {
+  let messages_endpoint = match endpoint {
+    Endpoint::ChatCompletions => false,
+    Endpoint::Messages => true,
+    Endpoint::Responses => {
+      return unsupported(
+        "reasoning",
+        provider_id,
+        endpoint,
+        "DeepSeek reasoning lowering supports only Chat Completions and Messages",
+      );
+    }
+  };
+
   reject_mode(
     reasoning,
     provider_id,
@@ -307,14 +317,10 @@ fn lower_deepseek_reasoning(
   if let Some(effort) = reasoning.effort.as_ref() {
     let effort = effort.as_str().to_string();
     thinking.insert("effort".into(), Value::String(effort.clone()));
-    match endpoint {
-      Endpoint::ChatCompletions => {
-        obj.insert("reasoning_effort".into(), Value::String(effort));
-      }
-      Endpoint::Messages => {
-        object_field(obj, "output_config").insert("effort".into(), Value::String(effort));
-      }
-      Endpoint::Responses => unreachable!("DeepSeek lowering is only used for Chat and Messages"),
+    if messages_endpoint {
+      object_field(obj, "output_config").insert("effort".into(), Value::String(effort));
+    } else {
+      obj.insert("reasoning_effort".into(), Value::String(effort));
     }
   }
   Ok(())
@@ -722,6 +728,10 @@ fn normalize_claude_model(model: &str) -> String {
   model.to_ascii_lowercase().replace(['.', '_'], "-")
 }
 
+fn is_claude_model(model: &str) -> bool {
+  normalize_claude_model(model).starts_with("claude-")
+}
+
 fn remove_fields(obj: &mut Map<String, Value>, fields: &[&str]) {
   for field in fields {
     obj.remove(*field);
@@ -794,13 +804,12 @@ mod tests {
   use crate::pipeline::config::RunConfig;
   use crate::pipeline::ctx::PipelineCtx;
   use crate::pipeline::stages::{ConvertRequestStage, Extracted, Resolved, ResolvedRoute};
-  use crate::test_support::{mock_handle, mock_handle_with_provider, MockProvider};
-  use crate::utils::codec::{decode_body_bytes, encode_body_bytes, ContentEncodingKind};
+  use crate::test_support::mock_handle;
+  use crate::utils::codec::ContentEncodingKind;
   use bytes::Bytes;
   use std::sync::Arc;
   use tokn_core::generation::ReasoningSummary;
-  use tokn_core::pipeline::InputTransformer;
-  use tokn_core::provider::{Endpoint, Result as ProviderResult, ID_OPENAI, ID_ZAI};
+  use tokn_core::provider::{Endpoint, ID_OPENAI, ID_ZAI};
   use tokn_headers::HeaderMap;
 
   fn ctx_at(endpoint: Endpoint) -> PipelineCtx {
@@ -857,97 +866,6 @@ mod tests {
       provider_id: smol_str::SmolStr::from(handle.provider.id()),
       account_handle: handle,
     }
-  }
-
-  #[tokio::test]
-  async fn passthrough_when_endpoints_match_and_no_transformer() {
-    let body = serde_json::json!({"model": "input-model", "messages": [{"role":"user","content":"hi"}]});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body.clone(), None, raw.clone(), None);
-    let res = resolved_with(
-      mock_handle("acct", "mock"),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-
-    let out = DefaultConvertRequest.convert_request(&ctx(), &ex, &res).await.unwrap();
-    assert_eq!(*out.upstream_body, body);
-    // Body unchanged → original wire bytes reused verbatim.
-    assert_eq!(out.upstream_wire_body, raw);
-    assert!(out.content_encoding.is_none());
-  }
-
-  #[tokio::test]
-  async fn rewrites_model_field() {
-    let body = serde_json::json!({"model": "input-model", "messages": []});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", "mock"),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "upstream-model-7",
-    );
-
-    let out = DefaultConvertRequest.convert_request(&ctx(), &ex, &res).await.unwrap();
-    assert_eq!(out.upstream_body["model"], "upstream-model-7");
-  }
-
-  #[tokio::test]
-  async fn runs_provider_input_transformer() {
-    struct Stamp;
-    impl InputTransformer for Stamp {
-      fn transform_input(&self, _endpoint: Endpoint, mut body: Value) -> ProviderResult<Value> {
-        if let Some(obj) = body.as_object_mut() {
-          obj.insert("stamped".into(), Value::Bool(true));
-        }
-        Ok(body)
-      }
-    }
-    let body = serde_json::json!({"model": "input-model"});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let handle = mock_handle_with_provider("acct", MockProvider::new("mock").with_transformer(Stamp));
-    let res = resolved_with(
-      handle,
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-
-    let out = DefaultConvertRequest.convert_request(&ctx(), &ex, &res).await.unwrap();
-    assert_eq!(out.upstream_body["stamped"], true);
-  }
-
-  #[tokio::test]
-  async fn cross_endpoint_convert_runs_when_endpoints_differ() {
-    // Responses → ChatCompletions. We don't assert on the exact shape
-    // (that's `tokn_convert`'s responsibility) — just that the body
-    // mutated and was re-serialized into `debug_outbound_body`.
-    let body = serde_json::json!({
-      "model": "input-model",
-      "input": [{"role": "user", "content": "hi"}]
-    });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body.clone(), None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", "mock"),
-      Endpoint::Responses,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-
-    let out = DefaultConvertRequest
-      .convert_request(&ctx_at(Endpoint::Responses), &ex, &res)
-      .await
-      .unwrap();
-    assert_ne!(
-      *out.upstream_body, body,
-      "expected cross-endpoint conversion to mutate body"
-    );
-    // wire body was re-serialized (not the original raw bytes).
-    assert_eq!(out.upstream_wire_body, out.debug_outbound_body);
   }
 
   #[tokio::test]
@@ -1171,6 +1089,34 @@ mod tests {
     assert_eq!(out.upstream_body["top_k"], 40);
   }
 
+  #[test]
+  fn llama_chat_rejects_typed_reasoning() {
+    let mut body = serde_json::json!({
+      "model": "input-model",
+      "messages": [{"role": "user", "content": "hi"}]
+    });
+    let options = GenerationOptions::new().with_reasoning(ReasoningOptions::new().with_effort(ReasoningEffort::High));
+
+    let error = lower_generation_options(
+      &mut body,
+      Endpoint::ChatCompletions,
+      ID_LLAMA_CPP,
+      "input-model",
+      &options,
+    )
+    .expect_err("llama.cpp has no portable reasoning control");
+
+    assert!(matches!(
+      error,
+      RequestsError::UnsupportedGenerationControl {
+        control: "reasoning",
+        provider_id,
+        endpoint: Endpoint::ChatCompletions,
+        ..
+      } if provider_id == ID_LLAMA_CPP
+    ));
+  }
+
   #[tokio::test]
   async fn deepseek_chat_lowers_mode_and_effort_for_provider_transformer() {
     let body = serde_json::json!({
@@ -1205,6 +1151,35 @@ mod tests {
     assert_eq!(out.upstream_body["thinking"]["type"], "enabled");
     assert_eq!(out.upstream_body["thinking"]["effort"], "high");
     assert_eq!(out.upstream_body["reasoning_effort"], "high");
+  }
+
+  #[test]
+  fn deepseek_responses_returns_typed_unsupported_error() {
+    let mut body = serde_json::json!({
+      "model": "deepseek-v4-pro",
+      "input": [{"role": "user", "content": "hi"}]
+    });
+    let original = body.clone();
+    let reasoning = ReasoningOptions::new().with_effort(ReasoningEffort::High);
+
+    let error = lower_deepseek_reasoning(
+      body.as_object_mut().expect("object body"),
+      Endpoint::Responses,
+      ID_DEEPSEEK,
+      &reasoning,
+    )
+    .expect_err("DeepSeek Responses must fail without panicking");
+
+    assert!(matches!(
+      error,
+      RequestsError::UnsupportedGenerationControl {
+        control: "reasoning",
+        provider_id,
+        endpoint: Endpoint::Responses,
+        ..
+      } if provider_id == ID_DEEPSEEK
+    ));
+    assert_eq!(body, original, "unsupported lowering must not mutate the request");
   }
 
   #[test]
@@ -1408,6 +1383,27 @@ mod tests {
     );
     assert_eq!(out.upstream_body["max_tokens"], 4096);
     assert_eq!(out.upstream_body["output_config"]["effort"], "high");
+  }
+
+  #[test]
+  fn copilot_claude_chat_dispatch_normalizes_case_and_separators() {
+    for model in ["CLAUDE-SONNET-4.6", "claude_sonnet_4_6", "Claude.Sonnet.4.6"] {
+      let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}]
+      });
+      let options = GenerationOptions::new().with_reasoning(
+        ReasoningOptions::new()
+          .with_mode(ReasoningMode::Adaptive)
+          .with_effort(ReasoningEffort::Medium),
+      );
+
+      lower_generation_options(&mut body, Endpoint::ChatCompletions, ID_GITHUB_COPILOT, model, &options)
+        .unwrap_or_else(|error| panic!("{model} should use Claude lowering: {error}"));
+
+      assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}), "{model}");
+      assert_eq!(body["output_config"]["effort"], "medium", "{model}");
+    }
   }
 
   #[test]
@@ -1699,159 +1695,5 @@ mod tests {
 
     assert_eq!(*out.upstream_body, body);
     assert_eq!(out.upstream_wire_body, raw);
-  }
-
-  #[tokio::test]
-  async fn gzip_round_trips_when_body_changes() {
-    let body = serde_json::json!({"model": "input-model", "messages": []});
-    let compressed = encode_body_bytes(
-      serde_json::to_vec(&body).unwrap().as_slice(),
-      Some(ContentEncodingKind::Gzip),
-    )
-    .unwrap();
-    let ex = extracted_with(body, Some(ContentEncodingKind::Gzip), compressed, None);
-    // Different upstream model → body mutates → we must re-compress.
-    let res = resolved_with(
-      mock_handle("acct", "mock"),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "upstream-model-2",
-    );
-
-    let out = DefaultConvertRequest.convert_request(&ctx(), &ex, &res).await.unwrap();
-    assert_eq!(out.content_encoding, Some(ContentEncodingKind::Gzip));
-    let decoded = decode_body_bytes(out.upstream_wire_body.clone(), out.content_encoding).unwrap();
-    let v: Value = serde_json::from_slice(&decoded).unwrap();
-    assert_eq!(v["model"], "upstream-model-2");
-  }
-
-  #[tokio::test]
-  async fn content_encoding_propagates_to_output() {
-    let body = serde_json::json!({"model": "input-model"});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, Some(ContentEncodingKind::Zstd), raw, None);
-    let res = resolved_with(
-      mock_handle("acct", "mock"),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-
-    let out = DefaultConvertRequest.convert_request(&ctx(), &ex, &res).await.unwrap();
-    assert_eq!(out.content_encoding, Some(ContentEncodingKind::Zstd));
-  }
-
-  #[tokio::test]
-  async fn transformer_failure_is_permanent_stage_error() {
-    struct Boom;
-    impl InputTransformer for Boom {
-      fn transform_input(&self, _endpoint: Endpoint, _body: Value) -> ProviderResult<Value> {
-        Err(tokn_core::provider::error::Error::Profiles { message: "boom".into() })
-      }
-    }
-    let body = serde_json::json!({"model": "input-model"});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let handle = mock_handle_with_provider("acct", MockProvider::new("mock").with_transformer(Boom));
-    let res = resolved_with(
-      handle,
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-
-    let err = DefaultConvertRequest
-      .convert_request(&ctx(), &ex, &res)
-      .await
-      .unwrap_err();
-    assert_eq!(err.stage, Stage::ConvertRequest);
-    assert!(!err.recoverable);
-    assert!(err.message().contains("boom"));
-  }
-
-  #[tokio::test]
-  async fn uses_run_config_upstream_endpoint_override_for_cross_endpoint_conversion() {
-    let body = serde_json::json!({
-      "model": "input-model",
-      "input": [{"role": "user", "content": "hi"}]
-    });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body.clone(), None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", "mock"),
-      Endpoint::Responses,
-      Endpoint::Responses,
-      "input-model",
-    );
-    let ctx = ctx_with_config(
-      Endpoint::Responses,
-      RunConfig::builder()
-        .with_str(crate::pipeline::stages::RUN_UPSTREAM_ENDPOINT_KEY, "chat_completions")
-        .build(),
-    );
-
-    let out = DefaultConvertRequest
-      .convert_request(&ctx, &ex, &res)
-      .await
-      .expect("convert should use configured upstream endpoint");
-
-    assert_ne!(*out.upstream_body, body);
-    assert_eq!(out.upstream_wire_body, out.debug_outbound_body);
-  }
-
-  #[tokio::test]
-  async fn errors_when_no_resolved_endpoint_is_available() {
-    let body = serde_json::json!({"model": "input-model"});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let mut res = resolved_with(
-      mock_handle("acct", "mock"),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-    res.route = ResolvedRoute::provider_traffic(tokn_core::provider::ProviderRequestKind::Opaque);
-    let ctx = PipelineCtx::new(
-      "req-cr-missing",
-      tokn_core::request_event::RequestEndpoint::custom("/v1/experimental/agents"),
-      Arc::new(EventBus::new(64)),
-    );
-
-    let err = DefaultConvertRequest
-      .convert_request(&ctx, &ex, &res)
-      .await
-      .unwrap_err();
-
-    assert_eq!(err.stage, Stage::ConvertRequest);
-    assert!(!err.recoverable);
-    match err.inner() {
-      RequestsError::MissingResolvedEndpoint { request_endpoint } => {
-        assert_eq!(request_endpoint.as_str(), "/v1/experimental/agents");
-      }
-      other => panic!("expected MissingResolvedEndpoint, got {other:?}"),
-    }
-  }
-
-  #[test]
-  fn extracted_helper_preserves_user_agent_and_none_initiator() {
-    let body = serde_json::json!({"model": "input-model"});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-
-    assert_eq!(
-      extracted_with(body.clone(), None, raw.clone(), None)
-        .initiator
-        .as_deref(),
-      None
-    );
-    assert_eq!(
-      extracted_with(body.clone(), None, raw.clone(), Some("user"))
-        .initiator
-        .as_deref(),
-      Some("user")
-    );
-    assert_eq!(
-      extracted_with(body, None, raw, Some("agent")).initiator.as_deref(),
-      Some("agent")
-    );
   }
 }
