@@ -614,7 +614,7 @@ fn build_policy_runtime(name: &str, spec: PolicySpec, deps: PolicyBuildDeps) -> 
 
 fn validate_api_default_provider_modes(cfg: &Config, default_mode: RouteMode) -> Result<()> {
   let mut missing = Vec::new();
-  if matches!(default_mode, RouteMode::Passthrough | RouteMode::Switch) && cfg.defaults.default_provider_id.is_none() {
+  if default_mode.is_verbatim() && cfg.defaults.default_provider_id.is_none() {
     missing.push("defaults.default_provider_id".to_string());
   }
   for (profile_name, profile) in &cfg.profiles {
@@ -623,7 +623,7 @@ fn validate_api_default_provider_modes(cfg: &Config, default_mode: RouteMode) ->
       .default_provider_id
       .as_ref()
       .or(cfg.defaults.default_provider_id.as_ref());
-    if matches!(mode, RouteMode::Passthrough | RouteMode::Switch) && default_provider_id.is_none() {
+    if mode.is_verbatim() && default_provider_id.is_none() {
       missing.push(format!("profiles.{profile_name}.default_provider_id"));
     }
   }
@@ -1540,7 +1540,7 @@ mod tests {
     let mut cfg = Config::default();
     cfg.server.route_mode = RouteMode::Passthrough;
     cfg.defaults.mode = default_mode;
-    if matches!(default_mode, RouteMode::Passthrough | RouteMode::Switch) {
+    if default_mode.is_verbatim() {
       cfg.defaults.default_provider_id = Some("zai-coding-plan".into());
     }
     cfg.db.enabled = true;

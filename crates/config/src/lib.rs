@@ -8,6 +8,7 @@ pub use tokn_core::AgentId;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokn_core::provider::ID_GITHUB_COPILOT;
 
@@ -99,6 +100,13 @@ pub enum RouteMode {
   #[default]
   Route,
   Fuzzy,
+}
+
+impl RouteMode {
+  /// Whether requests preserve the selected upstream provider and model.
+  pub const fn is_verbatim(self) -> bool {
+    matches!(self, Self::Passthrough | Self::Switch)
+  }
 }
 
 /// Where an agent binding obtains its accounts.
@@ -637,9 +645,7 @@ impl Config {
       )?;
       if agent.provider.is_some() {
         let mode = agent.mode.unwrap_or(RouteMode::Route);
-        if agent.account_source != AgentAccountSource::Main
-          || !matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
-        {
+        if agent.account_source != AgentAccountSource::Main || !mode.is_verbatim() {
           return error::InvalidAccountSnafu {
             id: format!("agents.{name}.provider"),
             message: String::from(
@@ -657,11 +663,7 @@ impl Config {
         }
       }
       if agent.provider_filter.is_some()
-        && (agent.account_source != AgentAccountSource::Main
-          || matches!(
-            agent.mode.unwrap_or(RouteMode::Route),
-            RouteMode::Passthrough | RouteMode::Switch
-          ))
+        && (agent.account_source != AgentAccountSource::Main || agent.mode.unwrap_or(RouteMode::Route).is_verbatim())
       {
         return error::InvalidAccountSnafu {
           id: format!("agents.{name}.provider_filter"),
@@ -1121,74 +1123,80 @@ fn is_proxy_host(s: &str) -> bool {
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-  let tmp = stage_atomic_write(path, contents)?;
-  std::fs::rename(&tmp, path).context(error::RenameSnafu {
-    from: tmp,
+  let staged = stage_atomic_write(path, contents)?;
+  let from = staged.path().to_path_buf();
+  staged.persist(path).map(|_| ()).map_err(|error| Error::Rename {
+    from,
     to: path.to_path_buf(),
+    source: error.error,
   })
 }
 
 fn write_atomic_guarded(path: &Path, contents: &str, expected: ConfigEditPreimage<'_>) -> GuardedEditResult<()> {
-  let tmp = stage_atomic_write(path, contents)?;
-  commit_staged_atomic_write_guarded(path, tmp, expected)
+  let staged = stage_atomic_write(path, contents)?;
+  commit_staged_atomic_write_guarded(path, staged, expected)
 }
 
 fn commit_staged_atomic_write_guarded(
   path: &Path,
-  tmp: PathBuf,
+  staged: tempfile::NamedTempFile,
   expected: ConfigEditPreimage<'_>,
 ) -> GuardedEditResult<()> {
   let current = read_optional_config_bytes(path)?;
   if !expected.matches(current.as_deref()) {
-    let _ = std::fs::remove_file(&tmp);
     return Err(GuardedEditError::Changed {
       path: path.to_path_buf(),
     });
   }
 
+  let from = staged.path().to_path_buf();
   match expected {
-    ConfigEditPreimage::Missing => match std::fs::hard_link(&tmp, path) {
-      Ok(()) => {
-        let _ = std::fs::remove_file(&tmp);
-        Ok(())
-      }
-      Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-        let _ = std::fs::remove_file(&tmp);
-        Err(GuardedEditError::Changed {
+    ConfigEditPreimage::Missing => match staged.persist_noclobber(path) {
+      Ok(_) => Ok(()),
+      Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Err(GuardedEditError::Changed {
+        path: path.to_path_buf(),
+      }),
+      Err(error) => Err(
+        Error::Write {
           path: path.to_path_buf(),
-        })
-      }
-      Err(source) => {
-        let _ = std::fs::remove_file(&tmp);
-        Err(
-          Error::Write {
-            path: path.to_path_buf(),
-            source,
-          }
-          .into(),
-        )
-      }
+          source: error.error,
+        }
+        .into(),
+      ),
     },
     ConfigEditPreimage::Contents(_) => {
-      std::fs::rename(&tmp, path).context(error::RenameSnafu {
-        from: tmp,
+      staged.persist(path).map_err(|error| Error::Rename {
+        from,
         to: path.to_path_buf(),
+        source: error.error,
       })?;
       Ok(())
     }
   }
 }
 
-fn stage_atomic_write(path: &Path, contents: &str) -> Result<PathBuf> {
-  let tmp = path.with_extension("toml.tmp");
-  std::fs::write(&tmp, contents).context(error::WriteSnafu { path: tmp.clone() })?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    let perm = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(&tmp, perm).context(error::SetPermissionsSnafu { path: tmp.clone() })?;
-  }
-  Ok(tmp)
+fn stage_atomic_write(path: &Path, contents: &str) -> Result<tempfile::NamedTempFile> {
+  let parent = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."));
+  let mut staged = tempfile::Builder::new()
+    .prefix(".tokn-config-")
+    .suffix(".tmp")
+    .tempfile_in(parent)
+    .context(error::WriteSnafu {
+      path: path.to_path_buf(),
+    })?;
+  staged
+    .as_file_mut()
+    .write_all(contents.as_bytes())
+    .context(error::WriteSnafu {
+      path: staged.path().to_path_buf(),
+    })?;
+  staged.as_file().sync_all().context(error::WriteSnafu {
+    path: staged.path().to_path_buf(),
+  })?;
+  Ok(staged)
 }
 
 #[cfg(test)]
@@ -1829,14 +1837,96 @@ profile = "opencode"
     let concurrent = b"[server]\nport = 6262\n";
     std::fs::write(&path, initial).unwrap();
     let staged = stage_atomic_write(&path, "[server]\nport = 5151\n").unwrap();
+    let staged_path = staged.path().to_path_buf();
     std::fs::write(&path, concurrent).unwrap();
 
-    let error =
-      commit_staged_atomic_write_guarded(&path, staged.clone(), ConfigEditPreimage::Contents(initial)).unwrap_err();
+    let error = commit_staged_atomic_write_guarded(&path, staged, ConfigEditPreimage::Contents(initial)).unwrap_err();
 
     assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
     assert_eq!(std::fs::read(&path).unwrap(), concurrent);
-    assert!(!staged.exists());
+    assert!(!staged_path.exists());
+  }
+
+  #[test]
+  fn guarded_staged_writes_use_distinct_paths_and_reject_stale_preimages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"[server]\nport = 4141\n";
+    let first = b"[server]\nport = 5151\n";
+    let second = b"[server]\nport = 6262\n";
+    std::fs::write(&path, initial).unwrap();
+    let first_staged = stage_atomic_write(&path, std::str::from_utf8(first).unwrap()).unwrap();
+    let second_staged = stage_atomic_write(&path, std::str::from_utf8(second).unwrap()).unwrap();
+    let first_staged_path = first_staged.path().to_path_buf();
+    let second_staged_path = second_staged.path().to_path_buf();
+
+    assert_ne!(first_staged_path, second_staged_path);
+    commit_staged_atomic_write_guarded(&path, first_staged, ConfigEditPreimage::Contents(initial)).unwrap();
+    let error =
+      commit_staged_atomic_write_guarded(&path, second_staged, ConfigEditPreimage::Contents(initial)).unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), first);
+    assert!(!first_staged_path.exists());
+    assert!(!second_staged_path.exists());
+  }
+
+  #[test]
+  fn guarded_missing_commit_rejects_a_target_created_after_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let concurrent = b"[server]\nport = 6262\n";
+    let staged = stage_atomic_write(&path, "[server]\nport = 5151\n").unwrap();
+    let staged_path = staged.path().to_path_buf();
+    std::fs::write(&path, concurrent).unwrap();
+
+    let error = commit_staged_atomic_write_guarded(&path, staged, ConfigEditPreimage::Missing).unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+    assert!(!staged_path.exists());
+  }
+
+  #[test]
+  fn guarded_edit_does_not_reuse_the_legacy_predictable_staging_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let legacy_staging_path = path.with_extension("toml.tmp");
+    std::fs::write(&legacy_staging_path, "sentinel").unwrap();
+
+    Config::edit_in_place_with_contents_if_unchanged(&path, None, |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&legacy_staging_path).unwrap(), "sentinel");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("port = 5151"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn guarded_edit_does_not_follow_a_legacy_staging_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let legacy_staging_path = path.with_extension("toml.tmp");
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "do not modify").unwrap();
+    symlink(&victim, &legacy_staging_path).unwrap();
+
+    Config::edit_in_place_with_contents_if_unchanged(&path, None, |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not modify");
+    assert!(std::fs::symlink_metadata(&legacy_staging_path)
+      .unwrap()
+      .file_type()
+      .is_symlink());
   }
 
   #[test]

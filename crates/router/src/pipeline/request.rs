@@ -69,7 +69,7 @@ fn resolve_request(
         .map(|v| v.as_str()),
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-  if matches!(route.mode, RouteMode::Passthrough | RouteMode::Switch) {
+  if route.mode.is_verbatim() {
     return Err(ApiError::bad_request(format!(
       "{} mode only applies in proxy mode",
       match route.mode {
