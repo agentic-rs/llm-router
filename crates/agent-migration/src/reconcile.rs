@@ -44,6 +44,38 @@ pub struct UnlinkRequest {
   pub backup_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProfileLayout {
+  /// One generated profile exposes a merged provider catalogue.
+  Single,
+  /// One generated profile is pinned to one gateway provider.
+  SinglePinned,
+  /// One generated child profile is materialized per gateway provider.
+  PerProvider,
+}
+
+impl AgentProfileLayout {
+  pub fn for_binding(mode: RouteMode, account_source: AgentAccountSource) -> Self {
+    if !is_verbatim_mode(mode) {
+      Self::Single
+    } else if account_source == AgentAccountSource::Main {
+      Self::SinglePinned
+    } else {
+      Self::PerProvider
+    }
+  }
+}
+
+impl std::fmt::Display for AgentProfileLayout {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(match self {
+      Self::Single => "single",
+      Self::SinglePinned => "single_pinned",
+      Self::PerProvider => "per_provider",
+    })
+  }
+}
+
 #[derive(Debug)]
 pub struct ReconcilePlan {
   pub agent: AgentId,
@@ -76,8 +108,8 @@ pub struct ReconcilePlan {
   /// Desired filter persisted in the agent binding. `None` means automatic
   /// discovery from the effective main account pool.
   pub provider_filter: Option<Vec<String>>,
-  /// Canonical providers materialized for this reconciliation.
-  pub published_provider_ids: Vec<String>,
+  /// Canonical main-account providers materialized for this reconciliation.
+  pub(crate) published_provider_ids: Vec<String>,
   /// Providers whose catalogue is dynamic or otherwise has no static models
   /// that OpenCode can put in its model picker.
   pub providers_without_models: Vec<String>,
@@ -92,6 +124,36 @@ pub struct ReconcilePlan {
   pub edits: Vec<PlannedEdit>,
   pub(crate) previous_manifest: Option<PathBuf>,
   opencode_preflight: Option<crate::opencode_markdown::OpenCodePreflight>,
+}
+
+impl ReconcilePlan {
+  /// Canonical gateway providers reachable through this materialized link.
+  pub fn gateway_provider_ids(&self) -> Vec<String> {
+    self
+      .provider_routes
+      .iter()
+      .map(|route| route.gateway_provider_id.as_str())
+      .collect::<BTreeSet<_>>()
+      .into_iter()
+      .map(str::to_string)
+      .collect()
+  }
+
+  /// Provider IDs injected into the agent's own model picker/configuration.
+  pub fn injected_provider_ids(&self) -> Vec<String> {
+    if self.agent == AgentId::Opencode && is_verbatim_mode(self.binding_mode) {
+      return self
+        .gateway_provider_ids()
+        .into_iter()
+        .map(|provider| format!("{}-{provider}", crate::projection::SHARED_PROVIDER_ID))
+        .collect();
+    }
+    vec![crate::projection::SHARED_PROVIDER_ID.to_string()]
+  }
+
+  pub fn profile_layout(&self) -> AgentProfileLayout {
+    AgentProfileLayout::for_binding(self.binding_mode, self.account_source)
+  }
 }
 
 #[derive(Debug)]
@@ -405,6 +467,13 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
       request.agent
     );
   }
+  if cfg.api_key.enabled && binding_mode != RouteMode::Passthrough {
+    bail!(
+      "{} cannot use --mode {} while [api_key].enabled = true because generated agent credentials are not provisioned as gateway client keys yet; disable API-key enforcement or use --mode passthrough",
+      request.agent,
+      route_mode_as_str(binding_mode)
+    );
+  }
   let previous_mode = previous_materialized_mode(&cfg, previous_materialized_profile.as_deref());
   let previous_provider_ids =
     previous_materialized_provider_ids(&cfg, previous_materialized_profile.as_deref(), previous_mode);
@@ -561,7 +630,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
       &imported_accounts,
       &transferred_source_providers,
       adapter.default_provider_id(),
-    ),
+    )?,
     AgentAccountSource::Main => main_provider_routes(
       &cfg,
       binding_profile.as_deref(),
@@ -576,7 +645,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
       &enabled_imported_accounts,
       &transferred_source_providers,
       adapter.default_provider_id(),
-    ),
+    )?,
     AgentAccountSource::Main => main_provider_routes(
       &cfg,
       binding_profile.as_deref(),
@@ -595,7 +664,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
   if is_verbatim_mode(binding_mode) {
     validate_provider_route_profiles(&cfg, &request.agent, &provider_routes)?;
   }
-  validate_verbatim_provider_routes(adapter.as_ref(), binding_mode, &provider_routes)?;
+  validate_verbatim_provider_routes(&request.agent, adapter.as_ref(), binding_mode, &provider_routes)?;
   let publication_plan = if request.agent == AgentId::Opencode {
     compile_opencode_publications(
       binding_mode,
@@ -1428,29 +1497,47 @@ fn provider_routes(
   accounts: &[Account],
   transferred_source_providers: &BTreeSet<String>,
   default_provider_id: &str,
-) -> Vec<ProviderRoute> {
+) -> Result<Vec<ProviderRoute>> {
   if accounts.is_empty() {
-    return vec![ProviderRoute {
+    return Ok(vec![ProviderRoute {
       source_provider_id: default_provider_id.to_string(),
       gateway_provider_id: default_provider_id.to_string(),
       account_id: String::new(),
       profile: binding_profile.unwrap_or_default().to_string(),
       base_url: gateway_profile_base_url(cfg, binding_profile),
       transfer_source_auth: false,
-    }];
+    }]);
   }
 
   let Some(binding_profile) = binding_profile else {
-    return Vec::new();
+    return Ok(Vec::new());
   };
-  let mut routes = BTreeMap::new();
+  let mut selected_accounts = BTreeMap::<&str, &Account>::new();
   for account in accounts {
     let Some(source_provider_id) = source_provider_id(account) else {
       continue;
     };
-    let profile = format!("{binding_profile}-{}", account.provider);
-    routes.insert(
-      source_provider_id.to_string(),
+    if let Some(existing) = selected_accounts.get(source_provider_id).copied() {
+      if existing.enabled && account.enabled && existing.id != account.id {
+        bail!(
+          "OpenCode source provider '{source_provider_id}' maps to multiple enabled gateway accounts ('{}' for '{}' and '{}' for '{}'); disable all but one before linking or syncing",
+          existing.id,
+          existing.provider,
+          account.id,
+          account.provider
+        );
+      }
+      if existing.enabled || !account.enabled {
+        continue;
+      }
+    }
+    selected_accounts.insert(source_provider_id, account);
+  }
+
+  let routes = selected_accounts
+    .into_iter()
+    .map(|(source_provider_id, account)| {
+      let profile = format!("{binding_profile}-{}", account.provider);
       ProviderRoute {
         source_provider_id: source_provider_id.to_string(),
         gateway_provider_id: account.provider.clone(),
@@ -1458,10 +1545,10 @@ fn provider_routes(
         base_url: gateway_profile_base_url(cfg, Some(&profile)),
         profile,
         transfer_source_auth: transferred_source_providers.contains(source_provider_id),
-      },
-    );
-  }
-  routes.into_values().collect()
+      }
+    })
+    .collect();
+  Ok(routes)
 }
 
 fn main_provider_routes(
@@ -1762,22 +1849,20 @@ fn previous_materialized_account_source(
   previous_profile: Option<&str>,
   existing_binding: Option<&tokn_config::AgentConfig>,
 ) -> Option<AgentAccountSource> {
-  previous_profile
-    .and_then(|profile| cfg.profiles.get(profile))
-    .map(|profile| {
-      if profile.accounts.is_some() {
-        AgentAccountSource::Agent
-      } else {
-        AgentAccountSource::Main
-      }
-    })
-    // A profile-less binding is a supported legacy upgrade path. There is no
-    // independent runtime profile from which to infer its prior boundary.
-    .or_else(|| {
-      existing_binding
-        .filter(|binding| binding.profile.is_none())
-        .map(|binding| binding.account_source)
-    })
+  // The declarative binding owns the credential boundary. Generated profile
+  // shape is only a legacy recovery signal when there is no binding; otherwise
+  // profile drift could make an explicit account-source change look safe.
+  existing_binding.map(|binding| binding.account_source).or_else(|| {
+    previous_profile
+      .and_then(|profile| cfg.profiles.get(profile))
+      .map(|profile| {
+        if profile.accounts.is_some() {
+          AgentAccountSource::Agent
+        } else {
+          AgentAccountSource::Main
+        }
+      })
+  })
 }
 
 fn is_verbatim_mode(mode: RouteMode) -> bool {
@@ -1840,6 +1925,7 @@ fn materialized_default_provider(
 }
 
 fn validate_verbatim_provider_routes(
+  agent: &AgentId,
   adapter: &dyn crate::adapter::AgentAdapter,
   mode: RouteMode,
   routes: &[ProviderRoute],
@@ -1857,7 +1943,7 @@ fn validate_verbatim_provider_routes(
     let descriptor = registry.resolve(&route.gateway_provider_id).ok_or_else(|| {
       anyhow!(
         "{} link selected unknown provider '{}' for --mode {}",
-        adapter.default_provider_id(),
+        agent,
         route.gateway_provider_id,
         route_mode_as_str(mode)
       )
@@ -1867,7 +1953,7 @@ fn validate_verbatim_provider_routes(
     }
     bail!(
       "{} --mode {} sends {:?} traffic, but provider '{}' does not support that endpoint; use --mode route instead",
-      adapter.default_provider_id(),
+      agent,
       route_mode_as_str(mode),
       endpoint,
       route.gateway_provider_id
@@ -2463,6 +2549,77 @@ mod tests {
       last_refresh: None,
       settings: toml::Table::new(),
     }
+  }
+
+  #[test]
+  fn declarative_binding_owns_the_previous_account_source_when_profile_shape_drifts() {
+    for (binding_source, materialized_source) in [
+      (AgentAccountSource::Agent, AgentAccountSource::Main),
+      (AgentAccountSource::Main, AgentAccountSource::Agent),
+    ] {
+      let mut cfg = Config::default();
+      cfg.profiles.insert(
+        "work".into(),
+        tokn_config::ProfileConfig {
+          mode: Some(RouteMode::Route),
+          agent_id: Some(AgentId::Opencode),
+          default_provider_id: None,
+          providers: Some(vec!["openai".into()]),
+          accounts: (materialized_source == AgentAccountSource::Agent).then(|| vec!["opencode-openai".into()]),
+          model_families: None,
+        },
+      );
+      let binding = tokn_config::AgentConfig {
+        mode: Some(RouteMode::Route),
+        profile: Some("work".into()),
+        account_source: binding_source,
+        provider: None,
+        provider_filter: None,
+        source_providers: None,
+        sync: true,
+      };
+
+      assert_eq!(
+        previous_materialized_account_source(&cfg, Some("work"), Some(&binding)),
+        Some(binding_source)
+      );
+    }
+  }
+
+  #[test]
+  fn provider_routes_reject_multiple_enabled_accounts_for_one_opencode_source() {
+    let imported = |id: &str, provider: &str| {
+      let mut account = annotate_imported_account(
+        sample_account(id, provider),
+        AgentId::Opencode,
+        Path::new("/tmp/opencode-auth.json"),
+        "auth.openai",
+        "20260729T000000Z",
+      );
+      account
+        .settings
+        .get_mut("import")
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .insert("source_provider".into(), toml::Value::String("openai".into()));
+      account
+    };
+    let accounts = [
+      imported("opencode-openai", tokn_core::provider::ID_OPENAI),
+      imported("opencode-codex", tokn_core::provider::ID_CODEX),
+    ];
+
+    let error = provider_routes(
+      &Config::default(),
+      Some("opencode"),
+      &accounts,
+      &BTreeSet::new(),
+      tokn_core::provider::ID_OPENAI,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("multiple enabled gateway accounts"));
+    assert!(error.to_string().contains("disable all but one"));
   }
 
   fn sample_active_manifest(
@@ -3178,6 +3335,9 @@ providers = ["anthropic"]
     assert_eq!(plan.provider.as_deref(), Some(tokn_core::provider::ID_OPENAI));
     assert_eq!(plan.provider_filter, None);
     assert_eq!(plan.published_provider_ids, vec!["openai".to_string()]);
+    assert_eq!(plan.gateway_provider_ids(), vec!["openai".to_string()]);
+    assert_eq!(plan.injected_provider_ids(), vec!["tokn-router-openai".to_string()]);
+    assert_eq!(plan.profile_layout(), AgentProfileLayout::SinglePinned);
     assert_eq!(plan.edits.len(), 1);
     plan.timestamp = "20260714T010101Z".into();
 
@@ -3260,6 +3420,12 @@ providers = ["anthropic"]
       relink_plan.published_provider_ids,
       vec!["deepseek".to_string(), "openai".to_string()]
     );
+    assert_eq!(
+      relink_plan.gateway_provider_ids(),
+      vec!["deepseek".to_string(), "openai".to_string()]
+    );
+    assert_eq!(relink_plan.injected_provider_ids(), vec!["tokn-router".to_string()]);
+    assert_eq!(relink_plan.profile_layout(), AgentProfileLayout::Single);
     assert_eq!(
       relink_plan
         .provider_routes
@@ -3558,6 +3724,7 @@ providers = ["anthropic"]
     )
     .unwrap_err();
     assert!(error.to_string().contains("does not support that endpoint"));
+    assert!(error.to_string().contains("opencode --mode switch"));
     assert_eq!(std::fs::read_to_string(&gateway_config_path).unwrap(), root_config);
     assert_eq!(std::fs::read_to_string(&opencode_config_path).unwrap(), opencode_config);
     assert_eq!(std::fs::read_to_string(&opencode_auth_path).unwrap(), opencode_auth);
@@ -3811,6 +3978,73 @@ accounts = ["opencode-openai"]
       .to_string()
       .contains("does not encode provider-qualified model ids"));
     assert!(!gateway_auth_path.exists());
+  }
+
+  #[test]
+  fn generated_agent_clients_reject_managed_modes_with_api_key_enforcement() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway_config_path = dir.path().join("gateway/config.toml");
+    let gateway_auth_path = dir.path().join("gateway/auth.yaml");
+    let agent_home = dir.path().join("home");
+    let opencode_auth_path = agent_home.join(".local/share/opencode/auth.json");
+    std::fs::create_dir_all(gateway_config_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(opencode_auth_path.parent().unwrap()).unwrap();
+    std::fs::write(&gateway_config_path, "[api_key]\nenabled = true\n").unwrap();
+    std::fs::write(&gateway_auth_path, "opaque gateway credential data").unwrap();
+    std::fs::write(&opencode_auth_path, "opaque local credential data").unwrap();
+
+    for mode in [RouteMode::Route, RouteMode::Fuzzy, RouteMode::Exact, RouteMode::Switch] {
+      let error = plan_reconcile_with_gateway_auth_path(
+        ReconcileRequest {
+          agent: AgentId::Opencode,
+          profile: None,
+          mode: Some(mode),
+          account_source: Some(AgentAccountSource::Main),
+          default_provider_id: (mode == RouteMode::Switch).then(|| tokn_core::provider::ID_OPENAI.into()),
+          provider_filter: None,
+          gateway_config_path: Some(gateway_config_path.clone()),
+          agent_home: Some(agent_home.clone()),
+        },
+        gateway_auth_path.clone(),
+      )
+      .unwrap_err();
+
+      assert!(error.to_string().contains("[api_key].enabled = true"));
+      assert!(error.to_string().contains("agent credentials"));
+    }
+    assert_eq!(
+      std::fs::read_to_string(&gateway_auth_path).unwrap(),
+      "opaque gateway credential data"
+    );
+    assert_eq!(
+      std::fs::read_to_string(&opencode_auth_path).unwrap(),
+      "opaque local credential data"
+    );
+
+    std::fs::write(&gateway_auth_path, "version: 1\naccounts: []\n").unwrap();
+    save_main_accounts(
+      &gateway_auth_path,
+      &gateway_config_path,
+      &[("main-openai", tokn_core::provider::ID_OPENAI)],
+    );
+    let opencode_config_path = agent_home.join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(opencode_config_path.parent().unwrap()).unwrap();
+    std::fs::write(&opencode_config_path, "{}\n").unwrap();
+    let passthrough = plan_reconcile_with_gateway_auth_path(
+      ReconcileRequest {
+        agent: AgentId::Opencode,
+        profile: None,
+        mode: Some(RouteMode::Passthrough),
+        account_source: Some(AgentAccountSource::Main),
+        default_provider_id: Some(tokn_core::provider::ID_OPENAI.into()),
+        provider_filter: None,
+        gateway_config_path: Some(gateway_config_path),
+        agent_home: Some(agent_home),
+      },
+      gateway_auth_path,
+    )
+    .unwrap();
+    assert_eq!(passthrough.binding_mode, RouteMode::Passthrough);
   }
 
   #[test]

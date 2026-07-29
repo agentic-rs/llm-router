@@ -12,7 +12,7 @@ mod status;
 
 pub use manifest::FileBackup;
 pub use reconcile::{
-  apply_reconcile, import_accounts, plan_reconcile, unlink, ApplyReport, FileAction, ImportReport, ImportRequest,
-  PlannedEdit, ReconcilePlan, ReconcileRequest, UnlinkReport, UnlinkRequest,
+  apply_reconcile, import_accounts, plan_reconcile, unlink, AgentProfileLayout, ApplyReport, FileAction, ImportReport,
+  ImportRequest, PlannedEdit, ReconcilePlan, ReconcileRequest, UnlinkReport, UnlinkRequest,
 };
 pub use status::{list_agents, show_agent, AgentBindingStatus, AgentStatus};
