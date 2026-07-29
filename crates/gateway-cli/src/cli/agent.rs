@@ -56,13 +56,20 @@ pub struct AgentLinkArgs {
   #[arg(long)]
   pub use_main_accounts: bool,
   /// Provider used by a main-account passthrough or switch link. If omitted,
-  /// a prior main-account profile target or `[defaults].default_provider_id` is used.
-  #[arg(long, requires = "use_main_accounts")]
+  /// a prior binding target or `[defaults].default_provider_id` is used.
+  #[arg(long, requires = "use_main_accounts", conflicts_with = "provider_filters")]
   pub provider: Option<String>,
-  /// OpenCode provider namespace to redirect to the gateway's main account
-  /// pool. May be supplied more than once; defaults to `openai`.
-  #[arg(long = "source-provider", requires = "use_main_accounts")]
-  pub source_providers: Vec<String>,
+  /// Limit main-account provider discovery to this provider ID.
+  ///
+  /// May be supplied more than once. If omitted, `agent link` discovers all
+  /// enabled providers in the effective main account pool.
+  #[arg(
+    long = "provider-filter",
+    requires = "use_main_accounts",
+    conflicts_with = "provider",
+    value_name = "ID"
+  )]
+  pub provider_filters: Vec<String>,
   #[arg(long)]
   pub yes: bool,
 }
@@ -128,18 +135,10 @@ fn import(cfg_path: Option<PathBuf>, args: AgentImportArgs) -> Result<()> {
 }
 
 fn link(cfg_path: Option<PathBuf>, args: AgentLinkArgs) -> Result<()> {
-  let plan = plan_reconcile(ReconcileRequest {
-    agent: args.target.agent,
-    profile: args.profile,
-    mode: args.mode,
-    account_source: requested_account_source(args.use_main_accounts),
-    default_provider_id: args.provider,
-    source_provider_ids: (!args.source_providers.is_empty()).then_some(args.source_providers),
-    gateway_config_path: cfg_path,
-    agent_home: None,
-  })?;
+  let yes = args.yes;
+  let plan = plan_reconcile(link_reconcile_request(cfg_path, args))?;
   print_plan("link", &plan);
-  if !args.yes && !confirm("Apply this agent link?")? {
+  if !yes && !confirm("Apply this agent link?")? {
     println!("Link cancelled.");
     return Ok(());
   }
@@ -164,16 +163,7 @@ fn sync(cfg_path: Option<PathBuf>, args: AgentSyncArgs) -> Result<()> {
   }
 
   for agent in agents {
-    let plan = plan_reconcile(ReconcileRequest {
-      agent: agent.clone(),
-      profile: None,
-      mode: None,
-      account_source: None,
-      default_provider_id: None,
-      source_provider_ids: None,
-      gateway_config_path: cfg_path.clone(),
-      agent_home: None,
-    })?;
+    let plan = plan_reconcile(sync_reconcile_request(cfg_path.clone(), agent.clone()))?;
     print_plan("sync", &plan);
     let report = apply_reconcile(plan)?;
     println!("synced {} -> {}", agent, report.manifest_path.display());
@@ -286,16 +276,30 @@ fn print_status(status: &AgentStatus) {
       println!("  profile: {}", binding.profile.as_deref().unwrap_or("(defaults)"));
       println!("  mode: {}", route_mode_as_str(binding.mode));
       println!("  account_source: {}", account_source_as_str(binding.account_source));
+      if let Some(provider) = binding.provider.as_deref() {
+        println!("  provider: {provider}");
+      }
       if binding.account_source == AgentAccountSource::Main {
         println!(
-          "  source_providers: {}",
+          "  provider_filter: {}",
           binding
-            .source_providers
+            .provider_filter
             .as_deref()
             .filter(|providers| !providers.is_empty())
             .map(|providers| providers.join(", "))
-            .unwrap_or_else(|| "openai".into())
+            .unwrap_or_else(|| "(all effective providers)".into())
         );
+      }
+      if let Some(source_providers) = binding.source_providers.as_deref() {
+        println!(
+          "  legacy_source_providers: {}",
+          if source_providers.is_empty() {
+            "(empty legacy value)".to_string()
+          } else {
+            source_providers.join(", ")
+          }
+        );
+        println!("  migration: unlink this binding before linking again");
       }
       println!("  sync: {}", binding.sync);
     }
@@ -318,6 +322,9 @@ fn print_plan(kind: &str, plan: &ReconcilePlan) {
   println!("profile: {}", plan.binding_profile.as_deref().unwrap_or("(defaults)"));
   println!("mode: {}", route_mode_as_str(plan.binding_mode));
   println!("account_source: {}", account_source_as_str(plan.account_source));
+  if let Some(provider) = plan.provider.as_deref() {
+    println!("provider: {provider}");
+  }
   println!("target_base_url: {}", plan.target_base_url);
   println!("gateway_config: {}", plan.gateway_config_path.display());
   println!(
@@ -331,7 +338,26 @@ fn print_plan(kind: &str, plan: &ReconcilePlan) {
     println!("gateway_auth: unchanged");
   }
   if plan.account_source == AgentAccountSource::Main {
-    print_string_list("source_providers", &plan.source_provider_ids);
+    println!(
+      "provider_filter: {}",
+      plan
+        .provider_filter
+        .as_deref()
+        .map(|providers| providers.join(", "))
+        .unwrap_or_else(|| "(all effective providers)".into())
+    );
+    print_string_list("published_providers", &plan.published_provider_ids);
+  }
+  if !plan.providers_without_models.is_empty() {
+    println!(
+      "warning: OpenCode has no static model catalogue for {}; existing custom selections are preserved when safe, but these providers will not add models to the picker",
+      plan.providers_without_models.join(", ")
+    );
+  }
+  if plan.agent == AgentId::Opencode && plan.account_source == AgentAccountSource::Agent {
+    println!(
+      "warning: project-local .opencode agent/command Markdown model references are not rewritten; update references to transferred providers so they use the generated tokn-router namespace"
+    );
   }
   print_string_list(
     "imported_accounts",
@@ -372,6 +398,34 @@ fn requested_account_source(use_main_accounts: bool) -> Option<AgentAccountSourc
   use_main_accounts.then_some(AgentAccountSource::Main)
 }
 
+fn link_reconcile_request(cfg_path: Option<PathBuf>, args: AgentLinkArgs) -> ReconcileRequest {
+  ReconcileRequest {
+    agent: args.target.agent,
+    profile: args.profile,
+    mode: args.mode,
+    account_source: requested_account_source(args.use_main_accounts),
+    default_provider_id: args.provider,
+    // An explicit link recomputes the published provider set. `Some([])` means
+    // automatic discovery; `None` is reserved for sync's preserve semantics.
+    provider_filter: Some(args.provider_filters),
+    gateway_config_path: cfg_path,
+    agent_home: None,
+  }
+}
+
+fn sync_reconcile_request(cfg_path: Option<PathBuf>, agent: AgentId) -> ReconcileRequest {
+  ReconcileRequest {
+    agent,
+    profile: None,
+    mode: None,
+    account_source: None,
+    default_provider_id: None,
+    provider_filter: None,
+    gateway_config_path: cfg_path,
+    agent_home: None,
+  }
+}
+
 fn account_source_as_str(source: AgentAccountSource) -> &'static str {
   match source {
     AgentAccountSource::Agent => "agent",
@@ -389,10 +443,112 @@ fn confirm(prompt: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::cli::{Cli, Cmd};
+  use clap::Parser;
+
+  fn link_args(provider_filters: Vec<String>) -> AgentLinkArgs {
+    AgentLinkArgs {
+      target: AgentTargetArgs {
+        agent: AgentId::Opencode,
+      },
+      profile: None,
+      mode: None,
+      use_main_accounts: true,
+      provider: None,
+      provider_filters,
+      yes: true,
+    }
+  }
 
   #[test]
   fn use_main_accounts_only_requests_a_source_when_present() {
     assert_eq!(requested_account_source(false), None);
     assert_eq!(requested_account_source(true), Some(AgentAccountSource::Main));
+  }
+
+  #[test]
+  fn explicit_link_without_provider_filters_requests_automatic_discovery() {
+    let request = link_reconcile_request(None, link_args(Vec::new()));
+
+    assert_eq!(request.provider_filter, Some(Vec::new()));
+  }
+
+  #[test]
+  fn explicit_link_forwards_provider_filters() {
+    let request = link_reconcile_request(None, link_args(vec!["openai".into(), "deepseek".into()]));
+
+    assert_eq!(request.provider_filter, Some(vec!["openai".into(), "deepseek".into()]));
+  }
+
+  #[test]
+  fn explicit_link_forwards_the_raw_provider() {
+    let mut args = link_args(Vec::new());
+    args.mode = Some(RouteMode::Switch);
+    args.provider = Some("openai".into());
+    let request = link_reconcile_request(None, args);
+
+    assert_eq!(request.default_provider_id.as_deref(), Some("openai"));
+  }
+
+  #[test]
+  fn sync_defers_provider_resolution_to_the_existing_binding() {
+    let request = sync_reconcile_request(None, AgentId::Opencode);
+
+    assert_eq!(request.provider_filter, None);
+  }
+
+  #[test]
+  fn provider_filter_uses_the_canonical_option_name() {
+    let cli = Cli::try_parse_from([
+      "tokn-router",
+      "agent",
+      "link",
+      "opencode",
+      "--use-main-accounts",
+      "--provider-filter",
+      "deepseek",
+    ])
+    .unwrap();
+    let Cmd::Agent(AgentCmd::Link(args)) = cli.cmd else {
+      panic!("expected agent link command");
+    };
+
+    assert_eq!(args.provider_filters, ["deepseek"]);
+  }
+
+  #[test]
+  fn legacy_source_provider_option_is_rejected() {
+    let err = Cli::try_parse_from([
+      "tokn-router",
+      "agent",
+      "link",
+      "opencode",
+      "--use-main-accounts",
+      "--source-provider",
+      "openai",
+    ])
+    .expect_err("legacy source-provider option must not be accepted");
+
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+  }
+
+  #[test]
+  fn provider_and_provider_filter_are_mutually_exclusive() {
+    let err = Cli::try_parse_from([
+      "tokn-router",
+      "agent",
+      "link",
+      "opencode",
+      "--use-main-accounts",
+      "--mode",
+      "switch",
+      "--provider",
+      "openai",
+      "--provider-filter",
+      "deepseek",
+    ])
+    .expect_err("raw provider and normalized filter must conflict");
+
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
   }
 }
