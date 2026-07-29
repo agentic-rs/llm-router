@@ -1,6 +1,7 @@
 use crate::adapter::ProviderRoute;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokn_core::AgentId;
 
@@ -44,6 +45,11 @@ pub struct FileBackup {
   pub backup: Option<PathBuf>,
   pub existed: bool,
   pub created_by_migration: bool,
+  /// SHA-256 of the bytes written by a completed link or sync. Legacy and
+  /// incomplete manifests omit this field and remain unconditionally
+  /// restorable.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub applied_sha256: Option<String>,
 }
 
 impl MigrationManifest {
@@ -157,6 +163,7 @@ pub(crate) fn backup_path_for(path: &Path, timestamp: &str, files: &mut Vec<File
     backup,
     existed,
     created_by_migration: false,
+    applied_sha256: None,
   });
   Ok(())
 }
@@ -183,8 +190,27 @@ pub(crate) fn backup_sensitive_path_for(path: &Path, timestamp: &str, files: &mu
     backup,
     existed,
     created_by_migration: false,
+    applied_sha256: None,
   });
   Ok(())
+}
+
+pub(crate) fn record_applied_digests(files: &mut [FileBackup]) -> Result<()> {
+  for file in files {
+    let bytes = std::fs::read(&file.original)
+      .with_context(|| format!("reading applied migration file {}", file.original.display()))?;
+    file.applied_sha256 = Some(sha256(&bytes));
+  }
+  Ok(())
+}
+
+pub(crate) fn sha256(bytes: &[u8]) -> String {
+  let digest = Sha256::digest(bytes);
+  let mut encoded = String::with_capacity(digest.len() * 2);
+  for byte in digest {
+    std::fmt::Write::write_fmt(&mut encoded, format_args!("{byte:02x}")).expect("writing to a String cannot fail");
+  }
+  encoded
 }
 
 pub(crate) fn restore_sensitive_path_from_backup(backup: &Path, destination: &Path) -> Result<()> {
@@ -380,12 +406,14 @@ mod tests {
         backup: None,
         existed: true,
         created_by_migration: false,
+        applied_sha256: None,
       },
       FileBackup {
         original: created.clone(),
         backup: None,
         existed: false,
         created_by_migration: false,
+        applied_sha256: None,
       },
     ];
 
@@ -394,6 +422,27 @@ mod tests {
 
     assert!(!files[0].created_by_migration);
     assert!(files[1].created_by_migration);
+  }
+
+  #[test]
+  fn record_applied_digests_hashes_each_managed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, b"linked config").unwrap();
+    let mut files = vec![FileBackup {
+      original: path,
+      backup: None,
+      existed: false,
+      created_by_migration: true,
+      applied_sha256: None,
+    }];
+
+    record_applied_digests(&mut files).unwrap();
+
+    assert_eq!(
+      files[0].applied_sha256.as_deref(),
+      Some("ce7dbbfbdaf29a44bfc74f1f02d919a58af05dac4c2a2cad822b6bc56deef164")
+    );
   }
 
   #[test]
@@ -425,6 +474,21 @@ mod tests {
     .unwrap();
 
     assert!(manifest.completed);
+  }
+
+  #[test]
+  fn legacy_file_backup_without_applied_digest_remains_readable() {
+    let backup: FileBackup = serde_json::from_str(
+      r#"{
+        "original": "/tmp/opencode.json",
+        "backup": "/tmp/opencode.json.bak",
+        "existed": true,
+        "created_by_migration": false
+      }"#,
+    )
+    .unwrap();
+
+    assert_eq!(backup.applied_sha256, None);
   }
 
   #[test]

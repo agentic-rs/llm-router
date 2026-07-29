@@ -652,7 +652,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
     source_auth_snapshot,
     agent_auth_path: (account_source == AgentAccountSource::Agent
       && adapter.transfers_credentials()
-      && !imported_accounts.is_empty())
+      && credential_routes.iter().any(|route| route.transfer_source_auth))
     .then(|| adapter.auth_path(&home)),
     binding_profile,
     previous_materialized_profile,
@@ -798,12 +798,8 @@ pub fn unlink(request: UnlinkRequest) -> Result<UnlinkReport> {
   }
   let timestamp = latest.1.timestamp.clone();
 
-  if !latest.1.credentials_handoff_complete {
-    restore_latest_credentials(&request.agent, &latest.1)?;
-    let latest = chain.first_mut().expect("manifest chain contains selected manifest");
-    latest.1.credentials_handoff_complete = true;
-    manifest::write_manifest(&latest.0, &latest.1)?;
-  }
+  preflight_manifest_file_restoration(&chain)?;
+  restore_pending_credentials(&request.agent, &mut chain)?;
   let mut actions = Vec::new();
   for (_, current) in &chain {
     restore_manifest_files(current, &mut actions)?;
@@ -906,10 +902,175 @@ fn validate_manifest_restore_paths(path: &Path, manifest: &MigrationManifest) ->
   Ok(())
 }
 
-fn restore_latest_credentials(agent: &AgentId, manifest: &MigrationManifest) -> Result<()> {
-  let Some(agent_auth_path) = &manifest.agent_auth_path else {
+#[derive(Debug)]
+enum SimulatedFileState {
+  Missing,
+  Contents(Vec<u8>),
+}
+
+impl SimulatedFileState {
+  fn capture(path: &Path) -> Result<Self> {
+    match std::fs::read(path) {
+      Ok(bytes) => Ok(Self::Contents(bytes)),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::Missing),
+      Err(error) => Err(error).with_context(|| format!("reading managed migration file {}", path.display())),
+    }
+  }
+}
+
+/// Validate every destructive file transition before credential handoff or
+/// file rollback starts. Each predecessor is checked against a simulated
+/// restore of its successor, so edits made between syncs cannot be hidden by
+/// checking only the latest on-disk image.
+///
+/// The agent auth shard is intentionally exempt from the comparison. Runtime
+/// credential refresh is expected to mutate it, and unlink preserves that
+/// state through `restore_pending_credentials` before removing the shard.
+fn preflight_manifest_file_restoration(chain: &[(PathBuf, MigrationManifest)]) -> Result<()> {
+  let mut simulated = BTreeMap::<PathBuf, SimulatedFileState>::new();
+
+  for (manifest_path, current) in chain {
+    for file in &current.files {
+      if current.gateway_auth_shard_path.as_deref() == Some(file.original.as_path()) {
+        continue;
+      }
+      let Some(expected) = file.applied_sha256.as_deref() else {
+        // Legacy and incomplete manifests predate post-image tracking. They
+        // must remain available as recovery points.
+        continue;
+      };
+      if !simulated.contains_key(&file.original) {
+        simulated.insert(file.original.clone(), SimulatedFileState::capture(&file.original)?);
+      }
+      let matches = match simulated
+        .get(&file.original)
+        .expect("simulated state was inserted above")
+      {
+        SimulatedFileState::Missing => false,
+        SimulatedFileState::Contents(bytes) => manifest::sha256(bytes) == expected,
+      };
+      if !matches {
+        bail!(
+          "{} changed after the link or sync recorded by {}; refusing to unlink because rollback would overwrite those changes",
+          file.original.display(),
+          manifest_path.display()
+        );
+      }
+    }
+
+    for file in current.files.iter().rev() {
+      let restored = if file.created_by_migration {
+        SimulatedFileState::Missing
+      } else if let Some(backup) = &file.backup {
+        let bytes = std::fs::read(backup).with_context(|| format!("reading migration backup {}", backup.display()))?;
+        SimulatedFileState::Contents(bytes)
+      } else {
+        continue;
+      };
+      simulated.insert(file.original.clone(), restored);
+    }
+  }
+
+  Ok(())
+}
+
+fn restore_pending_credentials(agent: &AgentId, chain: &mut [(PathBuf, MigrationManifest)]) -> Result<()> {
+  if chain.iter().all(|(_, manifest)| manifest.credentials_handoff_complete) {
     return Ok(());
+  }
+
+  let has_pending_auth_path = chain
+    .iter()
+    .any(|(_, manifest)| !manifest.credentials_handoff_complete && manifest.agent_auth_path.is_some());
+  let latest_completed = chain
+    .first()
+    .expect("manifest chain contains selected manifest")
+    .1
+    .completed;
+  let accounts = if has_pending_auth_path {
+    let latest = &chain.first().expect("manifest chain contains selected manifest").1;
+    load_transferred_credentials(latest)?
+  } else {
+    Vec::new()
   };
+  let accounts_by_source = accounts
+    .iter()
+    .map(|account| (transfer_source_provider(account).to_string(), account))
+    .collect::<BTreeMap<_, _>>();
+  let accounts_by_id = accounts
+    .iter()
+    .map(|account| (account.id.as_str(), account))
+    .collect::<BTreeMap<_, _>>();
+  let mut target_sources = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+
+  for (manifest_path, current) in chain
+    .iter()
+    .filter(|(_, manifest)| !manifest.credentials_handoff_complete)
+  {
+    let Some(agent_auth_path) = current.agent_auth_path.as_ref() else {
+      continue;
+    };
+    for route in current
+      .provider_routes
+      .iter()
+      .filter(|route| route.transfer_source_auth)
+    {
+      target_sources
+        .entry(agent_auth_path.clone())
+        .or_default()
+        .insert(route.source_provider_id.clone());
+    }
+    if current.provider_routes.is_empty() {
+      let sources = target_sources.entry(agent_auth_path.clone()).or_default();
+      for account_id in &current.imported_account_ids {
+        if let Some(account) = accounts_by_id.get(account_id.as_str()) {
+          sources.insert(transfer_source_provider(account).to_string());
+        } else if current.completed {
+          bail!(
+            "legacy transferred account '{account_id}' recorded by {} is missing from the latest gateway credential set",
+            manifest_path.display()
+          );
+        }
+      }
+    }
+  }
+  let adapter = adapter_for(agent).ok_or_else(|| anyhow!("unsupported agent {agent}"))?;
+  for (agent_auth_path, sources) in target_sources {
+    let target_accounts = sources
+      .iter()
+      .filter_map(|source| {
+        accounts_by_source.get(source).copied().map(Ok).or_else(|| {
+          latest_completed.then(|| {
+            Err(anyhow!(
+              "transferred provider '{source}' is missing from the latest gateway credential set"
+            ))
+          })
+        })
+      })
+      .collect::<Result<Vec<_>>>()?
+      .into_iter()
+      .cloned()
+      .collect::<Vec<_>>();
+    adapter.restore_transferred_credentials(&agent_auth_path, &target_accounts)?;
+  }
+
+  // Checkpoint every pending handoff before file rollback removes the auth
+  // shard. If writing one manifest fails, retrying is safe because credential
+  // restoration does not replace keys that are already present.
+  for (path, current) in chain
+    .iter_mut()
+    .filter(|(_, manifest)| !manifest.credentials_handoff_complete)
+  {
+    current.credentials_handoff_complete = true;
+    manifest::write_manifest(path, current)?;
+  }
+  Ok(())
+}
+
+fn load_transferred_credentials(manifest: &MigrationManifest) -> Result<Vec<Account>> {
+  if manifest.imported_account_ids.is_empty() {
+    return Ok(Vec::new());
+  }
   let Some(gateway_auth_path) = &manifest.gateway_auth_path else {
     bail!("manifest is missing the gateway auth path required to restore transferred credentials");
   };
@@ -918,11 +1079,11 @@ fn restore_latest_credentials(agent: &AgentId, manifest: &MigrationManifest) -> 
   for id in &manifest.imported_account_ids {
     let Some(account) = store.get(id).cloned() else {
       // Agent auth is stripped only after the shard save completes. A missing
-      // account in an incomplete migration therefore means the source auth is
-      // still authoritative and the file rollback can proceed without an
-      // export.
+      // account in an incomplete migration therefore means that account's
+      // source auth is still authoritative. Keep loading older chain accounts
+      // so their original stripped paths can still be restored.
       if !manifest.completed {
-        return Ok(());
+        continue;
       }
       bail!(
         "transferred account '{id}' is missing from {}",
@@ -932,7 +1093,7 @@ fn restore_latest_credentials(agent: &AgentId, manifest: &MigrationManifest) -> 
     if let Some(shard_path) = manifest.gateway_auth_shard_path.as_deref() {
       if store.account_source_path(id).as_deref() != Some(shard_path) {
         if !manifest.completed {
-          return Ok(());
+          continue;
         }
         bail!(
           "transferred account '{id}' is no longer owned by {}",
@@ -942,9 +1103,7 @@ fn restore_latest_credentials(agent: &AgentId, manifest: &MigrationManifest) -> 
     }
     accounts.push(account);
   }
-  adapter_for(agent)
-    .ok_or_else(|| anyhow!("unsupported agent {agent}"))?
-    .restore_transferred_credentials(agent_auth_path, &accounts)
+  Ok(accounts)
 }
 
 fn restore_manifest_files(manifest: &MigrationManifest, actions: &mut Vec<FileAction>) -> Result<()> {
@@ -1017,8 +1176,8 @@ fn apply_reconcile_to_manifest_path(plan: ReconcilePlan, manifest_path: PathBuf)
     manifest::mark_created(&mut files, &edit.path, existed);
   }
 
-  let manifest = MigrationManifest {
-    version: 4,
+  let mut manifest = MigrationManifest {
+    version: 5,
     completed: true,
     agent: plan.agent.clone(),
     timestamp: plan.timestamp.clone(),
@@ -1082,6 +1241,7 @@ fn apply_reconcile_to_manifest_path(plan: ReconcilePlan, manifest_path: PathBuf)
     write_edit(edit)?;
   }
 
+  manifest::record_applied_digests(&mut manifest.files)?;
   let manifest = manifest.complete();
   manifest::write_manifest(&manifest_path, &manifest)?;
   Ok(ApplyReport {
@@ -1127,14 +1287,17 @@ fn reject_successor_without_pending_credentials(plan: &ReconcilePlan) -> Result<
   if !adapter.transfers_credentials() {
     return Ok(());
   }
-  let previous = manifest::read_manifest(previous_manifest_path)?;
-  if previous.agent_auth_path.is_none() || previous.credentials_handoff_complete {
+  let previous_chain = manifest_chain(previous_manifest_path, &plan.agent)?;
+  let Some((pending_path, _)) = previous_chain
+    .iter()
+    .find(|(_, previous)| previous.agent_auth_path.is_some() && !previous.credentials_handoff_complete)
+  else {
     return Ok(());
-  }
+  };
   bail!(
     "{} has a pending credential handoff in {}, but its managed auth shard is unavailable; restore the shard or source credentials before syncing",
     plan.agent,
-    previous_manifest_path.display()
+    pending_path.display()
   );
 }
 
@@ -2332,6 +2495,7 @@ mod tests {
         backup: None,
         existed: true,
         created_by_migration: false,
+        applied_sha256: None,
       }],
     }
   }
@@ -3057,10 +3221,8 @@ providers = ["anthropic"]
     assert!(manifest.credentials_handoff_complete);
     assert!(manifest.imported_account_ids.is_empty());
 
-    let mut fragment = std::fs::read_to_string(&fragment_path)
-      .unwrap()
-      .parse::<toml_edit::DocumentMut>()
-      .unwrap();
+    let linked_fragment = std::fs::read_to_string(&fragment_path).unwrap();
+    let mut fragment = linked_fragment.parse::<toml_edit::DocumentMut>().unwrap();
     fragment["agents"]["opencode"]["mode"] = toml_edit::value("route");
     fragment["agents"]["opencode"]
       .as_table_mut()
@@ -3117,6 +3279,9 @@ providers = ["anthropic"]
       .unwrap();
     assert_eq!(rewritten["model"], "tokn-router/gpt-5");
 
+    // This test only previews the declarative relink. Put the active
+    // manifest's post-image back before using unlink for cleanup.
+    std::fs::write(&fragment_path, linked_fragment).unwrap();
     unlink(UnlinkRequest {
       agent: AgentId::Opencode,
       backup_id: Some(manifest_path.display().to_string()),
@@ -4109,6 +4274,7 @@ sync = true
           backup: Some(original_backup_path),
           existed: true,
           created_by_migration: false,
+          applied_sha256: None,
         }],
       },
     )
@@ -4812,6 +4978,13 @@ providers = ["anthropic"]
       .any(|file| file.original == gateway_auth_shard_path));
     assert!(!manifest.files.iter().any(|file| file.original == gateway_auth_path));
 
+    // Runtime credential refresh legitimately changes the managed shard
+    // after its applied digest was recorded. Unlink must export that current
+    // value instead of treating it as conflicting config drift.
+    let mut store = AuthStore::load(Some(&gateway_auth_path), None).unwrap();
+    store.get_mut("opencode-openai").unwrap().api_key = Some(tokn_core::util::secret::Secret::new("sk-rotated".into()));
+    store.save().unwrap();
+
     unlink(UnlinkRequest {
       agent: AgentId::Opencode,
       backup_id: Some(manifest_path.display().to_string()),
@@ -4826,9 +4999,200 @@ providers = ["anthropic"]
       original_opencode_config
     );
     assert_eq!(
-      serde_json::from_str::<Value>(&std::fs::read_to_string(&opencode_auth_path).unwrap()).unwrap(),
-      original_opencode_auth
+      serde_json::from_str::<Value>(&std::fs::read_to_string(&opencode_auth_path).unwrap()).unwrap()["openai"]["key"],
+      "sk-rotated"
     );
+  }
+
+  #[test]
+  fn unlink_rejects_post_link_edits_to_existing_opencode_config_before_restoring_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_home = dir.path().join("home");
+    let gateway_config_path = dir.path().join("gateway/config.toml");
+    let gateway_auth_path = dir.path().join("gateway/auth.yaml");
+    let manifest_path = dir.path().join("opencode-link.json");
+    let opencode_config_path = agent_home.join(".config/opencode/opencode.jsonc");
+    let opencode_auth_path = agent_home.join(".local/share/opencode/auth.json");
+    std::fs::create_dir_all(gateway_config_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(opencode_config_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(opencode_auth_path.parent().unwrap()).unwrap();
+    std::fs::write(&gateway_config_path, "[server]\nhost = \"127.0.0.1\"\nport = 4141\n").unwrap();
+    std::fs::write(
+      &opencode_config_path,
+      "{\n  // Existing user config.\n  \"mcp\": {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+      &opencode_auth_path,
+      serde_json::to_vec_pretty(&serde_json::json!({
+        "openai": {"type": "api", "key": "sk-opencode"}
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+
+    let mut plan = plan_reconcile_with_gateway_auth_path(
+      ReconcileRequest {
+        agent: AgentId::Opencode,
+        profile: None,
+        mode: None,
+        account_source: Some(AgentAccountSource::Agent),
+        default_provider_id: None,
+        provider_filter: None,
+        gateway_config_path: Some(gateway_config_path.clone()),
+        agent_home: Some(agent_home),
+      },
+      gateway_auth_path.clone(),
+    )
+    .unwrap();
+    plan.timestamp = "20260729T040101Z".into();
+    let gateway_auth_shard_path = plan.gateway_auth_shard_path.clone().unwrap();
+    apply_reconcile_to_manifest_path(plan, manifest_path.clone()).unwrap();
+
+    let linked_auth = std::fs::read(&opencode_auth_path).unwrap();
+    assert!(serde_json::from_slice::<Value>(&linked_auth)
+      .unwrap()
+      .get("openai")
+      .is_none());
+    let linked_shard = std::fs::read(&gateway_auth_shard_path).unwrap();
+    let fragment_path = tokn_config::paths::agent_config_fragment_path(&gateway_config_path, "opencode");
+    let linked_fragment = std::fs::read(&fragment_path).unwrap();
+    let mut edited = crate::jsonc::read_jsonc(&opencode_config_path).unwrap();
+    edited["theme"] = Value::String("user-theme".into());
+    std::fs::write(&opencode_config_path, serde_json::to_vec_pretty(&edited).unwrap()).unwrap();
+    let edited_config = std::fs::read(&opencode_config_path).unwrap();
+
+    let error = unlink(UnlinkRequest {
+      agent: AgentId::Opencode,
+      backup_id: Some(manifest_path.display().to_string()),
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains(&opencode_config_path.display().to_string()));
+    assert!(error.to_string().contains("rollback would overwrite"));
+    assert_eq!(std::fs::read(&opencode_config_path).unwrap(), edited_config);
+    assert_eq!(std::fs::read(&opencode_auth_path).unwrap(), linked_auth);
+    assert_eq!(std::fs::read(&gateway_auth_shard_path).unwrap(), linked_shard);
+    assert_eq!(std::fs::read(&fragment_path).unwrap(), linked_fragment);
+    let manifest = manifest::read_manifest(&manifest_path).unwrap();
+    assert!(!manifest.credentials_handoff_complete);
+    assert!(!manifest.unlinked);
+  }
+
+  #[test]
+  fn unlink_rejects_post_link_edits_to_a_link_created_opencode_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_home = dir.path().join("home");
+    let gateway_config_path = dir.path().join("gateway/config.toml");
+    let gateway_auth_path = dir.path().join("gateway/auth.yaml");
+    let manifest_path = dir.path().join("opencode-main-link.json");
+    let opencode_config_path = agent_home.join(".config/opencode/opencode.jsonc");
+    std::fs::create_dir_all(gateway_config_path.parent().unwrap()).unwrap();
+    std::fs::write(&gateway_config_path, "[server]\nhost = \"127.0.0.1\"\nport = 4141\n").unwrap();
+    save_main_accounts(
+      &gateway_auth_path,
+      &gateway_config_path,
+      &[("main-openai", tokn_core::provider::ID_OPENAI)],
+    );
+
+    let mut plan = plan_reconcile_with_gateway_auth_path(
+      ReconcileRequest {
+        agent: AgentId::Opencode,
+        profile: None,
+        mode: Some(RouteMode::Route),
+        account_source: Some(AgentAccountSource::Main),
+        default_provider_id: None,
+        provider_filter: Some(Vec::new()),
+        gateway_config_path: Some(gateway_config_path.clone()),
+        agent_home: Some(agent_home),
+      },
+      gateway_auth_path,
+    )
+    .unwrap();
+    plan.timestamp = "20260729T040102Z".into();
+    apply_reconcile_to_manifest_path(plan, manifest_path.clone()).unwrap();
+
+    assert!(opencode_config_path.exists());
+    let fragment_path = tokn_config::paths::agent_config_fragment_path(&gateway_config_path, "opencode");
+    let linked_fragment = std::fs::read(&fragment_path).unwrap();
+    let mut edited = crate::jsonc::read_jsonc(&opencode_config_path).unwrap();
+    edited["theme"] = Value::String("user-theme".into());
+    std::fs::write(&opencode_config_path, serde_json::to_vec_pretty(&edited).unwrap()).unwrap();
+    let edited_config = std::fs::read(&opencode_config_path).unwrap();
+
+    let error = unlink(UnlinkRequest {
+      agent: AgentId::Opencode,
+      backup_id: Some(manifest_path.display().to_string()),
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains(&opencode_config_path.display().to_string()));
+    assert_eq!(std::fs::read(&opencode_config_path).unwrap(), edited_config);
+    assert_eq!(std::fs::read(&fragment_path).unwrap(), linked_fragment);
+    let manifest = manifest::read_manifest(&manifest_path).unwrap();
+    assert!(manifest.files.iter().all(|file| file.applied_sha256.is_some()));
+    assert!(!manifest.unlinked);
+  }
+
+  #[test]
+  fn unlink_preflights_simulated_ancestor_post_images_before_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("opencode.json");
+    let original_backup_path = dir.path().join("opencode.json.original");
+    let intervening_backup_path = dir.path().join("opencode.json.intervening");
+    let first_manifest_path = dir.path().join("20260729T040101Z-opencode.json");
+    let second_manifest_path = dir.path().join("20260729T040102Z-opencode.json");
+    std::fs::write(&config_path, b"second applied image").unwrap();
+    std::fs::write(&original_backup_path, b"original image").unwrap();
+    std::fs::write(&intervening_backup_path, b"user edit between syncs").unwrap();
+    let first = MigrationManifest {
+      version: 5,
+      completed: true,
+      agent: AgentId::Opencode,
+      timestamp: "20260729T040101Z".into(),
+      profile: Some("opencode".into()),
+      target_base_url: "http://127.0.0.1:4141/opencode/v1".into(),
+      gateway_auth_path: None,
+      gateway_auth_shard_path: None,
+      agent_auth_path: None,
+      provider_routes: Vec::new(),
+      previous_manifest: None,
+      unlinked: false,
+      credentials_handoff_complete: true,
+      imported_account_ids: Vec::new(),
+      files: vec![FileBackup {
+        original: config_path.clone(),
+        backup: Some(original_backup_path),
+        existed: true,
+        created_by_migration: false,
+        applied_sha256: Some(manifest::sha256(b"first applied image")),
+      }],
+    };
+    let second = MigrationManifest {
+      timestamp: "20260729T040102Z".into(),
+      previous_manifest: Some(first_manifest_path.clone()),
+      files: vec![FileBackup {
+        original: config_path.clone(),
+        backup: Some(intervening_backup_path),
+        existed: true,
+        created_by_migration: false,
+        applied_sha256: Some(manifest::sha256(b"second applied image")),
+      }],
+      ..first.clone()
+    };
+    manifest::write_manifest(&first_manifest_path, &first).unwrap();
+    manifest::write_manifest(&second_manifest_path, &second).unwrap();
+
+    let error = unlink(UnlinkRequest {
+      agent: AgentId::Opencode,
+      backup_id: Some(second_manifest_path.display().to_string()),
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains(&first_manifest_path.display().to_string()));
+    assert_eq!(std::fs::read(&config_path).unwrap(), b"second applied image");
+    assert!(!manifest::read_manifest(&first_manifest_path).unwrap().unlinked);
+    assert!(!manifest::read_manifest(&second_manifest_path).unwrap().unlinked);
   }
 
   #[test]
@@ -4836,25 +5200,34 @@ providers = ["anthropic"]
     let dir = tempfile::tempdir().unwrap();
     let gateway_config_path = dir.path().join("gateway/config.toml");
     let gateway_auth_path = dir.path().join("gateway/auth.yaml");
+    let pending_manifest_path = dir.path().join("pending-opencode.json");
     let previous_manifest_path = dir.path().join("previous-opencode.json");
+    let pending_manifest = MigrationManifest {
+      version: 4,
+      completed: true,
+      agent: AgentId::Opencode,
+      timestamp: "20260714T020101Z".into(),
+      profile: Some("opencode".into()),
+      target_base_url: "http://127.0.0.1:4141/opencode/v1".into(),
+      gateway_auth_path: Some(gateway_auth_path.clone()),
+      gateway_auth_shard_path: Some(dir.path().join("gateway/auth.d/opencode.yaml")),
+      agent_auth_path: Some(dir.path().join("home/.local/share/opencode/auth.json")),
+      provider_routes: Vec::new(),
+      previous_manifest: None,
+      unlinked: false,
+      credentials_handoff_complete: false,
+      imported_account_ids: vec!["opencode-openai".into()],
+      files: Vec::new(),
+    };
+    manifest::write_manifest(&pending_manifest_path, &pending_manifest).unwrap();
     manifest::write_manifest(
       &previous_manifest_path,
       &MigrationManifest {
-        version: 4,
-        completed: true,
-        agent: AgentId::Opencode,
         timestamp: "20260714T020102Z".into(),
-        profile: Some("opencode".into()),
-        target_base_url: "http://127.0.0.1:4141/opencode/v1".into(),
-        gateway_auth_path: Some(gateway_auth_path.clone()),
-        gateway_auth_shard_path: Some(dir.path().join("gateway/auth.d/opencode.yaml")),
-        agent_auth_path: Some(dir.path().join("home/.local/share/opencode/auth.json")),
-        provider_routes: Vec::new(),
-        previous_manifest: None,
-        unlinked: false,
-        credentials_handoff_complete: false,
-        imported_account_ids: vec!["opencode-openai".into()],
-        files: Vec::new(),
+        agent_auth_path: None,
+        previous_manifest: Some(pending_manifest_path.clone()),
+        credentials_handoff_complete: true,
+        ..pending_manifest
       },
     )
     .unwrap();
@@ -4893,6 +5266,7 @@ providers = ["anthropic"]
     let error = reject_successor_without_pending_credentials(&plan).unwrap_err();
 
     assert!(error.to_string().contains("pending credential handoff"));
+    assert!(error.to_string().contains(&pending_manifest_path.display().to_string()));
   }
 
   #[test]
@@ -5031,6 +5405,7 @@ providers = ["anthropic"]
       .provider_routes
       .iter()
       .all(|route| !route.transfer_source_auth));
+    assert!(second_plan.agent_auth_path.is_none());
     apply_reconcile_to_manifest_path(second_plan, second_manifest_path.clone()).unwrap();
 
     let synced_store = AuthStore::load(Some(&gateway_auth_path), None).unwrap();
@@ -5050,6 +5425,7 @@ providers = ["anthropic"]
       second_manifest.previous_manifest.as_deref(),
       Some(first_manifest_path.as_path())
     );
+    assert!(second_manifest.credentials_handoff_complete);
 
     let err = unlink(UnlinkRequest {
       agent: AgentId::Opencode,
@@ -5085,6 +5461,190 @@ providers = ["anthropic"]
     let second_manifest = manifest::read_manifest(&second_manifest_path).unwrap();
     assert!(second_manifest.unlinked);
     assert!(second_manifest.credentials_handoff_complete);
+  }
+
+  #[test]
+  fn unlink_restores_mixed_manifest_chain_to_each_transfer_data_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway_auth_path = dir.path().join("gateway/auth.yaml");
+    let first_auth_path = dir.path().join("xdg-data-first/opencode/auth.json");
+    let second_auth_path = dir.path().join("xdg-data-second/opencode/auth.json");
+    let first_manifest_path = dir.path().join("manifests-first/20260604T153012Z-opencode.json");
+    let second_manifest_path = dir.path().join("manifests-second/20260604T153013Z-opencode.json");
+    std::fs::create_dir_all(first_auth_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(second_auth_path.parent().unwrap()).unwrap();
+    std::fs::write(&first_auth_path, "{}").unwrap();
+    std::fs::write(&second_auth_path, "{}").unwrap();
+    let shard_path = save_agent_shard_accounts(
+      &gateway_auth_path,
+      &first_auth_path,
+      &[
+        ("opencode-openai", tokn_core::provider::ID_OPENAI, true),
+        ("opencode-deepseek", tokn_core::provider::ID_DEEPSEEK, true),
+      ],
+    );
+    let route = |source_provider_id: &str, account_id: &str, transfer_source_auth: bool| ProviderRoute {
+      source_provider_id: source_provider_id.into(),
+      gateway_provider_id: source_provider_id.into(),
+      account_id: account_id.into(),
+      profile: format!("opencode-{source_provider_id}"),
+      base_url: format!("http://127.0.0.1:4141/opencode-{source_provider_id}/v1"),
+      transfer_source_auth,
+    };
+    let manifest = |version: u32,
+                    timestamp: &str,
+                    agent_auth_path: PathBuf,
+                    provider_routes: Vec<ProviderRoute>,
+                    imported_account_ids: Vec<String>,
+                    previous_manifest: Option<PathBuf>| MigrationManifest {
+      version,
+      completed: true,
+      agent: AgentId::Opencode,
+      timestamp: timestamp.into(),
+      profile: Some("opencode".into()),
+      target_base_url: "http://127.0.0.1:4141/opencode/v1".into(),
+      gateway_auth_path: Some(gateway_auth_path.clone()),
+      gateway_auth_shard_path: Some(shard_path.clone()),
+      agent_auth_path: Some(agent_auth_path),
+      provider_routes,
+      previous_manifest,
+      unlinked: false,
+      credentials_handoff_complete: false,
+      imported_account_ids,
+      files: Vec::new(),
+    };
+    manifest::write_manifest(
+      &first_manifest_path,
+      &manifest(
+        1,
+        "20260604T153012Z",
+        first_auth_path.clone(),
+        Vec::new(),
+        vec!["opencode-openai".into()],
+        None,
+      ),
+    )
+    .unwrap();
+    manifest::write_manifest(
+      &second_manifest_path,
+      &manifest(
+        4,
+        "20260604T153013Z",
+        second_auth_path.clone(),
+        vec![
+          route("openai", "opencode-openai", false),
+          route("deepseek", "opencode-deepseek", true),
+        ],
+        vec!["opencode-deepseek".into(), "opencode-openai".into()],
+        Some(first_manifest_path.clone()),
+      ),
+    )
+    .unwrap();
+
+    unlink(UnlinkRequest {
+      agent: AgentId::Opencode,
+      backup_id: Some(second_manifest_path.display().to_string()),
+    })
+    .unwrap();
+
+    let first_auth: Value = serde_json::from_str(&std::fs::read_to_string(first_auth_path).unwrap()).unwrap();
+    assert_eq!(first_auth["openai"]["key"], "sk-opencode-openai");
+    assert!(first_auth.get("deepseek").is_none());
+    let second_auth: Value = serde_json::from_str(&std::fs::read_to_string(second_auth_path).unwrap()).unwrap();
+    assert_eq!(second_auth["deepseek"]["key"], "sk-opencode-deepseek");
+    assert!(second_auth.get("openai").is_none());
+    assert!(
+      manifest::read_manifest(&first_manifest_path)
+        .unwrap()
+        .credentials_handoff_complete
+    );
+    assert!(
+      manifest::read_manifest(&second_manifest_path)
+        .unwrap()
+        .credentials_handoff_complete
+    );
+  }
+
+  #[test]
+  fn incomplete_successor_restores_available_ancestor_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway_auth_path = dir.path().join("gateway/auth.yaml");
+    let first_auth_path = dir.path().join("xdg-data-first/opencode/auth.json");
+    let second_auth_path = dir.path().join("xdg-data-second/opencode/auth.json");
+    let first_manifest_path = dir.path().join("20260604T153012Z-opencode.json");
+    let second_manifest_path = dir.path().join("20260604T153013Z-opencode.json");
+    std::fs::create_dir_all(first_auth_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(second_auth_path.parent().unwrap()).unwrap();
+    std::fs::write(&first_auth_path, "{}").unwrap();
+    std::fs::write(
+      &second_auth_path,
+      serde_json::to_vec_pretty(&serde_json::json!({
+        "deepseek": {"type": "api", "key": "sk-source-authoritative"}
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+    let shard_path = save_agent_shard_accounts(
+      &gateway_auth_path,
+      &first_auth_path,
+      &[("opencode-openai", tokn_core::provider::ID_OPENAI, true)],
+    );
+    let route = |source_provider_id: &str, account_id: &str, transfer_source_auth: bool| ProviderRoute {
+      source_provider_id: source_provider_id.into(),
+      gateway_provider_id: source_provider_id.into(),
+      account_id: account_id.into(),
+      profile: format!("opencode-{source_provider_id}"),
+      base_url: format!("http://127.0.0.1:4141/opencode-{source_provider_id}/v1"),
+      transfer_source_auth,
+    };
+    let first_manifest = MigrationManifest {
+      version: 4,
+      completed: true,
+      agent: AgentId::Opencode,
+      timestamp: "20260604T153012Z".into(),
+      profile: Some("opencode".into()),
+      target_base_url: "http://127.0.0.1:4141/opencode/v1".into(),
+      gateway_auth_path: Some(gateway_auth_path),
+      gateway_auth_shard_path: Some(shard_path),
+      agent_auth_path: Some(first_auth_path.clone()),
+      provider_routes: vec![route("openai", "opencode-openai", true)],
+      previous_manifest: None,
+      unlinked: false,
+      credentials_handoff_complete: false,
+      imported_account_ids: vec!["opencode-openai".into()],
+      files: Vec::new(),
+    };
+    let second_manifest = MigrationManifest {
+      completed: false,
+      timestamp: "20260604T153013Z".into(),
+      agent_auth_path: Some(second_auth_path.clone()),
+      provider_routes: vec![
+        route("openai", "opencode-openai", false),
+        route("deepseek", "opencode-deepseek", true),
+      ],
+      previous_manifest: Some(first_manifest_path.clone()),
+      imported_account_ids: vec!["opencode-deepseek".into(), "opencode-openai".into()],
+      ..first_manifest.clone()
+    };
+    manifest::write_manifest(&first_manifest_path, &first_manifest).unwrap();
+    manifest::write_manifest(&second_manifest_path, &second_manifest).unwrap();
+
+    unlink(UnlinkRequest {
+      agent: AgentId::Opencode,
+      backup_id: Some(second_manifest_path.display().to_string()),
+    })
+    .unwrap();
+
+    let first_auth: Value = serde_json::from_str(&std::fs::read_to_string(first_auth_path).unwrap()).unwrap();
+    assert_eq!(first_auth["openai"]["key"], "sk-opencode-openai");
+    let second_auth: Value = serde_json::from_str(&std::fs::read_to_string(second_auth_path).unwrap()).unwrap();
+    assert_eq!(second_auth["deepseek"]["key"], "sk-source-authoritative");
+    assert!(second_auth.get("openai").is_none());
+    for path in [&first_manifest_path, &second_manifest_path] {
+      let restored = manifest::read_manifest(path).unwrap();
+      assert!(restored.credentials_handoff_complete);
+      assert!(restored.unlinked);
+    }
   }
 
   #[test]
@@ -5155,6 +5715,7 @@ providers = ["anthropic"]
         backup: Some(backup),
         existed: true,
         created_by_migration: false,
+        applied_sha256: None,
       }],
     };
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -5195,6 +5756,7 @@ providers = ["anthropic"]
         backup: None,
         existed: false,
         created_by_migration: true,
+        applied_sha256: None,
       }],
     };
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
