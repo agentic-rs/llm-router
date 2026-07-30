@@ -102,6 +102,7 @@ rpassword = "7"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 sha2 = "0.11"
 subtle = "2"
 smol_str = { version = "0.3", features = ["serde"] }

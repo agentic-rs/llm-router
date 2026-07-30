@@ -277,7 +277,7 @@ async fn route_intercepted_request(
     }
   }
 
-  if matches!(resolved_mode, RouteMode::Passthrough | RouteMode::Switch) {
+  if resolved_mode.is_verbatim() {
     let response = match resolved_mode {
       RouteMode::Passthrough => {
         super::passthrough_pipeline::proxy_passthrough_via_pipeline(

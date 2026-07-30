@@ -297,6 +297,18 @@ impl AuthStore {
     self.source_paths.values().cloned().collect()
   }
 
+  /// Return the SHA-256 digest of the exact bytes loaded or most recently
+  /// written for a credential source.
+  ///
+  /// This supports conflict-safe migration checkpoints without exposing
+  /// credential contents or adopting a later filesystem mutation.
+  pub fn source_sha256(&self, source: &AuthSource) -> Option<String> {
+    let SourceSnapshot::Contents(contents) = self.source_snapshots.get(source)? else {
+      return None;
+    };
+    Some(tokn_core::util::digest::sha256_hex(contents))
+  }
+
   /// Resolve a source to its backing path. A validated shard path can be
   /// resolved before it has been created.
   pub fn source_path(&self, source: &AuthSource) -> Result<PathBuf> {
@@ -609,6 +621,27 @@ mod tests {
     assert_eq!(loaded.accounts.len(), 2);
     assert_eq!(loaded.accounts[0].id, "a1");
     assert_eq!(loaded.accounts[1].id, "a2");
+  }
+
+  #[test]
+  fn source_digest_tracks_exact_saved_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&path), None).unwrap();
+    store.upsert(sample_account("a1"));
+    store.save().unwrap();
+    let first = store.source_sha256(&AuthSource::Main).unwrap();
+
+    store.get_mut("a1").unwrap().label = Some("updated".into());
+    store.save().unwrap();
+    let second = store.source_sha256(&AuthSource::Main).unwrap();
+    let reloaded = AuthStore::load(Some(&path), None).unwrap();
+
+    assert_ne!(first, second);
+    assert_eq!(
+      reloaded.source_sha256(&AuthSource::Main).as_deref(),
+      Some(second.as_str())
+    );
   }
 
   #[test]

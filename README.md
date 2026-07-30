@@ -369,30 +369,82 @@ tokn-gateway agent list
 tokn-gateway agent show codex-cli|opencode
 tokn-gateway agent import codex-cli|opencode [--yes]
 tokn-gateway agent link codex-cli|opencode [--profile NAME] [--mode MODE] [--yes]
-tokn-gateway agent link opencode --use-main-accounts [--mode passthrough|switch|exact|route|fuzzy] [--provider ID] [--source-provider ID]... [--yes]
+tokn-gateway agent link opencode --use-main-accounts [--mode passthrough|switch|exact|route|fuzzy] [--provider ID] [--provider-filter ID]... [--yes]
 tokn-gateway agent sync codex-cli|opencode|--all [--yes]
-tokn-gateway agent unlink codex-cli|opencode [--backup-id ID]
+tokn-gateway agent unlink codex-cli|opencode [--backup-id ID] [--legacy-root PATH] [--yes]
 tokn-gateway migration [--commit|--rollback]
 tokn-gateway update
 tokn-gateway smoke provider|model|send ...
 ```
 
-Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`.
+Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`. A
+fresh link defaults to `route`; a relink or sync preserves the binding's
+current mode when `--mode` is omitted. `exact` requires an agent that can
+encode provider-qualified model IDs and is currently supported only by
+OpenCode.
 
 `agent link` writes its binding and generated profile to
-`config.d/<agent>.toml`, so the primary config remains untouched. When a normal
+`config.d/<agent>.toml`, so the primary config remains untouched. Tokn owns
+that generated fragment and checks its planned preimage during link and sync;
+do not edit it concurrently while either command is running. When a normal
 agent-owned link transfers credentials, its matching `auth.d/<agent>.yaml`
 fragment forms a separately backed up and restored credential bundle; the shared
-root `auth.yaml` stays unchanged. `--use-main-accounts` creates no auth fragment:
-OpenCode keeps its local credentials unchanged and routes selected provider
-namespaces through the gateway's existing account pool. `--source-provider` is
-repeatable and defaults to `openai`; raw `passthrough` and `switch` links require
-a target `--provider` (or a configured default provider) that supports
-OpenCode's Chat Completions endpoint. Codex CLI does not yet support
-main-account links because its credential bootstrap would need to be changed.
-An existing link keeps its account source; unlink it before linking again with a
-different source. To move a pre-`auth.d` imported link, unlink it first so its
-local credentials are restored, then link it again.
+root `auth.yaml` stays unchanged. An agent-owned link requires at least one
+importable local credential and never falls back to the main account pool.
+`--use-main-accounts` creates no auth fragment: OpenCode keeps its local
+credentials unchanged and routes selected providers through the gateway's
+existing account pool. `--provider-filter` is repeatable;
+if it is omitted, the link discovers all enabled providers in the effective
+main account pool. `agent sync` repeats that discovery and retains an explicit
+filter when one was configured. Because the link does not edit OpenCode's local
+auth, its direct providers remain available alongside the gateway-published
+providers. Raw `passthrough` and `switch` links require a single target
+`--provider` (or a configured default provider) that supports OpenCode's Chat
+Completions endpoint. That choice is persisted as
+`[agents.opencode].provider` and is the desired link state; the generated
+profile's `default_provider_id` is only its runtime snapshot. This means sync
+and status retain the raw target even when generated profile state drifts.
+`provider` and `provider_filter` are mutually exclusive: `provider` is
+valid only for main-account `switch`/`passthrough`, while `provider_filter` is
+valid only for main-account `route`/`fuzzy`/`exact`. Older raw bindings without
+`provider` recover it once from their generated profile (or gateway defaults)
+on sync. Codex
+CLI does not yet support main-account links because its credential bootstrap
+would need to be changed. An existing link keeps its account source; unlink it
+before linking again with a different source. To move a pre-`auth.d` imported
+link, unlink it first so its local credentials are restored, then link it again.
+Manifests written by older versions may contain paths relative to the directory
+where the link command ran. Unlink refuses to guess that directory; pass the
+original directory explicitly with `--legacy-root`. The directory itself no
+longer needs to exist. A legacy chain containing more than one relative-path
+manifest is refused because each link or sync invocation may have used a
+different working directory and one root cannot resolve that chain safely.
+
+OpenCode publication follows the route mode. `route` and `fuzzy` publish one
+`tokn-router` provider with a deduplicated model list. `exact` uses the same
+provider but publishes provider-qualified model IDs such as
+`tokn-router/deepseek/deepseek-chat`. `switch` and `passthrough` publish pinned
+providers such as `tokn-router-openai`, backed by provider-specific profiles.
+The provider/profile layout is derived rather than configured independently:
+normalized modes use one shared profile, raw main-account modes use one pinned
+profile, and raw agent-owned modes use one profile per provider. The generated
+profiles are the runtime materialization of `[agents.opencode].mode`; a
+mismatch is configuration drift. Providers without a static model catalogue
+remain usable with an existing custom selection, but cannot add discoverable
+entries to OpenCode's model picker and produce a link warning.
+
+Generated agent clients currently use a non-secret sentinel API key. Therefore
+link and sync reject every mode when `[api_key].enabled = true`, including
+`passthrough`, because it would bypass the requested client-authentication
+boundary. Disable gateway API-key enforcement before linking until
+agent-scoped client-key provisioning is supported.
+
+Agent-owned links also check global OpenCode agent and command Markdown files
+before transferring credentials. A `model` frontmatter entry that still names
+a transferred provider blocks the link and reports its generated replacement.
+Project-local `.opencode` Markdown files cannot be discovered by a global link,
+so update those model references to the generated `tokn-router` namespace
+manually; the link plan prints this reminder.
 
 ## Proxy Mode
 

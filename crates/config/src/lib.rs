@@ -1,13 +1,14 @@
 pub mod error;
 pub mod paths;
 
-pub use error::{Error, Result};
+pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
 pub use tokn_core::AgentId;
 
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokn_core::provider::ID_GITHUB_COPILOT;
 
@@ -15,6 +16,28 @@ pub const DEFAULT_PORT: u16 = 4141;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PROXY_PORT: u16 = 4142;
 pub const DEFAULT_PROVIDER: &str = ID_GITHUB_COPILOT;
+
+#[derive(Clone, Copy)]
+enum ConfigEditPreimage<'a> {
+  Missing,
+  Contents(&'a [u8]),
+}
+
+impl<'a> ConfigEditPreimage<'a> {
+  fn from_expected(expected: Option<&'a [u8]>) -> Self {
+    match expected {
+      Some(contents) => Self::Contents(contents),
+      None => Self::Missing,
+    }
+  }
+
+  fn matches(self, current: Option<&[u8]>) -> bool {
+    match self {
+      Self::Missing => current.is_none(),
+      Self::Contents(expected) => current == Some(expected),
+    }
+  }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -77,6 +100,13 @@ pub enum RouteMode {
   #[default]
   Route,
   Fuzzy,
+}
+
+impl RouteMode {
+  /// Whether requests preserve the selected upstream provider and model.
+  pub const fn is_verbatim(self) -> bool {
+    matches!(self, Self::Passthrough | Self::Switch)
+  }
 }
 
 /// Where an agent binding obtains its accounts.
@@ -155,8 +185,20 @@ pub struct AgentConfig {
   pub profile: Option<String>,
   #[serde(default, skip_serializing_if = "is_agent_account_source")]
   pub account_source: AgentAccountSource,
-  /// Agent-side provider identifiers redirected to this binding when it uses
-  /// the gateway's main account pool.
+  /// Desired provider for a main-account `switch` or `passthrough` binding.
+  ///
+  /// The generated profile's `default_provider_id` is only the runtime
+  /// materialization of this value.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub provider: Option<String>,
+  /// Optional canonical gateway-provider filter used when this binding reads
+  /// from the main account pool. Omitted means every effective provider.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub provider_filter: Option<Vec<String>>,
+  /// Legacy agent-side provider namespaces redirected by this binding.
+  ///
+  /// This is retained for migration only. Unlike `provider_filter`, these
+  /// values do not identify providers in the gateway's main account pool.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub source_providers: Option<Vec<String>>,
   #[serde(default, skip_serializing_if = "is_false")]
@@ -592,10 +634,45 @@ impl Config {
       if let Some(profile) = agent.profile.as_deref() {
         validate_profile_name(profile)?;
       }
+      validate_provider_id(&format!("agents.{name}.provider"), agent.provider.as_deref())?;
+      validate_providers(
+        &format!("agents.{name}.provider_filter"),
+        agent.provider_filter.as_deref(),
+      )?;
       validate_providers(
         &format!("agents.{name}.source_providers"),
         agent.source_providers.as_deref(),
       )?;
+      if agent.provider.is_some() {
+        let mode = agent.mode.unwrap_or(RouteMode::Route);
+        if agent.account_source != AgentAccountSource::Main || !mode.is_verbatim() {
+          return error::InvalidAccountSnafu {
+            id: format!("agents.{name}.provider"),
+            message: String::from(
+              "provider is only valid with account_source = \"main\" and mode = \"passthrough\" or \"switch\"",
+            ),
+          }
+          .fail();
+        }
+        if agent.provider_filter.is_some() {
+          return error::InvalidAccountSnafu {
+            id: format!("agents.{name}.provider"),
+            message: String::from("provider and provider_filter are mutually exclusive"),
+          }
+          .fail();
+        }
+      }
+      if agent.provider_filter.is_some()
+        && (agent.account_source != AgentAccountSource::Main || agent.mode.unwrap_or(RouteMode::Route).is_verbatim())
+      {
+        return error::InvalidAccountSnafu {
+          id: format!("agents.{name}.provider_filter"),
+          message: String::from(
+            "provider_filter is only valid with account_source = \"main\" and mode = \"route\", \"fuzzy\", or \"exact\"",
+          ),
+        }
+        .fail();
+      }
     }
     for (name, profile) in &self.profiles {
       validate_profile_name(name)?;
@@ -628,6 +705,18 @@ impl Config {
   where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
   {
+    Self::edit_in_place_with_contents(path, f).map(drop)
+  }
+
+  /// Edit, validate, and atomically write a config file, returning the exact
+  /// serialized contents passed to the writer.
+  ///
+  /// Callers that maintain conflict-safe post-image checkpoints can hash this
+  /// value without rereading a path that another process may have changed.
+  pub fn edit_in_place_with_contents<F>(path: &Path, f: F) -> Result<String>
+  where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+  {
     let raw = if path.exists() {
       std::fs::read_to_string(path).context(error::ReadSnafu {
         path: path.to_path_buf(),
@@ -635,6 +724,55 @@ impl Config {
     } else {
       String::new()
     };
+    let serialised = Self::serialise_edit(path, raw, f)?;
+    write_config_contents(path, &serialised)?;
+    Ok(serialised)
+  }
+
+  /// Edit, validate, and atomically write a config file guarded by an exact
+  /// preimage, returning the exact serialized contents passed to the writer.
+  ///
+  /// `None` requires the file to remain missing. `Some(bytes)` requires the
+  /// file to be present with those exact bytes. The preimage is checked before
+  /// the edit closure is invoked and again after the replacement is staged.
+  ///
+  /// A missing preimage is installed with create-if-absent semantics. For an
+  /// existing file, portable filesystems do not offer content-based
+  /// compare-and-swap; callers must serialize cooperating writers and must not
+  /// externally edit the generated file concurrently with the final
+  /// check-and-rename window.
+  pub fn edit_in_place_with_contents_if_unchanged<F>(
+    path: &Path,
+    expected: Option<&[u8]>,
+    f: F,
+  ) -> GuardedEditResult<String>
+  where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+  {
+    let expected = ConfigEditPreimage::from_expected(expected);
+    let current = read_optional_config_bytes(path)?;
+    if !expected.matches(current.as_deref()) {
+      return Err(GuardedEditError::Changed {
+        path: path.to_path_buf(),
+      });
+    }
+    let raw = match current {
+      Some(contents) => String::from_utf8(contents).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+      })?,
+      None => String::new(),
+    };
+    let serialised = Self::serialise_edit(path, raw, f)?;
+    ensure_config_parent(path)?;
+    write_atomic_guarded(path, &serialised, expected)?;
+    Ok(serialised)
+  }
+
+  fn serialise_edit<F>(path: &Path, raw: String, f: F) -> Result<String>
+  where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+  {
     let mut doc: toml_edit::DocumentMut = raw.parse().context(error::ParseEditSnafu {
       path: path.to_path_buf(),
     })?;
@@ -657,12 +795,32 @@ impl Config {
       section: "[defaults]/[profiles]",
       source: Box::new(e),
     })?;
-    if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent).context(error::CreateDirSnafu {
-        path: parent.to_path_buf(),
-      })?;
-    }
-    write_atomic(path, &serialised)
+    Ok(serialised)
+  }
+}
+
+fn ensure_config_parent(path: &Path) -> Result<()> {
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent).context(error::CreateDirSnafu {
+      path: parent.to_path_buf(),
+    })?;
+  }
+  Ok(())
+}
+
+fn write_config_contents(path: &Path, contents: &str) -> Result<()> {
+  ensure_config_parent(path)?;
+  write_atomic(path, contents)
+}
+
+fn read_optional_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+  match std::fs::read(path) {
+    Ok(contents) => Ok(Some(contents)),
+    Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(source) => Err(Error::Read {
+      path: path.to_path_buf(),
+      source,
+    }),
   }
 }
 
@@ -965,19 +1123,80 @@ fn is_proxy_host(s: &str) -> bool {
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-  let tmp = path.with_extension("toml.tmp");
-  std::fs::write(&tmp, contents).context(error::WriteSnafu { path: tmp.clone() })?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    let perm = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(&tmp, perm).context(error::SetPermissionsSnafu { path: tmp.clone() })?;
-  }
-  std::fs::rename(&tmp, path).context(error::RenameSnafu {
-    from: tmp.clone(),
+  let staged = stage_atomic_write(path, contents)?;
+  let from = staged.path().to_path_buf();
+  staged.persist(path).map(|_| ()).map_err(|error| Error::Rename {
+    from,
     to: path.to_path_buf(),
+    source: error.error,
+  })
+}
+
+fn write_atomic_guarded(path: &Path, contents: &str, expected: ConfigEditPreimage<'_>) -> GuardedEditResult<()> {
+  let staged = stage_atomic_write(path, contents)?;
+  commit_staged_atomic_write_guarded(path, staged, expected)
+}
+
+fn commit_staged_atomic_write_guarded(
+  path: &Path,
+  staged: tempfile::NamedTempFile,
+  expected: ConfigEditPreimage<'_>,
+) -> GuardedEditResult<()> {
+  let current = read_optional_config_bytes(path)?;
+  if !expected.matches(current.as_deref()) {
+    return Err(GuardedEditError::Changed {
+      path: path.to_path_buf(),
+    });
+  }
+
+  let from = staged.path().to_path_buf();
+  match expected {
+    ConfigEditPreimage::Missing => match staged.persist_noclobber(path) {
+      Ok(_) => Ok(()),
+      Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Err(GuardedEditError::Changed {
+        path: path.to_path_buf(),
+      }),
+      Err(error) => Err(
+        Error::Write {
+          path: path.to_path_buf(),
+          source: error.error,
+        }
+        .into(),
+      ),
+    },
+    ConfigEditPreimage::Contents(_) => {
+      staged.persist(path).map_err(|error| Error::Rename {
+        from,
+        to: path.to_path_buf(),
+        source: error.error,
+      })?;
+      Ok(())
+    }
+  }
+}
+
+fn stage_atomic_write(path: &Path, contents: &str) -> Result<tempfile::NamedTempFile> {
+  let parent = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."));
+  let mut staged = tempfile::Builder::new()
+    .prefix(".tokn-config-")
+    .suffix(".tmp")
+    .tempfile_in(parent)
+    .context(error::WriteSnafu {
+      path: path.to_path_buf(),
+    })?;
+  staged
+    .as_file_mut()
+    .write_all(contents.as_bytes())
+    .context(error::WriteSnafu {
+      path: staged.path().to_path_buf(),
+    })?;
+  staged.as_file().sync_all().context(error::WriteSnafu {
+    path: staged.path().to_path_buf(),
   })?;
-  Ok(())
+  Ok(staged)
 }
 
 #[cfg(test)]
@@ -1197,6 +1416,183 @@ mod tests {
   }
 
   #[test]
+  fn agents_preserve_provider_filter_and_legacy_source_providers_separately() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        account_source = "main"
+        provider_filter = ["openai"]
+        source_providers = ["openai", "deepseek"]
+      "#,
+    )
+    .expect("agent config should deserialize");
+
+    let agent = cfg.agents.get("opencode").expect("opencode agent");
+    assert_eq!(agent.provider_filter.as_deref(), Some(&["openai".to_string()][..]));
+    assert_eq!(
+      agent.source_providers.as_deref(),
+      Some(&["openai".to_string(), "deepseek".to_string()][..])
+    );
+    cfg.validate().expect("provider selections should validate");
+
+    let serialized = toml::to_string_pretty(&cfg).expect("config should serialize");
+    assert!(serialized.contains("provider_filter = ["));
+    assert!(serialized.contains("source_providers = ["));
+  }
+
+  #[test]
+  fn agents_preserve_a_raw_main_provider_as_binding_intent() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        mode = "switch"
+        account_source = "main"
+        provider = "openai"
+      "#,
+    )
+    .expect("agent config should deserialize");
+
+    let agent = cfg.agents.get("opencode").expect("opencode agent");
+    assert_eq!(agent.provider.as_deref(), Some("openai"));
+    cfg.validate().expect("raw main provider should validate");
+
+    let serialized = toml::to_string_pretty(&cfg).expect("config should serialize");
+    assert!(serialized.contains("provider = \"openai\""));
+  }
+
+  #[test]
+  fn agent_provider_rejects_invalid_topologies_and_provider_filters() {
+    for (config, expected) in [
+      (
+        r#"
+          [agents.opencode]
+          mode = "route"
+          account_source = "main"
+          provider = "openai"
+        "#,
+        "only valid",
+      ),
+      (
+        r#"
+          [agents.opencode]
+          mode = "switch"
+          provider = "openai"
+        "#,
+        "only valid",
+      ),
+      (
+        r#"
+          [agents.opencode]
+          mode = "switch"
+          account_source = "main"
+          provider = "openai"
+          provider_filter = ["openai"]
+        "#,
+        "mutually exclusive",
+      ),
+    ] {
+      let cfg: Config = toml::from_str(config).expect("agent config should deserialize before validation");
+      let error = cfg.validate().expect_err("invalid provider topology must fail");
+      assert!(error.to_string().contains("agents.opencode.provider"));
+      assert!(error.to_string().contains(expected));
+    }
+  }
+
+  #[test]
+  fn agent_provider_filter_rejects_invalid_topologies() {
+    for config in [
+      r#"
+        [agents.opencode]
+        provider_filter = ["openai"]
+      "#,
+      r#"
+        [agents.opencode]
+        mode = "switch"
+        account_source = "main"
+        provider_filter = ["openai"]
+      "#,
+    ] {
+      let cfg: Config = toml::from_str(config).expect("agent config should deserialize before validation");
+      let error = cfg.validate().expect_err("invalid provider filter topology must fail");
+      assert!(error.to_string().contains("agents.opencode.provider_filter"));
+      assert!(error.to_string().contains("only valid"));
+    }
+  }
+
+  #[test]
+  fn agent_provider_rejects_an_empty_id() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        mode = "switch"
+        account_source = "main"
+        provider = " "
+      "#,
+    )
+    .expect("agent config should deserialize before validation");
+
+    let error = cfg.validate().expect_err("empty provider must fail");
+    assert!(error.to_string().contains("agents.opencode.provider"));
+    assert!(error.to_string().contains("provider id must be non-empty"));
+  }
+
+  #[test]
+  fn legacy_source_providers_do_not_populate_provider_filter() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        source_providers = ["openai"]
+      "#,
+    )
+    .expect("legacy agent config should deserialize");
+
+    let agent = cfg.agents.get("opencode").expect("opencode agent");
+    assert_eq!(agent.provider_filter, None);
+    assert_eq!(agent.source_providers.as_deref(), Some(&["openai".to_string()][..]));
+
+    let serialized = toml::to_string_pretty(&cfg).expect("config should serialize");
+    assert!(!serialized.contains("provider_filter"));
+    assert!(serialized.contains("source_providers = ["));
+  }
+
+  #[test]
+  fn agents_validate_provider_filter_at_its_canonical_path() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        account_source = "main"
+        provider_filter = ["openai", " "]
+      "#,
+    )
+    .expect("agent config should deserialize before validation");
+
+    let err = cfg
+      .validate()
+      .expect_err("provider filter with an empty id must fail validation");
+    let message = err.to_string();
+    assert!(message.contains("agents.opencode.provider_filter"));
+    assert!(message.contains("provider ids must be non-empty"));
+  }
+
+  #[test]
+  fn agents_validate_legacy_source_providers_at_the_legacy_path() {
+    let cfg: Config = toml::from_str(
+      r#"
+        [agents.opencode]
+        source_providers = ["openai", " "]
+      "#,
+    )
+    .expect("legacy agent config should deserialize before validation");
+
+    let err = cfg
+      .validate()
+      .expect_err("legacy source providers with an empty id must fail validation");
+    let message = err.to_string();
+    assert!(message.contains("agents.opencode.source_providers"));
+    assert!(message.contains("provider ids must be non-empty"));
+  }
+
+  #[test]
   fn profiles_reject_invalid_names() {
     let cfg: Config = toml::from_str(
       r#"
@@ -1374,5 +1770,195 @@ profile = "opencode"
       paths::agent_config_fragment_path(&primary, "opencode"),
       dir.path().join("work.d/opencode.toml")
     );
+  }
+
+  #[test]
+  fn guarded_edit_rejects_changed_present_contents_before_invoking_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let current = b"[server]\nport = 5151\n";
+    std::fs::write(&path, current).unwrap();
+    let invoked = std::cell::Cell::new(false);
+
+    let error = Config::edit_in_place_with_contents_if_unchanged(&path, Some(b"[server]\nport = 4141\n"), |_| {
+      invoked.set(true);
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert!(!invoked.get());
+    assert_eq!(std::fs::read(&path).unwrap(), current);
+  }
+
+  #[test]
+  fn guarded_edit_rejects_file_created_after_missing_preimage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let created = b"[server]\nport = 5151\n";
+    std::fs::write(&path, created).unwrap();
+    let invoked = std::cell::Cell::new(false);
+
+    let error = Config::edit_in_place_with_contents_if_unchanged(&path, None, |_| {
+      invoked.set(true);
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert!(!invoked.get());
+    assert_eq!(std::fs::read(&path).unwrap(), created);
+  }
+
+  #[test]
+  fn guarded_edit_rechecks_the_preimage_after_invoking_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"[server]\nport = 4141\n";
+    let concurrent = b"[server]\nport = 6262\n";
+    std::fs::write(&path, initial).unwrap();
+
+    let error = Config::edit_in_place_with_contents_if_unchanged(&path, Some(initial), |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      std::fs::write(&path, concurrent).unwrap();
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+  }
+
+  #[test]
+  fn guarded_commit_rechecks_after_staging_without_overwriting_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"[server]\nport = 4141\n";
+    let concurrent = b"[server]\nport = 6262\n";
+    std::fs::write(&path, initial).unwrap();
+    let staged = stage_atomic_write(&path, "[server]\nport = 5151\n").unwrap();
+    let staged_path = staged.path().to_path_buf();
+    std::fs::write(&path, concurrent).unwrap();
+
+    let error = commit_staged_atomic_write_guarded(&path, staged, ConfigEditPreimage::Contents(initial)).unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+    assert!(!staged_path.exists());
+  }
+
+  #[test]
+  fn guarded_staged_writes_use_distinct_paths_and_reject_stale_preimages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"[server]\nport = 4141\n";
+    let first = b"[server]\nport = 5151\n";
+    let second = b"[server]\nport = 6262\n";
+    std::fs::write(&path, initial).unwrap();
+    let first_staged = stage_atomic_write(&path, std::str::from_utf8(first).unwrap()).unwrap();
+    let second_staged = stage_atomic_write(&path, std::str::from_utf8(second).unwrap()).unwrap();
+    let first_staged_path = first_staged.path().to_path_buf();
+    let second_staged_path = second_staged.path().to_path_buf();
+
+    assert_ne!(first_staged_path, second_staged_path);
+    commit_staged_atomic_write_guarded(&path, first_staged, ConfigEditPreimage::Contents(initial)).unwrap();
+    let error =
+      commit_staged_atomic_write_guarded(&path, second_staged, ConfigEditPreimage::Contents(initial)).unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), first);
+    assert!(!first_staged_path.exists());
+    assert!(!second_staged_path.exists());
+  }
+
+  #[test]
+  fn guarded_missing_commit_rejects_a_target_created_after_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let concurrent = b"[server]\nport = 6262\n";
+    let staged = stage_atomic_write(&path, "[server]\nport = 5151\n").unwrap();
+    let staged_path = staged.path().to_path_buf();
+    std::fs::write(&path, concurrent).unwrap();
+
+    let error = commit_staged_atomic_write_guarded(&path, staged, ConfigEditPreimage::Missing).unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+    assert!(!staged_path.exists());
+  }
+
+  #[test]
+  fn guarded_edit_does_not_reuse_the_legacy_predictable_staging_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let legacy_staging_path = path.with_extension("toml.tmp");
+    std::fs::write(&legacy_staging_path, "sentinel").unwrap();
+
+    Config::edit_in_place_with_contents_if_unchanged(&path, None, |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&legacy_staging_path).unwrap(), "sentinel");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("port = 5151"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn guarded_edit_does_not_follow_a_legacy_staging_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let legacy_staging_path = path.with_extension("toml.tmp");
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "do not modify").unwrap();
+    symlink(&victim, &legacy_staging_path).unwrap();
+
+    Config::edit_in_place_with_contents_if_unchanged(&path, None, |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not modify");
+    assert!(std::fs::symlink_metadata(&legacy_staging_path)
+      .unwrap()
+      .file_type()
+      .is_symlink());
+  }
+
+  #[test]
+  fn guarded_edit_writes_and_returns_exact_contents_when_preimage_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"# preserved comment\n[server]\nport = 4141\n";
+    std::fs::write(&path, initial).unwrap();
+
+    let written = Config::edit_in_place_with_contents_if_unchanged(&path, Some(initial), |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    assert!(written.contains("# preserved comment"));
+    assert!(written.contains("port = 5151"));
+  }
+
+  #[test]
+  fn guarded_edit_writes_and_returns_exact_contents_when_preimage_remains_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested/config.toml");
+
+    let written = Config::edit_in_place_with_contents_if_unchanged(&path, None, |doc| {
+      doc["server"]["port"] = toml_edit::value(5151);
+      Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    assert!(written.contains("port = 5151"));
   }
 }
