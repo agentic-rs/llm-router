@@ -59,8 +59,10 @@ pub struct AgentLinkArgs {
   /// source. Unlink before linking again with a different source.
   #[arg(long)]
   pub use_main_accounts: bool,
-  /// Provider used by a main-account passthrough or switch link. If omitted,
-  /// a prior binding target or `[defaults].default_provider_id` is used.
+  /// Limit a main-account passthrough or switch link to one provider.
+  ///
+  /// If omitted, the link publishes every enabled provider in the effective
+  /// main account pool.
   #[arg(long, requires = "use_main_accounts", conflicts_with = "provider_filters")]
   pub provider: Option<String>,
   /// Limit main-account provider discovery to this provider ID.
@@ -701,7 +703,7 @@ mod tests {
     for mode in [RouteMode::Switch, RouteMode::Passthrough] {
       assert_eq!(
         profile_layout(mode, AgentAccountSource::Main),
-        AgentProfileLayout::SinglePinned
+        AgentProfileLayout::Single
       );
       assert_eq!(
         profile_layout(mode, AgentAccountSource::Agent),

@@ -185,10 +185,11 @@ pub struct AgentConfig {
   pub profile: Option<String>,
   #[serde(default, skip_serializing_if = "is_agent_account_source")]
   pub account_source: AgentAccountSource,
-  /// Desired provider for a main-account `switch` or `passthrough` binding.
+  /// Optional provider pin for a main-account `switch` or `passthrough` binding.
   ///
-  /// The generated profile's `default_provider_id` is only the runtime
-  /// materialization of this value.
+  /// When omitted, the binding routes every enabled provider in the effective
+  /// main account pool. The generated profile's `default_provider_id` is only
+  /// the runtime materialization of an explicit pin.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub provider: Option<String>,
   /// Optional canonical gateway-provider filter used when this binding reads

@@ -452,11 +452,12 @@ fn materialized_profile_matches_binding(
       return false;
     }
     if mode.is_verbatim() {
-      let Some(provider) = binding.provider.as_deref() else {
-        return false;
-      };
-      return profile.default_provider_id.as_deref() == Some(provider)
-        && option_string_set(profile.providers.as_deref()) == Some(BTreeSet::from([provider]));
+      if let Some(provider) = binding.provider.as_deref() {
+        return profile.default_provider_id.as_deref() == Some(provider)
+          && option_string_set(profile.providers.as_deref()) == Some(BTreeSet::from([provider]));
+      }
+      return profile.default_provider_id.is_none()
+        && option_string_set(profile.providers.as_deref()) == Some(effective_main_provider_ids(cfg, store));
     }
     let expected_provider_ids = binding
       .provider_filter
@@ -633,11 +634,9 @@ mod tests {
         mode: Some(mode),
         profile: Some("work".into()),
         account_source,
-        provider: (account_source == AgentAccountSource::Main && mode.is_verbatim()).then(|| {
-          default_provider_id
-            .expect("raw main binding needs a provider")
-            .to_string()
-        }),
+        provider: (account_source == AgentAccountSource::Main && mode.is_verbatim())
+          .then(|| default_provider_id.map(str::to_string))
+          .flatten(),
         provider_filter,
         source_providers: None,
         sync: true,
@@ -1201,6 +1200,31 @@ accounts = ["opencode-openai"]
       &cfg,
       &store
     ));
+  }
+
+  #[test]
+  fn main_account_verbatim_modes_without_provider_expect_all_effective_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("opencode.json");
+    let auth_path = dir.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+    store.upsert(sample_account("main-openai", "openai"));
+    store.upsert(sample_account("main-deepseek", "deepseek"));
+
+    for mode in [RouteMode::Switch, RouteMode::Passthrough] {
+      let mut cfg = config_with_opencode_binding(mode, AgentAccountSource::Main, None, &[]);
+      cfg.profiles.get_mut("work").unwrap().providers = Some(vec!["deepseek".into(), "openai".into()]);
+      write_synced_opencode_config(&config_path, &cfg, &store);
+      assert!(config_points_at_gateway(&config_path, &AgentId::Opencode, &cfg, &store));
+
+      cfg.profiles.get_mut("work").unwrap().providers = Some(vec!["openai".into()]);
+      assert!(!config_points_at_gateway(
+        &config_path,
+        &AgentId::Opencode,
+        &cfg,
+        &store
+      ));
+    }
   }
 
   #[test]

@@ -27,8 +27,8 @@ pub struct ReconcileRequest {
   /// linked agent's stored account source and defaults fresh links to agent
   /// accounts.
   pub account_source: Option<AgentAccountSource>,
-  /// Provider selected by a main-account verbatim link. This is optional
-  /// when the profile or global defaults already declares one.
+  /// Optional provider to pin for a main-account verbatim link. When absent,
+  /// every enabled provider in the effective main account pool is linked.
   pub default_provider_id: Option<String>,
   /// Optional canonical gateway-provider filter for the main account pool.
   /// `Some([])` selects automatic discovery, while `None` preserves the
@@ -56,12 +56,10 @@ pub enum AgentProfileLayout {
 
 impl AgentProfileLayout {
   pub fn for_binding(mode: RouteMode, account_source: AgentAccountSource) -> Self {
-    if !mode.is_verbatim() {
-      Self::Single
-    } else if account_source == AgentAccountSource::Main {
-      Self::SinglePinned
-    } else {
+    if mode.is_verbatim() && account_source == AgentAccountSource::Agent {
       Self::PerProvider
+    } else {
+      Self::Single
     }
   }
 }
@@ -102,7 +100,7 @@ pub struct ReconcilePlan {
   pub previous_materialized_profile: Option<String>,
   pub binding_mode: RouteMode,
   pub account_source: AgentAccountSource,
-  /// Desired provider for a main-account raw-mode binding.
+  /// Optional provider pin for a main-account raw-mode binding.
   pub provider: Option<String>,
   pub default_provider_id: Option<String>,
   /// Desired filter persisted in the agent binding. `None` means automatic
@@ -152,7 +150,14 @@ impl ReconcilePlan {
   }
 
   pub fn profile_layout(&self) -> AgentProfileLayout {
-    AgentProfileLayout::for_binding(self.binding_mode, self.account_source)
+    if self.binding_mode.is_verbatim()
+      && self.account_source == AgentAccountSource::Main
+      && self.published_provider_ids.len() == 1
+    {
+      AgentProfileLayout::SinglePinned
+    } else {
+      AgentProfileLayout::for_binding(self.binding_mode, self.account_source)
+    }
   }
 }
 
@@ -604,6 +609,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
     binding_mode,
     account_source,
     request.default_provider_id.as_deref(),
+    request.provider_filter.is_none(),
   )?;
   let published_provider_ids = materialize_main_provider_ids(
     account_source,
@@ -613,15 +619,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
     &main_accounts,
   )?;
   let publication_accounts = if account_source == AgentAccountSource::Main {
-    let publication_provider_ids = if binding_mode.is_verbatim() {
-      vec![main_default_provider_id
-        .as_ref()
-        .expect("main-account verbatim mode resolves a default provider")
-        .clone()]
-    } else {
-      published_provider_ids.clone()
-    };
-    filter_publication_accounts(&main_accounts, &publication_provider_ids)
+    filter_publication_accounts(&main_accounts, &published_provider_ids)
   } else {
     enabled_imported_accounts.clone()
   };
@@ -869,11 +867,11 @@ fn unlink_inner(request: UnlinkRequest, legacy_root: Option<&Path>) -> Result<Un
       successor.display()
     );
   }
+  if manifest::read_manifest(&manifest_path)?.unlinked {
+    bail!("manifest {} has already been unlinked", manifest_path.display());
+  }
   let mut chain = manifest_chain(&manifest_path, &request.agent, legacy_root)?;
   let latest = chain.first().expect("manifest chain contains selected manifest");
-  if latest.1.unlinked {
-    bail!("manifest {} has already been unlinked", latest.0.display());
-  }
   let timestamp = latest.1.timestamp.clone();
 
   preflight_manifest_file_restoration(&chain)?;
@@ -888,9 +886,16 @@ fn unlink_inner(request: UnlinkRequest, legacy_root: Option<&Path>) -> Result<Un
     current.unlinked = true;
     manifest::write_manifest(path, current)?;
   }
+  let archived_manifest_path = chain
+    .iter()
+    .map(|(path, _)| manifest::archive_manifest(path))
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .next()
+    .expect("manifest chain contains selected manifest");
 
   Ok(UnlinkReport {
-    manifest_path,
+    manifest_path: archived_manifest_path,
     timestamp,
     actions,
   })
@@ -908,7 +913,7 @@ fn active_manifest_successor(path: &Path, agent: &AgentId, legacy_root: Option<&
       || !candidate
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.ends_with(&suffix))
+        .map(|name| !name.starts_with('.') && name.ends_with(&suffix))
         .unwrap_or(false)
     {
       continue;
@@ -2006,25 +2011,23 @@ fn materialize_main_provider_ids(
   if account_source != AgentAccountSource::Main {
     return Ok(Vec::new());
   }
-  if mode.is_verbatim() {
-    let default_provider_id = default_provider_id.expect("main-account verbatim mode resolves a default provider");
-    if !accounts.iter().any(|account| account.provider == default_provider_id) {
-      bail!(
-        "OpenCode main-account link selected provider '{default_provider_id}', but the effective gateway pool has no enabled account for it"
-      );
-    }
-    if !requested_provider_ids.is_empty() {
-      return Ok(requested_provider_ids.to_vec());
-    }
-    return Ok(vec![default_provider_id.to_string()]);
-  }
-
   let available = accounts
     .iter()
     .map(|account| account.provider.as_str())
     .collect::<BTreeSet<_>>();
   if available.is_empty() {
     bail!("OpenCode main-account link found no enabled accounts in the effective gateway pool");
+  }
+  if mode.is_verbatim() {
+    if let Some(default_provider_id) = default_provider_id {
+      if !available.contains(default_provider_id) {
+        bail!(
+          "OpenCode main-account link selected provider '{default_provider_id}', but the effective gateway pool has no enabled account for it"
+        );
+      }
+      return Ok(vec![default_provider_id.to_string()]);
+    }
+    return Ok(available.into_iter().map(str::to_string).collect());
   }
   if requested_provider_ids.is_empty() {
     return Ok(available.into_iter().map(str::to_string).collect());
@@ -2235,6 +2238,7 @@ fn resolve_main_default_provider(
   mode: RouteMode,
   account_source: AgentAccountSource,
   explicit_provider: Option<&str>,
+  preserve_existing_provider: bool,
 ) -> Result<Option<String>> {
   if explicit_provider.is_some() && (account_source != AgentAccountSource::Main || !mode.is_verbatim()) {
     bail!("--provider is only valid with --use-main-accounts and --mode passthrough or switch");
@@ -2242,24 +2246,25 @@ fn resolve_main_default_provider(
   if account_source != AgentAccountSource::Main || !mode.is_verbatim() {
     return Ok(None);
   }
-  let desired_provider = existing_binding.and_then(|binding| binding.provider.as_deref());
-  let legacy_materialized_provider = previous_materialized_profile
-    .and_then(|profile| cfg.profiles.get(profile))
-    .and_then(|profile| profile.default_provider_id.as_deref());
   let provider = explicit_provider
-    .or(desired_provider)
-    .or(legacy_materialized_provider)
-    .or(cfg.defaults.default_provider_id.as_deref())
+    .or_else(|| {
+      preserve_existing_provider
+        .then(|| existing_binding.and_then(|binding| binding.provider.as_deref()))
+        .flatten()
+    })
+    .or_else(|| {
+      preserve_existing_provider
+        .then(|| {
+          previous_materialized_profile
+            .and_then(|profile| cfg.profiles.get(profile))
+            .and_then(|profile| profile.default_provider_id.as_deref())
+        })
+        .flatten()
+    })
     .map(str::trim)
     .filter(|provider| !provider.is_empty())
-    .map(str::to_string)
-    .ok_or_else(|| {
-      anyhow!(
-        "--use-main-accounts with --mode {} requires --provider <id> or [defaults].default_provider_id",
-        route_mode_as_str(mode)
-      )
-    })?;
-  Ok(Some(provider))
+    .map(str::to_string);
+  Ok(provider)
 }
 
 fn materialized_default_provider(
@@ -2644,10 +2649,7 @@ fn upsert_profile_item(doc: &mut toml_edit::DocumentMut, profile: &str, write: &
   }
 
   if write.account_source == AgentAccountSource::Main {
-    if write.mode.is_verbatim() {
-      let default_provider_id = write.default_provider_id.expect("verbatim main profile has a provider");
-      profile_item["providers"] = array_value(&[default_provider_id.to_string()]);
-    } else if !write.materialized_provider_ids.is_empty() {
+    if !write.materialized_provider_ids.is_empty() {
       profile_item["providers"] = array_value(write.materialized_provider_ids);
     } else if let Some(table) = profile_item.as_table_mut() {
       table.remove("providers");
@@ -3418,6 +3420,7 @@ providers = ["openai"]
         RouteMode::Switch,
         AgentAccountSource::Main,
         None,
+        true,
       )
       .unwrap()
       .as_deref(),
@@ -3451,6 +3454,7 @@ providers = ["openai"]
         RouteMode::Switch,
         AgentAccountSource::Main,
         None,
+        true,
       )
       .unwrap()
       .as_deref(),
@@ -3464,6 +3468,7 @@ providers = ["openai"]
         RouteMode::Switch,
         AgentAccountSource::Main,
         Some("deepseek"),
+        true,
       )
       .unwrap()
       .as_deref(),
@@ -3920,6 +3925,73 @@ providers = ["anthropic"]
     assert_eq!(std::fs::read(&gateway_auth_path).unwrap(), gateway_auth);
     assert_eq!(std::fs::read(&opencode_auth_path).unwrap(), opencode_auth);
     assert_eq!(std::fs::read_to_string(&opencode_config_path).unwrap(), opencode_config);
+  }
+
+  #[test]
+  fn main_account_switch_without_provider_links_every_enabled_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_home = dir.path().join("home");
+    let gateway_config_path = dir.path().join("gateway/config.toml");
+    let gateway_auth_path = dir.path().join("gateway/auth.yaml");
+    let manifest_path = dir.path().join("main-switch.json");
+    let opencode_config_path = agent_home.join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(gateway_config_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(opencode_config_path.parent().unwrap()).unwrap();
+    std::fs::write(&gateway_config_path, "[server]\nport = 4141\n").unwrap();
+    std::fs::write(&opencode_config_path, r#"{"model":"deepseek/deepseek-v4-flash"}"#).unwrap();
+    save_main_accounts(
+      &gateway_auth_path,
+      &gateway_config_path,
+      &[("main-openai", "openai"), ("main-deepseek", "deepseek")],
+    );
+
+    let mut plan = plan_reconcile_with_gateway_auth_path(
+      ReconcileRequest {
+        agent: AgentId::Opencode,
+        profile: None,
+        mode: Some(RouteMode::Switch),
+        account_source: Some(AgentAccountSource::Main),
+        default_provider_id: None,
+        provider_filter: Some(Vec::new()),
+        gateway_config_path: Some(gateway_config_path.clone()),
+        agent_home: Some(agent_home.clone()),
+      },
+      gateway_auth_path,
+    )
+    .unwrap();
+
+    assert_eq!(plan.provider, None);
+    assert_eq!(plan.default_provider_id, None);
+    assert_eq!(plan.published_provider_ids, ["deepseek", "openai"]);
+    assert_eq!(plan.gateway_provider_ids(), ["deepseek", "openai"]);
+    assert_eq!(
+      plan.injected_provider_ids(),
+      ["tokn-router-deepseek", "tokn-router-openai"]
+    );
+    assert_eq!(plan.profile_layout(), AgentProfileLayout::Single);
+    let projected_config = plan
+      .edits
+      .iter()
+      .find(|edit| edit.path == opencode_config_path)
+      .and_then(|edit| match &edit.kind {
+        EditKind::Jsonc(raw) => Some(crate::jsonc::parse_jsonc(raw, &edit.path).unwrap()),
+        _ => None,
+      })
+      .unwrap();
+    assert_eq!(projected_config["model"], "tokn-router-deepseek/deepseek-v4-flash");
+    assert!(projected_config["provider"]["tokn-router-deepseek"].is_object());
+    assert!(projected_config["provider"]["tokn-router-openai"].is_object());
+
+    plan.timestamp = "20260731T000000Z".into();
+    apply_reconcile_to_manifest_path(plan, manifest_path).unwrap();
+
+    let (cfg, _) = Config::load(Some(&gateway_config_path)).unwrap();
+    assert_eq!(cfg.agents["opencode"].provider, None);
+    assert_eq!(cfg.profiles["opencode"].default_provider_id, None);
+    assert_eq!(
+      cfg.profiles["opencode"].providers.as_deref(),
+      Some(&["deepseek".to_string(), "openai".to_string()][..])
+    );
   }
 
   #[test]
@@ -4990,8 +5062,18 @@ sync = true
     .unwrap();
 
     assert_eq!(std::fs::read_to_string(opencode_config_path).unwrap(), original);
-    assert!(manifest::read_manifest(&first_manifest_path).unwrap().unlinked);
-    assert!(manifest::read_manifest(&second_manifest_path).unwrap().unlinked);
+    assert!(!first_manifest_path.exists());
+    assert!(!second_manifest_path.exists());
+    assert!(
+      manifest::read_manifest(&manifest::inactive_manifest_path(&first_manifest_path).unwrap())
+        .unwrap()
+        .unlinked
+    );
+    assert!(
+      manifest::read_manifest(&manifest::inactive_manifest_path(&second_manifest_path).unwrap())
+        .unwrap()
+        .unlinked
+    );
   }
 
   #[test]
@@ -5889,7 +5971,7 @@ providers = ["anthropic"]
     let restored: Value = serde_json::from_str(&std::fs::read_to_string(opencode_auth_path).unwrap()).unwrap();
     assert_eq!(restored["openai"]["key"], "sk-post-strip");
     assert!(!shard_path.exists());
-    let manifest = manifest::read_manifest(&manifest_path).unwrap();
+    let manifest = manifest::read_manifest(&manifest::inactive_manifest_path(&manifest_path).unwrap()).unwrap();
     assert!(manifest.credentials_handoff_complete);
     assert!(manifest.unlinked);
   }
@@ -6485,8 +6567,13 @@ providers = ["anthropic"]
     assert_eq!(restored_auth["github-copilot"]["access"], "ghu-latest");
     assert_eq!(restored_auth["github-copilot"]["expires"], 0);
     assert_eq!(restored_auth["anthropic"]["key"], "anthropic-keep");
-    assert!(manifest::read_manifest(&first_manifest_path).unwrap().unlinked);
-    let second_manifest = manifest::read_manifest(&second_manifest_path).unwrap();
+    assert!(
+      manifest::read_manifest(&manifest::inactive_manifest_path(&first_manifest_path).unwrap())
+        .unwrap()
+        .unlinked
+    );
+    let second_manifest =
+      manifest::read_manifest(&manifest::inactive_manifest_path(&second_manifest_path).unwrap()).unwrap();
     assert!(second_manifest.unlinked);
     assert!(second_manifest.credentials_handoff_complete);
   }
@@ -6582,12 +6669,12 @@ providers = ["anthropic"]
     assert_eq!(second_auth["deepseek"]["key"], "sk-opencode-deepseek");
     assert!(second_auth.get("openai").is_none());
     assert!(
-      manifest::read_manifest(&first_manifest_path)
+      manifest::read_manifest(&manifest::inactive_manifest_path(&first_manifest_path).unwrap())
         .unwrap()
         .credentials_handoff_complete
     );
     assert!(
-      manifest::read_manifest(&second_manifest_path)
+      manifest::read_manifest(&manifest::inactive_manifest_path(&second_manifest_path).unwrap())
         .unwrap()
         .credentials_handoff_complete
     );
@@ -6669,7 +6756,8 @@ providers = ["anthropic"]
     assert_eq!(second_auth["deepseek"]["key"], "sk-source-authoritative");
     assert!(second_auth.get("openai").is_none());
     for path in [&first_manifest_path, &second_manifest_path] {
-      let restored = manifest::read_manifest(path).unwrap();
+      let path = manifest::inactive_manifest_path(path).unwrap();
+      let restored = manifest::read_manifest(&path).unwrap();
       assert!(restored.credentials_handoff_complete);
       assert!(restored.unlinked);
     }
@@ -6712,7 +6800,11 @@ providers = ["anthropic"]
       serde_json::from_str::<Value>(&std::fs::read_to_string(agent_auth_path).unwrap()).unwrap(),
       auth
     );
-    assert!(manifest::read_manifest(&manifest_path).unwrap().unlinked);
+    assert!(
+      manifest::read_manifest(&manifest::inactive_manifest_path(&manifest_path).unwrap())
+        .unwrap()
+        .unlinked
+    );
   }
 
   #[test]
@@ -6756,6 +6848,10 @@ providers = ["anthropic"]
 
     assert_eq!(std::fs::read_to_string(original).unwrap(), "original");
     assert_eq!(report.actions.len(), 1);
+    let archived_manifest_path = manifest::inactive_manifest_path(&manifest_path).unwrap();
+    assert_eq!(report.manifest_path, archived_manifest_path);
+    assert!(!manifest_path.exists());
+    assert!(manifest::read_manifest(&archived_manifest_path).unwrap().unlinked);
   }
 
   #[test]
@@ -6854,7 +6950,11 @@ providers = ["anthropic"]
     .unwrap();
 
     assert!(report.actions.is_empty());
-    assert!(manifest::read_manifest(&manifest_path).unwrap().unlinked);
+    assert!(
+      manifest::read_manifest(&manifest::inactive_manifest_path(&manifest_path).unwrap())
+        .unwrap()
+        .unlinked
+    );
   }
 
   #[test]
