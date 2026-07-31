@@ -57,15 +57,34 @@ pub fn normalize_openai_platform_headers(headers: &HeaderMap, ctx: &HeaderPatchC
 }
 
 pub fn normalize_codex_headers(headers: &HeaderMap, ctx: &HeaderPatchCtx<'_>) -> HeaderMap {
-  codex_normalizer_for(ctx.agent_id, headers).normalize(
+  let Some(wire_identity) = ctx.wire_identity else {
+    return normalize_codex_provider_headers(headers, ctx);
+  };
+  codex_normalizer_for(wire_identity, headers).normalize(
     headers,
     &HeaderNormalizeCtx {
-      agent_id: ctx.agent_id,
+      agent_id: wire_identity,
       stream: ctx.stream,
       content_encoding: ctx.content_encoding,
       vars: ctx.vars,
     },
   )
+}
+
+fn normalize_codex_provider_headers(headers: &HeaderMap, ctx: &HeaderPatchCtx<'_>) -> HeaderMap {
+  let mut out = HeaderMap::new();
+  for name in [&AUTHORIZATION, &CHATGPT_ACCOUNT_ID] {
+    if let Some(value) = headers.get(name) {
+      out.insert(name, HeaderValue::from_string(value.as_str().to_string()));
+    }
+  }
+  out.insert(&ACCEPT, HeaderValue::from_static(accept_value(ctx.stream)));
+  out.insert(&CONTENT_TYPE, HeaderValue::from_static("application/json"));
+  out.insert(&OPENAI_BETA, HeaderValue::from_static(CODEX_RESPONSES_BETA));
+  if let Some(encoding) = ctx.content_encoding {
+    out.insert(&CONTENT_ENCODING, HeaderValue::from_string(encoding.to_string()));
+  }
+  out
 }
 
 impl HeaderNormalizer for CodexCliNormalizer {
@@ -279,7 +298,7 @@ mod tests {
       initiator: "user",
       inbound_headers: &HeaderMap::new(),
       vars: &TemplateVars::default(),
-      agent_id: &AgentId::Opencode,
+      wire_identity: Some(&AgentId::Opencode),
     };
     let opencode = HeaderMap::new();
     let out = normalize_codex_headers(&opencode, &ctx);
@@ -288,11 +307,50 @@ mod tests {
     let mut codex_cli = HeaderMap::new();
     codex_cli.insert(&X_CODEX_TURN_METADATA, "{}");
     let ctx = HeaderPatchCtx {
-      agent_id: &AgentId::CodexCli,
+      wire_identity: Some(&AgentId::CodexCli),
       ..ctx
     };
     let out = normalize_codex_headers(&codex_cli, &ctx);
     assert_eq!(out.get(&ORIGINATOR).unwrap().as_str(), "codex_cli_rs");
     assert_eq!(out.get(&X_CODEX_TURN_METADATA).unwrap().as_str(), "{}");
+  }
+
+  #[test]
+  fn codex_without_wire_identity_uses_only_provider_headers() {
+    let mut headers = HeaderMap::new();
+    headers.insert(&AUTHORIZATION, "Bearer atk-test");
+    headers.insert(&CHATGPT_ACCOUNT_ID, "acc-1");
+    headers.insert(&ORIGINATOR, "client-originator");
+    headers.insert(&USER_AGENT, "client/1.0");
+    headers.insert(&X_CODEX_TURN_METADATA, "{}");
+    let ctx = HeaderPatchCtx {
+      request_kind: ProviderRequestKind::Operation(crate::Endpoint::Responses),
+      body: &serde_json::Value::Null,
+      bearer_token: None,
+      content_encoding: Some("gzip"),
+      stream: true,
+      initiator: "user",
+      inbound_headers: &HeaderMap::new(),
+      vars: &TemplateVars::default(),
+      wire_identity: None,
+    };
+
+    let out = normalize_codex_headers(&headers, &ctx);
+
+    assert_eq!(out.get(&AUTHORIZATION).unwrap().as_str(), "Bearer atk-test");
+    assert_eq!(out.get(&CHATGPT_ACCOUNT_ID).unwrap().as_str(), "acc-1");
+    assert_eq!(out.get(&ACCEPT).unwrap().as_str(), "text/event-stream");
+    assert_eq!(out.get(&CONTENT_TYPE).unwrap().as_str(), "application/json");
+    assert_eq!(out.get(&OPENAI_BETA).unwrap().as_str(), CODEX_RESPONSES_BETA);
+    assert_eq!(out.get(&CONTENT_ENCODING).unwrap().as_str(), "gzip");
+    for persona in [
+      &ORIGINATOR,
+      &VERSION,
+      &USER_AGENT,
+      &SESSION_ID_LOWER,
+      &X_CODEX_TURN_METADATA,
+    ] {
+      assert!(!out.contains_key(persona));
+    }
   }
 }

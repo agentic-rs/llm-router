@@ -227,7 +227,7 @@ async fn provider_headers_patch_from_fixtures() {
           initiator: extracted.initiator.as_deref().unwrap_or("user"),
           inbound_headers: &extracted.headers,
           vars: &built.vars,
-          agent_id: &built.agent_id,
+          wire_identity: Some(&built.agent_id),
         },
       )
       .unwrap_or_else(|err| panic!("{}: patch_headers should succeed: {err}", scenario.name));

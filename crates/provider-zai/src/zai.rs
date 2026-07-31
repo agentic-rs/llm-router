@@ -273,7 +273,7 @@ impl Provider for ZaiProvider {
         initiator: ctx.initiator,
         inbound_headers: ctx.inbound_headers,
         vars: &ctx.vars,
-        agent_id: &ctx.agent_id,
+        wire_identity: ctx.wire_identity.as_ref(),
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
@@ -471,7 +471,7 @@ mod tests {
       client_headers: None,
       outbound: Some(capture.clone()),
       vars: TemplateVars::default(),
-      agent_id: tokn_core::AgentId::Opencode,
+      wire_identity: Some(tokn_core::AgentId::Opencode),
     };
     let resp = provider.chat(ctx).await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -500,7 +500,7 @@ mod tests {
       initiator: "user",
       inbound_headers: Box::leak(Box::new(HeaderMap::new())),
       vars: Box::leak(Box::new(TemplateVars::default())),
-      agent_id: Box::leak(Box::new(tokn_core::AgentId::Opencode)),
+      wire_identity: Some(Box::leak(Box::new(tokn_core::AgentId::Opencode))),
     }
   }
 
