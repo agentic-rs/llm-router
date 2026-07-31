@@ -12,8 +12,8 @@ use std::fmt;
 use std::sync::Arc;
 use tokn_access::ProviderAccess;
 use tokn_accounts::link::{
-  resolve_managed_target, resolve_relay_target, LinkedRoute, LinkedRouteKind, SelectedManagedTarget,
-  SelectedRelayTarget, TargetResolution, TargetResolveError,
+  resolve_managed_target, resolve_relay_target, LinkedRoute, LinkedRouteKind, PoolRuntimeResult, SelectedManagedTarget,
+  SelectedRelayTarget, SelectionOutcome, SelectionSettlement, TargetResolution, TargetResolveError,
 };
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_core::upstream_url::CanonicalHttpOrigin;
@@ -243,6 +243,17 @@ impl SelectedHttpTarget {
         ExecutionTarget::relay(selected.request_kind(), selected.target(), selected.wire_identity())
       }
       Self::Transparent(selected) => ExecutionTarget::transparent(selected.destination()),
+    }
+  }
+
+  /// Consume the exact selected target and apply one pool-local outcome.
+  /// Transparent traffic has no account selection and therefore settles as
+  /// unchanged without touching pool state.
+  pub fn settle(self, outcome: SelectionOutcome) -> PoolRuntimeResult<SelectionSettlement> {
+    match self {
+      Self::Managed(selected) => selected.into_target().into_selection_token().settle(outcome),
+      Self::Relay(selected) => selected.into_target().into_selection_token().settle(outcome),
+      Self::Transparent(_) => Ok(SelectionSettlement::Unchanged),
     }
   }
 }
@@ -813,6 +824,15 @@ mod tests {
       &upstream_id("upstream")
     );
     assert_eq!(selected.target().selection_token().key().account_id(), "account");
+
+    let (_, _, _, resolution) = routed.into_parts();
+    let TargetResolution::Selected(target) = resolution else {
+      panic!("expected selected managed target");
+    };
+    assert_eq!(
+      target.settle(SelectionOutcome::Healthy).unwrap(),
+      SelectionSettlement::Healthy
+    );
   }
 
   #[test]
@@ -1195,6 +1215,15 @@ mod tests {
     assert_eq!(
       execution_target.request_url(execution.head()).unwrap().as_str(),
       "http://[2001:db8::1]:8080/opaque"
+    );
+
+    let (_, _, _, resolution) = routed.into_parts();
+    let TargetResolution::Selected(target) = resolution else {
+      panic!("expected selected transparent target");
+    };
+    assert_eq!(
+      target.settle(SelectionOutcome::Unavailable).unwrap(),
+      SelectionSettlement::Unchanged
     );
   }
 
