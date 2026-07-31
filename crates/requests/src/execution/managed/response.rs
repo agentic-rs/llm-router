@@ -5,11 +5,16 @@
 //! accumulation, and live SSE translation therefore cannot revise account
 //! health after downstream polling begins.
 
+use super::ManagedHttpResponse;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use http::{HeaderMap, StatusCode};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
+use http::{HeaderMap, HeaderValue, StatusCode};
+use serde_json::Value;
 use snafu::Snafu;
 use tokn_convert::error::ConvertError;
+use tokn_convert::ir::IrResponse;
+use tokn_convert::sse::{EndpointTranslator, SsePipeline};
 use tokn_core::provider::Endpoint;
 
 /// Client-facing body after managed response adaptation.
@@ -107,4 +112,178 @@ impl ManagedResponseAdapter {
   pub fn new() -> Self {
     Self
   }
+
+  /// Adapt a received final response after the caller has settled the exact
+  /// account selection from its status. Actual response content type is
+  /// authoritative; the transformed upstream stream flag is used only when
+  /// the upstream omitted `Content-Type`.
+  pub async fn adapt(&self, upstream: ManagedHttpResponse) -> Result<ManagedClientResponse, ManagedResponseError> {
+    let (response, metadata) = upstream.into_parts();
+    let status = response.status();
+    let mut headers = response.headers().clone();
+
+    if !status.is_success() {
+      let body = read_body(response, status).await?;
+      return Ok(ManagedClientResponse {
+        status,
+        headers,
+        body: ManagedClientBody::Buffered(body),
+      });
+    }
+
+    let response_kind = ResponseKind::from_headers(&headers, metadata.upstream_stream());
+    match (metadata.requested_stream(), response_kind) {
+      (false, ResponseKind::Json) => {
+        let body = read_body(response, status).await?;
+        let body = convert_buffered_json(
+          status,
+          body,
+          metadata.upstream_operation(),
+          metadata.requested_operation(),
+        )?;
+        if metadata.upstream_operation() != metadata.requested_operation() {
+          set_buffered_json_headers(&mut headers);
+        }
+        Ok(ManagedClientResponse {
+          status,
+          headers,
+          body: ManagedClientBody::Buffered(body),
+        })
+      }
+      (false, ResponseKind::Sse) => {
+        let response = tokn_convert::sse::accumulate(metadata.upstream_operation(), response)
+          .await
+          .map_err(|source| ManagedResponseError::SseAccumulation { status, source })?;
+        let body = render_accumulated(
+          status,
+          response,
+          metadata.upstream_operation(),
+          metadata.requested_operation(),
+        )?;
+        set_buffered_json_headers(&mut headers);
+        Ok(ManagedClientResponse {
+          status,
+          headers,
+          body: ManagedClientBody::Buffered(body),
+        })
+      }
+      (true, ResponseKind::Sse) => {
+        let mut pipeline = SsePipeline::from_response(response);
+        if metadata.upstream_operation() != metadata.requested_operation() {
+          pipeline = pipeline.with_transformer(EndpointTranslator::new(
+            metadata.upstream_operation(),
+            metadata.requested_operation(),
+          ));
+        }
+        set_stream_headers(&mut headers);
+        Ok(ManagedClientResponse {
+          status,
+          headers,
+          body: ManagedClientBody::Stream(pipeline.run()),
+        })
+      }
+      (true, ResponseKind::Json) => Err(ManagedResponseError::StreamingProtocolMismatch {
+        upstream_operation: metadata.upstream_operation(),
+        content_type: content_type(&headers),
+      }),
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseKind {
+  Json,
+  Sse,
+}
+
+impl ResponseKind {
+  fn from_headers(headers: &HeaderMap, upstream_stream: bool) -> Self {
+    match content_type(headers) {
+      Some(value) if media_type(&value).eq_ignore_ascii_case("text/event-stream") => Self::Sse,
+      Some(_) => Self::Json,
+      None if upstream_stream => Self::Sse,
+      None => Self::Json,
+    }
+  }
+}
+
+async fn read_body(response: reqwest::Response, status: StatusCode) -> Result<Bytes, ManagedResponseError> {
+  response
+    .bytes()
+    .await
+    .map_err(|source| ManagedResponseError::ResponseRead { status, source })
+}
+
+fn convert_buffered_json(
+  status: StatusCode,
+  body: Bytes,
+  upstream_operation: Endpoint,
+  requested_operation: Endpoint,
+) -> Result<Bytes, ManagedResponseError> {
+  if body.is_empty() {
+    return Ok(body);
+  }
+  let value: Value =
+    serde_json::from_slice(&body).map_err(|source| ManagedResponseError::ResponseJson { status, source })?;
+  if upstream_operation == requested_operation {
+    return Ok(body);
+  }
+  let converted =
+    tokn_convert::convert_response(upstream_operation, requested_operation, &value).map_err(|source| {
+      ManagedResponseError::ResponseConversion {
+        status,
+        from: upstream_operation,
+        to: requested_operation,
+        source,
+      }
+    })?;
+  serialize_response(status, &converted)
+}
+
+fn render_accumulated(
+  status: StatusCode,
+  response: IrResponse,
+  upstream_operation: Endpoint,
+  requested_operation: Endpoint,
+) -> Result<Bytes, ManagedResponseError> {
+  let converted = match requested_operation {
+    Endpoint::ChatCompletions => tokn_convert::value::chat::response_to_value(&response),
+    Endpoint::Responses => tokn_convert::value::responses::response_to_value(&response),
+    Endpoint::Messages => tokn_convert::value::messages::response_to_value(&response),
+  }
+  .map_err(|source| ManagedResponseError::ResponseConversion {
+    status,
+    from: upstream_operation,
+    to: requested_operation,
+    source,
+  })?;
+  serialize_response(status, &converted)
+}
+
+fn serialize_response(status: StatusCode, value: &Value) -> Result<Bytes, ManagedResponseError> {
+  serde_json::to_vec(value)
+    .map(Bytes::from)
+    .map_err(|source| ManagedResponseError::ResponseSerialization { status, source })
+}
+
+fn set_buffered_json_headers(headers: &mut HeaderMap) {
+  headers.remove(CONTENT_LENGTH);
+  headers.remove(CONTENT_ENCODING);
+  headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+}
+
+fn set_stream_headers(headers: &mut HeaderMap) {
+  headers.remove(CONTENT_LENGTH);
+  headers.remove(CONTENT_ENCODING);
+  headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+}
+
+fn content_type(headers: &HeaderMap) -> Option<String> {
+  headers
+    .get(CONTENT_TYPE)
+    .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+}
+
+fn media_type(content_type: &str) -> &str {
+  content_type.split(';').next().unwrap_or_default().trim()
 }
