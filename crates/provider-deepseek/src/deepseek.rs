@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
+use tokn_core::provider::ProviderTarget;
+use tokn_core::upstream_url::CleartextHttpPolicy;
 use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
@@ -19,7 +21,7 @@ pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub struct DeepSeekProvider {
   pub id: String,
   api_key: Secret<String>,
-  base_url: String,
+  target: ProviderTarget,
   info: ProviderInfo,
 }
 
@@ -44,32 +46,49 @@ impl DeepSeekProvider {
   }
 
   pub fn from_account(a: Arc<AccountConfig>) -> Result<Self> {
+    let base_url = a.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+    let target = ProviderTarget::parse(base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: a.id.clone(),
+        source,
+      }
+    })?;
+    Self::from_account_at(a, target)
+  }
+
+  pub fn from_account_at(a: Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
     Self::validate_account(&a)?;
     let key = a.api_key.clone().expect("validated api_key");
-    let base_url = a.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    let upstream_url = target.base_url().to_string();
     Ok(Self {
       id: format!("deepseek:{}", a.id),
       api_key: key,
-      base_url: base_url.clone(),
       info: ProviderInfo {
         id: ID_DEEPSEEK.to_string(),
         aliases: &[ID_DEEPSEEK],
         display_name: "DeepSeek",
-        upstream_url: base_url,
+        upstream_url,
         auth_kind: AuthKind::StaticApiKey,
         default_models: crate::catalogue::default_models_for(ID_DEEPSEEK),
         default_endpoints: crate::DEFAULT_ENDPOINTS,
-        model_cache: std::sync::Arc::new(tokn_core::provider::ModelCache::default()),
+        model_cache: Arc::clone(target.model_cache()),
       },
+      target,
     })
   }
 
   fn url(&self, path: &str) -> String {
-    format!("{}{}", self.base_url.trim_end_matches('/'), path)
+    format!("{}{}", self.target.base_url().as_str().trim_end_matches('/'), path)
   }
 
   fn messages_path(&self) -> &'static str {
-    if self.base_url.trim_end_matches('/').ends_with("/anthropic") {
+    if self
+      .target
+      .base_url()
+      .as_str()
+      .trim_end_matches('/')
+      .ends_with("/anthropic")
+    {
       "/v1/messages"
     } else {
       "/anthropic/v1/messages"
@@ -306,7 +325,21 @@ mod tests {
   fn constructs_with_default_url() {
     let p = DeepSeekProvider::from_account(Arc::new(acct(Some("sk-test")))).unwrap();
     assert_eq!(p.info().id, ID_DEEPSEEK);
-    assert_eq!(p.info().upstream_url, DEFAULT_BASE_URL);
+    assert_eq!(p.info().upstream_url, format!("{DEFAULT_BASE_URL}/"));
+  }
+
+  #[test]
+  fn explicit_target_owns_destination_and_model_cache() {
+    let mut account = acct(Some("sk-test"));
+    account.base_url = Some("https://ignored.example".into());
+    let target = ProviderTarget::parse("https://proxy.example/deepseek", CleartextHttpPolicy::Allow).unwrap();
+    let model_cache = Arc::clone(target.model_cache());
+
+    let p = DeepSeekProvider::from_account_at(Arc::new(account), target).unwrap();
+
+    assert_eq!(p.info().upstream_url, "https://proxy.example/deepseek/");
+    assert_eq!(p.url("/models"), "https://proxy.example/deepseek/models");
+    assert!(Arc::ptr_eq(&p.info().model_cache, &model_cache));
   }
 
   #[test]
