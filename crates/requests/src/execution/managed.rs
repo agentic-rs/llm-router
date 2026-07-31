@@ -393,3 +393,162 @@ fn classify_provider_error(error: &ProviderError) -> SelectionOutcome {
     | ProviderError::Profiles { .. } => SelectionOutcome::Unchanged,
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tokn_core::provider;
+  use tokn_headers::{HeaderName, HeaderValue};
+
+  struct ForceStream;
+
+  impl InputTransformer for ForceStream {
+    fn transform_input(&self, _endpoint: Endpoint, mut body: Value) -> provider::Result<Value> {
+      body.as_object_mut().unwrap().insert("stream".into(), Value::Bool(true));
+      Ok(body)
+    }
+  }
+
+  fn headers(values: &[(&str, &str)]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in values {
+      headers.insert(HeaderName::new(*name), HeaderValue::from_string((*value).to_string()));
+    }
+    headers
+  }
+
+  fn input<'a>(
+    headers: &'a HeaderMap,
+    body: &'a Bytes,
+    requested_operation: Endpoint,
+    upstream_operation: Endpoint,
+  ) -> PrepareInput<'a> {
+    PrepareInput {
+      requested_model: "client-model",
+      requested_operation,
+      upstream_model: "upstream-model",
+      upstream_operation,
+      headers,
+      body,
+      wire_identity: None,
+    }
+  }
+
+  #[test]
+  fn preparation_rewrites_model_reencodes_gzip_and_tracks_both_stream_modes() {
+    let inbound_json = serde_json::json!({
+      "model": "client-model",
+      "input": "hello",
+      "stream": false
+    });
+    let decoded = serde_json::to_vec(&inbound_json).unwrap();
+    let body = encode_body_bytes(&decoded, Some(ContentEncodingKind::Gzip)).unwrap();
+    let headers = headers(&[("Content-Encoding", "gzip"), ("X-Initiator", " Agent ")]);
+
+    let prepared = prepare_managed_request(
+      input(&headers, &body, Endpoint::Responses, Endpoint::Responses),
+      "codex",
+      Some(&ForceStream),
+    )
+    .unwrap();
+
+    assert_eq!(prepared.body["model"], "upstream-model");
+    assert_eq!(prepared.body["stream"], true);
+    assert!(!prepared.requested_stream);
+    assert!(prepared.upstream_stream);
+    assert_eq!(prepared.initiator.as_deref(), Some("agent"));
+    assert!(prepared.client_headers.is_empty());
+    let round_trip = decode_json_request(&headers, prepared.wire_body).unwrap();
+    assert_eq!(round_trip.value, prepared.body);
+  }
+
+  #[test]
+  fn preparation_converts_operation_after_rewriting_model() {
+    let body =
+      Bytes::from_static(br#"{"model":"client-model","input":[{"role":"user","content":"hello"}],"stream":true}"#);
+    let prepared = prepare_managed_request(
+      input(&HeaderMap::new(), &body, Endpoint::Responses, Endpoint::ChatCompletions),
+      "llama-cpp",
+      None,
+    )
+    .unwrap();
+
+    assert_eq!(prepared.body["model"], "upstream-model");
+    assert!(prepared.body.get("messages").is_some());
+    assert!(prepared.requested_stream);
+    assert!(prepared.upstream_stream);
+  }
+
+  #[test]
+  fn unchanged_preparation_reuses_the_exact_wire_body() {
+    let body = Bytes::from_static(b"{ \"model\" : \"client-model\", \"messages\" : [] }");
+    let headers = HeaderMap::new();
+    let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
+    input.upstream_model = "client-model";
+
+    let prepared = prepare_managed_request(input, "llama-cpp", None).unwrap();
+
+    assert_eq!(prepared.wire_body, body);
+    assert_eq!(prepared.wire_body.as_ptr(), body.as_ptr());
+  }
+
+  #[test]
+  fn messages_default_is_applied_before_sending() {
+    let body = Bytes::from_static(br#"{"model":"client-model","messages":[]}"#);
+    let prepared = prepare_managed_request(
+      input(&HeaderMap::new(), &body, Endpoint::Messages, Endpoint::Messages),
+      "deepseek",
+      None,
+    )
+    .unwrap();
+
+    assert_eq!(prepared.body["max_tokens"], DEFAULT_MESSAGES_MAX_TOKENS);
+  }
+
+  #[test]
+  fn dispatch_body_mismatch_is_local_and_does_not_penalize_selection() {
+    let body = Bytes::from_static(br#"{"model":"different"}"#);
+    let error = prepare_managed_request(
+      input(
+        &HeaderMap::new(),
+        &body,
+        Endpoint::ChatCompletions,
+        Endpoint::ChatCompletions,
+      ),
+      "openai",
+      None,
+    )
+    .err()
+    .unwrap();
+
+    assert!(matches!(error, ManagedAttemptError::DispatchBodyMismatch { .. }));
+    assert_eq!(error.selection_outcome(), SelectionOutcome::Unchanged);
+  }
+
+  #[test]
+  fn explicit_wire_identity_builds_headers_from_inbound_correlation() {
+    let body = Bytes::from_static(br#"{"model":"client-model","messages":[]}"#);
+    let headers = headers(&[("X-Session-Id", "session-1")]);
+    let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
+    input.wire_identity = Some(&AgentId::Opencode);
+
+    let prepared = prepare_managed_request(input, "openai", None).unwrap();
+
+    assert!(!prepared.client_headers.is_empty());
+    assert_eq!(prepared.vars.session_id.as_deref(), Some("session-1"));
+  }
+
+  #[test]
+  fn token_exchange_unauthorized_penalizes_the_selected_credentials() {
+    let error = ManagedAttemptError::ProviderRequest {
+      provider: "copilot".into(),
+      source: ProviderError::HttpStatus {
+        what: "token exchange",
+        status: reqwest::StatusCode::UNAUTHORIZED,
+        body: "expired".into(),
+      },
+    };
+
+    assert_eq!(error.selection_outcome(), SelectionOutcome::Unauthorized);
+  }
+}
