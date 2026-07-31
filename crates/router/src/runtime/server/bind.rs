@@ -1,9 +1,10 @@
 //! Atomic listener binding over one exact linked runtime generation.
 
 use super::super::{
-  LinkedGatewayRuntime, LinkedListener, LinkedListenerKind, MaterializedClientAuth, MaterializedListener,
-  MaterializedListenerKind, MaterializedListeners,
+  LinkedGatewayRuntime, LinkedListenerKind, MaterializedClientAuth, MaterializedListener, MaterializedListenerKind,
+  MaterializedListeners,
 };
+use super::state::{GatewayServerState, ListenerServerState};
 use snafu::Snafu;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -11,31 +12,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokn_policy::{ClientAuthPlan, ListenerId, ListenerKind};
-
-/// Request-serving state shared by every connection entering one listener.
-///
-/// Retaining the complete gateway generation keeps provider, pool, route, and
-/// profile state alive alongside the exact listener node that was
-/// materialized from it.
-#[derive(Debug)]
-pub struct ListenerServerState {
-  gateway: Arc<LinkedGatewayRuntime>,
-  resource: MaterializedListener,
-}
-
-impl ListenerServerState {
-  pub fn gateway(&self) -> &Arc<LinkedGatewayRuntime> {
-    &self.gateway
-  }
-
-  pub fn resource(&self) -> &MaterializedListener {
-    &self.resource
-  }
-
-  pub fn listener(&self) -> &Arc<LinkedListener> {
-    self.resource.listener()
-  }
-}
 
 /// Every configured listener socket, acquired before any accept loop starts.
 #[derive(Debug)]
@@ -95,20 +71,17 @@ impl BoundListener {
 /// built map is dropped with this function frame, releasing every earlier
 /// socket before the error is returned.
 pub async fn bind_gateway_listeners(
-  gateway: Arc<LinkedGatewayRuntime>,
+  gateway: Arc<GatewayServerState>,
   resources: MaterializedListeners,
 ) -> ListenerBindResult<BoundGatewayListeners> {
-  validate_listener_set(&gateway, &resources)?;
+  validate_listener_set(gateway.runtime(), &resources)?;
 
   let mut states = BTreeMap::new();
   for (listener_id, resource) in resources.into_listeners() {
-    validate_listener_resource(&gateway, &listener_id, &resource)?;
+    validate_listener_resource(gateway.runtime(), &listener_id, &resource)?;
     states.insert(
       listener_id,
-      Arc::new(ListenerServerState {
-        gateway: gateway.clone(),
-        resource,
-      }),
+      Arc::new(ListenerServerState::new(gateway.clone(), resource)),
     );
   }
 
@@ -269,9 +242,12 @@ pub type ListenerBindResult<T> = std::result::Result<T, ListenerBindError>;
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::runtime::{link_gateway_runtime, materialize_listeners, RuntimeNameRegistry};
+  use crate::runtime::{
+    link_gateway_runtime, materialize_listeners, GatewayServingDefaults, RequestBodyLimits, RuntimeNameRegistry,
+  };
   use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
   use tokn_accounts::registry::Registry;
+  use tokn_core::util::http::HttpClientOptions;
   use tokn_policy::{
     ConnectAction, ForwardProxyListenerPlan, GatewayPlan, HttpAction, ListenerPlan, LlmApiListenerPlan,
   };
@@ -327,6 +303,17 @@ mod tests {
     Arc::new(link_gateway_runtime(&plan, &[], &Registry::builtin(), &RuntimeNameRegistry::builtin()).unwrap())
   }
 
+  fn serving_generation(runtime: Arc<LinkedGatewayRuntime>) -> Arc<GatewayServerState> {
+    Arc::new(
+      GatewayServerState::build(
+        runtime,
+        &HttpClientOptions::default(),
+        GatewayServingDefaults::new(RequestBodyLimits::new(1024, 1024)),
+      )
+      .unwrap(),
+    )
+  }
+
   #[tokio::test]
   async fn bound_state_retains_the_exact_runtime_generation() {
     let (addresses, reservations) = reserve_addresses(1);
@@ -334,11 +321,14 @@ mod tests {
     let linked_listener = gateway.listeners().listener(&listener_id("api")).unwrap().clone();
     let resources = materialize_listeners(gateway.listeners(), None).unwrap();
     let weak_gateway = Arc::downgrade(&gateway);
+    let serving = serving_generation(gateway.clone());
+    let weak_serving = Arc::downgrade(&serving);
     drop(reservations);
 
-    let bound = bind_gateway_listeners(gateway.clone(), resources).await.unwrap();
+    let bound = bind_gateway_listeners(serving.clone(), resources).await.unwrap();
     let state = bound.listener(&listener_id("api")).unwrap().state();
-    assert!(Arc::ptr_eq(state.gateway(), &gateway));
+    assert!(Arc::ptr_eq(state.gateway(), &serving));
+    assert!(Arc::ptr_eq(state.gateway().runtime(), &gateway));
     assert!(Arc::ptr_eq(state.listener(), &linked_listener));
     assert_eq!(
       bound.listener(&listener_id("api")).unwrap().local_addr().unwrap(),
@@ -346,9 +336,12 @@ mod tests {
     );
 
     drop(gateway);
+    drop(serving);
     assert!(weak_gateway.upgrade().is_some());
+    assert!(weak_serving.upgrade().is_some());
     drop(bound);
     assert!(weak_gateway.upgrade().is_none());
+    assert!(weak_serving.upgrade().is_none());
   }
 
   #[tokio::test]
@@ -358,7 +351,9 @@ mod tests {
     let other = runtime([("unexpected", llm_listener(addresses[0]))]);
     let resources = materialize_listeners(other.listeners(), None).unwrap();
 
-    let error = bind_gateway_listeners(gateway, resources).await.unwrap_err();
+    let error = bind_gateway_listeners(serving_generation(gateway), resources)
+      .await
+      .unwrap_err();
     assert!(matches!(error, ListenerBindError::ListenerSetMismatch { .. }));
     assert_eq!(reservations[0].local_addr().unwrap(), addresses[0]);
   }
@@ -370,7 +365,9 @@ mod tests {
     let other = runtime([("api", llm_listener(addresses[0]))]);
     let resources = materialize_listeners(other.listeners(), None).unwrap();
 
-    let error = bind_gateway_listeners(gateway, resources).await.unwrap_err();
+    let error = bind_gateway_listeners(serving_generation(gateway), resources)
+      .await
+      .unwrap_err();
     assert!(matches!(error, ListenerBindError::ListenerIdentityMismatch { .. }));
     assert_eq!(reservations[0].local_addr().unwrap(), addresses[0]);
   }
@@ -388,7 +385,9 @@ mod tests {
     ]);
     let resources = materialize_listeners(gateway.listeners(), None).unwrap();
 
-    let error = bind_gateway_listeners(gateway, resources).await.unwrap_err();
+    let error = bind_gateway_listeners(serving_generation(gateway), resources)
+      .await
+      .unwrap_err();
     assert!(matches!(
       error,
       ListenerBindError::Bind {
@@ -415,7 +414,9 @@ mod tests {
       .all(|(_, resource)| resource.kind().proxy_ca().is_none()));
     drop(reservations);
 
-    let bound = bind_gateway_listeners(gateway, resources).await.unwrap();
+    let bound = bind_gateway_listeners(serving_generation(gateway), resources)
+      .await
+      .unwrap();
     assert_eq!(bound.len(), 2);
     assert!(bound
       .listeners()
@@ -427,7 +428,9 @@ mod tests {
     let gateway = runtime([]);
     let resources = materialize_listeners(gateway.listeners(), None).unwrap();
 
-    let bound = bind_gateway_listeners(gateway, resources).await.unwrap();
+    let bound = bind_gateway_listeners(serving_generation(gateway), resources)
+      .await
+      .unwrap();
     assert!(bound.is_empty());
     assert_eq!(bound.into_listeners().len(), 0);
   }

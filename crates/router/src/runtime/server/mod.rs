@@ -8,6 +8,7 @@ mod auth;
 mod bind;
 mod body;
 mod response;
+mod state;
 
 pub use admission::{
   admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request, classify_request_kind,
@@ -15,11 +16,11 @@ pub use admission::{
   RequestTargetForm,
 };
 pub use auth::{authenticate_forward_proxy_client, authenticate_llm_api_client, ClientAuthError};
-pub use bind::{
-  bind_gateway_listeners, BoundGatewayListeners, BoundListener, ListenerBindError, ListenerBindResult,
-  ListenerServerState,
-};
+pub use bind::{bind_gateway_listeners, BoundGatewayListeners, BoundListener, ListenerBindError, ListenerBindResult};
 pub use body::{
   buffer_matched_body, BufferedRequestBody, ManagedRequestBody, RequestBodyError, RequestBodyLimits, RequestBodyResult,
 };
 pub use response::{managed_response_to_axum, opaque_response_to_axum, ResponseBridgeError, ResponseBridgeResult};
+pub use state::{
+  GatewayServerState, GatewayServerStateError, GatewayServerStateResult, GatewayServingDefaults, ListenerServerState,
+};
