@@ -5,9 +5,9 @@
 //! by reconstructing provider, account, upstream, or destination identity.
 
 use http::{uri::PathAndQuery, Method};
-use tokn_accounts::link::{SelectedManagedTarget, SelectedRelayTarget};
+use tokn_accounts::link::{RelayDestination, SelectedManagedTarget, SelectedRelayTarget};
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
-use tokn_core::upstream_url::CanonicalHttpOrigin;
+use tokn_core::upstream_url::{CanonicalHttpOrigin, InvalidRequestUrl};
 use tokn_core::AgentId;
 
 /// Exact request-line fields retained for one outbound attempt.
@@ -163,6 +163,16 @@ impl<'a> RelayExecutionTarget<'a> {
   pub fn wire_identity(&self) -> Option<&'a AgentId> {
     self.wire_identity
   }
+
+  /// Compose the exact opaque request URL without interpreting the inbound
+  /// target as a relative URL. Fixed relays append it beneath the configured
+  /// upstream prefix; origin relays preserve the admitted ingress origin.
+  pub fn request_url(&self, head: HttpAttemptHead<'_>) -> Result<reqwest::Url, InvalidRequestUrl> {
+    match self.target.destination() {
+      RelayDestination::Configured(target) => target.base_url().relay_url(head.path_and_query()),
+      RelayDestination::Original(origin) => origin.request_url(head.path_and_query()),
+    }
+  }
 }
 
 /// Account-less execution at the exact admitted inbound origin.
@@ -178,6 +188,11 @@ impl<'a> TransparentExecutionTarget<'a> {
 
   pub fn destination(&self) -> &'a CanonicalHttpOrigin {
     self.destination
+  }
+
+  /// Compose the exact opaque request URL at the admitted ingress origin.
+  pub fn request_url(&self, head: HttpAttemptHead<'_>) -> Result<reqwest::Url, InvalidRequestUrl> {
+    self.destination.request_url(head.path_and_query())
   }
 }
 
