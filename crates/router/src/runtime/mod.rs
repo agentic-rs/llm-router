@@ -1,3 +1,4 @@
+mod dispatch;
 mod gateway;
 mod listeners;
 mod matchers;
@@ -5,6 +6,11 @@ mod names;
 mod profiles;
 mod resources;
 
+pub use dispatch::{
+  dispatch_http, HttpDispatch, HttpDispatchError, HttpDispatchRequest, HttpDispatchResult, HttpDispatchSite,
+  HttpRequestSemantics, RoutedHttpDispatch, SelectedHttpTarget, SelectedManagedHttpTarget, SelectedRelayHttpTarget,
+  SelectedTransparentHttpTarget,
+};
 pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
 pub use listeners::{
   link_listeners, BindingKind, ConnectActionSite, HttpActionSite, LinkedConnectDecision, LinkedConnectPolicy,
