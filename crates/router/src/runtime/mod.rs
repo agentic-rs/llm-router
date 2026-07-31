@@ -3,6 +3,7 @@ mod listeners;
 mod matchers;
 mod names;
 mod profiles;
+mod resources;
 
 pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
 pub use listeners::{
@@ -18,4 +19,8 @@ pub use names::{RuntimeNameError, RuntimeNameRegistry, RuntimeNameResult};
 pub use profiles::{
   link_profiles, scan_profile_reachability, LinkedProfile, LinkedProfiles, LinkedWireIdentity, ProfileLinkError,
   ProfileLinkResult, ProfileReachability, ProfileReferenceSite,
+};
+pub use resources::{
+  materialize_listeners, ListenerResourceError, ListenerResourceResult, MaterializedClientAuth, MaterializedListener,
+  MaterializedListenerKind, MaterializedListeners,
 };
