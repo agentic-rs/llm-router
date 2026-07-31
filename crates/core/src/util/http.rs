@@ -7,6 +7,26 @@ use snafu::ResultExt;
 use std::time::Duration;
 use tokn_headers::HeaderMap;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_PLANE_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientKind {
+  Control,
+  Managed,
+  Opaque,
+}
+
+impl ClientKind {
+  fn total_timeout(self) -> Option<Duration> {
+    match self {
+      Self::Control => Some(CONTROL_PLANE_TOTAL_TIMEOUT),
+      Self::Managed | Self::Opaque => None,
+    }
+  }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HttpClientOptions {
   pub url: Option<String>,
@@ -14,45 +34,65 @@ pub struct HttpClientOptions {
   pub system: bool,
 }
 
+/// Build the bounded client used by control-plane and legacy call sites.
 pub fn build_client(options: &HttpClientOptions) -> Result<reqwest::Client> {
-  let builder = decompression_client_builder();
-  build_client_with_options(builder, options)
+  build_client_with_options(control_plane_client_builder(), options)
 }
 
 /// Build a client for one selected managed upstream attempt.
 ///
 /// Redirects are returned to the caller so execution cannot drift away from
 /// the selected upstream. Response decompression remains enabled because
-/// managed JSON and SSE conversion operate on decoded bytes.
+/// managed JSON and SSE conversion operate on decoded bytes. No total request
+/// timeout is installed: reqwest applies that deadline through the complete
+/// response body, which would terminate long-lived SSE streams.
 pub fn build_managed_client(options: &HttpClientOptions) -> Result<reqwest::Client> {
-  let builder = decompression_client_builder().redirect(reqwest::redirect::Policy::none());
-  build_client_with_options(builder, options)
+  build_client_with_options(managed_client_builder(), options)
 }
 
 /// Build a client for opaque relay and transparent traffic.
 ///
 /// Redirects are returned to the caller instead of being followed, and
 /// response content codings remain untouched so the caller can forward the
-/// original response headers and bytes together.
+/// original response headers and bytes together. No total request timeout is
+/// installed because opaque response bodies may be arbitrarily long-lived.
 pub fn build_opaque_client(options: &HttpClientOptions) -> Result<reqwest::Client> {
-  let builder = base_client_builder()
+  build_client_with_options(opaque_client_builder(), options)
+}
+
+/// Common connection and pooling policy.
+///
+/// [`ClientKind`] determines whether to add a total request timeout. Reqwest's
+/// default is no total timeout, which the data-plane kinds retain.
+fn transport_client_builder(kind: ClientKind) -> reqwest::ClientBuilder {
+  let builder = reqwest::Client::builder()
+    .connect_timeout(CONNECT_TIMEOUT)
+    .pool_idle_timeout(Some(POOL_IDLE_TIMEOUT));
+  match kind.total_timeout() {
+    Some(timeout) => builder.timeout(timeout),
+    None => builder,
+  }
+}
+
+fn control_plane_client_builder() -> reqwest::ClientBuilder {
+  with_decompression(transport_client_builder(ClientKind::Control))
+}
+
+fn managed_client_builder() -> reqwest::ClientBuilder {
+  with_decompression(transport_client_builder(ClientKind::Managed)).redirect(reqwest::redirect::Policy::none())
+}
+
+fn opaque_client_builder() -> reqwest::ClientBuilder {
+  transport_client_builder(ClientKind::Opaque)
     .redirect(reqwest::redirect::Policy::none())
     .gzip(false)
     .brotli(false)
     .deflate(false)
-    .zstd(false);
-  build_client_with_options(builder, options)
+    .zstd(false)
 }
 
-fn base_client_builder() -> reqwest::ClientBuilder {
-  reqwest::Client::builder()
-    .connect_timeout(Duration::from_secs(15))
-    .timeout(Duration::from_secs(600))
-    .pool_idle_timeout(Some(Duration::from_secs(90)))
-}
-
-fn decompression_client_builder() -> reqwest::ClientBuilder {
-  base_client_builder()
+fn with_decompression(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+  builder
     // Personas advertise `Accept-Encoding: gzip, deflate, br, zstd` (from
     // real-world captures), and providers honor it (zai → gzip). Without
     // these toggles reqwest hands compressed bytes to managed response
@@ -214,6 +254,18 @@ mod tests {
   use super::*;
   use std::net::SocketAddr;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+  #[test]
+  fn total_timeout_is_bounded_only_for_control_plane_clients() {
+    assert_eq!(ClientKind::Control.total_timeout(), Some(CONTROL_PLANE_TOTAL_TIMEOUT));
+    assert_eq!(ClientKind::Managed.total_timeout(), None);
+    assert_eq!(ClientKind::Opaque.total_timeout(), None);
+  }
+
+  #[test]
+  fn control_plane_client_builds_without_proxy() {
+    build_client(&HttpClientOptions::default()).expect("control-plane client should build");
+  }
 
   #[test]
   fn opaque_client_builds_without_proxy() {
