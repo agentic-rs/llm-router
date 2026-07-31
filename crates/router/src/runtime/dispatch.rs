@@ -23,7 +23,7 @@ use tokn_core::AgentId;
 use tokn_policy::{
   BindingId, CanonicalHttpPath, HttpIngress, InvalidHttpPath, ListenerId, ProfileId, ProviderId, RouteId,
 };
-use tokn_requests::execution::{ExecutionTarget, HttpAttemptHead};
+use tokn_requests::execution::ExecutionTarget;
 
 /// Immutable, typed request-line and ingress facts admitted at the HTTP trust
 /// boundary.
@@ -208,24 +208,12 @@ impl RoutedHttpDispatch {
     self.profile.route()
   }
 
-  pub fn resolution(&self) -> &TargetResolution<SelectedHttpTarget> {
+  #[cfg(test)]
+  pub(super) fn resolution(&self) -> &TargetResolution<SelectedHttpTarget> {
     self.resolution.as_ref()
   }
 
-  /// Borrow the exact admitted request head and selected target for one
-  /// execution attempt. Cooling and ineligible resolutions have no execution
-  /// view because no account/upstream target was selected.
-  pub fn execution_view(&self) -> Option<HttpExecutionView<'_>> {
-    let TargetResolution::Selected(target) = self.resolution() else {
-      return None;
-    };
-    Some(HttpExecutionView {
-      head: HttpAttemptHead::new(self.head.method(), self.head.path_and_query()),
-      target: target.execution_target(),
-    })
-  }
-
-  pub fn into_parts(
+  pub(super) fn into_parts(
     self,
   ) -> (
     HttpDispatchSite,
@@ -237,33 +225,16 @@ impl RoutedHttpDispatch {
   }
 }
 
-/// Borrowed input to one post-dispatch HTTP execution attempt.
-#[derive(Clone, Copy, Debug)]
-pub struct HttpExecutionView<'a> {
-  head: HttpAttemptHead<'a>,
-  target: ExecutionTarget<'a>,
-}
-
-impl<'a> HttpExecutionView<'a> {
-  pub fn head(&self) -> HttpAttemptHead<'a> {
-    self.head
-  }
-
-  pub fn target(&self) -> ExecutionTarget<'a> {
-    self.target
-  }
-}
-
 /// Route-family-specific selected HTTP execution target.
 #[derive(Debug)]
-pub enum SelectedHttpTarget {
+pub(super) enum SelectedHttpTarget {
   Managed(SelectedManagedHttpTarget),
   Relay(SelectedRelayHttpTarget),
   Transparent(SelectedTransparentHttpTarget),
 }
 
 impl SelectedHttpTarget {
-  pub fn execution_target(&self) -> ExecutionTarget<'_> {
+  pub(super) fn execution_target(&self) -> ExecutionTarget<'_> {
     match self {
       Self::Managed(selected) => ExecutionTarget::managed(
         selected.requested_model(),
@@ -281,7 +252,7 @@ impl SelectedHttpTarget {
   /// Consume the exact selected target and apply one pool-local outcome.
   /// Transparent traffic has no account selection and therefore settles as
   /// unchanged without touching pool state.
-  pub fn settle(self, outcome: SelectionOutcome) -> PoolRuntimeResult<SelectionSettlement> {
+  pub(super) fn settle(self, outcome: SelectionOutcome) -> PoolRuntimeResult<SelectionSettlement> {
     match self {
       Self::Managed(selected) => selected.into_target().into_selection_token().settle(outcome),
       Self::Relay(selected) => selected.into_target().into_selection_token().settle(outcome),
@@ -293,7 +264,7 @@ impl SelectedHttpTarget {
 /// Managed selection keeps inbound request semantics alongside the outbound
 /// model and operation selected by the accounts resolver.
 #[derive(Debug)]
-pub struct SelectedManagedHttpTarget {
+pub(super) struct SelectedManagedHttpTarget {
   requested_model: SmolStr,
   requested_operation: Endpoint,
   target: SelectedManagedTarget,
@@ -301,61 +272,61 @@ pub struct SelectedManagedHttpTarget {
 }
 
 impl SelectedManagedHttpTarget {
-  pub fn requested_model(&self) -> &str {
+  pub(super) fn requested_model(&self) -> &str {
     self.requested_model.as_str()
   }
 
-  pub fn requested_operation(&self) -> Endpoint {
+  pub(super) fn requested_operation(&self) -> Endpoint {
     self.requested_operation
   }
 
-  pub fn target(&self) -> &SelectedManagedTarget {
+  pub(super) fn target(&self) -> &SelectedManagedTarget {
     &self.target
   }
 
-  pub fn wire_identity(&self) -> Option<&AgentId> {
+  pub(super) fn wire_identity(&self) -> Option<&AgentId> {
     self.wire_identity.as_ref()
   }
 
-  pub fn into_target(self) -> SelectedManagedTarget {
+  fn into_target(self) -> SelectedManagedTarget {
     self.target
   }
 }
 
 /// Opaque relay selection with its post-selection wire identity.
 #[derive(Debug)]
-pub struct SelectedRelayHttpTarget {
+pub(super) struct SelectedRelayHttpTarget {
   target: SelectedRelayTarget,
   request_kind: ProviderRequestKind,
   wire_identity: Option<AgentId>,
 }
 
 impl SelectedRelayHttpTarget {
-  pub fn target(&self) -> &SelectedRelayTarget {
+  pub(super) fn target(&self) -> &SelectedRelayTarget {
     &self.target
   }
 
-  pub fn request_kind(&self) -> ProviderRequestKind {
+  pub(super) fn request_kind(&self) -> ProviderRequestKind {
     self.request_kind
   }
 
-  pub fn wire_identity(&self) -> Option<&AgentId> {
+  pub(super) fn wire_identity(&self) -> Option<&AgentId> {
     self.wire_identity.as_ref()
   }
 
-  pub fn into_target(self) -> SelectedRelayTarget {
+  fn into_target(self) -> SelectedRelayTarget {
     self.target
   }
 }
 
 /// Account-less transparent destination derived from typed HTTP ingress.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SelectedTransparentHttpTarget {
+pub(super) struct SelectedTransparentHttpTarget {
   destination: CanonicalHttpOrigin,
 }
 
 impl SelectedTransparentHttpTarget {
-  pub fn destination(&self) -> &CanonicalHttpOrigin {
+  pub(super) fn destination(&self) -> &CanonicalHttpOrigin {
     &self.destination
   }
 }
@@ -595,6 +566,7 @@ mod tests {
     QualificationNamespace, RelayRetry, RelayRoute, RelayTarget, RoutePlan, SessionAffinityPlan, TlsPlan, UpstreamId,
     UpstreamOrigin, UpstreamPlan, UpstreamSelector, WireIdentity,
   };
+  use tokn_requests::execution::HttpAttemptHead;
 
   fn listener_id(value: &str) -> ListenerId {
     ListenerId::new(value).unwrap()
@@ -762,6 +734,17 @@ mod tests {
     route
   }
 
+  fn execution_head(dispatch: &RoutedHttpDispatch) -> HttpAttemptHead<'_> {
+    HttpAttemptHead::new(dispatch.head().method(), dispatch.head().path_and_query())
+  }
+
+  fn execution_target(dispatch: &RoutedHttpDispatch) -> ExecutionTarget<'_> {
+    let TargetResolution::Selected(target) = dispatch.resolution() else {
+      panic!("expected selected target, got {:?}", dispatch.resolution());
+    };
+    target.execution_target()
+  }
+
   #[test]
   fn request_head_keeps_the_exact_target_but_canonicalizes_the_match_path() {
     let head = request_head(
@@ -851,13 +834,13 @@ mod tests {
     let TargetResolution::Selected(SelectedHttpTarget::Managed(selected)) = routed.resolution() else {
       panic!("expected selected managed target, got {:?}", routed.resolution());
     };
-    let execution = routed.execution_view().unwrap();
-    assert!(std::ptr::eq(execution.head().method(), routed.head().method()));
+    let execution_head = execution_head(&routed);
+    assert!(std::ptr::eq(execution_head.method(), routed.head().method()));
     assert!(std::ptr::eq(
-      execution.head().path_and_query(),
+      execution_head.path_and_query(),
       routed.head().path_and_query()
     ));
-    let ExecutionTarget::Managed(execution_target) = execution.target() else {
+    let ExecutionTarget::Managed(execution_target) = execution_target(&routed) else {
       panic!("expected managed execution target");
     };
     assert!(std::ptr::eq(execution_target.target(), selected.target()));
@@ -964,8 +947,7 @@ mod tests {
       TargetResolution::Selected(SelectedHttpTarget::Relay(selected))
         if selected.request_kind() == ProviderRequestKind::Operation(Endpoint::Responses)
     ));
-    let execution = relay.execution_view().unwrap();
-    let ExecutionTarget::Relay(execution_target) = execution.target() else {
+    let ExecutionTarget::Relay(execution_target) = execution_target(&relay) else {
       panic!("expected relay execution target");
     };
     assert_eq!(
@@ -973,7 +955,7 @@ mod tests {
       ProviderRequestKind::Operation(Endpoint::Responses)
     );
     assert_eq!(
-      execution_target.request_url(execution.head()).unwrap().as_str(),
+      execution_target.request_url(execution_head(&relay)).unwrap().as_str(),
       "https://upstream.example/v1/opaque"
     );
 
@@ -1182,7 +1164,6 @@ mod tests {
         reason: NoEligibleReason::ProviderAccessDenied
       }
     ));
-    assert!(denied.execution_view().is_none());
   }
 
   #[test]
@@ -1242,12 +1223,11 @@ mod tests {
       routed.head().path_and_query().as_str(),
       "/v1/models?client_version=test"
     );
-    let execution = routed.execution_view().unwrap();
-    let ExecutionTarget::Relay(execution_target) = execution.target() else {
+    let ExecutionTarget::Relay(execution_target) = execution_target(&routed) else {
       panic!("expected relay execution target");
     };
     assert_eq!(
-      execution_target.request_url(execution.head()).unwrap().as_str(),
+      execution_target.request_url(execution_head(&routed)).unwrap().as_str(),
       "https://origin.example/v1/models?client_version=test"
     );
   }
@@ -1295,13 +1275,12 @@ mod tests {
       panic!("expected transparent selection, got {:?}", routed.resolution());
     };
     assert_eq!(selected.destination().as_str(), "http://[2001:db8::1]:8080");
-    let execution = routed.execution_view().unwrap();
-    let ExecutionTarget::Transparent(execution_target) = execution.target() else {
+    let ExecutionTarget::Transparent(execution_target) = execution_target(&routed) else {
       panic!("expected transparent execution target");
     };
     assert!(std::ptr::eq(execution_target.destination(), selected.destination()));
     assert_eq!(
-      execution_target.request_url(execution.head()).unwrap().as_str(),
+      execution_target.request_url(execution_head(&routed)).unwrap().as_str(),
       "http://[2001:db8::1]:8080/opaque"
     );
 
