@@ -81,7 +81,7 @@ impl OpenAiProvider {
         initiator: ctx.initiator,
         inbound_headers: ctx.inbound_headers,
         vars: &ctx.vars,
-        agent_id: &ctx.agent_id,
+        wire_identity: ctx.wire_identity.as_ref(),
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
@@ -154,7 +154,7 @@ impl Provider for OpenAiProvider {
         initiator: "user",
         inbound_headers: &HeaderMap::new(),
         vars: &TemplateVars::default(),
-        agent_id: &tokn_core::AgentId::Opencode,
+        wire_identity: Some(&tokn_core::AgentId::Opencode),
       },
     )?;
     let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, None, "openai /models").await?;
@@ -220,7 +220,7 @@ mod tests {
       initiator: "user",
       inbound_headers: Box::leak(Box::new(HeaderMap::new())),
       vars: Box::leak(Box::new(TemplateVars::default())),
-      agent_id: Box::leak(Box::new(tokn_core::AgentId::Opencode)),
+      wire_identity: Some(Box::leak(Box::new(tokn_core::AgentId::Opencode))),
     }
   }
 
@@ -358,7 +358,7 @@ mod tests {
         client_headers: None,
         outbound: None,
         vars: TemplateVars::default(),
-        agent_id: tokn_core::AgentId::Opencode,
+        wire_identity: Some(tokn_core::AgentId::Opencode),
       })
       .await
       .unwrap();

@@ -333,9 +333,7 @@ impl CopilotProvider {
       _ => self.resolve_initiator(ctx.body, ctx.inbound_headers, ctx.initiator),
     };
     tracing::Span::current().record("initiator", initiator.as_str());
-    let mut h = ctx.client_headers.clone().unwrap_or_else(|| {
-      headers::copilot_request_headers(token.expose(), &self.headers, ctx.stream, &initiator).unwrap_or_default()
-    });
+    let mut h = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
       &mut h,
       &HeaderPatchCtx {
@@ -347,7 +345,7 @@ impl CopilotProvider {
         initiator: &initiator,
         inbound_headers: ctx.inbound_headers,
         vars: &ctx.vars,
-        agent_id: &ctx.agent_id,
+        wire_identity: ctx.wire_identity.as_ref(),
       },
     )?;
     debug!(%url, "POST upstream");
@@ -450,7 +448,7 @@ mod tests {
       initiator,
       inbound_headers: Box::leak(Box::new(HeaderMap::new())),
       vars: Box::leak(Box::new(TemplateVars::default())),
-      agent_id: Box::leak(Box::new(tokn_core::AgentId::CopilotCli)),
+      wire_identity: Some(Box::leak(Box::new(tokn_core::AgentId::CopilotCli))),
     }
   }
 
@@ -525,7 +523,7 @@ mod tests {
       initiator: "user",
       inbound_headers: &HeaderMap::new(),
       vars: &TemplateVars::default(),
-      agent_id: &tokn_core::AgentId::CopilotCli,
+      wire_identity: Some(&tokn_core::AgentId::CopilotCli),
     };
     let err = p.patch_headers(&mut h, &ctx).unwrap_err();
     assert!(err.to_string().contains("copilot bearer token"), "{err}");
@@ -651,7 +649,7 @@ mod tests {
         client_headers: None,
         outbound: None,
         vars: TemplateVars::default(),
-        agent_id: tokn_core::AgentId::CopilotCli,
+        wire_identity: Some(tokn_core::AgentId::CopilotCli),
       })
       .await
       .unwrap();

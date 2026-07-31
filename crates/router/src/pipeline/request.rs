@@ -225,7 +225,7 @@ pub fn dry_run_request(
         initiator: prepared.meta.initiator.as_deref().unwrap_or("user"),
         inbound_headers: &inbound_lh,
         vars: &prepared.vars,
-        agent_id: &tokn_core::AgentId::Opencode,
+        wire_identity: Some(&tokn_core::AgentId::Opencode),
       },
     )
     .ok();

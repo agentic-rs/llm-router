@@ -310,7 +310,9 @@ pub struct RequestCtx<'a> {
   pub client_headers: Option<HeaderMap>,
   pub outbound: Option<OutboundCapture>,
   pub vars: TemplateVars,
-  pub agent_id: AgentId,
+  /// Explicit client identity to present on the upstream wire. `None` means
+  /// provider-required headers only; providers must not invent a persona.
+  pub wire_identity: Option<AgentId>,
 }
 
 impl RequestCtx<'_> {
@@ -387,7 +389,9 @@ pub struct HeaderPatchCtx<'a> {
   pub initiator: &'a str,
   pub inbound_headers: &'a HeaderMap,
   pub vars: &'a TemplateVars,
-  pub agent_id: &'a AgentId,
+  /// Explicit client identity to normalize around. `None` requests a neutral
+  /// provider-owned header shape without synthesized persona markers.
+  pub wire_identity: Option<&'a AgentId>,
 }
 
 impl HeaderPatchCtx<'_> {
@@ -499,15 +503,24 @@ pub trait Provider: Send + Sync {
   }
 
   /// Remove client account credentials, then inject the selected account's
-  /// provider-owned replacements.
+  /// provider-owned replacements. A replacement keeps the original header
+  /// position when that credential name was already present; other credential
+  /// kinds are removed before the request leaves the process.
   ///
   /// Cookie authentication is credential material too: retaining it beside a
   /// selected bearer or API key could authenticate as a different account.
   fn replace_credentials(&self, headers: &mut HeaderMap, ctx: &CredentialPatchCtx<'_>) -> Result<()> {
+    let mut injected = HeaderMap::new();
+    self.inject_credentials(&mut injected, ctx)?;
     for name in [&AUTHORIZATION, &X_API_KEY, &CHATGPT_ACCOUNT_ID, &COOKIE] {
-      headers.remove(name);
+      if !injected.contains_key(name) {
+        headers.remove(name);
+      }
     }
-    self.inject_credentials(headers, ctx)
+    for (name, value) in injected {
+      headers.insert(name, value);
+    }
+    Ok(())
   }
 
   fn patch_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
@@ -692,6 +705,10 @@ mod tests {
     fn endpoint_rules(&self) -> Option<&'static [EndpointRule]> {
       self.rules
     }
+    fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> error::Result<()> {
+      headers.insert(&AUTHORIZATION, "Bearer selected");
+      Ok(())
+    }
     async fn list_models(&self, _http: &reqwest::Client) -> error::Result<Value> {
       Ok(Value::Null)
     }
@@ -752,5 +769,39 @@ mod tests {
     assert!(!p.supports("", Endpoint::Messages));
     // Non-empty unknown model → identity gate denies.
     assert!(!p.supports("unknown", Endpoint::ChatCompletions));
+  }
+
+  #[test]
+  fn credential_replacement_preserves_matching_header_position() {
+    let provider = stub(Some(&[]), &[Endpoint::ChatCompletions]);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-before", "1");
+    headers.append(&AUTHORIZATION, "Bearer client-1");
+    headers.append(&AUTHORIZATION, "Bearer client-2");
+    headers.insert(&COOKIE, "session=client");
+    headers.insert(&X_API_KEY, "client-key");
+    headers.insert("x-after", "2");
+
+    provider
+      .replace_credentials(
+        &mut headers,
+        &CredentialPatchCtx {
+          request_kind: ProviderRequestKind::Opaque,
+          bearer_token: None,
+        },
+      )
+      .unwrap();
+
+    assert_eq!(
+      headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>(),
+      [
+        ("x-before", "1"),
+        ("authorization", "Bearer selected"),
+        ("x-after", "2"),
+      ]
+    );
   }
 }

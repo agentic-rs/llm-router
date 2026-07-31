@@ -81,7 +81,7 @@ impl SendStage for DefaultSend {
       client_headers: Some(headers.headers.clone()),
       outbound: Some(capture.clone()),
       vars: headers.vars.clone(),
-      agent_id: headers.agent_id.clone(),
+      wire_identity: Some(headers.agent_id.clone()),
     };
 
     let provider = resolved.account_handle.provider.clone();
