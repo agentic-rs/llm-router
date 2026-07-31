@@ -292,6 +292,7 @@ fn media_type(content_type: &str) -> &str {
 mod tests {
   use super::*;
   use crate::execution::ManagedResponseMetadata;
+  use futures_util::{stream, StreamExt};
 
   fn upstream(
     status: StatusCode,
@@ -436,5 +437,38 @@ mod tests {
         ..
       }
     ));
+  }
+
+  #[tokio::test]
+  async fn translated_stream_delivers_before_upstream_eof() {
+    let first_event = Bytes::from_static(
+      b"data: {\"id\":\"chatcmpl-live\",\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+    );
+    let source =
+      stream::iter([Ok::<_, std::io::Error>(first_event)]).chain(stream::pending::<std::io::Result<Bytes>>());
+    let response = http::Response::builder()
+      .status(StatusCode::OK)
+      .header(CONTENT_TYPE, "text/event-stream")
+      .body(reqwest::Body::wrap_stream(source))
+      .unwrap();
+    let upstream = ManagedHttpResponse {
+      response: reqwest::Response::from(response),
+      metadata: metadata(Endpoint::Responses, Endpoint::ChatCompletions, true, true),
+    };
+
+    let adapted = ManagedResponseAdapter::new().adapt(upstream).await.unwrap();
+    let (_, headers, body) = adapted.into_parts();
+    let ManagedClientBody::Stream(mut body) = body else {
+      panic!("expected live stream")
+    };
+    let first = tokio::time::timeout(std::time::Duration::from_millis(250), body.next())
+      .await
+      .expect("adapter waited for upstream EOF")
+      .expect("stream ended before its first translated event")
+      .unwrap();
+
+    assert!(String::from_utf8_lossy(&first).contains("response.created"));
+    assert_eq!(headers[CONTENT_TYPE], "text/event-stream");
+    assert!(!headers.contains_key(CONTENT_LENGTH));
   }
 }
