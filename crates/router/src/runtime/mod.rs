@@ -36,7 +36,10 @@ pub use resources::{
   MaterializedListenerKind, MaterializedListeners,
 };
 pub use server::{
-  authenticate_forward_proxy_client, authenticate_llm_api_client, bind_gateway_listeners, managed_response_to_axum,
-  opaque_response_to_axum, BoundGatewayListeners, BoundListener, ClientAuthError, ListenerBindError,
-  ListenerBindResult, ListenerServerState, ResponseBridgeError, ResponseBridgeResult,
+  admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request,
+  authenticate_forward_proxy_client, authenticate_llm_api_client, bind_gateway_listeners, classify_request_kind,
+  managed_response_to_axum, opaque_response_to_axum, AdmissionError, AdmittedHttpRequest, AuthorityLocation,
+  BoundGatewayListeners, BoundListener, ClientAuthError, ExpectedRequestTarget, ForwardProxyAdmission,
+  ListenerBindError, ListenerBindResult, ListenerServerState, RequestTargetForm, ResponseBridgeError,
+  ResponseBridgeResult,
 };
