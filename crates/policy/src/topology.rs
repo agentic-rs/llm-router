@@ -637,6 +637,7 @@ pub struct UpstreamPlan {
   base_url: Option<SmolStr>,
   origins: Box<[UpstreamOrigin]>,
   allow_insecure_http: bool,
+  eligible_accounts: Option<BTreeSet<SmolStr>>,
 }
 
 impl UpstreamPlan {
@@ -651,7 +652,17 @@ impl UpstreamPlan {
       base_url,
       origins,
       allow_insecure_http,
+      eligible_accounts: None,
     }
+  }
+
+  /// Restrict this endpoint to named accounts. `None` permits every account
+  /// whose provider matches. Runtime linking intersects this constraint with
+  /// the selected account pool before constructing any credential-bearing
+  /// provider binding.
+  pub fn with_eligible_accounts(mut self, eligible_accounts: Option<BTreeSet<SmolStr>>) -> Self {
+    self.eligible_accounts = eligible_accounts;
+    self
   }
 
   pub fn provider(&self) -> &ProviderId {
@@ -673,6 +684,17 @@ impl UpstreamPlan {
   /// compiler; defaults must receive the same check after resolution.
   pub fn allow_insecure_http(&self) -> bool {
     self.allow_insecure_http
+  }
+
+  pub fn eligible_accounts(&self) -> Option<&BTreeSet<SmolStr>> {
+    self.eligible_accounts.as_ref()
+  }
+
+  pub fn permits_account(&self, account_id: &str) -> bool {
+    self
+      .eligible_accounts
+      .as_ref()
+      .is_none_or(|accounts| accounts.contains(account_id))
   }
 }
 
@@ -906,7 +928,8 @@ mod tests {
       ]
       .into_boxed_slice(),
       false,
-    );
+    )
+    .with_eligible_accounts(Some(BTreeSet::from([SmolStr::new("work")])));
     let group = ModelGroupPlan::new(
       vec![
         ModelCandidate::new(Some(id("openai-public")), "gpt-5"),
@@ -917,6 +940,8 @@ mod tests {
 
     assert_eq!(upstream.provider().as_str(), "openai");
     assert_eq!(upstream.origins()[1].as_str(), "https://chatgpt.com");
+    assert!(upstream.permits_account("work"));
+    assert!(!upstream.permits_account("personal"));
     assert_eq!(group.candidates()[0].model(), "gpt-5");
     assert_eq!(group.candidates()[1].upstream(), None);
   }

@@ -86,6 +86,10 @@ pub enum UpstreamSelector {
   /// Select from explicitly configured upstreams compatible with the route's
   /// account pool. Provider catalogue defaults are resolved for those
   /// upstreams during runtime linking; they do not create implicit entries.
+  ///
+  /// The account-pool strategy chooses an account first. Compatible upstreams
+  /// for that account are then considered in typed upstream-id order as
+  /// deterministic failover, not as an implicit load-balancing policy.
   Any,
   Fixed(UpstreamId),
 }
