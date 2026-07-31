@@ -325,7 +325,6 @@ mod tests {
     assert!(!request.headers().contains_key(http::header::CONTENT_LENGTH));
     assert_eq!(request.body().and_then(reqwest::Body::as_bytes), Some(body.as_ref()));
   }
-
   #[tokio::test]
   async fn managed_client_does_not_follow_redirects() {
     let address = serve_redirect_then_ok().await;
