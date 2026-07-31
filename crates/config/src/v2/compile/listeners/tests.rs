@@ -390,7 +390,12 @@ path_prefixes = ["/"]
 #[test]
 fn canonicalizes_and_validates_raw_encoded_path_prefixes() {
   assert_eq!(
-    compile_path_prefixes(&["/v1/%2fchat".into()], "encoded").unwrap().0,
+    compile_path_prefixes(&["/v1/%2fchat".into()], "encoded")
+      .unwrap()
+      .0
+      .into_iter()
+      .map(|prefix| prefix.to_string())
+      .collect::<Vec<_>>(),
     vec!["/v1/%2Fchat"]
   );
 

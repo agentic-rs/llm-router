@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokn_policy::{
   BindingId, CanonicalHost, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan, DestinationPolicy,
-  ForwardProxyListenerPlan, HostPattern, HttpAction, HttpBindingPlan, HttpMatch, ListenerId, ListenerPlan,
-  LlmApiListenerPlan, OperationId, ProfileId, ProfilePlan, RouteId, RoutePlan, TlsPlan,
+  ForwardProxyListenerPlan, HostPattern, HttpAction, HttpBindingPlan, HttpMatch, HttpPathPrefix, ListenerId,
+  ListenerPlan, LlmApiListenerPlan, OperationId, ProfileId, ProfilePlan, RouteId, RoutePlan, TlsPlan,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +57,7 @@ fn all_atoms<T>(alternatives: &[T], mut predicate: impl FnMut(Option<&T>) -> boo
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HttpMatchKey {
   hosts: Vec<HostPattern>,
-  path_prefixes: Vec<String>,
+  path_prefixes: Vec<HttpPathPrefix>,
   methods: Vec<String>,
   operations: Vec<String>,
 }
@@ -66,7 +66,7 @@ impl HttpMatchKey {
   fn subsumes(&self, other: &Self) -> bool {
     dimension_subsumes(&self.hosts, &other.hosts, HostPattern::subsumes)
       && dimension_subsumes(&self.path_prefixes, &other.path_prefixes, |prefix, path| {
-        path.starts_with(prefix)
+        prefix.subsumes(path)
       })
       && dimension_subsumes(&self.methods, &other.methods, PartialEq::eq)
       && dimension_subsumes(&self.operations, &other.operations, PartialEq::eq)
@@ -75,14 +75,12 @@ impl HttpMatchKey {
   fn subsumes_atom(
     &self,
     host: Option<&HostPattern>,
-    path_prefix: Option<&String>,
+    path_prefix: Option<&HttpPathPrefix>,
     method: Option<&String>,
     operation: Option<&String>,
   ) -> bool {
     dimension_subsumes_atom(&self.hosts, host, HostPattern::subsumes)
-      && dimension_subsumes_atom(&self.path_prefixes, path_prefix, |prefix, path| {
-        path.starts_with(prefix)
-      })
+      && dimension_subsumes_atom(&self.path_prefixes, path_prefix, |prefix, path| prefix.subsumes(path))
       && dimension_subsumes_atom(&self.methods, method, PartialEq::eq)
       && dimension_subsumes_atom(&self.operations, operation, PartialEq::eq)
   }
@@ -464,7 +462,7 @@ fn compile_http_match(raw: &crate::v2::RawBinding) -> Result<(HttpMatch, HttpMat
 
   let matcher = HttpMatch::new(
     hosts.into_boxed_slice(),
-    path_prefixes.into_iter().map(Into::into).collect(),
+    path_prefixes.into_boxed_slice(),
     methods.into_iter().map(Into::into).collect(),
     operations.into_boxed_slice(),
   )
@@ -597,20 +595,23 @@ fn invalid_host(location: &str, message: impl Into<String>) -> CompileError {
   invalid_value(location.to_string(), message)
 }
 
-fn compile_path_prefixes(raw_paths: &[String], binding_id: &str) -> Result<(Vec<String>, Vec<String>), CompileError> {
+fn compile_path_prefixes(
+  raw_paths: &[String],
+  binding_id: &str,
+) -> Result<(Vec<HttpPathPrefix>, Vec<HttpPathPrefix>), CompileError> {
   let location = format!("bindings.{binding_id}.path_prefixes");
   let mut values = Vec::with_capacity(raw_paths.len());
-  let mut claimed = Vec::<(String, String)>::new();
+  let mut claimed = Vec::<(String, HttpPathPrefix)>::new();
   for raw_path in raw_paths {
-    let path = canonical_path_prefix(raw_path, &location)?;
+    let path = HttpPathPrefix::parse(raw_path).map_err(|error| invalid_value(location.clone(), error.to_string()))?;
     for (prior_raw, prior) in &claimed {
       if prior == &path {
         return Err(duplicate_value(location.clone(), raw_path));
       }
-      if path.starts_with(prior) {
+      if prior.subsumes(&path) {
         return Err(redundant_value(location.clone(), raw_path, prior_raw));
       }
-      if prior.starts_with(path.as_str()) {
+      if path.subsumes(prior) {
         return Err(redundant_value(location.clone(), prior_raw, raw_path));
       }
     }
@@ -618,91 +619,6 @@ fn compile_path_prefixes(raw_paths: &[String], binding_id: &str) -> Result<(Vec<
     values.push(path);
   }
   Ok((values.clone(), values))
-}
-
-fn canonical_path_prefix(raw: &str, location: &str) -> Result<String, CompileError> {
-  if raw.is_empty() || !raw.starts_with('/') {
-    return Err(invalid_value(
-      location.to_string(),
-      "path prefixes must be non-empty and start with `/`",
-    ));
-  }
-  if raw == "/" {
-    return Err(invalid_value(
-      location.to_string(),
-      "`/` matches every path; omit this dimension (and use the listener default action if no constraints remain)",
-    ));
-  }
-  if !raw.is_ascii() {
-    return Err(invalid_value(
-      location.to_string(),
-      "path prefixes must be ASCII URI paths; percent-encode non-ASCII bytes",
-    ));
-  }
-
-  let bytes = raw.as_bytes();
-  let mut canonical = String::with_capacity(raw.len());
-  let mut index = 0;
-  while index < bytes.len() {
-    let byte = bytes[index];
-    if byte == b'%' {
-      let Some(encoded) = bytes.get(index + 1..index + 3) else {
-        return Err(invalid_value(
-          location.to_string(),
-          "percent escapes in path prefixes must contain exactly two hexadecimal digits",
-        ));
-      };
-      if !encoded.iter().all(u8::is_ascii_hexdigit) {
-        return Err(invalid_value(
-          location.to_string(),
-          "percent escapes in path prefixes must contain exactly two hexadecimal digits",
-        ));
-      }
-      canonical.push('%');
-      canonical.push(char::from(encoded[0].to_ascii_uppercase()));
-      canonical.push(char::from(encoded[1].to_ascii_uppercase()));
-      index += 3;
-      continue;
-    }
-    if byte != b'/' && !is_rfc3986_pchar(byte) {
-      return Err(invalid_value(
-        location.to_string(),
-        "path prefixes may only contain RFC 3986 path characters and percent escapes",
-      ));
-    }
-    canonical.push(char::from(byte));
-    index += 1;
-  }
-
-  if canonical.split('/').any(is_dot_segment) {
-    return Err(invalid_value(
-      location.to_string(),
-      "path prefixes must not contain literal or percent-encoded `.` or `..` segments",
-    ));
-  }
-  Ok(canonical)
-}
-
-fn is_rfc3986_pchar(byte: u8) -> bool {
-  byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&byte)
-}
-
-fn is_dot_segment(segment: &str) -> bool {
-  let bytes = segment.as_bytes();
-  let mut dots = 0;
-  let mut index = 0;
-  while index < bytes.len() {
-    if bytes[index] == b'.' {
-      dots += 1;
-      index += 1;
-    } else if bytes.get(index..index + 3) == Some(b"%2E") {
-      dots += 1;
-      index += 3;
-    } else {
-      return false;
-    }
-  }
-  matches!(dots, 1 | 2)
 }
 
 fn compile_methods(raw_methods: &[String], binding_id: &str) -> Result<(Vec<String>, Vec<String>), CompileError> {
