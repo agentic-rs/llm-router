@@ -5,6 +5,7 @@ mod matchers;
 mod names;
 mod profiles;
 mod resources;
+mod server;
 
 pub use dispatch::{
   dispatch_http, HttpDispatch, HttpDispatchError, HttpDispatchRequest, HttpDispatchResult, HttpDispatchSite,
@@ -29,4 +30,8 @@ pub use profiles::{
 pub use resources::{
   materialize_listeners, ListenerResourceError, ListenerResourceResult, MaterializedClientAuth, MaterializedListener,
   MaterializedListenerKind, MaterializedListeners,
+};
+pub use server::{
+  bind_gateway_listeners, BoundGatewayListeners, BoundListener, ListenerBindError, ListenerBindResult,
+  ListenerServerState,
 };
