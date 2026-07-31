@@ -1,8 +1,10 @@
 //! Synchronous HTTP dispatch over the fully linked runtime graph.
 //!
-//! This module composes listener matching, exact profile/route ownership, and
-//! account target selection without parsing headers, touching payload bytes,
-//! performing I/O, or sleeping for cooldowns.
+//! Listener matching is deliberately separate from route resolution. The
+//! first stage needs only admitted request-line facts and pins the exact
+//! profile generation. The second stage may then use parsed managed semantics
+//! to select an account target without allowing payload facts to change which
+//! listener action matched.
 
 use super::{HttpRequestFacts, LinkedHttpAction, LinkedListener, LinkedProfile, LinkedWireIdentity};
 use http::{uri::PathAndQuery, Method};
@@ -130,6 +132,83 @@ impl fmt::Display for HttpDispatchSite {
       Some(binding) => write!(formatter, "listener '{}' HTTP binding '{}'", self.listener_id, binding),
       None => write!(formatter, "listener '{}' default HTTP action", self.listener_id),
     }
+  }
+}
+
+/// Payload-independent listener decision for one admitted HTTP request.
+#[derive(Debug)]
+pub enum HttpRouteMatch {
+  Reject(HttpDispatchSite),
+  Route(MatchedHttpRoute),
+}
+
+impl HttpRouteMatch {
+  pub fn site(&self) -> &HttpDispatchSite {
+    match self {
+      Self::Reject(site) => site,
+      Self::Route(route) => route.site(),
+    }
+  }
+}
+
+/// An HTTP route pinned to the exact listener action and linked profile that
+/// matched before any managed request body is inspected.
+#[derive(Debug)]
+pub struct MatchedHttpRoute {
+  site: HttpDispatchSite,
+  head: HttpRequestHead,
+  profile: Arc<LinkedProfile>,
+  request_kind: ProviderRequestKind,
+}
+
+impl MatchedHttpRoute {
+  pub fn site(&self) -> &HttpDispatchSite {
+    &self.site
+  }
+
+  pub fn head(&self) -> &HttpRequestHead {
+    &self.head
+  }
+
+  pub fn profile(&self) -> &Arc<LinkedProfile> {
+    &self.profile
+  }
+
+  pub fn route(&self) -> &Arc<LinkedRoute> {
+    self.profile.route()
+  }
+
+  pub fn request_kind(&self) -> ProviderRequestKind {
+    self.request_kind
+  }
+
+  /// Resolve the matched profile into one request-time target decision.
+  ///
+  /// Managed semantics are intentionally required here, after the listener
+  /// action is fixed. Relay authorization remains pinned to the request kind
+  /// retained by the matching stage and cannot be changed by later payload
+  /// inspection.
+  pub fn resolve(
+    self,
+    semantics: HttpRequestSemantics<'_>,
+    session_id: Option<&str>,
+    provider_access: &ProviderAccess,
+  ) -> HttpDispatchResult<RoutedHttpDispatch> {
+    let resolution = resolve_profile(
+      &self.site,
+      &self.head,
+      &self.profile,
+      self.request_kind,
+      semantics,
+      session_id,
+      provider_access,
+    )?;
+    Ok(RoutedHttpDispatch {
+      site: self.site,
+      head: self.head,
+      profile: self.profile,
+      resolution: Box::new(resolution),
+    })
   }
 }
 
@@ -328,17 +407,18 @@ impl SelectedTransparentHttpTarget {
   }
 }
 
-/// Dispatch one request through a linked listener.
-pub fn dispatch_http(
+/// Match one admitted request against a linked listener without consulting
+/// managed payload semantics or selecting an account target.
+pub fn match_http(
   listener: &LinkedListener,
-  request: HttpDispatchRequest<'_>,
-  provider_access: &ProviderAccess,
-) -> HttpDispatchResult<HttpDispatch> {
+  head: HttpRequestHead,
+  request_kind: ProviderRequestKind,
+) -> HttpRouteMatch {
   let facts = HttpRequestFacts {
-    ingress: request.head.ingress(),
-    path: request.head.canonical_path(),
-    method: request.head.method().as_str(),
-    operation: request.semantics.operation(),
+    ingress: head.ingress(),
+    path: head.canonical_path(),
+    method: head.method().as_str(),
+    operation: request_kind.endpoint(),
   };
   let decision = listener.http().decide(&facts);
   let site = HttpDispatchSite {
@@ -347,22 +427,38 @@ pub fn dispatch_http(
   };
 
   let LinkedHttpAction::Route(profile) = decision.action() else {
-    return Ok(HttpDispatch::Reject(site));
+    return HttpRouteMatch::Reject(site);
   };
-  let profile = profile.clone();
-  let resolution = dispatch_profile(&site, &profile, request, provider_access)?;
-  Ok(HttpDispatch::Routed(RoutedHttpDispatch {
+  HttpRouteMatch::Route(MatchedHttpRoute {
     site,
-    head: request.head.clone(),
-    profile,
-    resolution: Box::new(resolution),
-  }))
+    head,
+    profile: profile.clone(),
+    request_kind,
+  })
 }
 
-fn dispatch_profile(
-  site: &HttpDispatchSite,
-  profile: &LinkedProfile,
+/// Dispatch one request through both matching and target-resolution stages.
+pub fn dispatch_http(
+  listener: &LinkedListener,
   request: HttpDispatchRequest<'_>,
+  provider_access: &ProviderAccess,
+) -> HttpDispatchResult<HttpDispatch> {
+  let request_kind = request.semantics.provider_request_kind(request.head.path_and_query());
+  match match_http(listener, request.head.clone(), request_kind) {
+    HttpRouteMatch::Reject(site) => Ok(HttpDispatch::Reject(site)),
+    HttpRouteMatch::Route(route) => route
+      .resolve(request.semantics, request.session_id, provider_access)
+      .map(HttpDispatch::Routed),
+  }
+}
+
+fn resolve_profile(
+  site: &HttpDispatchSite,
+  head: &HttpRequestHead,
+  profile: &LinkedProfile,
+  request_kind: ProviderRequestKind,
+  semantics: HttpRequestSemantics<'_>,
+  session_id: Option<&str>,
   provider_access: &ProviderAccess,
 ) -> HttpDispatchResult<TargetResolution<SelectedHttpTarget>> {
   match profile.route().kind() {
@@ -370,7 +466,7 @@ fn dispatch_profile(
       let HttpRequestSemantics::Structured {
         requested_model,
         requested_operation,
-      } = request.semantics
+      } = semantics
       else {
         return Err(HttpDispatchError::ManagedStructuredSemanticsRequired {
           site: site.clone(),
@@ -378,13 +474,29 @@ fn dispatch_profile(
           route: profile.route().id().clone(),
         });
       };
-      let resolution = resolve_managed_target(
-        route,
-        requested_model,
-        requested_operation,
-        request.session_id,
-        |provider| provider_access.allows(provider.as_str()),
-      )
+      match request_kind {
+        ProviderRequestKind::Operation(matched_operation) if matched_operation == requested_operation => {}
+        ProviderRequestKind::Operation(matched_operation) => {
+          return Err(HttpDispatchError::ManagedOperationChangedAfterMatch {
+            site: site.clone(),
+            profile: profile.id().clone(),
+            route: profile.route().id().clone(),
+            matched_operation,
+            requested_operation,
+          });
+        }
+        request_kind @ (ProviderRequestKind::Models | ProviderRequestKind::Opaque) => {
+          return Err(HttpDispatchError::ManagedOperationRequestKindRequired {
+            site: site.clone(),
+            profile: profile.id().clone(),
+            route: profile.route().id().clone(),
+            request_kind,
+          });
+        }
+      }
+      let resolution = resolve_managed_target(route, requested_model, requested_operation, session_id, |provider| {
+        provider_access.allows(provider.as_str())
+      })
       .map_err(|source| HttpDispatchError::ManagedTarget {
         site: site.clone(),
         profile: profile.id().clone(),
@@ -394,19 +506,14 @@ fn dispatch_profile(
       map_managed_resolution(site, profile, requested_model, requested_operation, resolution)
     }
     LinkedRouteKind::Relay(route) => {
-      let resolution = resolve_relay_target(route, request.head.ingress(), request.session_id, |provider| {
+      let resolution = resolve_relay_target(route, head.ingress(), session_id, |provider| {
         provider_access.allows(provider.as_str())
       });
-      map_relay_resolution(
-        site,
-        profile,
-        request.semantics.provider_request_kind(request.head.path_and_query()),
-        resolution,
-      )
+      map_relay_resolution(site, profile, request_kind, resolution)
     }
     LinkedRouteKind::Transparent(_) => Ok(TargetResolution::Selected(SelectedHttpTarget::Transparent(
       SelectedTransparentHttpTarget {
-        destination: CanonicalHttpOrigin::from_ingress(request.head.ingress()),
+        destination: CanonicalHttpOrigin::from_ingress(head.ingress()),
       },
     ))),
   }
@@ -505,6 +612,27 @@ pub enum HttpDispatchError {
     site: HttpDispatchSite,
     profile: ProfileId,
     route: RouteId,
+  },
+
+  #[snafu(display(
+    "{site} selected managed profile '{profile}' route '{route}', but matched request kind {request_kind:?} is not an LLM operation"
+  ))]
+  ManagedOperationRequestKindRequired {
+    site: HttpDispatchSite,
+    profile: ProfileId,
+    route: RouteId,
+    request_kind: ProviderRequestKind,
+  },
+
+  #[snafu(display(
+    "{site} selected managed profile '{profile}' route '{route}' for operation {matched_operation}, but resolution supplied operation {requested_operation}"
+  ))]
+  ManagedOperationChangedAfterMatch {
+    site: HttpDispatchSite,
+    profile: ProfileId,
+    route: RouteId,
+    matched_operation: Endpoint,
+    requested_operation: Endpoint,
   },
 
   #[snafu(display("{site} failed to resolve managed profile '{profile}' route '{route}': {source}"))]
@@ -710,6 +838,13 @@ mod tests {
     routed
   }
 
+  fn matched(result: HttpRouteMatch) -> MatchedHttpRoute {
+    let HttpRouteMatch::Route(route) = result else {
+      panic!("expected matched route, got {result:?}");
+    };
+    route
+  }
+
   #[test]
   fn request_head_keeps_the_exact_target_but_canonicalizes_the_match_path() {
     let head = request_head(
@@ -850,6 +985,13 @@ mod tests {
     let head = request_head(direct_ingress("reject.example"), "/opaque");
     let denied = ProviderAccess::from_provider_ids(vec!["nothing".into()]).unwrap();
 
+    let matched = match_http(listener, head.clone(), ProviderRequestKind::Opaque);
+    let HttpRouteMatch::Reject(site) = matched else {
+      panic!("expected matching stage to reject");
+    };
+    assert_eq!(site.listener_id().as_str(), "listener");
+    assert!(site.binding_id().is_none());
+
     let dispatch = dispatch_http(
       listener,
       request(&head, HttpRequestSemantics::Opaque { operation: None }),
@@ -911,19 +1053,19 @@ mod tests {
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
     let head = request_head(direct_ingress("original.example"), "/opaque");
 
-    let relay = routed(
-      dispatch_http(
-        listener,
-        request(
-          &head,
-          HttpRequestSemantics::Opaque {
-            operation: Some(Endpoint::Responses),
-          },
-        ),
-        &ProviderAccess::All,
-      )
-      .unwrap(),
-    );
+    let relay = matched(match_http(
+      listener,
+      head.clone(),
+      ProviderRequestKind::Operation(Endpoint::Responses),
+    ))
+    .resolve(
+      HttpRequestSemantics::Opaque {
+        operation: Some(Endpoint::Messages),
+      },
+      Some("session"),
+      &ProviderAccess::All,
+    )
+    .unwrap();
     assert_eq!(relay.site().binding_id().unwrap().as_str(), "relay-binding");
     assert!(matches!(
       relay.resolution(),
@@ -992,17 +1134,26 @@ mod tests {
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
     let head = request_head(direct_ingress("managed.example"), "/opaque");
 
-    let error = dispatch_http(
+    let route = matched(match_http(
       listener,
-      request(
-        &head,
+      head.clone(),
+      ProviderRequestKind::Operation(Endpoint::ChatCompletions),
+    ));
+    assert_eq!(route.head(), &head);
+    assert!(Arc::ptr_eq(
+      route.profile(),
+      runtime.profiles().profile(&profile_id("managed-profile")).unwrap()
+    ));
+
+    let error = route
+      .resolve(
         HttpRequestSemantics::Opaque {
           operation: Some(Endpoint::ChatCompletions),
         },
-      ),
-      &ProviderAccess::All,
-    )
-    .unwrap_err();
+        Some("session"),
+        &ProviderAccess::All,
+      )
+      .unwrap_err();
 
     assert!(matches!(
       error,
@@ -1014,6 +1165,77 @@ mod tests {
         && site.binding_id().is_none()
         && profile.as_str() == "managed-profile"
         && route.as_str() == "managed-route"
+    ));
+  }
+
+  #[test]
+  fn managed_resolution_cannot_change_or_invent_the_matched_operation() {
+    let plan = gateway(
+      llm_listener(Vec::new(), HttpAction::Route(profile_id("managed-profile"))),
+      BTreeMap::from([(
+        profile_id("managed-profile"),
+        ProfilePlan::new(route_id("managed-route"), WireIdentity::None),
+      )]),
+      BTreeMap::from([(
+        route_id("managed-route"),
+        RoutePlan::Managed(ManagedRoute::new(
+          ManagedTarget::new(
+            pool_id("default"),
+            UpstreamSelector::Fixed(upstream_id("upstream")),
+            ModelSelector::Capability,
+          ),
+          OperationPolicy::TranslateCompatible,
+          None,
+          ManagedRetry::Never,
+        )),
+      )]),
+      BTreeMap::from([(pool_id("default"), pool())]),
+      BTreeMap::from([(upstream_id("upstream"), upstream("https://upstream.example/v1/", &[]))]),
+      BTreeMap::new(),
+    );
+    let runtime = link(&plan, &[account("account")]);
+    let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
+    let head = request_head(direct_ingress("managed.example"), "/v1/responses");
+
+    let changed = matched(match_http(
+      listener,
+      head.clone(),
+      ProviderRequestKind::Operation(Endpoint::Responses),
+    ))
+    .resolve(
+      HttpRequestSemantics::Structured {
+        requested_model: "model",
+        requested_operation: Endpoint::ChatCompletions,
+      },
+      None,
+      &ProviderAccess::All,
+    )
+    .unwrap_err();
+    assert!(matches!(
+      changed,
+      HttpDispatchError::ManagedOperationChangedAfterMatch {
+        matched_operation: Endpoint::Responses,
+        requested_operation: Endpoint::ChatCompletions,
+        ..
+      }
+    ));
+
+    let non_operation = matched(match_http(listener, head, ProviderRequestKind::Models))
+      .resolve(
+        HttpRequestSemantics::Structured {
+          requested_model: "model",
+          requested_operation: Endpoint::Responses,
+        },
+        None,
+        &ProviderAccess::All,
+      )
+      .unwrap_err();
+    assert!(matches!(
+      non_operation,
+      HttpDispatchError::ManagedOperationRequestKindRequired {
+        request_kind: ProviderRequestKind::Models,
+        ..
+      }
     ));
   }
 
