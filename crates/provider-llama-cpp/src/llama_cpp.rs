@@ -81,8 +81,8 @@ impl LlamaCppProvider {
     })
   }
 
-  fn url(&self, path: &str) -> String {
-    format!("{}{}", self.target.base_url().as_str().trim_end_matches('/'), path)
+  fn operation_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+    Ok(self.target.base_url().operation_url(segments.iter().copied())?)
   }
 }
 
@@ -148,15 +148,24 @@ impl Provider for LlamaCppProvider {
         agent_id: &tokn_core::AgentId::Opencode,
       },
     )?;
-    let url = self.url("/models");
+    let url = self.operation_url(&["models"])?;
     debug!(%url, "GET llama.cpp models");
-    let resp = crate::util::http::send(http, Method::GET, &url, headers, None, None, "llama.cpp /models").await?;
+    let resp = crate::util::http::send(
+      http,
+      Method::GET,
+      url.as_str(),
+      headers,
+      None,
+      None,
+      "llama.cpp /models",
+    )
+    .await?;
     crate::util::http::read_json(resp, "llama.cpp /models").await
   }
 
   #[instrument(name = "llama_cpp_chat", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    let url = self.url("/chat/completions");
+    let url = self.operation_url(&["chat", "completions"])?;
     debug!(%url, "POST llama.cpp chat");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -177,7 +186,7 @@ impl Provider for LlamaCppProvider {
     crate::util::http::send(
       ctx.http,
       Method::POST,
-      &url,
+      url.as_str(),
       headers,
       Some(body_bytes),
       ctx.outbound.as_ref(),
@@ -257,7 +266,10 @@ mod tests {
     let provider = LlamaCppProvider::from_account_at(Arc::new(account), target).unwrap();
 
     assert_eq!(provider.info().upstream_url, "https://selected.example/api/v1/");
-    assert_eq!(provider.url("/models"), "https://selected.example/api/v1/models");
+    assert_eq!(
+      provider.operation_url(&["models"]).unwrap().as_str(),
+      "https://selected.example/api/v1/models"
+    );
     assert!(Arc::ptr_eq(&provider.info().model_cache, &expected_cache));
   }
 
