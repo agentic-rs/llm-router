@@ -77,11 +77,11 @@ impl DeepSeekProvider {
     })
   }
 
-  fn url(&self, path: &str) -> String {
-    format!("{}{}", self.target.base_url().as_str().trim_end_matches('/'), path)
+  fn operation_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+    Ok(self.target.base_url().operation_url(segments.iter().copied())?)
   }
 
-  fn messages_path(&self) -> &'static str {
+  fn messages_url(&self) -> Result<reqwest::Url> {
     if self
       .target
       .base_url()
@@ -89,14 +89,18 @@ impl DeepSeekProvider {
       .trim_end_matches('/')
       .ends_with("/anthropic")
     {
-      "/v1/messages"
+      self.operation_url(&["v1", "messages"])
     } else {
-      "/anthropic/v1/messages"
+      self.operation_url(&["anthropic", "v1", "messages"])
     }
   }
 
-  async fn upstream_post(&self, ctx: RequestCtx<'_>, path: &str, what: &'static str) -> Result<reqwest::Response> {
-    let url = self.url(path);
+  async fn upstream_post(
+    &self,
+    ctx: RequestCtx<'_>,
+    url: reqwest::Url,
+    what: &'static str,
+  ) -> Result<reqwest::Response> {
     debug!(%url, "POST deepseek upstream");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -117,7 +121,7 @@ impl DeepSeekProvider {
     let resp = crate::util::http::send(
       ctx.http,
       Method::POST,
-      &url,
+      url.as_str(),
       headers,
       Some(body_bytes),
       ctx.outbound.as_ref(),
@@ -188,27 +192,22 @@ impl Provider for DeepSeekProvider {
         agent_id: &tokn_core::AgentId::Opencode,
       },
     )?;
-    let resp = crate::util::http::send(
-      http,
-      Method::GET,
-      &self.url("/models"),
-      headers,
-      None,
-      None,
-      "deepseek /models",
-    )
-    .await?;
+    let url = self.operation_url(&["models"])?;
+    let resp =
+      crate::util::http::send(http, Method::GET, url.as_str(), headers, None, None, "deepseek /models").await?;
     crate::util::http::read_json(resp, "deepseek /models").await
   }
 
   #[instrument(name = "deepseek_chat", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/chat/completions", "deepseek chat").await
+    let url = self.operation_url(&["chat", "completions"])?;
+    self.upstream_post(ctx, url, "deepseek chat").await
   }
 
   #[instrument(name = "deepseek_messages", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn messages(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, self.messages_path(), "deepseek messages").await
+    let url = self.messages_url()?;
+    self.upstream_post(ctx, url, "deepseek messages").await
   }
 
   fn on_unauthorized(&self) {
@@ -338,7 +337,10 @@ mod tests {
     let p = DeepSeekProvider::from_account_at(Arc::new(account), target).unwrap();
 
     assert_eq!(p.info().upstream_url, "https://proxy.example/deepseek/");
-    assert_eq!(p.url("/models"), "https://proxy.example/deepseek/models");
+    assert_eq!(
+      p.operation_url(&["models"]).unwrap().as_str(),
+      "https://proxy.example/deepseek/models"
+    );
     assert!(Arc::ptr_eq(&p.info().model_cache, &model_cache));
   }
 
@@ -395,11 +397,23 @@ mod tests {
   }
 
   #[test]
-  fn anthropic_base_uses_v1_messages_path() {
+  fn messages_url_adds_the_anthropic_prefix() {
+    let p = DeepSeekProvider::from_account(Arc::new(acct(Some("sk-test")))).unwrap();
+    assert_eq!(
+      p.messages_url().unwrap().as_str(),
+      "https://api.deepseek.com/anthropic/v1/messages"
+    );
+  }
+
+  #[test]
+  fn messages_url_does_not_duplicate_an_anthropic_prefix() {
     let mut account = acct(Some("sk-test"));
     account.base_url = Some("https://api.deepseek.com/anthropic".into());
     let p = DeepSeekProvider::from_account(Arc::new(account)).unwrap();
-    assert_eq!(p.messages_path(), "/v1/messages");
+    assert_eq!(
+      p.messages_url().unwrap().as_str(),
+      "https://api.deepseek.com/anthropic/v1/messages"
+    );
   }
 
   fn patch_ctx(endpoint: Endpoint, stream: bool, content_encoding: Option<&'static str>) -> HeaderPatchCtx<'static> {
