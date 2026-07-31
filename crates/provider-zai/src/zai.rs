@@ -22,6 +22,8 @@ use reqwest::Method;
 use serde_json::Value;
 use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
+use tokn_core::provider::ProviderTarget;
+use tokn_core::upstream_url::CleartextHttpPolicy;
 use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
@@ -42,7 +44,7 @@ pub const ZHIPUAI_CODING_PLAN_BASE_URL: &str = "https://open.bigmodel.cn/api/cod
 pub struct ZaiProvider {
   pub id: String,
   api_key: Secret<String>,
-  base_url: String,
+  target: ProviderTarget,
   info: ProviderInfo,
 }
 
@@ -52,7 +54,7 @@ impl std::fmt::Debug for ZaiProvider {
     // panic output.
     f.debug_struct("ZaiProvider")
       .field("id", &self.id)
-      .field("base_url", &self.base_url)
+      .field("base_url", &self.target.base_url())
       .field("provider", &self.info.id)
       .finish()
   }
@@ -80,29 +82,45 @@ impl ZaiProvider {
 
   pub fn from_account(a: std::sync::Arc<AccountConfig>) -> Result<Self> {
     Self::validate_account(&a)?;
-    let key = a.api_key.clone().expect("validated api_key");
     let base_url = a.base_url.clone().unwrap_or_else(|| {
       default_base_url(&a.provider)
         .expect("validated Z.ai provider id")
         .to_string()
     });
+    let target = ProviderTarget::parse(&base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: a.id.clone(),
+        source,
+      }
+    })?;
+    Ok(Self::from_validated_account_at(a, target))
+  }
+
+  pub fn from_account_at(a: std::sync::Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
+    Self::validate_account(&a)?;
+    Ok(Self::from_validated_account_at(a, target))
+  }
+
+  fn from_validated_account_at(a: std::sync::Arc<AccountConfig>, target: ProviderTarget) -> Self {
+    let key = a.api_key.clone().expect("validated api_key");
+    let upstream_url = target.base_url().to_string();
 
     let info = ProviderInfo {
       id: a.provider.clone(),
       aliases: &[],
       display_name: "Z.ai (GLM Coding Plan)",
-      upstream_url: base_url.clone(),
+      upstream_url,
       auth_kind: AuthKind::StaticApiKey,
       default_models: models::catalogue_for(&a.provider),
       default_endpoints: crate::DEFAULT_ENDPOINTS,
-      model_cache: std::sync::Arc::new(tokn_core::provider::ModelCache::default()),
+      model_cache: target.model_cache().clone(),
     };
-    Ok(Self {
+    Self {
       id: format!("{}:{}", a.provider, a.id),
       api_key: key,
-      base_url,
+      target,
       info,
-    })
+    }
   }
 
   fn auth_headers(&self, streaming: bool) -> Result<HeaderMap> {
@@ -193,7 +211,7 @@ impl Provider for ZaiProvider {
     fields(account = %self.id, key_fp = %self.api_key.fingerprint(), status = tracing::field::Empty, count = tracing::field::Empty),
   )]
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
-    let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+    let url = format!("{}models", self.target.base_url());
     debug!(%url, "GET zai models");
     let resp = crate::util::http::send(
       http,
@@ -241,7 +259,7 @@ impl Provider for ZaiProvider {
     span.record("model", model_id);
     span.record("reasoning", reasoning);
 
-    let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+    let url = format!("{}chat/completions", self.target.base_url());
     debug!(%url, "POST zai chat");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -356,7 +374,7 @@ mod tests {
       (ID_ZHIPUAI_CODING_PLAN, ZHIPUAI_CODING_PLAN_BASE_URL),
     ] {
       let provider = ZaiProvider::from_account(std::sync::Arc::new(acct(provider, Some("sk-x")))).unwrap();
-      assert_eq!(provider.base_url, expected);
+      assert_eq!(provider.target.base_url().as_str(), format!("{expected}/"));
     }
   }
 
@@ -365,7 +383,21 @@ mod tests {
     let mut a = acct("zhipuai", Some("sk-x"));
     a.base_url = Some("https://open.bigmodel.cn/api/paas/v4".into());
     let p = ZaiProvider::from_account(std::sync::Arc::new(a)).unwrap();
-    assert_eq!(p.base_url, "https://open.bigmodel.cn/api/paas/v4");
+    assert_eq!(p.target.base_url().as_str(), "https://open.bigmodel.cn/api/paas/v4/");
+  }
+
+  #[test]
+  fn explicit_target_owns_the_destination_and_cache() {
+    let mut account = acct("zai", Some("sk-x"));
+    account.base_url = Some("https://ignored.example/v1".into());
+    let target = ProviderTarget::parse("https://gateway.example/zai", CleartextHttpPolicy::Allow).unwrap();
+    let cache = target.model_cache().clone();
+
+    let provider = ZaiProvider::from_account_at(std::sync::Arc::new(account), target).unwrap();
+
+    assert_eq!(provider.target.base_url().as_str(), "https://gateway.example/zai/");
+    assert_eq!(provider.info().upstream_url, "https://gateway.example/zai/");
+    assert!(std::sync::Arc::ptr_eq(&provider.info().model_cache, &cache));
   }
 
   #[test]
