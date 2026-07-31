@@ -7,13 +7,19 @@
 
 mod id;
 mod route;
+mod topology;
 
 pub use id::{
   AccountPoolId, BindingId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId, ProfileId,
-  RetryPolicyId, RouteId, UpstreamId, WireIdentityId,
+  ProviderId, RetryPolicyId, RouteId, UpstreamId, WireIdentityId,
 };
 pub use route::{
   CredentialPolicy, DestinationPolicy, FallbackSelector, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget,
   ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, QualificationNamespace, RelayRetry, RelayRoute,
   RelayTarget, RouteKind, RoutePlan, UpstreamSelector, WireIdentity,
+};
+pub use topology::{
+  AccountPoolPlan, AccountSelectionStrategy, AccountSelector, BindingAction, BindingMatch, BindingPlan, ClientAuthPlan,
+  EmptyBindingMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, ListenerKind, ListenerPlan,
+  LlmApiListenerPlan, ModelCandidate, ModelGroupPlan, SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
 };

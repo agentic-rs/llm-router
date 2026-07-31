@@ -118,6 +118,7 @@ define_identifier!(BindingId, "binding");
 define_identifier!(RouteId, "route");
 define_identifier!(ProfileId, "profile");
 define_identifier!(AccountPoolId, "account pool");
+define_identifier!(ProviderId, "provider");
 define_identifier!(UpstreamId, "upstream");
 define_identifier!(ModelGroupId, "model group");
 define_identifier!(HeaderPatchSetId, "header patch set");
