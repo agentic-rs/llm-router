@@ -5,10 +5,12 @@
 //! runtime crates consume them without depending on TOML shape or compatibility
 //! aliases.
 
+mod authority;
 mod id;
 mod route;
 mod topology;
 
+pub use authority::{CanonicalAuthority, CanonicalHost, IngressAuthority, InvalidAuthority, InvalidHost};
 pub use id::{
   AccountPoolId, BindingId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId, ProfileId,
   ProviderId, RetryPolicyId, RouteId, UpstreamId, WireIdentityId,
