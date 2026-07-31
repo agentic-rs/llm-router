@@ -9,8 +9,8 @@ mod server;
 
 pub use dispatch::{
   dispatch_http, HttpDispatch, HttpDispatchError, HttpDispatchRequest, HttpDispatchResult, HttpDispatchSite,
-  HttpRequestHead, HttpRequestSemantics, RoutedHttpDispatch, SelectedHttpTarget, SelectedManagedHttpTarget,
-  SelectedRelayHttpTarget, SelectedTransparentHttpTarget,
+  HttpExecutionView, HttpRequestHead, HttpRequestSemantics, RoutedHttpDispatch, SelectedHttpTarget,
+  SelectedManagedHttpTarget, SelectedRelayHttpTarget, SelectedTransparentHttpTarget,
 };
 pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
 pub use listeners::{
