@@ -14,14 +14,13 @@ use tokn_mock_server::{MockAuthConfig, MockEndpoint, MockLlmConfig, MockLlmServe
 use tokn_requests::execution::{
   ManagedClientBody, ManagedExecutionTarget, ManagedHttpAttempt, ManagedHttpExecutor, ManagedResponseAdapter,
 };
-use tokn_requests::utils::codec::{decode_body_bytes, encode_body_bytes, ContentEncodingKind};
 
 const REQUESTED_MODEL: &str = "client-alias";
 const UPSTREAM_MODEL: &str = "selected-backend-model";
 const CODEX_MODEL: &str = "gpt-5.3-codex";
 
 #[tokio::test]
-async fn managed_executor_uses_the_exact_v2_selected_target_and_reencodes_conversion() {
+async fn managed_executor_uses_the_exact_v2_selected_target_and_serializes_uncompressed_conversion() {
   let selected_server = MockLlmServer::start(
     MockLlmConfig {
       routes: vec![MockRoute::chat_completions()],
@@ -115,14 +114,12 @@ upstream = "selected"
     }],
     "stream": false
   });
-  let inbound_json_bytes = serde_json::to_vec(&inbound_json).unwrap();
-  let inbound_body = encode_body_bytes(&inbound_json_bytes, Some(ContentEncodingKind::Gzip)).unwrap();
   let mut inbound_headers = HeaderMap::new();
   inbound_headers.insert("content-type", "application/json");
   inbound_headers.insert("content-encoding", "gzip");
 
   let target = ManagedExecutionTarget::new(REQUESTED_MODEL, Endpoint::Responses, &selected, None);
-  let attempt = ManagedHttpAttempt::new(target, &inbound_headers, &inbound_body);
+  let attempt = ManagedHttpAttempt::new(target, &inbound_headers, &inbound_json);
   let http = build_managed_client(&HttpClientOptions::default()).unwrap();
   let result = ManagedHttpExecutor::new(http).execute(attempt).await.unwrap();
 
@@ -147,11 +144,9 @@ upstream = "selected"
   assert_eq!(captured.method, reqwest::Method::POST);
   assert_eq!(captured.path, "/chat/completions");
   assert_eq!(captured.header("authorization"), Some("Bearer selected-key"));
-  assert_eq!(captured.header("content-encoding"), Some("gzip"));
-  assert_ne!(captured.body, inbound_body);
+  assert_eq!(captured.header("content-encoding"), None);
 
-  let decoded = decode_body_bytes(captured.body.clone(), Some(ContentEncodingKind::Gzip)).unwrap();
-  let upstream_json: Value = serde_json::from_slice(&decoded).unwrap();
+  let upstream_json: Value = serde_json::from_slice(&captured.body).unwrap();
   assert_eq!(upstream_json["model"], UPSTREAM_MODEL);
   assert_eq!(upstream_json["messages"][0]["role"], "user");
   assert_eq!(upstream_json["messages"][0]["content"], "hello from responses");
@@ -261,7 +256,6 @@ accounts = ["codex-account"]
     "input": "hello",
     "stream": false
   });
-  let inbound_body = serde_json::to_vec(&inbound_json).unwrap().into();
   let mut inbound_headers = HeaderMap::new();
   inbound_headers.insert("content-type", "application/json");
   inbound_headers.insert("originator", "client-originator");
@@ -272,7 +266,7 @@ accounts = ["codex-account"]
 
   let target = ManagedExecutionTarget::new(CODEX_MODEL, Endpoint::Responses, &selected, None);
   assert!(target.wire_identity().is_none());
-  let attempt = ManagedHttpAttempt::new(target, &inbound_headers, &inbound_body);
+  let attempt = ManagedHttpAttempt::new(target, &inbound_headers, &inbound_json);
   let http = build_managed_client(&HttpClientOptions::default()).unwrap();
   let result = ManagedHttpExecutor::new(http).execute(attempt).await.unwrap();
 

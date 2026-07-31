@@ -10,7 +10,9 @@
 use super::dispatch::SelectedHttpTarget;
 use super::{HttpDispatchSite, RoutedHttpDispatch};
 use bytes::Bytes;
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderMap;
+use serde_json::Value;
 use snafu::Snafu;
 use std::time::Instant;
 use tokn_accounts::link::{NoEligibleReason, SelectionOutcome, TargetResolution};
@@ -44,14 +46,11 @@ impl HttpExecutionCoordinator {
   ///
   /// Native headers remain byte-preserving for relay and transparent traffic.
   /// Only the managed arm creates the string-backed semantic projection used
-  /// by provider request construction. `body` distinguishes an absent opaque
-  /// body from a present empty body; managed execution treats absence as an
-  /// empty payload and reports its existing invalid-request error.
+  /// by provider request construction.
   pub async fn execute(
     &self,
     dispatch: RoutedHttpDispatch,
-    headers: HeaderMap,
-    body: Option<Bytes>,
+    request: HttpExecutionRequest,
   ) -> HttpExecutionResult<HttpExecutionOutcome> {
     let (site, head, _profile, resolution) = dispatch.into_parts();
     let target = match resolution {
@@ -67,7 +66,7 @@ impl HttpExecutionCoordinator {
     // `receive_head` borrows the exact selected target. Its owned result is
     // retained only after that borrow ends, which makes settlement the sole
     // operation possible before response adaptation or downstream exposure.
-    let received = self.receive_head(&head, &target, &headers, body.as_ref()).await;
+    let received = self.receive_head(&head, &target, &request).await;
     let outcome = match &received {
       Ok(response) => response.selection_outcome(),
       Err(error) => error.selection_outcome(),
@@ -85,6 +84,7 @@ impl HttpExecutionCoordinator {
       Ok(ReceivedResponse::Opaque(response)) => Ok(HttpExecutionOutcome::Opaque { site, response }),
       Err(AttemptFailure::Managed(source)) => Err(HttpExecutionError::ManagedAttempt { site, source }),
       Err(AttemptFailure::Opaque(source)) => Err(HttpExecutionError::OpaqueAttempt { site, source }),
+      Err(AttemptFailure::RequestFamilyMismatch) => Err(HttpExecutionError::RequestFamilyMismatch { site }),
     }
   }
 
@@ -92,14 +92,12 @@ impl HttpExecutionCoordinator {
     &self,
     head: &super::HttpRequestHead,
     target: &SelectedHttpTarget,
-    headers: &HeaderMap,
-    body: Option<&Bytes>,
+    request: &HttpExecutionRequest,
   ) -> Result<ReceivedResponse, AttemptFailure> {
-    match target.execution_target() {
-      ExecutionTarget::Managed(target) => {
-        let semantic_headers = tokn_headers::HeaderMap::from(headers);
-        let empty_body = Bytes::new();
-        let attempt = ManagedHttpAttempt::new(target, &semantic_headers, body.unwrap_or(&empty_body));
+    match (target.execution_target(), &request.body) {
+      (ExecutionTarget::Managed(target), HttpExecutionBody::Managed(body)) => {
+        let semantic_headers = tokn_headers::HeaderMap::from(&request.headers);
+        let attempt = ManagedHttpAttempt::new(target, &semantic_headers, body);
         self
           .managed
           .execute(attempt)
@@ -107,12 +105,12 @@ impl HttpExecutionCoordinator {
           .map(ReceivedResponse::Managed)
           .map_err(AttemptFailure::Managed)
       }
-      ExecutionTarget::Relay(target) => {
+      (ExecutionTarget::Relay(target), HttpExecutionBody::Opaque(body)) => {
         let attempt = OpaqueHttpAttempt::new(
           HttpAttemptHead::new(head.method(), head.path_and_query()),
           OpaqueHttpTarget::Relay(target),
-          headers,
-          body,
+          &request.headers,
+          body.as_ref(),
         );
         self
           .opaque
@@ -121,12 +119,12 @@ impl HttpExecutionCoordinator {
           .map(ReceivedResponse::Opaque)
           .map_err(AttemptFailure::Opaque)
       }
-      ExecutionTarget::Transparent(target) => {
+      (ExecutionTarget::Transparent(target), HttpExecutionBody::Opaque(body)) => {
         let attempt = OpaqueHttpAttempt::new(
           HttpAttemptHead::new(head.method(), head.path_and_query()),
           OpaqueHttpTarget::Transparent(target),
-          headers,
-          body,
+          &request.headers,
+          body.as_ref(),
         );
         self
           .opaque
@@ -135,6 +133,47 @@ impl HttpExecutionCoordinator {
           .map(ReceivedResponse::Opaque)
           .map_err(AttemptFailure::Opaque)
       }
+      (ExecutionTarget::Managed(_), HttpExecutionBody::Opaque(_))
+      | (ExecutionTarget::Relay(_) | ExecutionTarget::Transparent(_), HttpExecutionBody::Managed(_)) => {
+        Err(AttemptFailure::RequestFamilyMismatch)
+      }
+    }
+  }
+}
+
+/// Route-family-specific request input for one already-routed attempt.
+#[derive(Debug)]
+pub struct HttpExecutionRequest {
+  headers: HeaderMap,
+  body: HttpExecutionBody,
+}
+
+#[derive(Debug)]
+enum HttpExecutionBody {
+  Managed(Value),
+  Opaque(Option<Bytes>),
+}
+
+impl HttpExecutionRequest {
+  /// Build managed input after content decoding and JSON validation.
+  ///
+  /// Managed execution always serializes identity JSON. Remove stale wire
+  /// encoding and framing fields before constructing its semantic header
+  /// projection; the outbound transport derives its own content length.
+  pub fn managed(mut headers: HeaderMap, body: Value) -> Self {
+    headers.remove(CONTENT_ENCODING);
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(TRANSFER_ENCODING);
+    Self {
+      headers,
+      body: HttpExecutionBody::Managed(body),
+    }
+  }
+
+  pub fn opaque(headers: HeaderMap, body: Option<Bytes>) -> Self {
+    Self {
+      headers,
+      body: HttpExecutionBody::Opaque(body),
     }
   }
 }
@@ -178,6 +217,9 @@ impl HttpExecutionOutcome {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum HttpExecutionError {
+  #[snafu(display("{site} routed target and prepared request families do not match"))]
+  RequestFamilyMismatch { site: HttpDispatchSite },
+
   #[snafu(display("{site} managed attempt failed before a final response head: {source}"))]
   ManagedAttempt {
     site: HttpDispatchSite,
@@ -200,7 +242,10 @@ pub enum HttpExecutionError {
 impl HttpExecutionError {
   pub fn site(&self) -> &HttpDispatchSite {
     match self {
-      Self::ManagedAttempt { site, .. } | Self::OpaqueAttempt { site, .. } | Self::ManagedResponse { site, .. } => site,
+      Self::RequestFamilyMismatch { site }
+      | Self::ManagedAttempt { site, .. }
+      | Self::OpaqueAttempt { site, .. }
+      | Self::ManagedResponse { site, .. } => site,
     }
   }
 }
@@ -225,6 +270,7 @@ impl ReceivedResponse {
 
 /// A failure before any final upstream response head was received.
 enum AttemptFailure {
+  RequestFamilyMismatch,
   Managed(ManagedAttemptError),
   Opaque(OpaqueAttemptError),
 }
@@ -232,6 +278,7 @@ enum AttemptFailure {
 impl AttemptFailure {
   fn selection_outcome(&self) -> SelectionOutcome {
     match self {
+      Self::RequestFamilyMismatch => SelectionOutcome::Unchanged,
       Self::Managed(error) => error.selection_outcome(),
       Self::Opaque(error) => error.selection_outcome(),
     }
@@ -563,6 +610,43 @@ mod tests {
     (format!("http://{address}/"), requests, head_received, release, task)
   }
 
+  #[test]
+  fn managed_input_removes_consumed_wire_metadata() {
+    let mut headers = json_headers();
+    headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+    headers.insert(CONTENT_LENGTH, "123".parse().unwrap());
+    headers.insert(TRANSFER_ENCODING, "chunked".parse().unwrap());
+
+    let request = HttpExecutionRequest::managed(headers, serde_json::json!({"model": "test"}));
+
+    assert!(!request.headers.contains_key(CONTENT_ENCODING));
+    assert!(!request.headers.contains_key(CONTENT_LENGTH));
+    assert!(!request.headers.contains_key(TRANSFER_ENCODING));
+    assert_eq!(request.headers[http::header::CONTENT_TYPE], "application/json");
+  }
+
+  #[tokio::test]
+  async fn request_family_mismatch_settles_without_an_upstream_attempt() {
+    let runtime = link(&relay_plan("https://unreachable.invalid/"), &[account("account")]);
+    let executor = coordinator();
+    let error = tokio::time::timeout(
+      Duration::from_secs(1),
+      executor.execute(
+        relay_dispatch(&runtime, Some(SESSION), &ProviderAccess::All),
+        HttpExecutionRequest::managed(json_headers(), serde_json::json!({"model": "test"})),
+      ),
+    )
+    .await
+    .expect("a family mismatch must fail before network I/O")
+    .unwrap_err();
+
+    assert!(matches!(error, HttpExecutionError::RequestFamilyMismatch { .. }));
+    assert!(matches!(
+      relay_dispatch(&runtime, Some(SESSION), &ProviderAccess::All).resolution(),
+      TargetResolution::Selected(_)
+    ));
+  }
+
   #[tokio::test]
   async fn pre_head_error_settles_once_and_no_target_outcomes_do_not_execute() {
     let (base_url, requests, server) = spawn_closing_server().await;
@@ -571,7 +655,10 @@ mod tests {
 
     let denied = ProviderAccess::from_provider_ids(vec!["openai".into()]).unwrap();
     let outcome = executor
-      .execute(relay_dispatch(&runtime, Some(SESSION), &denied), HeaderMap::new(), None)
+      .execute(
+        relay_dispatch(&runtime, Some(SESSION), &denied),
+        HttpExecutionRequest::opaque(HeaderMap::new(), None),
+      )
       .await
       .unwrap();
     assert!(matches!(
@@ -586,8 +673,7 @@ mod tests {
     let error = executor
       .execute(
         relay_dispatch(&runtime, Some(SESSION), &ProviderAccess::All),
-        HeaderMap::new(),
-        None,
+        HttpExecutionRequest::opaque(HeaderMap::new(), None),
       )
       .await
       .unwrap_err();
@@ -598,8 +684,7 @@ mod tests {
     let outcome = executor
       .execute(
         relay_dispatch(&runtime, Some(SESSION), &ProviderAccess::All),
-        HeaderMap::new(),
-        None,
+        HttpExecutionRequest::opaque(HeaderMap::new(), None),
       )
       .await
       .unwrap();
@@ -617,7 +702,10 @@ mod tests {
 
     let outcome = tokio::time::timeout(
       Duration::from_secs(2),
-      executor.execute(first, HeaderMap::new(), Some(Bytes::from_static(b"request"))),
+      executor.execute(
+        first,
+        HttpExecutionRequest::opaque(HeaderMap::new(), Some(Bytes::from_static(b"request"))),
+      ),
     )
     .await
     .expect("opaque execution should return after the response head")
@@ -662,8 +750,10 @@ mod tests {
       executor
         .execute(
           selected,
-          json_headers(),
-          Some(Bytes::from_static(br#"{"model":"client-model","messages":[]}"#)),
+          HttpExecutionRequest::managed(
+            json_headers(),
+            serde_json::json!({"model": "client-model", "messages": []}),
+          ),
         )
         .await
     });
