@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
+use tokn_core::provider::ProviderTarget;
+use tokn_core::upstream_url::CleartextHttpPolicy;
 use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
@@ -20,13 +22,24 @@ const CODEX_MODELS_PATH: &str = "/models?client_version=0.130.0";
 pub struct CodexProvider {
   pub id: String,
   credential: Credential,
-  base_url: String,
+  target: ProviderTarget,
   provider_account_id: Option<String>,
   info: ProviderInfo,
 }
 
 impl CodexProvider {
   pub fn from_account(a: Arc<AccountConfig>) -> Result<Self> {
+    let base_url = a.base_url.as_deref().unwrap_or(CODEX_BASE_URL);
+    let target = ProviderTarget::parse(base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: a.id.clone(),
+        source,
+      }
+    })?;
+    Self::from_account_at(a, target)
+  }
+
+  pub fn from_account_at(a: Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
     validate(a.as_ref())?;
     let credential = Credential::AccessToken(
       a.access_token
@@ -34,27 +47,28 @@ impl CodexProvider {
         .or_else(|| a.api_key.clone())
         .expect("validated access token"),
     );
-    let base = a.base_url.clone().unwrap_or_else(|| CODEX_BASE_URL.to_string());
+    let upstream_url = target.base_url().to_string();
+    let model_cache = target.model_cache().clone();
     Ok(Self {
       id: format!("{}:{}", a.provider, a.id),
       credential,
-      base_url: base.clone(),
+      target,
       provider_account_id: a.provider_account_id.clone(),
       info: ProviderInfo {
         id: a.provider.clone(),
         aliases: &[],
         display_name: "ChatGPT Codex",
-        upstream_url: base,
+        upstream_url,
         auth_kind: AuthKind::OAuthDeviceFlow,
         default_models: crate::catalogue::default_models_for(crate::ID_OPENAI),
         default_endpoints: crate::DEFAULT_ENDPOINTS_CODEX,
-        model_cache: Arc::new(tokn_core::provider::ModelCache::default()),
+        model_cache,
       },
     })
   }
 
   fn url(&self, path: &str) -> String {
-    common::url(&self.base_url, path)
+    common::url(self.target.base_url().as_str(), path)
   }
 
   async fn upstream_post(&self, ctx: RequestCtx<'_>, path: &str, what: &'static str) -> Result<reqwest::Response> {
@@ -416,9 +430,43 @@ mod tests {
   #[test]
   fn codex_constructs() {
     let codex = CodexProvider::from_account(Arc::new(acct(Some("atk-test")))).unwrap();
-    assert_eq!(codex.info().upstream_url, CODEX_BASE_URL);
+    assert_eq!(codex.info().upstream_url, format!("{CODEX_BASE_URL}/"));
     assert!(codex.supports("", Endpoint::Responses));
     assert!(!codex.supports("", Endpoint::ChatCompletions));
+  }
+
+  #[test]
+  fn codex_target_overrides_legacy_account_url_and_shares_cache() {
+    let mut account = acct(Some("atk-test"));
+    account.base_url = Some("https://ignored.example/codex".into());
+    let target = ProviderTarget::parse(
+      "https://gateway.example/backend-api/codex",
+      CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+    let target_cache = target.model_cache().clone();
+
+    let codex = CodexProvider::from_account_at(Arc::new(account), target).unwrap();
+
+    assert_eq!(
+      codex.url(CODEX_MODELS_PATH),
+      "https://gateway.example/backend-api/codex/models?client_version=0.130.0"
+    );
+    assert_eq!(codex.info().upstream_url, "https://gateway.example/backend-api/codex/");
+    assert!(Arc::ptr_eq(&codex.info().model_cache, &target_cache));
+  }
+
+  #[test]
+  fn codex_legacy_constructor_reports_invalid_account_url() {
+    let mut account = acct(Some("atk-test"));
+    account.base_url = Some("not-a-url".into());
+
+    let err = CodexProvider::from_account(Arc::new(account)).err().unwrap();
+
+    assert!(matches!(
+      err,
+      error::Error::InvalidUpstreamUrl { account, .. } if account == "test"
+    ));
   }
 
   #[test]

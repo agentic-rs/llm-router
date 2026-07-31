@@ -4,6 +4,8 @@ use reqwest::Method;
 use serde_json::Value;
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
+use tokn_core::provider::ProviderTarget;
+use tokn_core::upstream_url::CleartextHttpPolicy;
 use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
@@ -17,34 +19,46 @@ pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub struct OpenAiProvider {
   pub id: String,
   credential: Credential,
-  base_url: String,
+  target: ProviderTarget,
   info: ProviderInfo,
 }
 
 impl OpenAiProvider {
   pub fn from_account(a: Arc<AccountConfig>) -> Result<Self> {
+    let base_url = a.base_url.as_deref().unwrap_or(OPENAI_BASE_URL);
+    let target = ProviderTarget::parse(base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: a.id.clone(),
+        source,
+      }
+    })?;
+    Self::from_account_at(a, target)
+  }
+
+  pub fn from_account_at(a: Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
     validate(a.as_ref())?;
     let credential = Credential::ApiKey(a.api_key.clone().expect("validated api_key"));
-    let base = a.base_url.clone().unwrap_or_else(|| OPENAI_BASE_URL.to_string());
+    let upstream_url = target.base_url().to_string();
+    let model_cache = target.model_cache().clone();
     Ok(Self {
       id: format!("{}:{}", a.provider, a.id),
       credential,
-      base_url: base.clone(),
+      target,
       info: ProviderInfo {
         id: a.provider.clone(),
         aliases: &[],
         display_name: "OpenAI",
-        upstream_url: base,
+        upstream_url,
         auth_kind: AuthKind::StaticApiKey,
         default_models: crate::catalogue::default_models_for(ID_OPENAI),
         default_endpoints: crate::DEFAULT_ENDPOINTS_OPENAI,
-        model_cache: Arc::new(tokn_core::provider::ModelCache::default()),
+        model_cache,
       },
     })
   }
 
   fn url(&self, path: &str) -> String {
-    common::url(&self.base_url, path)
+    common::url(self.target.base_url().as_str(), path)
   }
 
   async fn upstream_post(&self, ctx: RequestCtx<'_>, path: &str, what: &'static str) -> Result<reqwest::Response> {
@@ -243,9 +257,36 @@ mod tests {
   #[test]
   fn openai_constructs() {
     let openai = OpenAiProvider::from_account(Arc::new(acct(Some("sk-test")))).unwrap();
-    assert_eq!(openai.info().upstream_url, OPENAI_BASE_URL);
+    assert_eq!(openai.info().upstream_url, format!("{OPENAI_BASE_URL}/"));
     assert!(openai.supports("", Endpoint::Responses));
     assert!(openai.supports("", Endpoint::ChatCompletions));
+  }
+
+  #[test]
+  fn openai_target_overrides_legacy_account_url_and_shares_cache() {
+    let mut account = acct(Some("sk-test"));
+    account.base_url = Some("https://ignored.example/v1".into());
+    let target = ProviderTarget::parse("https://gateway.example/openai/v1", CleartextHttpPolicy::LoopbackOnly).unwrap();
+    let target_cache = target.model_cache().clone();
+
+    let openai = OpenAiProvider::from_account_at(Arc::new(account), target).unwrap();
+
+    assert_eq!(openai.url("/models"), "https://gateway.example/openai/v1/models");
+    assert_eq!(openai.info().upstream_url, "https://gateway.example/openai/v1/");
+    assert!(Arc::ptr_eq(&openai.info().model_cache, &target_cache));
+  }
+
+  #[test]
+  fn openai_legacy_constructor_reports_invalid_account_url() {
+    let mut account = acct(Some("sk-test"));
+    account.base_url = Some("not-a-url".into());
+
+    let err = OpenAiProvider::from_account(Arc::new(account)).err().unwrap();
+
+    assert!(matches!(
+      err,
+      error::Error::InvalidUpstreamUrl { account, .. } if account == "test"
+    ));
   }
 
   #[tokio::test]
