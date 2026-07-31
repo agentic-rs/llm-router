@@ -8,9 +8,10 @@ mod resources;
 mod server;
 
 pub use dispatch::{
-  dispatch_http, HttpDispatch, HttpDispatchError, HttpDispatchRequest, HttpDispatchResult, HttpDispatchSite,
-  HttpExecutionView, HttpRequestHead, HttpRequestSemantics, RoutedHttpDispatch, SelectedHttpTarget,
-  SelectedManagedHttpTarget, SelectedRelayHttpTarget, SelectedTransparentHttpTarget,
+  dispatch_http, match_http, HttpDispatch, HttpDispatchError, HttpDispatchRequest, HttpDispatchResult,
+  HttpDispatchSite, HttpExecutionView, HttpRequestHead, HttpRequestSemantics, HttpRouteMatch, MatchedHttpRoute,
+  RoutedHttpDispatch, SelectedHttpTarget, SelectedManagedHttpTarget, SelectedRelayHttpTarget,
+  SelectedTransparentHttpTarget,
 };
 pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
 pub use listeners::{
