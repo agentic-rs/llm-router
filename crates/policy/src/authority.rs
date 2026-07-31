@@ -143,7 +143,7 @@ pub enum InvalidHost {
   TrailingDot,
   TooLong,
   InvalidDnsLabel,
-  NumericTopLevelLabel,
+  AmbiguousNumericSuffix,
   NonCanonicalIpv4 { canonical: Ipv4Addr },
 }
 
@@ -161,7 +161,9 @@ impl fmt::Display for InvalidHost {
       Self::InvalidDnsLabel => {
         formatter.write_str("DNS labels must be 1-63 ASCII letters, digits, or interior hyphens")
       }
-      Self::NumericTopLevelLabel => formatter.write_str("the final DNS label must not be entirely numeric"),
+      Self::AmbiguousNumericSuffix => {
+        formatter.write_str("the final DNS label is numeric-like and ambiguous with legacy IPv4 syntax")
+      }
       Self::NonCanonicalIpv4 { canonical } => {
         write!(formatter, "noncanonical IPv4 address; use `{canonical}`")
       }
@@ -186,13 +188,9 @@ fn validate_dns_name(raw: &str) -> Result<(), InvalidHost> {
     }
   }
 
-  if raw
-    .rsplit_once('.')
-    .map_or(raw, |(_, top_level)| top_level)
-    .bytes()
-    .all(|byte| byte.is_ascii_digit())
-  {
-    return Err(InvalidHost::NumericTopLevelLabel);
+  let top_level = raw.rsplit_once('.').map_or(raw, |(_, top_level)| top_level);
+  if top_level.bytes().all(|byte| byte.is_ascii_digit()) || parse_legacy_ipv4_number(top_level).is_some() {
+    return Err(InvalidHost::AmbiguousNumericSuffix);
   }
   Ok(())
 }
@@ -266,11 +264,16 @@ impl CanonicalAuthority {
     self.port.map(NonZeroU16::get)
   }
 
-  pub fn into_ingress(self, default_port: NonZeroU16) -> IngressAuthority {
-    IngressAuthority {
+  pub fn into_resolved(self, default_port: NonZeroU16) -> ResolvedAuthority {
+    ResolvedAuthority {
       host: self.host,
       port: self.port.unwrap_or(default_port),
     }
+  }
+
+  fn into_explicit(self) -> Result<ResolvedAuthority, InvalidAuthority> {
+    let port = self.port.ok_or(InvalidAuthority::MissingPort)?;
+    Ok(ResolvedAuthority { host: self.host, port })
   }
 }
 
@@ -376,7 +379,7 @@ impl fmt::Display for InvalidAuthority {
       Self::BracketsRequireIpv6 => formatter.write_str("authority brackets may only contain an IPv6 address"),
       Self::Ipv6MustBeBracketed => formatter.write_str("an IPv6 authority must enclose its host in brackets"),
       Self::InvalidPort => formatter.write_str("authority port must be an integer from 1 through 65535"),
-      Self::MissingPort => formatter.write_str("CONNECT authority must include an explicit port"),
+      Self::MissingPort => formatter.write_str("authority must include an explicit port"),
       Self::Host(source) => write!(formatter, "invalid authority host: {source}"),
     }
   }
@@ -391,29 +394,16 @@ impl std::error::Error for InvalidAuthority {
   }
 }
 
-/// The immutable destination authority used for request policy decisions.
-///
-/// Unlike a raw Host header, the port is always materialized. For intercepted
-/// traffic this value is created from the original CONNECT authority and must
-/// not be replaced by an inner request authority.
+/// A canonical endpoint authority with a materialized nonzero port.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct IngressAuthority {
+pub struct ResolvedAuthority {
   host: CanonicalHost,
   port: NonZeroU16,
 }
 
-impl IngressAuthority {
+impl ResolvedAuthority {
   pub fn new(host: CanonicalHost, port: NonZeroU16) -> Self {
     Self { host, port }
-  }
-
-  pub fn parse_connect(raw: &str) -> Result<Self, InvalidAuthority> {
-    let authority = CanonicalAuthority::parse(raw)?;
-    let port = authority.port.ok_or(InvalidAuthority::MissingPort)?;
-    Ok(Self {
-      host: authority.host,
-      port,
-    })
   }
 
   pub fn host(&self) -> &CanonicalHost {
@@ -425,12 +415,117 @@ impl IngressAuthority {
   }
 }
 
-impl fmt::Display for IngressAuthority {
+impl fmt::Display for ResolvedAuthority {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     self.host.write_authority_host(formatter)?;
     write!(formatter, ":{}", self.port)
   }
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum IngressAuthoritySource {
+  DirectHttp,
+  Connect,
+}
+
+/// The immutable original destination used for request policy decisions.
+///
+/// For intercepted traffic this is created from the original CONNECT
+/// authority and must not be replaced by an inner request authority. The
+/// source is retained so request handling cannot confuse a direct HTTP
+/// authority with a CONNECT security boundary.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IngressAuthority {
+  authority: ResolvedAuthority,
+  source: IngressAuthoritySource,
+}
+
+impl IngressAuthority {
+  pub fn from_http(authority: CanonicalAuthority, default_port: NonZeroU16) -> Self {
+    Self {
+      authority: authority.into_resolved(default_port),
+      source: IngressAuthoritySource::DirectHttp,
+    }
+  }
+
+  pub fn from_connect(raw: &str) -> Result<Self, InvalidAuthority> {
+    Self::from_connect_authority(CanonicalAuthority::parse(raw)?)
+  }
+
+  pub fn from_connect_authority(authority: CanonicalAuthority) -> Result<Self, InvalidAuthority> {
+    Ok(Self {
+      authority: authority.into_explicit()?,
+      source: IngressAuthoritySource::Connect,
+    })
+  }
+
+  pub fn authority(&self) -> &ResolvedAuthority {
+    &self.authority
+  }
+
+  pub fn source(&self) -> IngressAuthoritySource {
+    self.source
+  }
+
+  pub fn host(&self) -> &CanonicalHost {
+    self.authority.host()
+  }
+
+  pub fn port(&self) -> u16 {
+    self.authority.port()
+  }
+
+  /// Verify an inner request authority against the immutable ingress target.
+  ///
+  /// `default_port` belongs to the inner request's scheme. It must never be
+  /// replaced by the CONNECT target port: an omitted HTTPS inner port means
+  /// 443 even when the CONNECT target used another port.
+  pub fn validate_inner(&self, inner: CanonicalAuthority, default_port: NonZeroU16) -> Result<(), AuthorityMismatch> {
+    let found = inner.into_resolved(default_port);
+    if found == self.authority {
+      Ok(())
+    } else {
+      Err(AuthorityMismatch {
+        expected: self.authority.clone(),
+        found,
+      })
+    }
+  }
+}
+
+impl fmt::Display for IngressAuthority {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    self.authority.fmt(formatter)
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityMismatch {
+  expected: ResolvedAuthority,
+  found: ResolvedAuthority,
+}
+
+impl AuthorityMismatch {
+  pub fn expected(&self) -> &ResolvedAuthority {
+    &self.expected
+  }
+
+  pub fn found(&self) -> &ResolvedAuthority {
+    &self.found
+  }
+}
+
+impl fmt::Display for AuthorityMismatch {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+      formatter,
+      "inner request authority `{}` does not match ingress authority `{}`",
+      self.found, self.expected
+    )
+  }
+}
+
+impl std::error::Error for AuthorityMismatch {}
 
 #[cfg(test)]
 mod tests {
@@ -457,6 +552,8 @@ mod tests {
       "example.com.",
       "bad_name.example",
       "example.123",
+      "example.0x10",
+      "example.0x100000000",
       "2130706433",
       "127.1",
       "0177.0.0.1",
@@ -514,15 +611,19 @@ mod tests {
   #[test]
   fn connect_authority_requires_and_preserves_a_port() {
     assert_eq!(
-      IngressAuthority::parse_connect("Example.com:443").unwrap().to_string(),
+      IngressAuthority::from_connect("Example.com:443").unwrap().to_string(),
       "example.com:443"
     );
     assert_eq!(
-      IngressAuthority::parse_connect("[::1]:8443").unwrap().to_string(),
+      IngressAuthority::from_connect("[::1]:8443").unwrap().to_string(),
       "[::1]:8443"
     );
     assert_eq!(
-      IngressAuthority::parse_connect("example.com"),
+      IngressAuthority::from_connect("[::1]:8443").unwrap().source(),
+      IngressAuthoritySource::Connect
+    );
+    assert_eq!(
+      IngressAuthority::from_connect("example.com"),
       Err(InvalidAuthority::MissingPort)
     );
   }
@@ -530,9 +631,23 @@ mod tests {
   #[test]
   fn materializes_an_optional_authority_port_once() {
     let default_port = NonZeroU16::new(443).unwrap();
-    let authority = CanonicalAuthority::parse("example.com")
-      .unwrap()
-      .into_ingress(default_port);
-    assert_eq!(authority.to_string(), "example.com:443");
+    let ingress = IngressAuthority::from_http(CanonicalAuthority::parse("example.com").unwrap(), default_port);
+    assert_eq!(ingress.to_string(), "example.com:443");
+    assert_eq!(ingress.source(), IngressAuthoritySource::DirectHttp);
+  }
+
+  #[test]
+  fn validates_inner_authority_with_its_own_scheme_default() {
+    let ingress = IngressAuthority::from_connect("example.com:8443").unwrap();
+    let https_port = NonZeroU16::new(443).unwrap();
+
+    let mismatch = ingress
+      .validate_inner(CanonicalAuthority::parse("example.com").unwrap(), https_port)
+      .unwrap_err();
+    assert_eq!(mismatch.expected().to_string(), "example.com:8443");
+    assert_eq!(mismatch.found().to_string(), "example.com:443");
+    assert!(ingress
+      .validate_inner(CanonicalAuthority::parse("example.com:8443").unwrap(), https_port)
+      .is_ok());
   }
 }
