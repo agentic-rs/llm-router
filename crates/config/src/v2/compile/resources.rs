@@ -7,10 +7,11 @@ use reqwest::Url;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokn_policy::{
-  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, FallbackSelector, ManagedRetry,
-  ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan, ModelSelector, OperationPolicy, ProfileId,
-  ProfilePlan, ProviderId, QualificationNamespace, RelayRetry, RelayRoute, RelayTarget, RouteId, RouteKind, RoutePlan,
-  SessionAffinityPlan, UpstreamId, UpstreamOrigin, UpstreamPlan, UpstreamSelector, WireIdentity, WireIdentityId,
+  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, CanonicalAuthority, CanonicalHost,
+  FallbackSelector, ManagedRetry, ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan,
+  ModelSelector, OperationPolicy, ProfileId, ProfilePlan, ProviderId, QualificationNamespace, RelayRetry, RelayRoute,
+  RelayTarget, RouteId, RouteKind, RoutePlan, SessionAffinityPlan, UpstreamId, UpstreamOrigin, UpstreamPlan,
+  UpstreamSelector, WireIdentity, WireIdentityId,
 };
 
 const MAX_FAILURE_COOLDOWN_SECS: u64 = 86_400;
@@ -262,7 +263,7 @@ fn canonical_origin(value: &str, location: String, allow_insecure_http: bool) ->
 }
 
 fn parse_http_url(value: &str, location: &str, allow_insecure_http: bool) -> Result<Url, CompileError> {
-  let raw_host = validate_raw_http_url(value, location)?;
+  let raw_authority = validate_raw_http_url(value, location)?;
   let parsed =
     Url::parse(value).map_err(|error| invalid_value(location.to_string(), format!("invalid URL: {error}")))?;
   if !matches!(parsed.scheme(), "http" | "https") {
@@ -277,15 +278,15 @@ fn parse_http_url(value: &str, location: &str, allow_insecure_http: bool) -> Res
   if parsed.port() == Some(0) {
     return Err(invalid_value(location.to_string(), "port zero is not allowed"));
   }
-  let host = parsed.host_str().expect("host presence was checked");
-  if host.trim_end_matches('.').len() != host.len() {
+  let parsed_host = CanonicalHost::parse(parsed.host_str().expect("host presence was checked"))
+    .map_err(|error| invalid_value(location.to_string(), format!("invalid URL host after parsing: {error}")))?;
+  if raw_authority.host() != &parsed_host {
     return Err(invalid_value(
       location.to_string(),
-      "DNS hosts must not have a trailing dot",
+      "URL parser changed the host representation; use a canonical DNS name or IP address",
     ));
   }
-  reject_noncanonical_ipv4_host(raw_host, host, location)?;
-  if parsed.scheme() == "http" && !allow_insecure_http && !is_literal_loopback(host) {
+  if parsed.scheme() == "http" && !allow_insecure_http && !raw_authority.host().is_loopback() {
     return Err(invalid_value(
       location.to_string(),
       "non-loopback HTTP can expose account credentials; use HTTPS or set allow_insecure_http = true",
@@ -294,7 +295,7 @@ fn parse_http_url(value: &str, location: &str, allow_insecure_http: bool) -> Res
   Ok(parsed)
 }
 
-fn validate_raw_http_url<'a>(value: &'a str, location: &str) -> Result<&'a str, CompileError> {
+fn validate_raw_http_url(value: &str, location: &str) -> Result<CanonicalAuthority, CompileError> {
   if !value.is_ascii() {
     return Err(invalid_value(
       location.to_string(),
@@ -323,24 +324,8 @@ fn validate_raw_http_url<'a>(value: &'a str, location: &str) -> Result<&'a str, 
     })?;
   let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
   let authority = &remainder[..authority_end];
-  if authority.is_empty() || authority.contains('@') || authority.contains('%') {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must contain a plain host authority without credentials or escapes",
-    ));
-  }
-  let raw_host = raw_authority_host(authority).ok_or_else(|| {
-    invalid_value(
-      location.to_string(),
-      "URL authority must contain a valid host and optional port",
-    )
-  })?;
-  if raw_host.ends_with('.') {
-    return Err(invalid_value(
-      location.to_string(),
-      "DNS hosts must not have a trailing dot",
-    ));
-  }
+  let canonical_authority = CanonicalAuthority::parse(authority)
+    .map_err(|error| invalid_value(location.to_string(), format!("invalid URL authority: {error}")))?;
 
   let raw_path_and_suffix = &remainder[authority_end..];
   let raw_path = raw_path_and_suffix
@@ -354,30 +339,7 @@ fn validate_raw_http_url<'a>(value: &'a str, location: &str) -> Result<&'a str, 
     ));
   }
 
-  Ok(raw_host)
-}
-
-fn raw_authority_host(authority: &str) -> Option<&str> {
-  if let Some(bracketed) = authority.strip_prefix('[') {
-    let closing = bracketed.find(']')?;
-    let host = &bracketed[..closing];
-    let suffix = &bracketed[closing + 1..];
-    if !suffix.is_empty()
-      && !suffix
-        .strip_prefix(':')
-        .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-      return None;
-    }
-    return (!host.is_empty()).then_some(host);
-  }
-
-  let host = match authority.rsplit_once(':') {
-    Some((host, port)) if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) => host,
-    Some(_) => return None,
-    None => authority,
-  };
-  (!host.is_empty() && !host.contains(':')).then_some(host)
+  Ok(canonical_authority)
 }
 
 fn is_raw_dot_segment(segment: &str) -> bool {
@@ -399,33 +361,6 @@ fn is_raw_dot_segment(segment: &str) -> bool {
     }
   }
   matches!(dots, 1 | 2)
-}
-
-fn reject_noncanonical_ipv4_host(raw_host: &str, parsed_host: &str, location: &str) -> Result<(), CompileError> {
-  let parsed_host = parsed_host
-    .strip_prefix('[')
-    .and_then(|value| value.strip_suffix(']'))
-    .unwrap_or(parsed_host);
-  let Ok(parsed_address) = parsed_host.parse::<std::net::Ipv4Addr>() else {
-    return Ok(());
-  };
-  if raw_host.parse::<std::net::Ipv4Addr>().ok() != Some(parsed_address) {
-    return Err(invalid_value(
-      location.to_string(),
-      format!("IPv4 host must use canonical dotted-decimal form `{parsed_address}`"),
-    ));
-  }
-  Ok(())
-}
-
-fn is_literal_loopback(host: &str) -> bool {
-  let host = host
-    .strip_prefix('[')
-    .and_then(|value| value.strip_suffix(']'))
-    .unwrap_or(host);
-  host
-    .parse::<std::net::IpAddr>()
-    .is_ok_and(|address| address.is_loopback())
 }
 
 fn compile_model_groups(

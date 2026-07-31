@@ -355,6 +355,8 @@ fn upstream_urls_reject_port_zero_and_normalize_base_prefixes() {
     "https://api.example.com/a/../v1",
     "https://api.example.com/%2E%2e/v1",
     "https://127.1/v1",
+    "https://example.0x10/v1",
+    "https://example.123/v1",
   ] {
     config.upstreams.get_mut("default").unwrap().base_url = Some(invalid.into());
     assert!(matches!(
