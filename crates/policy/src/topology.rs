@@ -1,6 +1,6 @@
 use crate::{
-  AccountPoolId, BindingId, ListenerId, ModelGroupId, OperationId, ProfileId, ProfilePlan, ProviderId, RouteId,
-  RoutePlan, UpstreamId,
+  AccountPoolId, BindingId, CanonicalHost, ListenerId, ModelGroupId, OperationId, ProfileId, ProfilePlan, ProviderId,
+  RouteId, RoutePlan, UpstreamId,
 };
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
@@ -306,41 +306,75 @@ pub enum HttpAction {
   Reject,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum HostPatternKind {
+  Exact(CanonicalHost),
+  SubdomainsOf(CanonicalHost),
+}
+
 /// A host selector in a binding rule.
 ///
 /// Runtime matching uses a canonical, immutable ingress authority. For an
 /// intercepted request this is the original CONNECT authority, never an
 /// untrusted inner Host header. A conflicting inner authority must be rejected
 /// before binding or credential selection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HostPattern {
-  Exact(SmolStr),
-  /// Match subdomains of the named suffix, but not the suffix itself.
-  SubdomainsOf(SmolStr),
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HostPattern {
+  kind: HostPatternKind,
 }
 
 impl HostPattern {
-  pub fn exact(host: impl AsRef<str>) -> Self {
-    Self::Exact(SmolStr::new(host.as_ref().to_ascii_lowercase()))
+  pub fn exact(host: CanonicalHost) -> Self {
+    Self {
+      kind: HostPatternKind::Exact(host),
+    }
   }
 
-  pub fn subdomains_of(suffix: impl AsRef<str>) -> Self {
-    Self::SubdomainsOf(SmolStr::new(suffix.as_ref().to_ascii_lowercase()))
+  pub fn subdomains_of(suffix: CanonicalHost) -> Result<Self, InvalidSubdomainSuffix> {
+    if !suffix.is_dns() {
+      return Err(InvalidSubdomainSuffix);
+    }
+    Ok(Self {
+      kind: HostPatternKind::SubdomainsOf(suffix),
+    })
   }
 
-  pub fn matches(&self, host: &str) -> bool {
-    match self {
-      Self::Exact(expected) => host.eq_ignore_ascii_case(expected),
-      Self::SubdomainsOf(suffix) => {
-        host.len() > suffix.len()
-          && host
-            .get(..host.len() - suffix.len())
-            .is_some_and(|prefix| prefix.ends_with('.'))
-          && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+  pub fn host(&self) -> &CanonicalHost {
+    match &self.kind {
+      HostPatternKind::Exact(host) | HostPatternKind::SubdomainsOf(host) => host,
+    }
+  }
+
+  pub fn matches(&self, host: &CanonicalHost) -> bool {
+    match &self.kind {
+      HostPatternKind::Exact(expected) => host == expected,
+      HostPatternKind::SubdomainsOf(suffix) => host.is_strict_subdomain_of(suffix),
+    }
+  }
+
+  /// Whether every host selected by `other` is also selected by this pattern.
+  pub fn subsumes(&self, other: &Self) -> bool {
+    match (&self.kind, &other.kind) {
+      (HostPatternKind::Exact(left), HostPatternKind::Exact(right)) => left == right,
+      (HostPatternKind::SubdomainsOf(suffix), HostPatternKind::Exact(host)) => host.is_strict_subdomain_of(suffix),
+      (HostPatternKind::SubdomainsOf(left), HostPatternKind::SubdomainsOf(right)) => {
+        left == right || right.is_strict_subdomain_of(left)
       }
+      (HostPatternKind::Exact(_), HostPatternKind::SubdomainsOf(_)) => false,
     }
   }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidSubdomainSuffix;
+
+impl fmt::Display for InvalidSubdomainSuffix {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str("subdomain patterns require a DNS suffix, not an IP address")
+  }
+}
+
+impl std::error::Error for InvalidSubdomainSuffix {}
 
 /// Error returned when a binding tries to act as an implicit catch-all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -696,9 +730,21 @@ mod tests {
     T::try_from(value.to_string()).unwrap()
   }
 
+  fn host(value: &str) -> CanonicalHost {
+    CanonicalHost::parse(value).unwrap()
+  }
+
+  fn exact_host(value: &str) -> HostPattern {
+    HostPattern::exact(host(value))
+  }
+
+  fn subdomains_of(value: &str) -> HostPattern {
+    HostPattern::subdomains_of(host(value)).unwrap()
+  }
+
   fn http_matcher(host: &str) -> HttpMatch {
     HttpMatch::new(
-      vec![HostPattern::exact(host)].into_boxed_slice(),
+      vec![exact_host(host)].into_boxed_slice(),
       Box::default(),
       Box::default(),
       Box::default(),
@@ -716,7 +762,7 @@ mod tests {
     let second_http = HttpBindingPlan::new(
       id("wildcard"),
       HttpMatch::new(
-        vec![HostPattern::subdomains_of("example.com")].into_boxed_slice(),
+        vec![subdomains_of("example.com")].into_boxed_slice(),
         Box::default(),
         Box::default(),
         Box::default(),
@@ -727,7 +773,7 @@ mod tests {
     let first_connect = ConnectRulePlan::new(
       id("tunnel-internal"),
       ConnectMatch::new(
-        vec![HostPattern::subdomains_of("internal.example")].into_boxed_slice(),
+        vec![subdomains_of("internal.example")].into_boxed_slice(),
         vec![443].into_boxed_slice(),
       )
       .unwrap(),
@@ -736,7 +782,7 @@ mod tests {
     let second_connect = ConnectRulePlan::new(
       id("intercept-public"),
       ConnectMatch::new(
-        vec![HostPattern::subdomains_of("example.com")].into_boxed_slice(),
+        vec![subdomains_of("example.com")].into_boxed_slice(),
         vec![443, 8443].into_boxed_slice(),
       )
       .unwrap(),
@@ -776,7 +822,7 @@ mod tests {
     );
 
     let rule = HttpMatch::new(
-      vec![HostPattern::exact("api.example.com")].into_boxed_slice(),
+      vec![exact_host("api.example.com")].into_boxed_slice(),
       vec![SmolStr::new("/v1"), SmolStr::new("/compatible")].into_boxed_slice(),
       vec![SmolStr::new("POST")].into_boxed_slice(),
       vec![id("responses"), id("chat-completions")].into_boxed_slice(),
@@ -797,23 +843,27 @@ mod tests {
     );
 
     let rule = ConnectMatch::new(
-      vec![HostPattern::exact("api.example.com")].into_boxed_slice(),
+      vec![exact_host("api.example.com")].into_boxed_slice(),
       vec![443, 8443].into_boxed_slice(),
     )
     .unwrap();
 
-    assert_eq!(rule.hosts(), &[HostPattern::exact("api.example.com")]);
+    assert_eq!(rule.hosts(), &[exact_host("api.example.com")]);
     assert_eq!(rule.ports(), &[443, 8443]);
   }
 
   #[test]
   fn subdomain_pattern_excludes_apex_and_label_lookalikes() {
-    let pattern = HostPattern::subdomains_of("example.com");
+    let pattern = subdomains_of("example.com");
 
-    assert!(pattern.matches("api.example.com"));
-    assert!(pattern.matches("API.EXAMPLE.COM"));
-    assert!(!pattern.matches("example.com"));
-    assert!(!pattern.matches("notexample.com"));
+    assert!(pattern.matches(&host("api.example.com")));
+    assert!(pattern.matches(&host("API.EXAMPLE.COM")));
+    assert!(!pattern.matches(&host("example.com")));
+    assert!(!pattern.matches(&host("notexample.com")));
+    assert_eq!(
+      HostPattern::subdomains_of(host("127.0.0.1")),
+      Err(InvalidSubdomainSuffix)
+    );
   }
 
   #[test]

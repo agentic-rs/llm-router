@@ -23,6 +23,6 @@ pub use route::{
 pub use topology::{
   AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
   ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, HttpAction,
-  HttpBindingPlan, HttpMatch, ListenerKind, ListenerPlan, LlmApiListenerPlan, ModelCandidate, ModelGroupPlan,
-  SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
+  HttpBindingPlan, HttpMatch, InvalidSubdomainSuffix, ListenerKind, ListenerPlan, LlmApiListenerPlan, ModelCandidate,
+  ModelGroupPlan, SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
 };
