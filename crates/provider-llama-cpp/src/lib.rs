@@ -13,6 +13,7 @@ pub use llama_cpp::*;
 use std::sync::Arc;
 use tokn_auth::descriptor::{EndpointSpec, ProviderDescriptor};
 use tokn_auth::provider::CredentialFlavor;
+use tokn_core::provider::ProviderTarget;
 
 pub static DEFAULT_ENDPOINTS: &[Endpoint] = &[Endpoint::ChatCompletions];
 
@@ -47,6 +48,7 @@ pub fn validate(account: &tokn_core::account::AccountConfig) -> tokn_core::provi
 
 pub fn build(
   account: Arc<tokn_core::account::AccountConfig>,
+  target: ProviderTarget,
 ) -> tokn_core::provider::Result<Arc<dyn tokn_core::provider::Provider>> {
-  Ok(Arc::new(llama_cpp::LlamaCppProvider::from_account(account)?))
+  Ok(Arc::new(llama_cpp::LlamaCppProvider::from_account_at(account, target)?))
 }
