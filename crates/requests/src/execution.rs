@@ -5,10 +5,64 @@
 //! by reconstructing provider, account, upstream, or destination identity.
 
 use http::{uri::PathAndQuery, Method, StatusCode};
+use std::collections::BTreeSet;
 use tokn_accounts::link::{RelayDestination, SelectedManagedTarget, SelectedRelayTarget, SelectionOutcome};
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, InvalidRequestUrl};
 use tokn_core::AgentId;
+use tokn_headers::HeaderMap;
+
+const FORWARD_STRIPPED_HEADERS: &[&str] = &[
+  "connection",
+  "content-length",
+  "host",
+  "http2-settings",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+];
+
+/// Copy end-to-end inbound headers for a new outbound HTTP connection.
+///
+/// The returned map preserves order, original casing, duplicate values, and
+/// credentials. Relay authorization may replace credentials afterward;
+/// transparent forwarding leaves them untouched. Transport-derived fields,
+/// router controls, and every extension named by `Connection` are removed.
+pub fn sanitize_forward_headers(inbound: &HeaderMap) -> HeaderMap {
+  let mut stripped = FORWARD_STRIPPED_HEADERS
+    .iter()
+    .map(|name| (*name).to_string())
+    .collect::<BTreeSet<_>>();
+  for value in inbound.get_all("connection") {
+    stripped.extend(
+      value
+        .as_str()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase),
+    );
+  }
+
+  let mut outbound = HeaderMap::with_capacity(inbound.len());
+  for (name, value) in inbound {
+    let lower = name.as_str();
+    if stripped.contains(lower) || is_router_owned_header(lower) {
+      continue;
+    }
+    outbound.append(name.clone(), value.clone());
+  }
+  outbound
+}
+
+fn is_router_owned_header(name: &str) -> bool {
+  name.starts_with("x-tokn-router-") || matches!(name, "x-route-mode" | "x-behave-as")
+}
 
 /// Classify a received final response head for account-pool settlement.
 ///
@@ -216,6 +270,67 @@ impl<'a> TransparentExecutionTarget<'a> {
 mod tests {
   use super::*;
   use tokn_core::upstream_url::CleartextHttpPolicy;
+  use tokn_headers::{HeaderName, HeaderValue};
+
+  fn headers(values: &[(&str, &str)]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in values {
+      headers.append(HeaderName::new(*name), HeaderValue::from_string((*value).to_string()));
+    }
+    headers
+  }
+
+  #[test]
+  fn forward_sanitizer_removes_connection_and_router_metadata() {
+    let inbound = headers(&[
+      ("Host", "client.example"),
+      ("Content-Length", "999"),
+      ("Connection", "keep-alive, X-Connection-Only"),
+      ("X-Connection-Only", "secret"),
+      ("Keep-Alive", "timeout=5"),
+      ("Proxy-Authorization", "Basic gateway-secret"),
+      ("Transfer-Encoding", "chunked"),
+      ("X-Tokn-Router-Local-Addr", "127.0.0.1:8080"),
+      ("X-Route-Mode", "relay"),
+      ("X-Behave-As", "codex"),
+      ("Authorization", "Bearer upstream-secret"),
+      ("Cookie", "session=upstream"),
+      ("X-End-To-End", "first"),
+      ("X-End-To-End", "second"),
+    ]);
+
+    let outbound = sanitize_forward_headers(&inbound);
+
+    for removed in [
+      "host",
+      "content-length",
+      "connection",
+      "x-connection-only",
+      "keep-alive",
+      "proxy-authorization",
+      "transfer-encoding",
+      "x-tokn-router-local-addr",
+      "x-route-mode",
+      "x-behave-as",
+    ] {
+      assert!(!outbound.contains_key(removed), "header {removed}");
+    }
+    assert_eq!(
+      outbound.get("authorization").map(|value| value.as_str()),
+      Some("Bearer upstream-secret")
+    );
+    assert_eq!(
+      outbound.get("cookie").map(|value| value.as_str()),
+      Some("session=upstream")
+    );
+    assert_eq!(
+      outbound
+        .get_all("x-end-to-end")
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>(),
+      ["first", "second"]
+    );
+  }
 
   #[test]
   fn attempt_head_borrows_the_exact_request_line() {
