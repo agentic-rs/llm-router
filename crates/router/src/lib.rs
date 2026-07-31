@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 pub mod api;
 pub mod pipeline;
 pub mod proxy;
+pub mod runtime;
 
 pub use tokn_accounts as accounts;
 pub use tokn_config as config;
