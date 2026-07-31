@@ -12,6 +12,7 @@ readme = "../../README.md"
 [dependencies]
 tokn-auth = { workspace = true }
 tokn-accounts = { workspace = true }
+tokn-catalogue = { workspace = true }
 tokn-config = { workspace = true }
 tokn-core = { workspace = true }
 tokn-provider-copilot = { workspace = true }

@@ -7,7 +7,7 @@ use crate::reconcile::PlannedEdit;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tokn_config::Account;
+use tokn_config::{Account, RouteMode};
 use tokn_core::provider::Endpoint;
 use tokn_core::AgentId;
 
@@ -71,6 +71,7 @@ pub trait AgentAdapter {
   fn rewrite_config(
     &self,
     home: &Path,
+    mode: RouteMode,
     base_url: &str,
     routes: &[ProviderRoute],
     removed_source_provider_ids: &[String],

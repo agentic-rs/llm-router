@@ -3,7 +3,7 @@ use crate::reconcile::{annotate_imported_account, EditKind, PlannedEdit};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tokn_config::{Account, AuthType};
+use tokn_config::{Account, AuthType, RouteMode};
 use tokn_core::account::AccountTier;
 use tokn_core::provider::ID_CODEX;
 use tokn_core::util::secret::Secret;
@@ -46,6 +46,7 @@ impl AgentAdapter for CodexAdapter {
   fn rewrite_config(
     &self,
     home: &Path,
+    _mode: RouteMode,
     base_url: &str,
     _routes: &[ProviderRoute],
     _removed_source_provider_ids: &[String],
@@ -203,7 +204,7 @@ mod tests {
 
     let accounts = adapter.discover_accounts(dir.path(), "20260604T153012Z").unwrap();
     let edits = adapter
-      .rewrite_config(dir.path(), "http://127.0.0.1:4141/codex/v1", &[], &[])
+      .rewrite_config(dir.path(), RouteMode::Route, "http://127.0.0.1:4141/codex/v1", &[], &[])
       .unwrap();
 
     assert_eq!(accounts.len(), 1);

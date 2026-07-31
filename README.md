@@ -388,7 +388,10 @@ OpenCode keeps its local credentials unchanged and routes selected provider
 namespaces through the gateway's existing account pool. `--source-provider` is
 repeatable and defaults to `openai`; raw `passthrough` and `switch` links require
 a target `--provider` (or a configured default provider) that supports
-OpenCode's Chat Completions endpoint. Codex CLI does not yet support
+OpenCode's Chat Completions endpoint. OpenCode `passthrough` and `switch` links
+publish pinned `tokn-router-<provider>` namespaces with the catalogue models,
+and rewrite matching `provider/model` selections; this includes
+`tokn-router-deepseek/deepseek-v4-flash` for DeepSeek. Codex CLI does not yet support
 main-account links because its credential bootstrap would need to be changed.
 An existing link keeps its account source; unlink it before linking again with a
 different source. To move a pre-`auth.d` imported link, unlink it first so its

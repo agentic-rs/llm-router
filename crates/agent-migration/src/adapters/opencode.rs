@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tokn_config::{Account, AuthType};
+use tokn_config::{Account, AuthType, RouteMode};
 use tokn_core::account::AccountTier;
 use tokn_core::util::secret::Secret;
 use tokn_core::AgentId;
@@ -53,6 +53,7 @@ impl AgentAdapter for OpencodeAdapter {
   fn rewrite_config(
     &self,
     home: &Path,
+    mode: RouteMode,
     base_url: &str,
     routes: &[ProviderRoute],
     removed_source_provider_ids: &[String],
@@ -65,7 +66,7 @@ impl AgentAdapter for OpencodeAdapter {
       "{}\n".to_string()
     };
     let root = parse_cst(&raw, &config_path)?;
-    rewrite_config_with_removed_sources(&root, base_url, routes, removed_source_provider_ids)?;
+    rewrite_config_with_removed_sources(&root, mode, base_url, routes, removed_source_provider_ids)?;
 
     let mut edits = Vec::new();
     if let Some(auth_edit) = remove_transferred_credentials(&self.auth_path(home), routes)? {
@@ -99,11 +100,12 @@ fn opencode_config_path(home: &Path) -> PathBuf {
 
 #[cfg(test)]
 fn rewrite_config(root: &jsonc_parser::cst::CstRootNode, base_url: &str, routes: &[ProviderRoute]) -> Result<()> {
-  rewrite_config_with_removed_sources(root, base_url, routes, &[])
+  rewrite_config_with_removed_sources(root, RouteMode::Route, base_url, routes, &[])
 }
 
 fn rewrite_config_with_removed_sources(
   root: &jsonc_parser::cst::CstRootNode,
+  mode: RouteMode,
   base_url: &str,
   routes: &[ProviderRoute],
   removed_source_provider_ids: &[String],
@@ -115,55 +117,172 @@ fn rewrite_config_with_removed_sources(
     set_property(&obj, "$schema", "https://opencode.ai/config.json");
   }
   remove_unreferenced_legacy_router_provider(&obj, base_url);
-  remove_stale_generated_provider_routes(&obj, routes, removed_source_provider_ids);
+  remove_stale_generated_provider_routes(&obj, mode, routes, removed_source_provider_ids);
   let providers = obj.object_value_or_set("provider");
+  rewrite_selected_models(&obj, mode, routes)?;
   for route in routes {
-    let provider = providers.object_value_or_set(&route.source_provider_id);
-    set_property(&provider, "name", format!("tokn-router ({})", route.source_provider_id));
+    let provider_id = published_provider_id(mode, route);
+    if let Some(existing) = providers.get(&provider_id) {
+      if let Some(value) = existing.to_serde_value() {
+        if !is_generated_provider_route(&value, &provider_id) {
+          bail!(
+            "OpenCode provider '{}' already exists and is not managed by the agent link",
+            provider_id
+          );
+        }
+      }
+    }
+    let provider = providers.object_value_or_set(&provider_id);
+    set_property(
+      &provider,
+      "name",
+      format!("tokn-router ({})", route.gateway_provider_id),
+    );
     set_property(&provider, "npm", "@ai-sdk/openai-compatible");
     let options = provider.object_value_or_set("options");
     set_property(&options, "baseURL", route.base_url.clone());
     set_property(&options, "apiKey", "tokn-router");
+    if is_verbatim_mode(mode) {
+      set_property(&provider, "models", published_models(&route.gateway_provider_id));
+    }
   }
+  Ok(())
+}
+
+fn is_verbatim_mode(mode: RouteMode) -> bool {
+  matches!(mode, RouteMode::Passthrough | RouteMode::Switch)
+}
+
+fn published_provider_id(mode: RouteMode, route: &ProviderRoute) -> String {
+  if is_verbatim_mode(mode) {
+    format!("tokn-router-{}", route.gateway_provider_id)
+  } else {
+    route.source_provider_id.clone()
+  }
+}
+
+fn published_models(provider_id: &str) -> Vec<(String, jsonc_parser::cst::CstInputValue)> {
+  tokn_catalogue::default_models_for(provider_id)
+    .into_iter()
+    .map(|model| (model.id, vec![("name".to_string(), model.name.into())].into()))
+    .collect()
+}
+
+fn rewrite_selected_models(
+  obj: &jsonc_parser::cst::CstObject,
+  mode: RouteMode,
+  routes: &[ProviderRoute],
+) -> Result<()> {
+  if !is_verbatim_mode(mode) {
+    return Ok(());
+  }
+
+  for property_name in ["model", "small_model"] {
+    rewrite_model_property(obj, property_name, mode, routes)?;
+  }
+  for collection_name in ["agent", "command", "mode"] {
+    let Some(collection) = obj.object_value(collection_name) else {
+      continue;
+    };
+    let Some(Value::Object(entries)) = collection.to_serde_value() else {
+      bail!("OpenCode config property '{}' must contain an object", collection_name);
+    };
+    for entry_name in entries.keys() {
+      let Some(entry) = collection.get(entry_name) else {
+        continue;
+      };
+      let Some(entry) = entry.object_value() else {
+        continue;
+      };
+      rewrite_model_property(&entry, "model", mode, routes)?;
+    }
+  }
+  Ok(())
+}
+
+fn rewrite_model_property(
+  obj: &jsonc_parser::cst::CstObject,
+  property_name: &str,
+  mode: RouteMode,
+  routes: &[ProviderRoute],
+) -> Result<()> {
+  let Some(property) = obj.get(property_name) else {
+    return Ok(());
+  };
+  let Some(model) = property
+    .to_serde_value()
+    .and_then(|value| value.as_str().map(str::to_string))
+  else {
+    return Ok(());
+  };
+  let Some((provider_id, model_id)) = model.split_once('/') else {
+    return Ok(());
+  };
+  let Some(route) = routes
+    .iter()
+    .find(|route| route.source_provider_id == provider_id || published_provider_id(mode, route) == provider_id)
+  else {
+    return Ok(());
+  };
+  let target_provider_id = published_provider_id(mode, route);
+  if provider_id == target_provider_id {
+    return Ok(());
+  }
+  property.set_value(format!("{target_provider_id}/{model_id}").into());
   Ok(())
 }
 
 fn remove_stale_generated_provider_routes(
   obj: &jsonc_parser::cst::CstObject,
+  mode: RouteMode,
   routes: &[ProviderRoute],
   removed_source_provider_ids: &[String],
 ) {
   let active = routes
     .iter()
-    .map(|route| route.source_provider_id.as_str())
+    .map(|route| published_provider_id(mode, route))
     .collect::<BTreeSet<_>>();
   let Some(providers) = obj.object_value("provider") else {
     return;
   };
   for source_provider_id in removed_source_provider_ids {
-    if active.contains(source_provider_id.as_str()) {
-      continue;
-    }
-    let Some(provider) = providers.get(source_provider_id) else {
-      continue;
-    };
-    let Some(value) = provider.to_serde_value() else {
-      continue;
-    };
-    if is_generated_provider_route(&value, source_provider_id) {
-      provider.remove();
+    let candidates = [source_provider_id.clone(), format!("tokn-router-{source_provider_id}")];
+    for provider_id in candidates {
+      if active.contains(&provider_id) {
+        continue;
+      }
+      let Some(provider) = providers.get(&provider_id) else {
+        continue;
+      };
+      let Some(value) = provider.to_serde_value() else {
+        continue;
+      };
+      if is_generated_provider_route(&value, &provider_id) {
+        provider.remove();
+      }
     }
   }
 }
 
-fn is_generated_provider_route(value: &Value, source_provider_id: &str) -> bool {
+fn is_generated_provider_route(value: &Value, provider_id: &str) -> bool {
   let Some(provider) = value.as_object() else {
     return false;
   };
-  if provider.len() != 3
-    || provider.get("name").and_then(Value::as_str) != Some(&format!("tokn-router ({source_provider_id})"))
+  if provider
+    .keys()
+    .any(|key| !matches!(key.as_str(), "name" | "npm" | "options" | "models"))
     || provider.get("npm").and_then(Value::as_str) != Some("@ai-sdk/openai-compatible")
   {
+    return false;
+  }
+  let Some(name) = provider.get("name").and_then(Value::as_str) else {
+    return false;
+  };
+  let expected_suffix = provider_id.strip_prefix("tokn-router-").unwrap_or(provider_id);
+  if name != format!("tokn-router ({expected_suffix})") {
+    return false;
+  }
+  if provider.get("models").is_some_and(|models| !models.is_object()) {
     return false;
   }
   let Some(options) = provider.get("options").and_then(Value::as_object) else {
@@ -418,8 +537,46 @@ fn account_from_provider_auth(provider: &str, auth: &Value) -> Option<Account> {
       auth,
       None,
     ),
+    (_, "api") => generic_api_key_account(provider, auth),
     _ => None,
   }
+}
+
+fn generic_api_key_account(provider: &str, auth: &serde_json::Map<String, Value>) -> Option<Account> {
+  let api_key = auth.get("key").and_then(Value::as_str)?.trim();
+  if api_key.is_empty() {
+    return None;
+  }
+  let registry = tokn_accounts::registry::Registry::builtin();
+  let descriptor = registry.resolve(provider)?;
+  if !descriptor.supports_credential(tokn_auth::CredentialFlavor::ApiKey) {
+    return None;
+  }
+  let account = Account {
+    id: format!("opencode-{provider}"),
+    provider: provider.to_string(),
+    enabled: true,
+    tier: AccountTier::Active,
+    tags: vec!["agent-migrated".into(), "opencode".into()],
+    label: Some(format!("opencode {} migration", descriptor.display_name)),
+    base_url: Some(descriptor.base_url.to_string()),
+    headers: Default::default(),
+    auth_type: Some(AuthType::Bearer),
+    username: None,
+    api_key: Some(Secret::new(api_key.to_string())),
+    api_key_expires_at: None,
+    access_token: None,
+    access_token_expires_at: None,
+    id_token: None,
+    refresh_token: None,
+    provider_account_id: None,
+    extra: Default::default(),
+    refresh_url: None,
+    last_refresh: None,
+    settings: toml::Table::new(),
+  };
+  registry.validate(&account).ok()?;
+  Some(account)
 }
 
 fn openai_account_from_key(api_key: &str) -> Account {
@@ -594,6 +751,7 @@ mod tests {
 
     rewrite_config_with_removed_sources(
       &root,
+      RouteMode::Route,
       "http://127.0.0.1:4141/opencode/v1",
       &[route("openai", "openai", "", "http://127.0.0.1:4141/opencode/v1")],
       &["github-copilot".to_string()],
@@ -606,6 +764,48 @@ mod tests {
     assert_eq!(
       json["provider"]["openai"]["options"]["baseURL"],
       "http://127.0.0.1:4141/opencode/v1"
+    );
+  }
+
+  #[test]
+  fn switch_pins_deepseek_v4_flash_and_rewrites_model_selections() {
+    let path = Path::new("opencode.jsonc");
+    let root = parse_cst(
+      r#"{
+  "model": "deepseek/deepseek-v4-flash",
+  "small_model": "deepseek/deepseek-chat",
+  "agent": {
+    "review": {"model": "deepseek/deepseek-v4-flash"}
+  }
+}"#,
+      path,
+    )
+    .unwrap();
+    let routes = [route("deepseek", "deepseek", "", "http://127.0.0.1:4141/opencode/v1")];
+
+    rewrite_config_with_removed_sources(
+      &root,
+      RouteMode::Switch,
+      "http://127.0.0.1:4141/opencode/v1",
+      &routes,
+      &[],
+    )
+    .unwrap();
+
+    let json = root.to_serde_value().unwrap();
+    assert_eq!(json["model"], "tokn-router-deepseek/deepseek-v4-flash");
+    assert_eq!(json["small_model"], "tokn-router-deepseek/deepseek-chat");
+    assert_eq!(
+      json["agent"]["review"]["model"],
+      "tokn-router-deepseek/deepseek-v4-flash"
+    );
+    assert_eq!(
+      json["provider"]["tokn-router-deepseek"]["options"]["baseURL"],
+      "http://127.0.0.1:4141/opencode/v1"
+    );
+    assert_eq!(
+      json["provider"]["tokn-router-deepseek"]["models"]["deepseek-v4-flash"]["name"],
+      "DeepSeek V4 Flash"
     );
   }
 
@@ -841,6 +1041,22 @@ mod tests {
   }
 
   #[test]
+  fn accounts_from_auth_json_imports_deepseek_api_key() {
+    let json = serde_json::json!({"deepseek": {"type": "api", "key": "sk-deepseek"}});
+    let accounts = accounts_from_auth_json(
+      &json,
+      std::path::Path::new("/tmp/opencode-auth.json"),
+      "20260604T153012Z",
+    );
+
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, "opencode-deepseek");
+    assert_eq!(accounts[0].provider, "deepseek");
+    assert_eq!(accounts[0].api_key.as_ref().unwrap().expose(), "sk-deepseek");
+    assert_eq!(source_provider_id(&accounts[0]), Some("deepseek"));
+  }
+
+  #[test]
   fn accounts_from_auth_json_imports_oauth_records() {
     let json = serde_json::json!({
       "github-copilot": {"type": "oauth", "access": "at", "refresh": "ghu_rt", "expires": 0},
@@ -947,7 +1163,13 @@ mod tests {
     )];
 
     let edits = adapter
-      .rewrite_config(dir.path(), "http://127.0.0.1:4141/opencode/v1", &routes, &[])
+      .rewrite_config(
+        dir.path(),
+        RouteMode::Route,
+        "http://127.0.0.1:4141/opencode/v1",
+        &routes,
+        &[],
+      )
       .unwrap();
 
     assert_eq!(edits.len(), 2);

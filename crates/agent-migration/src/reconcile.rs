@@ -465,7 +465,13 @@ fn plan_reconcile_with_gateway_auth_path(
     &provider_routes,
   )?;
   validate_verbatim_provider_routes(adapter.as_ref(), binding_mode, &provider_routes)?;
-  let edits = adapter.rewrite_config(&home, &target_base_url, &provider_routes, &removed_source_provider_ids)?;
+  let edits = adapter.rewrite_config(
+    &home,
+    binding_mode,
+    &target_base_url,
+    &provider_routes,
+    &removed_source_provider_ids,
+  )?;
   gateway_config_snapshot.validate()?;
   if let Some(snapshot) = &gateway_auth_sources_snapshot {
     snapshot.validate(&gateway_auth_path)?;
@@ -2010,12 +2016,11 @@ providers = ["anthropic"]
 
     let rewritten = crate::jsonc::read_jsonc(&opencode_config_path).unwrap();
     assert_eq!(rewritten["mcp"]["local"], true);
-    for provider in ["openai", "github-copilot"] {
-      assert_eq!(
-        rewritten["provider"][provider]["options"]["baseURL"],
-        "http://127.0.0.1:4141/opencode/v1"
-      );
-    }
+    assert_eq!(
+      rewritten["provider"]["tokn-router-openai"]["options"]["baseURL"],
+      "http://127.0.0.1:4141/opencode/v1"
+    );
+    assert!(rewritten["provider"].get("tokn-router-github-copilot").is_none());
     let manifest = manifest::read_manifest(&manifest_path).unwrap();
     assert_eq!(manifest.gateway_auth_path, None);
     assert_eq!(manifest.agent_auth_path, None);

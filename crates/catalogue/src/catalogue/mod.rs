@@ -64,4 +64,12 @@ mod tests {
     let mi = model_info_for("zai", "glm-4.5-air");
     assert!(mi.is_some(), "expected glm-4.5-air on zai");
   }
+
+  #[test]
+  fn deepseek_v4_flash_is_catalogued() {
+    let mi = model_info_for("deepseek", "deepseek-v4-flash").expect("deepseek-v4-flash should be catalogued");
+    assert_eq!(mi.name, "DeepSeek V4 Flash");
+    assert!(mi.capabilities.reasoning);
+    assert!(mi.capabilities.toolcall);
+  }
 }
