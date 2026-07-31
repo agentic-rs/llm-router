@@ -1,19 +1,20 @@
-//! Session → account affinity map used by [`super::AccountPool`] to keep
-//! multi-turn conversations (tool-call follow-ups, OpenAI Responses
+//! Session affinity map used by [`super::AccountPool`] to keep multi-turn
+//! conversations (tool-call follow-ups, OpenAI Responses
 //! `previous_response_id`, Anthropic extended-thinking continuations) on the
-//! same upstream credential.
+//! same selected runtime value.
 //!
 //! Lookup semantics are tri-state via [`Lookup`]:
-//! - `Hit(account_id)` — session known and still within TTL.
+//! - `Hit(value)` — session known and still within TTL.
 //! - `Expired` — session was known, the affinity TTL elapsed, but the entry is
 //!   still retained for debug/observability.
-//! - `Unknown` — first-use; the dispatcher allocates an account and records.
+//! - `Unknown` — first-use; the caller selects a value and records it.
 //!
-//! Entries use a single last-touch timestamp. An entry remains retained until
-//! `retained_ttl` from its last successful record, where `retained_ttl` is
-//! computed once at construction as `max(session_ttl, configured_retention)`.
-//! Once older than that it is forgotten and a future request with the same id
-//! is treated as a brand new session.
+//! Entries use a single last-touch timestamp. Legacy configuration supplies an
+//! absolute retention TTL, while v2's [`SessionAffinityPlan`] supplies an
+//! additional retention duration after the live TTL. Separate constructors
+//! make that semantic difference explicit. Once an entry exceeds its computed
+//! retention TTL it is forgotten and a future request with the same id is
+//! treated as a brand new session.
 //!
 //! In-memory only — by design. Cross-restart affinity would need durable
 //! state, which we explicitly chose not to keep here.
@@ -27,17 +28,18 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokn_policy::SessionAffinityPlan;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Lookup {
-  Hit(String),
+pub enum Lookup<V> {
+  Hit(V),
   Expired,
   Unknown,
 }
 
 #[derive(Debug)]
-struct Entry<I> {
-  account_id: String,
+struct Entry<V, I> {
+  value: V,
   /// When this binding was last successfully touched.
   stamped_at: I,
 }
@@ -67,8 +69,8 @@ impl Clock for SystemClock {
   }
 }
 
-pub struct Affinity<C: Clock = SystemClock> {
-  map: RwLock<HashMap<String, Entry<C::Instant>>>,
+pub struct Affinity<V: Clone, C: Clock = SystemClock> {
+  map: RwLock<HashMap<String, Entry<V, C::Instant>>>,
   ttl: C::Duration,
   retained_ttl: C::Duration,
   gc_every: usize,
@@ -76,18 +78,34 @@ pub struct Affinity<C: Clock = SystemClock> {
   clock: C,
 }
 
-impl Affinity<SystemClock> {
-  pub fn new(ttl: Duration, retained_ttl: Duration) -> Self {
-    Affinity::<SystemClock>::with_clock(ttl, retained_ttl, SystemClock)
+impl<V: Clone> Affinity<V, SystemClock> {
+  /// Construct affinity using legacy configuration's absolute retention TTL.
+  ///
+  /// `absolute_retention_ttl` is measured from the last touch, just like
+  /// `ttl`. Values shorter than `ttl` are clamped to `ttl`, preserving the
+  /// legacy tombstone behavior.
+  pub fn with_legacy_absolute_retention(ttl: Duration, absolute_retention_ttl: Duration) -> Self {
+    Self::with_clock_and_absolute_retention(ttl, absolute_retention_ttl, SystemClock)
   }
 
+  /// Construct affinity from v2 policy semantics.
+  ///
+  /// `expired_retention` is additional time after the live TTL. Saturation
+  /// keeps an extreme configuration from wrapping to a shorter retention TTL.
+  pub fn from_session_plan(plan: SessionAffinityPlan) -> Self {
+    let retained_ttl = plan.ttl().saturating_add(plan.expired_retention());
+    Self::with_clock_and_absolute_retention(plan.ttl(), retained_ttl, SystemClock)
+  }
+}
+
+impl Affinity<String, SystemClock> {
   #[cfg(test)]
   pub(crate) fn rewind_live_entry(&self, key: &str, delta: Duration) -> bool {
     let mut g = self.map.write();
     let Some(entry) = g.get_mut(key) else {
       return false;
     };
-    if entry.account_id.is_empty() {
+    if entry.value.is_empty() {
       return false;
     }
     let Some(stamped_at) = entry.stamped_at.checked_sub(delta) else {
@@ -98,8 +116,8 @@ impl Affinity<SystemClock> {
   }
 }
 
-impl<C: Clock> Affinity<C> {
-  fn with_clock(ttl: C::Duration, retained_ttl: C::Duration, clock: C) -> Self {
+impl<V: Clone, C: Clock> Affinity<V, C> {
+  fn with_clock_and_absolute_retention(ttl: C::Duration, retained_ttl: C::Duration, clock: C) -> Self {
     Self {
       map: RwLock::new(HashMap::new()),
       ttl,
@@ -120,14 +138,14 @@ impl<C: Clock> Affinity<C> {
   }
 
   /// Look up `key`. Side-effect: fully stale retained entries are removed.
-  pub fn lookup(&self, key: &str) -> Lookup {
+  pub fn lookup(&self, key: &str) -> Lookup<V> {
     self.maybe_sweep_expired();
     {
       let g = self.map.read();
       if let Some(e) = g.get(key) {
         let age = self.clock.elapsed(e.stamped_at);
         if age < self.ttl {
-          return Lookup::Hit(e.account_id.clone());
+          return Lookup::Hit(e.value.clone());
         }
         if age < self.retained_ttl {
           return Lookup::Expired;
@@ -141,7 +159,7 @@ impl<C: Clock> Affinity<C> {
       Some(e) => {
         let age = self.clock.elapsed(e.stamped_at);
         if age < self.ttl {
-          Lookup::Hit(e.account_id.clone())
+          Lookup::Hit(e.value.clone())
         } else if age < self.retained_ttl {
           Lookup::Expired
         } else {
@@ -153,14 +171,14 @@ impl<C: Clock> Affinity<C> {
     }
   }
 
-  /// Bind `key` to `account_id` (sliding-window refresh on repeat calls).
-  pub fn record(&self, key: &str, account_id: &str) {
+  /// Bind `key` to `value` (sliding-window refresh on repeat calls).
+  pub fn record(&self, key: &str, value: impl Into<V>) {
     self.maybe_sweep_expired();
     let mut g = self.map.write();
     g.insert(
       key.to_string(),
       Entry {
-        account_id: account_id.to_string(),
+        value: value.into(),
         stamped_at: self.clock.now(),
       },
     );
@@ -208,8 +226,9 @@ mod tests {
     }
   }
 
-  fn test_affinity(ttl: u64, retained_ttl: u64) -> Affinity<FakeClock> {
-    let mut affinity = Affinity::<FakeClock>::with_clock(ttl, retained_ttl, FakeClock::new());
+  fn test_affinity(ttl: u64, retained_ttl: u64) -> Affinity<String, FakeClock> {
+    let mut affinity =
+      Affinity::<String, FakeClock>::with_clock_and_absolute_retention(ttl, retained_ttl, FakeClock::new());
     affinity.gc_every = 4;
     affinity
   }
@@ -277,5 +296,28 @@ mod tests {
     a.record("fresh-2", "acct");
     a.record("fresh-3", "acct");
     assert!(a.len() <= 3);
+  }
+
+  #[test]
+  fn stores_non_string_values() {
+    let a = Affinity::<u32, FakeClock>::with_clock_and_absolute_retention(ms(40), ms(120), FakeClock::new());
+    a.record("k", 42_u32);
+    assert_eq!(a.lookup("k"), Lookup::Hit(42));
+  }
+
+  #[test]
+  fn session_plan_retention_is_additional_after_ttl() {
+    let a = Affinity::<String>::from_session_plan(SessionAffinityPlan::new(
+      Duration::from_secs(40),
+      Duration::from_secs(20),
+    ));
+    assert_eq!(a.ttl, Duration::from_secs(40));
+    assert_eq!(a.retained_ttl, Duration::from_secs(60));
+  }
+
+  #[test]
+  fn session_plan_retention_addition_saturates() {
+    let a = Affinity::<String>::from_session_plan(SessionAffinityPlan::new(Duration::MAX, Duration::from_nanos(1)));
+    assert_eq!(a.retained_ttl, Duration::MAX);
   }
 }
