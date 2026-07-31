@@ -1,5 +1,6 @@
 mod connect;
 mod dispatch;
+mod execution;
 mod gateway;
 mod listeners;
 mod matchers;
@@ -16,6 +17,7 @@ pub use dispatch::{
   HttpRequestSemantics, HttpRouteMatch, MatchedHttpRoute, RoutedHttpDispatch, SelectedHttpTarget,
   SelectedManagedHttpTarget, SelectedRelayHttpTarget, SelectedTransparentHttpTarget,
 };
+pub use execution::{HttpExecutionCoordinator, HttpExecutionError, HttpExecutionOutcome, HttpExecutionResult};
 pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
 pub use listeners::{
   link_listeners, BindingKind, ConnectActionSite, HttpActionSite, LinkedConnectDecision, LinkedConnectPolicy,
