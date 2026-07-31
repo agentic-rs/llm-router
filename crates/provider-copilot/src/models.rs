@@ -21,9 +21,9 @@ pub async fn list(
   headers: &CopilotHeaders,
 ) -> Result<Value> {
   let h = crate::headers::copilot_request_headers(api_token, headers, false, "user")?;
-  let url = format!("{base_url}models");
+  let url = base_url.operation_url(["models"])?;
   debug!("fetching copilot model list");
-  let resp = crate::util::http::send(client, reqwest::Method::GET, &url, h, None, None, "list models").await?;
+  let resp = crate::util::http::send(client, reqwest::Method::GET, url.as_str(), h, None, None, "list models").await?;
   let status = resp.status();
   tracing::Span::current().record("status", status.as_u16());
   let v: Value = crate::util::http::read_json(resp, "list models").await?;

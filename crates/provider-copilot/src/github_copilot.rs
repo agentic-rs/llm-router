@@ -103,10 +103,6 @@ impl CopilotProvider {
     })
   }
 
-  fn url(&self, path: &str) -> String {
-    format!("{}{}", self.target.base_url().as_str().trim_end_matches('/'), path)
-  }
-
   fn snapshot(&self) -> (Option<Secret<String>>, Option<i64>) {
     let g = self.cache.read();
     (g.token.clone(), g.expires_at)
@@ -238,15 +234,15 @@ impl Provider for CopilotProvider {
   }
 
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/chat/completions", "chat").await
+    self.upstream_post(ctx, &["chat", "completions"], "chat").await
   }
 
   async fn responses(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/responses", "responses").await
+    self.upstream_post(ctx, &["responses"], "responses").await
   }
 
   async fn messages(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/v1/messages", "messages").await
+    self.upstream_post(ctx, &["v1", "messages"], "messages").await
   }
 
   fn on_unauthorized(&self) {
@@ -299,12 +295,19 @@ impl CopilotProvider {
     fields(
       account = %self.id,
       what,
-      path,
+      path = tracing::field::Empty,
       stream = ctx.stream,
       initiator = tracing::field::Empty,
     ),
   )]
-  async fn upstream_post(&self, ctx: RequestCtx<'_>, path: &str, what: &'static str) -> Result<reqwest::Response> {
+  async fn upstream_post(
+    &self,
+    ctx: RequestCtx<'_>,
+    path_segments: &[&str],
+    what: &'static str,
+  ) -> Result<reqwest::Response> {
+    let url = self.target.base_url().operation_url(path_segments.iter().copied())?;
+    tracing::Span::current().record("path", url.path());
     let token = self.ensure_api_token(ctx.http).await?;
     let initiator = match ctx.endpoint {
       // For /v1/responses the inbound body uses `input`, not `messages`,
@@ -331,13 +334,12 @@ impl CopilotProvider {
         agent_id: &ctx.agent_id,
       },
     )?;
-    let url = self.url(path);
     debug!(%url, "POST upstream");
     let body_bytes = ctx.request_body_bytes();
     let resp = crate::util::http::send(
       ctx.http,
       Method::POST,
-      &url,
+      url.as_str(),
       h,
       Some(body_bytes),
       ctx.outbound.as_ref(),
@@ -527,7 +529,12 @@ mod tests {
     let provider = CopilotProvider::from_account_at(Arc::new(account), target).unwrap();
 
     assert_eq!(
-      provider.url("/chat/completions"),
+      provider
+        .target
+        .base_url()
+        .operation_url(["chat", "completions"])
+        .unwrap()
+        .as_str(),
       "https://gateway.example/copilot/data-plane/chat/completions"
     );
     assert_eq!(
