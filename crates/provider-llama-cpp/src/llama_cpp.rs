@@ -13,7 +13,7 @@ use crate::{
   ID_LLAMA_CPP,
 };
 
-pub const DEFAULT_BASE_URL: &str = "http://localhost:8080/v1";
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 
 pub struct LlamaCppProvider {
   pub id: String,

@@ -27,13 +27,17 @@ use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-  error, AuthKind, HeaderPatchCtx, ModelInfo, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
-  ZAI_PROVIDERS,
+  error, AuthKind, HeaderPatchCtx, ModelInfo, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result, ID_ZAI,
+  ID_ZAI_CODING_PLAN, ID_ZHIPUAI, ID_ZHIPUAI_CODING_PLAN, ZAI_PROVIDERS,
 };
 
-/// Default upstream for the coding plan. Override per-account via
-/// `[accounts.<id>.zai] base_url = "..."`.
-pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+/// Canonical upstreams for the four Z.ai provider identities. Legacy account
+/// URLs may override these until destination ownership moves fully to v2
+/// upstream resources.
+pub const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+pub const ZAI_CODING_PLAN_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+pub const ZHIPUAI_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+pub const ZHIPUAI_CODING_PLAN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
 pub struct ZaiProvider {
   pub id: String,
@@ -77,10 +81,11 @@ impl ZaiProvider {
   pub fn from_account(a: std::sync::Arc<AccountConfig>) -> Result<Self> {
     Self::validate_account(&a)?;
     let key = a.api_key.clone().expect("validated api_key");
-    let base_url = a
-      .base_url
-      .clone()
-      .unwrap_or_else(|| default_base_url(&a.provider).to_string());
+    let base_url = a.base_url.clone().unwrap_or_else(|| {
+      default_base_url(&a.provider)
+        .expect("validated Z.ai provider id")
+        .to_string()
+    });
 
     let info = ProviderInfo {
       id: a.provider.clone(),
@@ -130,8 +135,14 @@ impl InputTransformer for ZaiProvider {
   }
 }
 
-pub fn default_base_url(_provider: &str) -> &'static str {
-  DEFAULT_BASE_URL
+pub fn default_base_url(provider: &str) -> Option<&'static str> {
+  match provider {
+    ID_ZAI => Some(ZAI_BASE_URL),
+    ID_ZAI_CODING_PLAN => Some(ZAI_CODING_PLAN_BASE_URL),
+    ID_ZHIPUAI => Some(ZHIPUAI_BASE_URL),
+    ID_ZHIPUAI_CODING_PLAN => Some(ZHIPUAI_CODING_PLAN_BASE_URL),
+    _ => None,
+  }
 }
 
 #[async_trait]
@@ -337,9 +348,16 @@ mod tests {
   }
 
   #[test]
-  fn defaults_to_official_endpoint() {
-    let p = ZaiProvider::from_account(std::sync::Arc::new(acct("zai", Some("sk-x")))).unwrap();
-    assert_eq!(p.base_url, DEFAULT_BASE_URL);
+  fn each_alias_defaults_to_its_descriptor_endpoint() {
+    for (provider, expected) in [
+      (ID_ZAI, ZAI_BASE_URL),
+      (ID_ZAI_CODING_PLAN, ZAI_CODING_PLAN_BASE_URL),
+      (ID_ZHIPUAI, ZHIPUAI_BASE_URL),
+      (ID_ZHIPUAI_CODING_PLAN, ZHIPUAI_CODING_PLAN_BASE_URL),
+    ] {
+      let provider = ZaiProvider::from_account(std::sync::Arc::new(acct(provider, Some("sk-x")))).unwrap();
+      assert_eq!(provider.base_url, expected);
+    }
   }
 
   #[test]

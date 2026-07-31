@@ -68,7 +68,7 @@ impl ProviderAuth for ZaiAuth {
   }
 
   fn default_base_url(&self) -> Option<&'static str> {
-    Some(crate::zai::default_base_url(self.id))
+    crate::zai::default_base_url(self.id)
   }
 
   async fn refresh_credential(&self, _client: &reqwest::Client, _account: &AccountConfig) -> Result<RefreshOutcome> {
@@ -81,10 +81,11 @@ impl ProviderAuth for ZaiAuth {
       account: account.id.clone(),
       field: "api_key",
     })?;
-    let base = account
-      .base_url
-      .clone()
-      .unwrap_or_else(|| crate::zai::default_base_url(self.id).to_string());
+    let base = account.base_url.clone().unwrap_or_else(|| {
+      crate::zai::default_base_url(self.id)
+        .expect("registered Z.ai auth provider id")
+        .to_string()
+    });
     let url = format!("{}/models", base.trim_end_matches('/'));
     let resp = client
       .get(&url)
