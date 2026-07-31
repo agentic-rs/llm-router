@@ -918,6 +918,10 @@ mod tests {
       execution_target.request_kind(),
       ProviderRequestKind::Operation(Endpoint::Responses)
     );
+    assert_eq!(
+      execution_target.request_url(execution.head()).unwrap().as_str(),
+      "https://upstream.example/v1/opaque"
+    );
 
     let transparent = routed(
       dispatch_http(
@@ -1129,6 +1133,14 @@ mod tests {
       routed.head().path_and_query().as_str(),
       "/v1/models?client_version=test"
     );
+    let execution = routed.execution_view().unwrap();
+    let ExecutionTarget::Relay(execution_target) = execution.target() else {
+      panic!("expected relay execution target");
+    };
+    assert_eq!(
+      execution_target.request_url(execution.head()).unwrap().as_str(),
+      "https://origin.example/v1/models?client_version=test"
+    );
   }
 
   #[test]
@@ -1180,6 +1192,10 @@ mod tests {
       panic!("expected transparent execution target");
     };
     assert!(std::ptr::eq(execution_target.destination(), selected.destination()));
+    assert_eq!(
+      execution_target.request_url(execution.head()).unwrap().as_str(),
+      "http://[2001:db8::1]:8080/opaque"
+    );
   }
 
   #[test]
