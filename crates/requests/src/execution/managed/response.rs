@@ -287,3 +287,154 @@ fn content_type(headers: &HeaderMap) -> Option<String> {
 fn media_type(content_type: &str) -> &str {
   content_type.split(';').next().unwrap_or_default().trim()
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::execution::ManagedResponseMetadata;
+
+  fn upstream(
+    status: StatusCode,
+    content_type: Option<&'static str>,
+    body: &'static str,
+    metadata: ManagedResponseMetadata,
+  ) -> ManagedHttpResponse {
+    let mut response = http::Response::builder().status(status);
+    if let Some(content_type) = content_type {
+      response = response.header(CONTENT_TYPE, content_type);
+    }
+    response = response.header(CONTENT_LENGTH, body.len());
+    ManagedHttpResponse {
+      response: reqwest::Response::from(response.body(body).unwrap()),
+      metadata,
+    }
+  }
+
+  fn metadata(
+    requested_operation: Endpoint,
+    upstream_operation: Endpoint,
+    requested_stream: bool,
+    upstream_stream: bool,
+  ) -> ManagedResponseMetadata {
+    ManagedResponseMetadata::new(
+      requested_operation,
+      upstream_operation,
+      requested_stream,
+      upstream_stream,
+    )
+  }
+
+  fn buffered(response: ManagedClientResponse) -> (StatusCode, HeaderMap, Bytes) {
+    let (status, headers, body) = response.into_parts();
+    let ManagedClientBody::Buffered(body) = body else {
+      panic!("expected buffered body")
+    };
+    (status, headers, body)
+  }
+
+  #[tokio::test]
+  async fn non_success_response_is_buffered_without_conversion() {
+    let body = r#"{"error":{"message":"slow down"}}"#;
+    let response = upstream(
+      StatusCode::TOO_MANY_REQUESTS,
+      Some("application/json"),
+      body,
+      metadata(Endpoint::Responses, Endpoint::ChatCompletions, true, true),
+    );
+
+    let (status, headers, actual) = buffered(ManagedResponseAdapter::new().adapt(response).await.unwrap());
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(actual.as_ref(), body.as_bytes());
+    assert_eq!(headers[CONTENT_TYPE], "application/json");
+    assert_eq!(headers[CONTENT_LENGTH], body.len().to_string());
+  }
+
+  #[tokio::test]
+  async fn same_operation_json_preserves_exact_response_bytes() {
+    let body = "{ \"id\" : \"chat-1\", \"choices\" : [] }";
+    let response = upstream(
+      StatusCode::OK,
+      Some("application/json; charset=utf-8"),
+      body,
+      metadata(Endpoint::ChatCompletions, Endpoint::ChatCompletions, false, false),
+    );
+
+    let (_, headers, actual) = buffered(ManagedResponseAdapter::new().adapt(response).await.unwrap());
+
+    assert_eq!(actual.as_ref(), body.as_bytes());
+    assert_eq!(headers[CONTENT_LENGTH], body.len().to_string());
+    assert_eq!(headers[CONTENT_TYPE], "application/json; charset=utf-8");
+  }
+
+  #[tokio::test]
+  async fn cross_operation_json_is_converted_and_reframed() {
+    let body = r#"{
+      "id":"chatcmpl-1",
+      "object":"chat.completion",
+      "model":"upstream-model",
+      "choices":[{
+        "index":0,
+        "message":{"role":"assistant","content":"hello"},
+        "finish_reason":"stop"
+      }]
+    }"#;
+    let response = upstream(
+      StatusCode::OK,
+      Some("application/json"),
+      body,
+      metadata(Endpoint::Responses, Endpoint::ChatCompletions, false, false),
+    );
+
+    let (_, headers, actual) = buffered(ManagedResponseAdapter::new().adapt(response).await.unwrap());
+    let actual: Value = serde_json::from_slice(&actual).unwrap();
+
+    assert_eq!(actual["object"], "response");
+    assert_eq!(actual["output_text"], "hello");
+    assert!(!headers.contains_key(CONTENT_LENGTH));
+    assert_eq!(headers[CONTENT_TYPE], "application/json");
+  }
+
+  #[tokio::test]
+  async fn buffered_client_accumulates_actual_sse_even_when_it_did_not_request_streaming() {
+    let body = concat!(
+      "data: {\"id\":\"chatcmpl-1\",\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+      "data: {\"id\":\"chatcmpl-1\",\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+      "data: [DONE]\n\n"
+    );
+    let response = upstream(
+      StatusCode::OK,
+      Some("Text/Event-Stream; charset=utf-8"),
+      body,
+      metadata(Endpoint::Responses, Endpoint::ChatCompletions, false, true),
+    );
+
+    let (_, headers, actual) = buffered(ManagedResponseAdapter::new().adapt(response).await.unwrap());
+    let actual: Value = serde_json::from_slice(&actual).unwrap();
+
+    assert_eq!(actual["object"], "response");
+    assert_eq!(actual["output_text"], "hello");
+    assert!(!headers.contains_key(CONTENT_LENGTH));
+    assert_eq!(headers[CONTENT_TYPE], "application/json");
+  }
+
+  #[tokio::test]
+  async fn explicit_json_is_a_protocol_error_for_a_streaming_client() {
+    let response = upstream(
+      StatusCode::OK,
+      Some("application/json"),
+      r#"{"id":"response-1"}"#,
+      metadata(Endpoint::Responses, Endpoint::Responses, true, true),
+    );
+
+    let error = ManagedResponseAdapter::new().adapt(response).await.err().unwrap();
+
+    assert!(matches!(
+      error,
+      ManagedResponseError::StreamingProtocolMismatch {
+        upstream_operation: Endpoint::Responses,
+        ..
+      }
+    ));
+  }
+}
