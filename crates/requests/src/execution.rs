@@ -8,7 +8,8 @@ mod managed;
 mod opaque;
 
 pub use managed::{
-  ManagedAttemptError, ManagedHttpAttempt, ManagedHttpExecutor, ManagedHttpResponse, ManagedResponseMetadata,
+  ManagedAttemptError, ManagedClientBody, ManagedClientResponse, ManagedHttpAttempt, ManagedHttpExecutor,
+  ManagedHttpResponse, ManagedResponseAdapter, ManagedResponseError, ManagedResponseMetadata,
 };
 pub use opaque::{OpaqueAttemptError, OpaqueHttpAttempt, OpaqueHttpExecutor, OpaqueHttpTarget};
 

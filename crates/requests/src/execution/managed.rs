@@ -5,6 +5,10 @@
 //! selected provider exactly once. It does not resolve, retry, settle account
 //! state, or consume the returned response body.
 
+mod response;
+
+pub use response::{ManagedClientBody, ManagedClientResponse, ManagedResponseAdapter, ManagedResponseError};
+
 use super::ManagedExecutionTarget;
 use crate::utils::codec::{decode_json_request, encode_body_bytes, CodecError, ContentEncodingKind};
 use bytes::Bytes;
@@ -60,6 +64,20 @@ pub struct ManagedResponseMetadata {
 }
 
 impl ManagedResponseMetadata {
+  pub fn new(
+    requested_operation: Endpoint,
+    upstream_operation: Endpoint,
+    requested_stream: bool,
+    upstream_stream: bool,
+  ) -> Self {
+    Self {
+      requested_operation,
+      upstream_operation,
+      requested_stream,
+      upstream_stream,
+    }
+  }
+
   pub fn requested_operation(&self) -> Endpoint {
     self.requested_operation
   }
@@ -194,12 +212,12 @@ impl ManagedHttpExecutor {
       provider.info().id.as_str(),
       provider.input_transformer(),
     )?;
-    let metadata = ManagedResponseMetadata {
-      requested_operation: target.requested_operation(),
-      upstream_operation: selected.operation(),
-      requested_stream: prepared.requested_stream,
-      upstream_stream: prepared.upstream_stream,
-    };
+    let metadata = ManagedResponseMetadata::new(
+      target.requested_operation(),
+      selected.operation(),
+      prepared.requested_stream,
+      prepared.upstream_stream,
+    );
     let request = RequestCtx {
       endpoint: selected.operation(),
       http: &self.http,
