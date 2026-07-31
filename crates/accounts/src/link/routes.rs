@@ -14,9 +14,9 @@ use std::sync::Arc;
 use tokn_core::provider::ProviderTarget;
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CleartextHttpPolicy, InvalidUpstreamUrl};
 use tokn_policy::{
-  AccountPoolId, FallbackSelector, GatewayPlan, HeaderPatchSetId, ManagedRetry, ManagedRoute, ModelGroupId,
-  ModelSelector, OperationPolicy, ProviderId, QualificationNamespace, RelayRetry, RelayRoute, RelayTarget, RouteId,
-  RouteKind, RoutePlan, UpstreamId, UpstreamSelector,
+  AccountPoolId, DestinationPolicy, FallbackSelector, GatewayPlan, HeaderPatchSetId, ManagedRetry, ManagedRoute,
+  ModelGroupId, ModelSelector, OperationPolicy, ProviderId, QualificationNamespace, RelayRetry, RelayRoute,
+  RelayTarget, RouteId, RouteKind, RoutePlan, UpstreamId, UpstreamSelector,
 };
 
 /// Runtime materialization of the reachable route subgraph.
@@ -73,6 +73,71 @@ impl LinkedRoute {
       LinkedRouteKind::Relay(route) => route.header_patches(),
       LinkedRouteKind::Transparent(route) => route.header_patches(),
     }
+  }
+
+  /// Whether request execution selects an upstream or preserves the ingress
+  /// destination. This is derived from the linked route so startup consumers
+  /// do not need to retain the policy graph.
+  pub fn destination_policy(&self) -> DestinationPolicy {
+    match &self.kind {
+      LinkedRouteKind::Managed(_)
+      | LinkedRouteKind::Relay(LinkedRelayRoute {
+        target: LinkedRelayTarget::Fixed { .. },
+        ..
+      }) => DestinationPolicy::SelectedUpstream,
+      LinkedRouteKind::Relay(LinkedRelayRoute {
+        target: LinkedRelayTarget::FromOrigin { .. },
+        ..
+      })
+      | LinkedRouteKind::Transparent(_) => DestinationPolicy::Original,
+    }
+  }
+
+  /// Provider ids that this linked route can select at request time.
+  ///
+  /// Results are sorted and deduplicated. Managed fallback routes are narrowed
+  /// to surviving linked candidates rather than the wider base upstream
+  /// domain, which keeps startup identity requirements exact.
+  pub fn possible_provider_ids(&self) -> Box<[ProviderId]> {
+    let mut providers = BTreeSet::new();
+    match &self.kind {
+      LinkedRouteKind::Managed(route) => match route.model() {
+        LinkedModelSelector::Capability | LinkedModelSelector::Qualified { .. } => {
+          providers.extend(
+            route
+              .upstreams()
+              .upstreams()
+              .iter()
+              .map(|upstream| upstream.provider_id().clone()),
+          );
+        }
+        LinkedModelSelector::Fallback(fallback) => {
+          for upstream_id in fallback
+            .groups()
+            .iter()
+            .flat_map(LinkedModelGroup::candidates)
+            .flat_map(|candidate| candidate.upstream_ids())
+          {
+            let upstream = route
+              .upstreams()
+              .upstream(upstream_id)
+              .expect("linked fallback candidate upstream must belong to the managed route domain");
+            providers.insert(upstream.provider_id().clone());
+          }
+        }
+      },
+      LinkedRouteKind::Relay(route) => {
+        providers.extend(
+          route
+            .target()
+            .upstreams()
+            .iter()
+            .map(|upstream| upstream.provider_id().clone()),
+        );
+      }
+      LinkedRouteKind::Transparent(_) => {}
+    }
+    providers.into_iter().collect()
   }
 }
 
@@ -1235,6 +1300,10 @@ mod tests {
     let alias = CanonicalHttpOrigin::parse("https://alias.example", CleartextHttpPolicy::LoopbackOnly).unwrap();
 
     assert_eq!(target.upstreams().len(), 1);
+    assert_eq!(
+      linked.route(&route).unwrap().destination_policy(),
+      DestinationPolicy::Original
+    );
     assert_eq!(origins.len(), 2);
     assert!(origins.contains_key(&base));
     assert!(origins.contains_key(&alias));
@@ -1319,6 +1388,11 @@ mod tests {
       linked.route(&route).unwrap().kind(),
       LinkedRouteKind::Transparent(_)
     ));
+    assert_eq!(
+      linked.route(&route).unwrap().destination_policy(),
+      DestinationPolicy::Original
+    );
+    assert!(linked.route(&route).unwrap().possible_provider_ids().is_empty());
   }
 
   #[test]
@@ -1366,6 +1440,34 @@ mod tests {
     let managed = linked_managed(linked.route(&managed_id).unwrap());
     let relay = linked_relay(linked.route(&relay_id).unwrap());
 
+    assert_eq!(
+      linked.route(&managed_id).unwrap().destination_policy(),
+      DestinationPolicy::SelectedUpstream
+    );
+    assert_eq!(
+      linked.route(&relay_id).unwrap().destination_policy(),
+      DestinationPolicy::SelectedUpstream
+    );
+    assert_eq!(
+      linked
+        .route(&managed_id)
+        .unwrap()
+        .possible_provider_ids()
+        .iter()
+        .map(ProviderId::as_str)
+        .collect::<Vec<_>>(),
+      [ID_LLAMA_CPP]
+    );
+    assert_eq!(
+      linked
+        .route(&relay_id)
+        .unwrap()
+        .possible_provider_ids()
+        .iter()
+        .map(ProviderId::as_str)
+        .collect::<Vec<_>>(),
+      [ID_LLAMA_CPP]
+    );
     assert_eq!(managed.operation(), OperationPolicy::Preserve);
     assert_eq!(managed.header_patches(), Some(&managed_patch));
     assert_eq!(managed.retry(), &ManagedRetry::Recoverable(managed_retry));
