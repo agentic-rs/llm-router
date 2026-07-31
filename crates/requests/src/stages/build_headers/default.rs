@@ -29,7 +29,6 @@ use std::collections::HashMap;
 use tokn_core::AgentId;
 use tokn_headers::inbound::build_template_vars;
 use tokn_headers::registry::build_wire_identity_headers;
-use tokn_headers::HeaderMap;
 
 /// Default BuildHeaders stage. See module docs for the resolution
 /// algorithm.
@@ -109,7 +108,7 @@ mod tests {
   use serde_json::json;
   use std::sync::Arc;
   use tokn_core::provider::Endpoint;
-  use tokn_headers::{keys, HeaderValue};
+  use tokn_headers::{keys, HeaderMap, HeaderValue};
 
   fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut m = HeaderMap::new();
