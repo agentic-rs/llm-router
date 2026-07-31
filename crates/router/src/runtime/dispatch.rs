@@ -85,6 +85,13 @@ pub struct HttpDispatchSite {
 }
 
 impl HttpDispatchSite {
+  pub(crate) fn new(listener_id: ListenerId, binding_id: Option<BindingId>) -> Self {
+    Self {
+      listener_id,
+      binding_id,
+    }
+  }
+
   pub fn listener_id(&self) -> &ListenerId {
     &self.listener_id
   }
@@ -345,10 +352,7 @@ pub fn match_http(
     operation: request_kind.endpoint(),
   };
   let decision = listener.http().decide(&facts);
-  let site = HttpDispatchSite {
-    listener_id: listener.id().clone(),
-    binding_id: decision.binding_id().cloned(),
-  };
+  let site = HttpDispatchSite::new(listener.id().clone(), decision.binding_id().cloned());
 
   let LinkedHttpAction::Route(profile) = decision.action() else {
     return HttpRouteMatch::Reject(site);

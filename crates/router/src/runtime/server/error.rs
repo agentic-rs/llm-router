@@ -45,8 +45,12 @@ pub enum ServerError {
     site: HttpDispatchSite,
   },
   Dispatch(HttpDispatchError),
-  NoEligible(NoEligibleReason),
+  NoEligible {
+    site: HttpDispatchSite,
+    reason: NoEligibleReason,
+  },
   CoolingDown {
+    site: HttpDispatchSite,
     retry_at: Instant,
   },
   Execution(HttpExecutionError),
@@ -75,9 +79,14 @@ impl ServerError {
     Self::RouteRejected { site }
   }
 
+  /// Report that one routed decision had no eligible request-time target.
+  pub fn no_eligible(site: HttpDispatchSite, reason: NoEligibleReason) -> Self {
+    Self::NoEligible { site, reason }
+  }
+
   /// Report that all otherwise eligible bindings are temporarily cooling.
-  pub fn cooling_down(retry_at: Instant) -> Self {
-    Self::CoolingDown { retry_at }
+  pub fn cooling_down(site: HttpDispatchSite, retry_at: Instant) -> Self {
+    Self::CoolingDown { site, retry_at }
   }
 
   pub fn status(&self) -> StatusCode {
@@ -103,7 +112,7 @@ impl ServerError {
 
   /// Whole-second delay sent in `Retry-After`, rounded upward.
   pub fn retry_after_seconds(&self) -> Option<u64> {
-    let Self::CoolingDown { retry_at } = self else {
+    let Self::CoolingDown { retry_at, .. } = self else {
       return None;
     };
     Some(ceil_seconds(retry_at.saturating_duration_since(Instant::now())))
@@ -120,7 +129,7 @@ impl ServerError {
         "listener policy rejected this request",
       ),
       Self::Dispatch(source) => dispatch_descriptor(source),
-      Self::NoEligible(reason) => no_eligible_descriptor(reason),
+      Self::NoEligible { reason, .. } => no_eligible_descriptor(reason),
       Self::CoolingDown { .. } => ErrorDescriptor::new(
         StatusCode::SERVICE_UNAVAILABLE,
         "temporarily_unavailable",
@@ -164,9 +173,12 @@ impl fmt::Display for ServerError {
       Self::RequestBody(source) => write!(formatter, "HTTP request body admission failed: {source}"),
       Self::RouteRejected { site } => write!(formatter, "{site} explicitly rejected the HTTP request"),
       Self::Dispatch(source) => write!(formatter, "HTTP dispatch failed: {source}"),
-      Self::NoEligible(reason) => write!(formatter, "HTTP dispatch found no eligible target: {reason}"),
-      Self::CoolingDown { retry_at } => {
-        write!(formatter, "all eligible HTTP targets are cooling until {retry_at:?}")
+      Self::NoEligible { site, reason } => write!(formatter, "{site} found no eligible target: {reason}"),
+      Self::CoolingDown { site, retry_at } => {
+        write!(
+          formatter,
+          "all eligible HTTP targets for {site} are cooling until {retry_at:?}"
+        )
       }
       Self::Execution(source) => write!(formatter, "HTTP execution failed: {source}"),
       Self::ResponseBridge(source) => write!(formatter, "HTTP response bridging failed: {source}"),
@@ -183,7 +195,7 @@ impl std::error::Error for ServerError {
       Self::Dispatch(source) => Some(source),
       Self::Execution(source) => Some(source),
       Self::ResponseBridge(source) => Some(source),
-      Self::RouteRejected { .. } | Self::NoEligible(_) | Self::CoolingDown { .. } => None,
+      Self::RouteRejected { .. } | Self::NoEligible { .. } | Self::CoolingDown { .. } => None,
     }
   }
 }
@@ -223,12 +235,6 @@ impl From<RequestBodyError> for ServerError {
 impl From<HttpDispatchError> for ServerError {
   fn from(source: HttpDispatchError) -> Self {
     Self::Dispatch(source)
-  }
-}
-
-impl From<NoEligibleReason> for ServerError {
-  fn from(reason: NoEligibleReason) -> Self {
-    Self::NoEligible(reason)
   }
 }
 
@@ -530,6 +536,11 @@ mod tests {
   use serde_json::Value;
   use std::io;
   use tokn_core::provider::Error as ProviderError;
+  use tokn_policy::ListenerId;
+
+  fn dispatch_site() -> HttpDispatchSite {
+    HttpDispatchSite::new(ListenerId::new("listener").unwrap(), None)
+  }
 
   #[test]
   fn admission_distinguishes_method_errors_and_malformed_targets() {
@@ -623,13 +634,17 @@ mod tests {
 
   #[test]
   fn target_availability_and_access_denial_are_distinct() {
-    let unavailable = ServerError::from(NoEligibleReason::ModelSelectorNoMatch {
-      requested_model: "unknown".into(),
-    });
+    let unavailable = ServerError::no_eligible(
+      dispatch_site(),
+      NoEligibleReason::ModelSelectorNoMatch {
+        requested_model: "unknown".into(),
+      },
+    );
     assert_eq!(unavailable.status(), StatusCode::NOT_FOUND);
     assert_eq!(unavailable.code(), "target_unavailable");
+    assert!(unavailable.to_string().contains("listener 'listener'"));
 
-    let denied = ServerError::from(NoEligibleReason::ProviderAccessDenied);
+    let denied = ServerError::no_eligible(dispatch_site(), NoEligibleReason::ProviderAccessDenied);
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     assert_eq!(denied.code(), "provider_access_denied");
   }
@@ -673,7 +688,7 @@ mod tests {
   fn cooling_down_rounds_retry_after_up() {
     assert_eq!(ceil_seconds(Duration::from_millis(1001)), 2);
 
-    let error = ServerError::cooling_down(Instant::now() + Duration::from_secs(10));
+    let error = ServerError::cooling_down(dispatch_site(), Instant::now() + Duration::from_secs(10));
     assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(error.code(), "temporarily_unavailable");
     assert_eq!(error.retry_after_seconds(), Some(10));
