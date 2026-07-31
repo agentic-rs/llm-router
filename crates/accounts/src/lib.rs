@@ -7,6 +7,7 @@
 
 pub mod affinity;
 pub mod inventory;
+pub mod link;
 pub mod registry;
 pub mod routing;
 
