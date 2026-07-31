@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokn_auth::descriptor::{ProviderDescriptor, RewriteTarget};
 use tokn_core::account::AccountConfig;
-use tokn_core::provider::{error, Endpoint, Provider, Result};
+use tokn_core::provider::{error, Endpoint, Provider, ProviderTarget, Result};
+use tokn_core::upstream_url::CleartextHttpPolicy;
 
 pub struct Registry {
   descriptors: BTreeMap<&'static str, &'static ProviderDescriptor>,
@@ -59,9 +60,31 @@ impl Registry {
   }
 
   pub fn build(&self, account: Arc<AccountConfig>) -> Result<Arc<dyn Provider>> {
+    let descriptor = self
+      .resolve(&account.provider)
+      .ok_or_else(|| error::Error::UnknownProvider {
+        id: account.provider.clone(),
+        account: account.id.clone(),
+      })?;
+    let base_url = account.base_url.as_deref().unwrap_or(descriptor.base_url);
+    let target = ProviderTarget::parse(base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: account.id.clone(),
+        source,
+      }
+    })?;
+    self.build_at(account, target)
+  }
+
+  /// Bind an account to an explicit runtime destination.
+  ///
+  /// The supplied target is authoritative: a legacy `base_url` stored on the
+  /// account is deliberately ignored. Clone one target when several accounts
+  /// belong to the same configured upstream so their model cache is shared.
+  pub fn build_at(&self, account: Arc<AccountConfig>, target: ProviderTarget) -> Result<Arc<dyn Provider>> {
     self.validate(&account)?;
     let descriptor = self.resolve(&account.provider).expect("validated provider descriptor");
-    (descriptor.build)(account)
+    (descriptor.build)(account, target)
   }
 
   pub fn provider_id_for_url(&self, url_or_host: &str) -> Option<&'static str> {
@@ -191,6 +214,19 @@ mod tests {
     ID_ZHIPUAI, ID_ZHIPUAI_CODING_PLAN,
   };
 
+  fn llama_account(id: &str, base_url: Option<&str>) -> Arc<AccountConfig> {
+    let mut account: AccountConfig = toml::from_str(
+      r#"
+        id = "fixture"
+        provider = "llama-cpp"
+      "#,
+    )
+    .expect("valid account fixture");
+    account.id = id.to_string();
+    account.base_url = base_url.map(str::to_string);
+    Arc::new(account)
+  }
+
   #[test]
   fn registry_matches_provider_hosts() {
     let registry = Registry::builtin();
@@ -312,6 +348,75 @@ mod tests {
       assert!(!d.credentials.is_empty(), "{} has no credentials", d.id);
       assert!(d.build_auth.is_some(), "{} has no build_auth", d.id);
     }
+  }
+
+  #[test]
+  fn descriptor_defaults_are_safe_canonical_targets() {
+    let registry = Registry::builtin();
+    for descriptor in registry.iter() {
+      ProviderTarget::parse(descriptor.base_url, CleartextHttpPolicy::LoopbackOnly)
+        .unwrap_or_else(|error| panic!("{} has an invalid default base URL: {error}", descriptor.id));
+    }
+  }
+
+  #[test]
+  fn zai_descriptors_keep_exact_alias_destinations() {
+    let registry = Registry::builtin();
+    for (id, expected) in [
+      (ID_ZAI, "https://api.z.ai/api/paas/v4"),
+      (ID_ZAI_CODING_PLAN, "https://api.z.ai/api/coding/paas/v4"),
+      (ID_ZHIPUAI, "https://open.bigmodel.cn/api/paas/v4"),
+      (ID_ZHIPUAI_CODING_PLAN, "https://open.bigmodel.cn/api/coding/paas/v4"),
+    ] {
+      assert_eq!(registry.resolve(id).expect("registered Z.ai alias").base_url, expected);
+    }
+  }
+
+  #[test]
+  fn explicit_target_overrides_legacy_account_url() {
+    let registry = Registry::builtin();
+    let account = llama_account("local", Some("https://account.example/v1"));
+    let target = ProviderTarget::parse("https://selected.example/api/v1", CleartextHttpPolicy::LoopbackOnly)
+      .expect("valid target");
+
+    let provider = registry.build_at(account, target).expect("provider builds");
+
+    assert_eq!(provider.info().upstream_url, "https://selected.example/api/v1/");
+  }
+
+  #[test]
+  fn accounts_bound_to_one_target_share_its_model_cache() {
+    let registry = Registry::builtin();
+    let target = ProviderTarget::parse("https://selected.example/api/v1", CleartextHttpPolicy::LoopbackOnly)
+      .expect("valid target");
+
+    let first = registry
+      .build_at(llama_account("first", None), target.clone())
+      .expect("first provider builds");
+    let second = registry
+      .build_at(llama_account("second", None), target)
+      .expect("second provider builds");
+
+    assert!(Arc::ptr_eq(&first.info().model_cache, &second.info().model_cache));
+  }
+
+  #[test]
+  fn independently_constructed_targets_have_independent_model_caches() {
+    let registry = Registry::builtin();
+    let account = llama_account("local", None);
+    let first_target = ProviderTarget::parse("https://selected.example/api/v1", CleartextHttpPolicy::LoopbackOnly)
+      .expect("valid target");
+    let second_target = ProviderTarget::parse("https://selected.example/api/v1", CleartextHttpPolicy::LoopbackOnly)
+      .expect("valid target");
+
+    let first = registry
+      .build_at(Arc::clone(&account), first_target)
+      .expect("first provider builds");
+    let second = registry
+      .build_at(account, second_target)
+      .expect("second provider builds");
+
+    assert!(!Arc::ptr_eq(&first.info().model_cache, &second.info().model_cache));
   }
 
   #[test]
