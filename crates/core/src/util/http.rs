@@ -14,19 +14,17 @@ pub struct HttpClientOptions {
 }
 
 pub fn build_client(options: &HttpClientOptions) -> Result<reqwest::Client> {
-  let builder = base_client_builder()
-    // Transparent response decompression. Personas advertise
-    // `Accept-Encoding: gzip, deflate, br, zstd` (from real-world captures),
-    // and providers honor it (zai → gzip). Without these toggles reqwest
-    // hands the raw compressed bytes to downstream `convert_response` stages,
-    // which then fail with `expected value at line 1 column 1`.
-    // When reqwest decompresses, it also strips the response
-    // `Content-Encoding` and `Content-Length` headers so the persisted
-    // body and headers are mutually consistent.
-    .gzip(true)
-    .brotli(true)
-    .deflate(true)
-    .zstd(true);
+  let builder = decompression_client_builder();
+  build_client_with_options(builder, options)
+}
+
+/// Build a client for one selected managed upstream attempt.
+///
+/// Redirects are returned to the caller so execution cannot drift away from
+/// the selected upstream. Response decompression remains enabled because
+/// managed JSON and SSE conversion operate on decoded bytes.
+pub fn build_managed_client(options: &HttpClientOptions) -> Result<reqwest::Client> {
+  let builder = decompression_client_builder().redirect(reqwest::redirect::Policy::none());
   build_client_with_options(builder, options)
 }
 
@@ -50,6 +48,20 @@ fn base_client_builder() -> reqwest::ClientBuilder {
     .connect_timeout(Duration::from_secs(15))
     .timeout(Duration::from_secs(600))
     .pool_idle_timeout(Some(Duration::from_secs(90)))
+}
+
+fn decompression_client_builder() -> reqwest::ClientBuilder {
+  base_client_builder()
+    // Personas advertise `Accept-Encoding: gzip, deflate, br, zstd` (from
+    // real-world captures), and providers honor it (zai → gzip). Without
+    // these toggles reqwest hands compressed bytes to managed response
+    // conversion, which then fails to parse JSON or SSE. Reqwest also removes
+    // `Content-Encoding` and `Content-Length` after decoding so headers remain
+    // consistent with the returned body.
+    .gzip(true)
+    .brotli(true)
+    .deflate(true)
+    .zstd(true)
 }
 
 fn build_client_with_options(
@@ -165,25 +177,39 @@ mod tests {
     build_opaque_client(&HttpClientOptions::default()).expect("opaque client should build");
   }
 
+  #[test]
+  fn managed_client_builds_without_proxy() {
+    build_managed_client(&HttpClientOptions::default()).expect("managed client should build");
+  }
+
+  #[tokio::test]
+  async fn managed_client_does_not_follow_redirects() {
+    let address = serve_redirect_then_ok().await;
+    let client = build_managed_client(&HttpClientOptions::default()).unwrap();
+    let response = client.get(format!("http://{address}/start")).send().await.unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+  }
+
+  #[tokio::test]
+  async fn managed_client_decodes_encoded_response_bytes() {
+    const GZIP_BODY: &[u8] = &[
+      31, 139, 8, 0, 0, 0, 0, 0, 2, 19, 203, 77, 204, 75, 76, 79, 77, 81, 72, 73, 77, 206, 79, 1, 210, 73, 149, 37,
+      169, 197, 0, 77, 154, 181, 35, 21, 0, 0, 0,
+    ];
+
+    let address = serve_once("gzip", GZIP_BODY).await;
+    let client = build_managed_client(&HttpClientOptions::default()).unwrap();
+    let response = client.get(format!("http://{address}/encoded")).send().await.unwrap();
+
+    assert!(!response.headers().contains_key(reqwest::header::CONTENT_ENCODING));
+    assert!(!response.headers().contains_key(reqwest::header::CONTENT_LENGTH));
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"managed decoded bytes");
+  }
+
   #[tokio::test]
   async fn opaque_client_does_not_follow_redirects() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-      for response in [
-        format!(
-          "HTTP/1.1 302 Found\r\nlocation: http://{address}/followed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-        ),
-        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
-      ] {
-        let Ok(Ok((mut socket, _))) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await else {
-          return;
-        };
-        read_request_head(&mut socket).await;
-        socket.write_all(response.as_bytes()).await.unwrap();
-      }
-    });
-
+    let address = serve_redirect_then_ok().await;
     let client = build_opaque_client(&HttpClientOptions::default()).unwrap();
     let response = client.get(format!("http://{address}/start")).send().await.unwrap();
 
@@ -202,6 +228,26 @@ mod tests {
       assert_eq!(response.headers()[reqwest::header::CONTENT_ENCODING], encoding);
       assert_eq!(response.bytes().await.unwrap().as_ref(), encoded);
     }
+  }
+
+  async fn serve_redirect_then_ok() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+      for response in [
+        format!(
+          "HTTP/1.1 302 Found\r\nlocation: http://{address}/followed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ),
+        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+      ] {
+        let Ok(Ok((mut socket, _))) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await else {
+          return;
+        };
+        read_request_head(&mut socket).await;
+        socket.write_all(response.as_bytes()).await.unwrap();
+      }
+    });
+    address
   }
 
   async fn serve_once(content_encoding: &'static str, body: &'static [u8]) -> SocketAddr {
