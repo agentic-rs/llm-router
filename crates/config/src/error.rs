@@ -12,6 +12,21 @@ pub enum Error {
   #[snafu(display("parse config `{}`", path.display()))]
   Parse { path: PathBuf, source: toml::de::Error },
 
+  #[snafu(display(
+    "config `{}` uses schema version 2 and cannot be handled by the legacy config API; use the v2 loader",
+    path.display()
+  ))]
+  V2ConfigRequiresV2Loader { path: PathBuf },
+
+  #[snafu(display("config `{}` has a non-integer `schema_version`", path.display()))]
+  InvalidSchemaVersion { path: PathBuf },
+
+  #[snafu(display(
+    "config `{}` uses unsupported schema version {found}; expected an unversioned legacy config or version 2",
+    path.display()
+  ))]
+  UnsupportedSchemaVersion { path: PathBuf, found: i64 },
+
   #[snafu(display("parse config `{}` as editable document", path.display()))]
   ParseEdit {
     path: PathBuf,
