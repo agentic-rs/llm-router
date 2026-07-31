@@ -13,11 +13,8 @@ pub struct HttpClientOptions {
   pub system: bool,
 }
 
-pub fn build_client(proxy: &HttpClientOptions) -> Result<reqwest::Client> {
-  let mut b = reqwest::Client::builder()
-    .connect_timeout(Duration::from_secs(15))
-    .timeout(Duration::from_secs(600))
-    .pool_idle_timeout(Some(Duration::from_secs(90)))
+pub fn build_client(options: &HttpClientOptions) -> Result<reqwest::Client> {
+  let builder = base_client_builder()
     // Transparent response decompression. Personas advertise
     // `Accept-Encoding: gzip, deflate, br, zstd` (from real-world captures),
     // and providers honor it (zai → gzip). Without these toggles reqwest
@@ -30,26 +27,61 @@ pub fn build_client(proxy: &HttpClientOptions) -> Result<reqwest::Client> {
     .brotli(true)
     .deflate(true)
     .zstd(true);
+  build_client_with_options(builder, options)
+}
 
-  if let Some(url) = &proxy.url {
+/// Build a client for opaque relay and transparent traffic.
+///
+/// Redirects are returned to the caller instead of being followed, and
+/// response content codings remain untouched so the caller can forward the
+/// original response headers and bytes together.
+pub fn build_opaque_client(options: &HttpClientOptions) -> Result<reqwest::Client> {
+  let builder = base_client_builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .gzip(false)
+    .brotli(false)
+    .deflate(false)
+    .zstd(false);
+  build_client_with_options(builder, options)
+}
+
+fn base_client_builder() -> reqwest::ClientBuilder {
+  reqwest::Client::builder()
+    .connect_timeout(Duration::from_secs(15))
+    .timeout(Duration::from_secs(600))
+    .pool_idle_timeout(Some(Duration::from_secs(90)))
+}
+
+fn build_client_with_options(
+  mut builder: reqwest::ClientBuilder,
+  options: &HttpClientOptions,
+) -> Result<reqwest::Client> {
+  builder = apply_proxy_options(builder, options)?;
+  Ok(builder.build()?)
+}
+
+fn apply_proxy_options(
+  mut builder: reqwest::ClientBuilder,
+  options: &HttpClientOptions,
+) -> Result<reqwest::ClientBuilder> {
+  if let Some(url) = &options.url {
     let mut p = reqwest::Proxy::all(url).map_err(|e| anyhow::anyhow!("invalid proxy url: {url}: {e}"))?;
-    if !proxy.no_proxy.is_empty() {
-      let joined = proxy.no_proxy.join(",");
+    if !options.no_proxy.is_empty() {
+      let joined = options.no_proxy.join(",");
       if let Some(np) = reqwest::NoProxy::from_string(&joined) {
         p = p.no_proxy(Some(np));
       }
     }
-    b = b.proxy(p);
+    builder = builder.proxy(p);
     tracing::info!(scheme = %scheme_of(url), "outbound proxy enabled");
-  } else if proxy.system {
+  } else if options.system {
     // Defer to reqwest defaults (env vars).
     tracing::info!("outbound proxy: deferring to system env vars");
   } else {
     // Explicitly disable any ambient HTTP_PROXY/HTTPS_PROXY.
-    b = b.no_proxy();
+    builder = builder.no_proxy();
   }
-
-  Ok(b.build()?)
+  Ok(builder)
 }
 
 pub async fn send(
@@ -120,4 +152,77 @@ where
 
 fn scheme_of(url: &str) -> &str {
   url.split("://").next().unwrap_or("?")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::net::SocketAddr;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+  #[test]
+  fn opaque_client_builds_without_proxy() {
+    build_opaque_client(&HttpClientOptions::default()).expect("opaque client should build");
+  }
+
+  #[tokio::test]
+  async fn opaque_client_does_not_follow_redirects() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+      for response in [
+        format!(
+          "HTTP/1.1 302 Found\r\nlocation: http://{address}/followed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ),
+        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+      ] {
+        let Ok(Ok((mut socket, _))) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await else {
+          return;
+        };
+        read_request_head(&mut socket).await;
+        socket.write_all(response.as_bytes()).await.unwrap();
+      }
+    });
+
+    let client = build_opaque_client(&HttpClientOptions::default()).unwrap();
+    let response = client.get(format!("http://{address}/start")).send().await.unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+  }
+
+  #[tokio::test]
+  async fn opaque_client_preserves_encoded_response_bytes() {
+    let client = build_opaque_client(&HttpClientOptions::default()).unwrap();
+    let encoded = b"opaque encoded bytes";
+
+    for encoding in ["gzip", "br", "deflate", "zstd"] {
+      let address = serve_once(encoding, encoded).await;
+      let response = client.get(format!("http://{address}/encoded")).send().await.unwrap();
+
+      assert_eq!(response.headers()[reqwest::header::CONTENT_ENCODING], encoding);
+      assert_eq!(response.bytes().await.unwrap().as_ref(), encoded);
+    }
+  }
+
+  async fn serve_once(content_encoding: &'static str, body: &'static [u8]) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+      let (mut socket, _) = listener.accept().await.unwrap();
+      read_request_head(&mut socket).await;
+      let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-encoding: {content_encoding}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+      );
+      socket.write_all(head.as_bytes()).await.unwrap();
+      socket.write_all(body).await.unwrap();
+    });
+    address
+  }
+
+  async fn read_request_head(socket: &mut tokio::net::TcpStream) {
+    let mut request = [0_u8; 4096];
+    let read = socket.read(&mut request).await.unwrap();
+    assert!(read > 0, "client closed before sending a request head");
+  }
 }
