@@ -1,5 +1,5 @@
 use crate::account::AccountConfig;
-use crate::upstream_url::CanonicalUpstreamUrl;
+use crate::upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy, InvalidUpstreamUrl};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Serialize;
@@ -178,6 +178,10 @@ impl ProviderTarget {
       base_url,
       model_cache: Arc::new(ModelCache::default()),
     }
+  }
+
+  pub fn parse(base_url: &str, cleartext: CleartextHttpPolicy) -> Result<Self, InvalidUpstreamUrl> {
+    CanonicalUpstreamUrl::parse(base_url, cleartext).map(Self::new)
   }
 
   pub fn base_url(&self) -> &CanonicalUpstreamUrl {

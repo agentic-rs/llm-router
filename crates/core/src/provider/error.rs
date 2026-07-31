@@ -2,6 +2,8 @@
 
 use snafu::Snafu;
 
+use crate::upstream_url::InvalidUpstreamUrl;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -15,6 +17,12 @@ pub enum Error {
 
   #[snafu(display("unknown provider '{id}' for account '{account}'"))]
   UnknownProvider { id: String, account: String },
+
+  #[snafu(display("invalid upstream URL for account '{account}': {source}"))]
+  InvalidUpstreamUrl {
+    account: String,
+    source: InvalidUpstreamUrl,
+  },
 
   #[snafu(display("invalid HTTP header value for '{name}'"))]
   HeaderValue {
