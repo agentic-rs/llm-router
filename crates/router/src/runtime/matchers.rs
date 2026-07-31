@@ -9,18 +9,18 @@ use smol_str::SmolStr;
 use snafu::Snafu;
 use tokn_core::provider::Endpoint;
 use tokn_policy::{
-  BindingId, CanonicalHttpPath, ConnectMatch, HostPattern, HttpMatch, HttpPathPrefix, IngressAuthority,
+  BindingId, CanonicalHttpPath, ConnectMatch, HostPattern, HttpIngress, HttpMatch, HttpPathPrefix, IngressAuthority,
   IngressAuthoritySource, ListenerId, OperationId,
 };
 
 /// Immutable facts used to evaluate one linked HTTP matcher.
 ///
-/// `ingress` is the original authority established by the listener. For
-/// intercepted traffic it remains the CONNECT authority, rather than an inner
-/// request's Host header.
+/// `ingress` has crossed the typed HTTP checkpoint. For intercepted traffic
+/// it retains the validated CONNECT authority, rather than an inner request's
+/// Host header.
 #[derive(Clone, Copy, Debug)]
 pub struct HttpRequestFacts<'a> {
-  pub ingress: &'a IngressAuthority,
+  pub ingress: &'a HttpIngress,
   pub path: &'a CanonicalHttpPath,
   pub method: &'a str,
   pub operation: Option<Endpoint>,
@@ -233,8 +233,7 @@ fn is_http_token_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::num::NonZeroU16;
-  use tokn_policy::{CanonicalAuthority, CanonicalHost};
+  use tokn_policy::{CanonicalAuthority, CanonicalHost, HttpScheme};
 
   fn listener_id(value: &str) -> ListenerId {
     ListenerId::new(value).unwrap()
@@ -260,8 +259,8 @@ mod tests {
     HostPattern::subdomains_of(host(value)).unwrap()
   }
 
-  fn direct_ingress(value: &str) -> IngressAuthority {
-    IngressAuthority::from_http(CanonicalAuthority::parse(value).unwrap(), NonZeroU16::new(443).unwrap())
+  fn direct_ingress(value: &str) -> HttpIngress {
+    HttpIngress::direct(HttpScheme::Https, CanonicalAuthority::parse(value).unwrap())
   }
 
   fn link(matcher: &HttpMatch) -> MatcherLinkResult<LinkedHttpMatcher> {
@@ -473,7 +472,7 @@ mod tests {
     let direct = direct_ingress("api.example.com");
 
     assert_eq!(
-      ConnectRequestFacts::new(&direct).unwrap_err(),
+      ConnectRequestFacts::new(direct.authority()).unwrap_err(),
       ConnectFactsError::ConnectIngressRequired {
         found: IngressAuthoritySource::DirectHttp,
       }

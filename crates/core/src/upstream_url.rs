@@ -1,7 +1,7 @@
 use reqwest::Url;
 use smol_str::SmolStr;
 use std::fmt;
-use tokn_policy::{CanonicalAuthority, CanonicalHost, InvalidAuthority};
+use tokn_policy::{CanonicalAuthority, CanonicalHost, HttpIngress, InvalidAuthority};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleartextHttpPolicy {
@@ -99,6 +99,28 @@ impl fmt::Display for CanonicalUpstreamUrl {
 pub struct CanonicalHttpOrigin(SmolStr);
 
 impl CanonicalHttpOrigin {
+  /// Derive an origin from a request that has crossed the typed HTTP ingress
+  /// checkpoint.
+  ///
+  /// Every component is already canonical and trusted: default ports are
+  /// omitted and IPv6 hosts are bracketed without reparsing an inbound Host
+  /// header or other untrusted URL text.
+  pub fn from_ingress(ingress: &HttpIngress) -> Self {
+    let scheme = ingress.scheme();
+    let host = ingress.host();
+    let authority_host = if host.is_ipv6() {
+      format!("[{}]", host.as_str())
+    } else {
+      host.as_str().to_string()
+    };
+    let value = if ingress.port() == scheme.default_port().get() {
+      format!("{scheme}://{authority_host}")
+    } else {
+      format!("{scheme}://{authority_host}:{}", ingress.port())
+    };
+    Self(SmolStr::new(value))
+  }
+
   pub fn parse(raw: &str, cleartext: CleartextHttpPolicy) -> Result<Self, InvalidUpstreamUrl> {
     let (url, authority) = parse_http_url(raw)?;
     reject_query_or_fragment(&url)?;
@@ -292,6 +314,7 @@ fn is_raw_dot_segment(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use tokn_policy::{HttpScheme, IngressAuthority};
 
   #[test]
   fn canonicalizes_base_prefixes_and_origins() {
@@ -305,6 +328,39 @@ mod tests {
 
     let origin = CanonicalHttpOrigin::parse("https://API.Example.com:443", CleartextHttpPolicy::LoopbackOnly).unwrap();
     assert_eq!(origin.as_str(), "https://api.example.com");
+  }
+
+  #[test]
+  fn derives_origins_from_validated_http_ingress_without_reparsing_host_text() {
+    let http = HttpIngress::direct(HttpScheme::Http, CanonicalAuthority::parse("Example.com").unwrap());
+    let https = HttpIngress::direct(HttpScheme::Https, CanonicalAuthority::parse("Example.com:443").unwrap());
+    let nondefault = HttpIngress::direct(
+      HttpScheme::Https,
+      CanonicalAuthority::parse("Example.com:8443").unwrap(),
+    );
+    let ipv6 = HttpIngress::direct(HttpScheme::Https, CanonicalAuthority::parse("[2001:0DB8::1]").unwrap());
+
+    assert_eq!(CanonicalHttpOrigin::from_ingress(&http).as_str(), "http://example.com");
+    assert_eq!(
+      CanonicalHttpOrigin::from_ingress(&https).as_str(),
+      "https://example.com"
+    );
+    assert_eq!(
+      CanonicalHttpOrigin::from_ingress(&nondefault).as_str(),
+      "https://example.com:8443"
+    );
+    assert_eq!(
+      CanonicalHttpOrigin::from_ingress(&ipv6).as_str(),
+      "https://[2001:db8::1]"
+    );
+
+    let connect = IngressAuthority::from_connect("API.Example.com:443").unwrap();
+    let intercepted =
+      HttpIngress::intercepted_https(&connect, CanonicalAuthority::parse("api.example.com").unwrap()).unwrap();
+    assert_eq!(
+      CanonicalHttpOrigin::from_ingress(&intercepted).as_str(),
+      "https://api.example.com"
+    );
   }
 
   #[test]
