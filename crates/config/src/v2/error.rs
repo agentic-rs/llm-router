@@ -9,7 +9,7 @@ pub enum Error {
   MissingSchemaVersion { path: PathBuf },
   InvalidSchemaVersion { path: PathBuf },
   UnsupportedSchemaVersion { path: PathBuf, found: i64 },
-  Compile { path: PathBuf, source: CompileError },
+  Compile { path: PathBuf, source: Box<CompileError> },
 }
 
 impl fmt::Display for Error {
@@ -46,7 +46,7 @@ impl std::error::Error for Error {
     match self {
       Self::Read { source, .. } => Some(source),
       Self::Parse { source, .. } => Some(source),
-      Self::Compile { source, .. } => Some(source),
+      Self::Compile { source, .. } => Some(source.as_ref()),
       Self::MissingSchemaVersion { .. } | Self::InvalidSchemaVersion { .. } | Self::UnsupportedSchemaVersion { .. } => {
         None
       }
@@ -68,9 +68,10 @@ pub enum CompileError {
     id: String,
   },
   DuplicateBind {
-    bind: String,
     first_listener: String,
+    first_bind: String,
     second_listener: String,
+    second_bind: String,
   },
   DuplicateOrigin {
     origin: String,
@@ -97,12 +98,13 @@ impl fmt::Display for CompileError {
       Self::EmptyRegistry { resource } => write!(formatter, "at least one {resource} must be configured"),
       Self::DuplicateId { resource, id } => write!(formatter, "duplicate {resource} id `{id}`"),
       Self::DuplicateBind {
-        bind,
         first_listener,
+        first_bind,
         second_listener,
+        second_bind,
       } => write!(
         formatter,
-        "listeners `{first_listener}` and `{second_listener}` use the same bind address `{bind}`"
+        "listener `{first_listener}` bind `{first_bind}` overlaps listener `{second_listener}` bind `{second_bind}`"
       ),
       Self::DuplicateOrigin {
         origin,

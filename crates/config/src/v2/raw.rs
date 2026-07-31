@@ -49,11 +49,20 @@ pub enum RawListener {
   LlmApi {
     bind: String,
     client_auth: RawClientAuth,
+    /// Explicitly acknowledge plaintext client traffic on a non-loopback
+    /// bind. Remote listeners must still use `local_keys`; unauthenticated
+    /// public listeners are never accepted.
+    #[serde(default)]
+    allow_insecure_public: bool,
     default_http_action: RawBindingAction,
   },
   ForwardProxy {
     bind: String,
     client_auth: RawClientAuth,
+    /// Explicitly acknowledge plaintext proxy authentication on a
+    /// non-loopback bind. Remote listeners must still use `local_keys`.
+    #[serde(default)]
+    allow_insecure_public: bool,
     default_http_action: RawBindingAction,
     default_connect: RawConnectAction,
     #[serde(default)]
@@ -71,7 +80,10 @@ pub enum RawClientAuth {
 
 /// One ordered match rule. Matcher dimensions are combined with AND, while
 /// values inside a dimension are alternatives. Empty-dimension and wildcard
-/// semantics are validated and canonicalized by the compiler.
+/// semantics are validated and canonicalized by the compiler. On a forward
+/// proxy, `hosts` matches the immutable ingress authority (the CONNECT target
+/// for intercepted traffic), not an inner Host header. `path_prefixes` are
+/// canonical raw encoded URI paths and are never percent-decoded across `/`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawBinding {
@@ -84,6 +96,8 @@ pub struct RawBinding {
   pub path_prefixes: Vec<String>,
   #[serde(default)]
   pub methods: Vec<String>,
+  /// Runtime/plugin-owned operation ids. The config compiler validates their
+  /// syntax; the runtime linker rejects names it cannot materialize.
   #[serde(default)]
   pub operations: Vec<String>,
 }
@@ -134,7 +148,7 @@ pub struct RawProfile {
 }
 
 /// Wire identity is a string for built-ins and an externally tagged value for
-/// a configured identity, for example `{ named = "codex-cli" }`.
+/// a runtime/plugin-owned identity, for example `{ named = "codex-cli" }`.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawWireIdentity {
@@ -243,9 +257,11 @@ const fn default_session_ttl_secs() -> u64 {
 }
 
 /// A configured provider endpoint. An omitted `base_url` is retained so the
-/// runtime linker can resolve the provider's catalogue default. Additional
-/// origins let an origin-preserving relay identify the same upstream through
-/// aliases.
+/// runtime linker can resolve the provider's catalogue default. The compiler
+/// canonicalizes an explicit base URL as a trailing-slash path prefix;
+/// managed endpoint paths and fixed-relay inbound paths append to that prefix.
+/// Additional origins let an origin-preserving relay identify the same
+/// upstream through aliases.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawUpstream {
@@ -254,6 +270,10 @@ pub struct RawUpstream {
   pub base_url: Option<String>,
   #[serde(default)]
   pub origins: Vec<String>,
+  /// Explicitly acknowledge that this upstream may send account credentials
+  /// over non-loopback cleartext HTTP. Loopback HTTP never needs the escape.
+  #[serde(default)]
+  pub allow_insecure_http: bool,
 }
 
 /// One ordered model fallback candidate.
@@ -293,6 +313,9 @@ operation = "translate_compatible"
 accounts = ["*"]
 providers = ["*"]
 strategy = "round_robin"
+
+[upstreams.default]
+provider = "openai"
 "#;
 
   #[test]
