@@ -1,22 +1,20 @@
-//! `requests`: greenfield reimplementation of the request pipeline.
+//! Request execution contracts and the legacy composable request pipeline.
 //!
-//! This crate is a library-only scaffold for the 6-stage pipeline:
+//! [`execution`] is the post-dispatch boundary for the v2 runtime. Its
+//! borrowed types pin one HTTP attempt to the exact target selected by the
+//! router without copying provider, account, or upstream identity.
+//!
+//! The remaining modules implement the legacy six-stage pipeline:
 //!
 //! ```text
 //! Extract → Resolve → BuildHeaders → ConvertRequest → Send → ConvertResponse
 //! ```
 //!
-//! Status (PR1): the trait surface and event system are complete. Concrete
-//! implementations are provided for the front half (`Extract`, `Resolve`).
-//! The back-half stages exist as traits with no-op implementations so the
-//! pipeline runner compiles end-to-end; the smoke tests opt into a degenerate
-//! Profile that stops after `Resolve` and reports success.
-//!
-//! Hooks (pre/post) are deliberately omitted from PR1. Per-stage wrapping is
-//! expected to be expressed via composition of stage trait impls (decorator
-//! pattern) in later PRs.
+//! The v2 execution contract is deliberately outside that pipeline. It does
+//! not add a seventh stage or adapt linked v2 targets into legacy route data.
 
 pub mod event;
+pub mod execution;
 pub mod pipeline;
 pub mod profile;
 pub mod stages;

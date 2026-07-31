@@ -19,6 +19,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }
+http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,7 +30,6 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
-http = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
 tokn-mock-server = { workspace = true }
