@@ -1,3 +1,4 @@
+mod connect;
 mod dispatch;
 mod gateway;
 mod listeners;
@@ -7,6 +8,9 @@ mod profiles;
 mod resources;
 mod server;
 
+pub use connect::{
+  dispatch_connect, ConnectDispatch, ConnectDispatchError, ConnectDispatchResult, ConnectDispatchSite,
+};
 pub use dispatch::{
   dispatch_http, match_http, HttpDispatch, HttpDispatchError, HttpDispatchRequest, HttpDispatchResult,
   HttpDispatchSite, HttpExecutionView, HttpRequestHead, HttpRequestSemantics, HttpRouteMatch, MatchedHttpRoute,
