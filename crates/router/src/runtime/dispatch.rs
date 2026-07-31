@@ -21,6 +21,7 @@ use tokn_core::AgentId;
 use tokn_policy::{
   BindingId, CanonicalHttpPath, HttpIngress, InvalidHttpPath, ListenerId, ProfileId, ProviderId, RouteId,
 };
+use tokn_requests::execution::{ExecutionTarget, HttpAttemptHead};
 
 /// Immutable, typed request-line and ingress facts admitted at the HTTP trust
 /// boundary.
@@ -179,6 +180,19 @@ impl RoutedHttpDispatch {
     self.resolution.as_ref()
   }
 
+  /// Borrow the exact admitted request head and selected target for one
+  /// execution attempt. Cooling and ineligible resolutions have no execution
+  /// view because no account/upstream target was selected.
+  pub fn execution_view(&self) -> Option<HttpExecutionView<'_>> {
+    let TargetResolution::Selected(target) = self.resolution() else {
+      return None;
+    };
+    Some(HttpExecutionView {
+      head: HttpAttemptHead::new(self.head.method(), self.head.path_and_query()),
+      target: target.execution_target(),
+    })
+  }
+
   pub fn into_parts(
     self,
   ) -> (
@@ -191,12 +205,46 @@ impl RoutedHttpDispatch {
   }
 }
 
+/// Borrowed input to one post-dispatch HTTP execution attempt.
+#[derive(Clone, Copy, Debug)]
+pub struct HttpExecutionView<'a> {
+  head: HttpAttemptHead<'a>,
+  target: ExecutionTarget<'a>,
+}
+
+impl<'a> HttpExecutionView<'a> {
+  pub fn head(&self) -> HttpAttemptHead<'a> {
+    self.head
+  }
+
+  pub fn target(&self) -> ExecutionTarget<'a> {
+    self.target
+  }
+}
+
 /// Route-family-specific selected HTTP execution target.
 #[derive(Debug)]
 pub enum SelectedHttpTarget {
   Managed(SelectedManagedHttpTarget),
   Relay(SelectedRelayHttpTarget),
   Transparent(SelectedTransparentHttpTarget),
+}
+
+impl SelectedHttpTarget {
+  pub fn execution_target(&self) -> ExecutionTarget<'_> {
+    match self {
+      Self::Managed(selected) => ExecutionTarget::managed(
+        selected.requested_model(),
+        selected.requested_operation(),
+        selected.target(),
+        selected.wire_identity(),
+      ),
+      Self::Relay(selected) => {
+        ExecutionTarget::relay(selected.request_kind(), selected.target(), selected.wire_identity())
+      }
+      Self::Transparent(selected) => ExecutionTarget::transparent(selected.destination()),
+    }
+  }
 }
 
 /// Managed selection keeps inbound request semantics alongside the outbound
@@ -744,6 +792,17 @@ mod tests {
     let TargetResolution::Selected(SelectedHttpTarget::Managed(selected)) = routed.resolution() else {
       panic!("expected selected managed target, got {:?}", routed.resolution());
     };
+    let execution = routed.execution_view().unwrap();
+    assert!(std::ptr::eq(execution.head().method(), routed.head().method()));
+    assert!(std::ptr::eq(
+      execution.head().path_and_query(),
+      routed.head().path_and_query()
+    ));
+    let ExecutionTarget::Managed(execution_target) = execution.target() else {
+      panic!("expected managed execution target");
+    };
+    assert!(std::ptr::eq(execution_target.target(), selected.target()));
+    assert_eq!(execution_target.wire_identity(), selected.wire_identity());
     assert_eq!(selected.requested_model(), "inbound-model");
     assert_eq!(selected.requested_operation(), Endpoint::Responses);
     assert_eq!(selected.target().model(), "outbound-model");
@@ -851,6 +910,14 @@ mod tests {
       TargetResolution::Selected(SelectedHttpTarget::Relay(selected))
         if selected.request_kind() == ProviderRequestKind::Operation(Endpoint::Responses)
     ));
+    let execution = relay.execution_view().unwrap();
+    let ExecutionTarget::Relay(execution_target) = execution.target() else {
+      panic!("expected relay execution target");
+    };
+    assert_eq!(
+      execution_target.request_kind(),
+      ProviderRequestKind::Operation(Endpoint::Responses)
+    );
 
     let transparent = routed(
       dispatch_http(
@@ -1001,6 +1068,7 @@ mod tests {
         reason: NoEligibleReason::ProviderAccessDenied
       }
     ));
+    assert!(denied.execution_view().is_none());
   }
 
   #[test]
@@ -1107,6 +1175,11 @@ mod tests {
       panic!("expected transparent selection, got {:?}", routed.resolution());
     };
     assert_eq!(selected.destination().as_str(), "http://[2001:db8::1]:8080");
+    let execution = routed.execution_view().unwrap();
+    let ExecutionTarget::Transparent(execution_target) = execution.target() else {
+      panic!("expected transparent execution target");
+    };
+    assert!(std::ptr::eq(execution_target.destination(), selected.destination()));
   }
 
   #[test]
