@@ -5,6 +5,7 @@
 //! performing I/O, or sleeping for cooldowns.
 
 use super::{HttpRequestFacts, LinkedHttpAction, LinkedListener, LinkedProfile, LinkedWireIdentity};
+use http::{uri::PathAndQuery, Method};
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::fmt;
@@ -14,10 +15,54 @@ use tokn_accounts::link::{
   resolve_managed_target, resolve_relay_target, LinkedRoute, LinkedRouteKind, SelectedManagedTarget,
   SelectedRelayTarget, TargetResolution, TargetResolveError,
 };
-use tokn_core::provider::Endpoint;
+use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_core::upstream_url::CanonicalHttpOrigin;
 use tokn_core::AgentId;
-use tokn_policy::{BindingId, CanonicalHttpPath, HttpIngress, ListenerId, ProfileId, ProviderId, RouteId};
+use tokn_policy::{
+  BindingId, CanonicalHttpPath, HttpIngress, InvalidHttpPath, ListenerId, ProfileId, ProviderId, RouteId,
+};
+
+/// Immutable, typed request-line and ingress facts admitted at the HTTP trust
+/// boundary.
+///
+/// The canonical path is derived once from the exact path-and-query retained
+/// for execution. This prevents listener matching and upstream forwarding from
+/// observing request targets that disagree through decoding or normalization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpRequestHead {
+  ingress: HttpIngress,
+  method: Method,
+  path_and_query: PathAndQuery,
+  canonical_path: CanonicalHttpPath,
+}
+
+impl HttpRequestHead {
+  pub fn new(ingress: HttpIngress, method: Method, path_and_query: PathAndQuery) -> Result<Self, InvalidHttpPath> {
+    let canonical_path = CanonicalHttpPath::parse(path_and_query.path())?;
+    Ok(Self {
+      ingress,
+      method,
+      path_and_query,
+      canonical_path,
+    })
+  }
+
+  pub fn ingress(&self) -> &HttpIngress {
+    &self.ingress
+  }
+
+  pub fn method(&self) -> &Method {
+    &self.method
+  }
+
+  pub fn path_and_query(&self) -> &PathAndQuery {
+    &self.path_and_query
+  }
+
+  pub fn canonical_path(&self) -> &CanonicalHttpPath {
+    &self.canonical_path
+  }
+}
 
 /// Payload-independent semantics available before a route is selected.
 ///
@@ -43,14 +88,19 @@ impl HttpRequestSemantics<'_> {
       } => Some(requested_operation),
     }
   }
+
+  fn provider_request_kind(self, path_and_query: &PathAndQuery) -> ProviderRequestKind {
+    self
+      .operation()
+      .map(ProviderRequestKind::Operation)
+      .unwrap_or_else(|| ProviderRequestKind::from_provider_path(path_and_query.as_str()))
+  }
 }
 
 /// Typed facts required to dispatch one HTTP request.
 #[derive(Clone, Copy, Debug)]
 pub struct HttpDispatchRequest<'a> {
-  pub ingress: &'a HttpIngress,
-  pub path: &'a CanonicalHttpPath,
-  pub method: &'a str,
+  pub head: &'a HttpRequestHead,
   pub semantics: HttpRequestSemantics<'a>,
   pub session_id: Option<&'a str>,
 }
@@ -103,6 +153,7 @@ impl HttpDispatch {
 #[derive(Debug)]
 pub struct RoutedHttpDispatch {
   site: HttpDispatchSite,
+  head: HttpRequestHead,
   profile: Arc<LinkedProfile>,
   resolution: Box<TargetResolution<SelectedHttpTarget>>,
 }
@@ -110,6 +161,10 @@ pub struct RoutedHttpDispatch {
 impl RoutedHttpDispatch {
   pub fn site(&self) -> &HttpDispatchSite {
     &self.site
+  }
+
+  pub fn head(&self) -> &HttpRequestHead {
+    &self.head
   }
 
   pub fn profile(&self) -> &Arc<LinkedProfile> {
@@ -128,10 +183,11 @@ impl RoutedHttpDispatch {
     self,
   ) -> (
     HttpDispatchSite,
+    HttpRequestHead,
     Arc<LinkedProfile>,
     TargetResolution<SelectedHttpTarget>,
   ) {
-    (self.site, self.profile, *self.resolution)
+    (self.site, self.head, self.profile, *self.resolution)
   }
 }
 
@@ -179,12 +235,17 @@ impl SelectedManagedHttpTarget {
 #[derive(Debug)]
 pub struct SelectedRelayHttpTarget {
   target: SelectedRelayTarget,
+  request_kind: ProviderRequestKind,
   wire_identity: Option<AgentId>,
 }
 
 impl SelectedRelayHttpTarget {
   pub fn target(&self) -> &SelectedRelayTarget {
     &self.target
+  }
+
+  pub fn request_kind(&self) -> ProviderRequestKind {
+    self.request_kind
   }
 
   pub fn wire_identity(&self) -> Option<&AgentId> {
@@ -215,9 +276,9 @@ pub fn dispatch_http(
   provider_access: &ProviderAccess,
 ) -> HttpDispatchResult<HttpDispatch> {
   let facts = HttpRequestFacts {
-    ingress: request.ingress,
-    path: request.path,
-    method: request.method,
+    ingress: request.head.ingress(),
+    path: request.head.canonical_path(),
+    method: request.head.method().as_str(),
     operation: request.semantics.operation(),
   };
   let decision = listener.http().decide(&facts);
@@ -233,6 +294,7 @@ pub fn dispatch_http(
   let resolution = dispatch_profile(&site, &profile, request, provider_access)?;
   Ok(HttpDispatch::Routed(RoutedHttpDispatch {
     site,
+    head: request.head.clone(),
     profile,
     resolution: Box::new(resolution),
   }))
@@ -273,14 +335,19 @@ fn dispatch_profile(
       map_managed_resolution(site, profile, requested_model, requested_operation, resolution)
     }
     LinkedRouteKind::Relay(route) => {
-      let resolution = resolve_relay_target(route, request.ingress, request.session_id, |provider| {
+      let resolution = resolve_relay_target(route, request.head.ingress(), request.session_id, |provider| {
         provider_access.allows(provider.as_str())
       });
-      map_relay_resolution(site, profile, resolution)
+      map_relay_resolution(
+        site,
+        profile,
+        request.semantics.provider_request_kind(request.head.path_and_query()),
+        resolution,
+      )
     }
     LinkedRouteKind::Transparent(_) => Ok(TargetResolution::Selected(SelectedHttpTarget::Transparent(
       SelectedTransparentHttpTarget {
-        destination: CanonicalHttpOrigin::from_ingress(request.ingress),
+        destination: CanonicalHttpOrigin::from_ingress(request.head.ingress()),
       },
     ))),
   }
@@ -319,6 +386,7 @@ fn map_managed_resolution(
 fn map_relay_resolution(
   site: &HttpDispatchSite,
   profile: &LinkedProfile,
+  request_kind: ProviderRequestKind,
   resolution: TargetResolution<SelectedRelayTarget>,
 ) -> HttpDispatchResult<TargetResolution<SelectedHttpTarget>> {
   match resolution {
@@ -331,7 +399,11 @@ fn map_relay_resolution(
         target.upstream().provider_id(),
       )?;
       Ok(TargetResolution::Selected(SelectedHttpTarget::Relay(
-        SelectedRelayHttpTarget { target, wire_identity },
+        SelectedRelayHttpTarget {
+          target,
+          request_kind,
+          wire_identity,
+        },
       )))
     }
     TargetResolution::CoolingDown { retry_at } => Ok(TargetResolution::CoolingDown { retry_at }),
@@ -560,15 +632,13 @@ mod tests {
     HttpIngress::direct(HttpScheme::Https, CanonicalAuthority::parse(authority).unwrap())
   }
 
-  fn request<'a>(
-    ingress: &'a HttpIngress,
-    path: &'a CanonicalHttpPath,
-    semantics: HttpRequestSemantics<'a>,
-  ) -> HttpDispatchRequest<'a> {
+  fn request_head(ingress: HttpIngress, path_and_query: &str) -> HttpRequestHead {
+    HttpRequestHead::new(ingress, Method::POST, path_and_query.parse().unwrap()).unwrap()
+  }
+
+  fn request<'a>(head: &'a HttpRequestHead, semantics: HttpRequestSemantics<'a>) -> HttpDispatchRequest<'a> {
     HttpDispatchRequest {
-      ingress,
-      path,
-      method: "POST",
+      head,
       semantics,
       session_id: Some("session"),
     }
@@ -579,6 +649,29 @@ mod tests {
       panic!("expected routed dispatch, got {dispatch:?}");
     };
     routed
+  }
+
+  #[test]
+  fn request_head_keeps_the_exact_target_but_canonicalizes_the_match_path() {
+    let head = request_head(
+      direct_ingress("client.example"),
+      "/v1%2fchat/completions?redirect=https%3A%2F%2Fother.example",
+    );
+
+    assert_eq!(head.method(), Method::POST);
+    assert_eq!(head.canonical_path().as_str(), "/v1%2Fchat/completions");
+    assert_eq!(
+      head.path_and_query().as_str(),
+      "/v1%2fchat/completions?redirect=https%3A%2F%2Fother.example"
+    );
+
+    let invalid = HttpRequestHead::new(
+      direct_ingress("client.example"),
+      Method::GET,
+      "/safe/%2e%2e/private".parse().unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(invalid, InvalidHttpPath::DotSegment);
   }
 
   #[test]
@@ -621,14 +714,12 @@ mod tests {
     let route_key = route_id("managed-route");
     let listener = runtime.listeners().listener(&listener_key).unwrap();
     let action_profile = listener.http().bindings()[0].action().profile().unwrap();
-    let ingress = direct_ingress("client.example");
-    let path = CanonicalHttpPath::parse("/v1/responses").unwrap();
+    let head = request_head(direct_ingress("client.example"), "/v1/responses?trace=one%2Ftwo");
 
     let dispatch = dispatch_http(
       listener,
       request(
-        &ingress,
-        &path,
+        &head,
         HttpRequestSemantics::Structured {
           requested_model: "inbound-model",
           requested_operation: Endpoint::Responses,
@@ -641,6 +732,8 @@ mod tests {
 
     assert_eq!(routed.site().listener_id(), &listener_key);
     assert_eq!(routed.site().binding_id().unwrap().as_str(), "managed-binding");
+    assert_eq!(routed.head(), &head);
+    assert_eq!(routed.head().path_and_query().as_str(), "/v1/responses?trace=one%2Ftwo");
     assert!(Arc::ptr_eq(routed.profile(), action_profile));
     assert!(Arc::ptr_eq(
       routed.profile(),
@@ -675,13 +768,12 @@ mod tests {
     );
     let runtime = link(&plan, &[]);
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
-    let ingress = direct_ingress("reject.example");
-    let path = CanonicalHttpPath::parse("/opaque").unwrap();
+    let head = request_head(direct_ingress("reject.example"), "/opaque");
     let denied = ProviderAccess::from_provider_ids(vec!["nothing".into()]).unwrap();
 
     let dispatch = dispatch_http(
       listener,
-      request(&ingress, &path, HttpRequestSemantics::Opaque { operation: None }),
+      request(&head, HttpRequestSemantics::Opaque { operation: None }),
       &denied,
     )
     .unwrap();
@@ -738,15 +830,13 @@ mod tests {
     );
     let runtime = link(&plan, &[account("account")]);
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
-    let ingress = direct_ingress("original.example");
-    let path = CanonicalHttpPath::parse("/opaque").unwrap();
+    let head = request_head(direct_ingress("original.example"), "/opaque");
 
     let relay = routed(
       dispatch_http(
         listener,
         request(
-          &ingress,
-          &path,
+          &head,
           HttpRequestSemantics::Opaque {
             operation: Some(Endpoint::Responses),
           },
@@ -758,15 +848,15 @@ mod tests {
     assert_eq!(relay.site().binding_id().unwrap().as_str(), "relay-binding");
     assert!(matches!(
       relay.resolution(),
-      TargetResolution::Selected(SelectedHttpTarget::Relay(_))
+      TargetResolution::Selected(SelectedHttpTarget::Relay(selected))
+        if selected.request_kind() == ProviderRequestKind::Operation(Endpoint::Responses)
     ));
 
     let transparent = routed(
       dispatch_http(
         listener,
         request(
-          &ingress,
-          &path,
+          &head,
           HttpRequestSemantics::Opaque {
             operation: Some(Endpoint::Messages),
           },
@@ -809,14 +899,12 @@ mod tests {
     );
     let runtime = link(&plan, &[account("account")]);
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
-    let ingress = direct_ingress("managed.example");
-    let path = CanonicalHttpPath::parse("/opaque").unwrap();
+    let head = request_head(direct_ingress("managed.example"), "/opaque");
 
     let error = dispatch_http(
       listener,
       request(
-        &ingress,
-        &path,
+        &head,
         HttpRequestSemantics::Opaque {
           operation: Some(Endpoint::ChatCompletions),
         },
@@ -867,14 +955,12 @@ mod tests {
     );
     let runtime = link(&plan, &[account("account")]);
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
-    let ingress = direct_ingress("managed.example");
-    let path = CanonicalHttpPath::parse("/v1/chat/completions").unwrap();
+    let head = request_head(direct_ingress("managed.example"), "/v1/chat/completions");
 
     let malformed = dispatch_http(
       listener,
       request(
-        &ingress,
-        &path,
+        &head,
         HttpRequestSemantics::Structured {
           requested_model: ID_LLAMA_CPP,
           requested_operation: Endpoint::ChatCompletions,
@@ -899,8 +985,7 @@ mod tests {
       dispatch_http(
         listener,
         request(
-          &ingress,
-          &path,
+          &head,
           HttpRequestSemantics::Structured {
             requested_model: "llama-cpp/model",
             requested_operation: Endpoint::ChatCompletions,
@@ -953,12 +1038,12 @@ mod tests {
     let connect = IngressAuthority::from_connect("origin.example:443").unwrap();
     let ingress =
       HttpIngress::intercepted_https(&connect, CanonicalAuthority::parse("origin.example").unwrap()).unwrap();
-    let path = CanonicalHttpPath::parse("/opaque").unwrap();
+    let head = request_head(ingress, "/v1/models?client_version=test");
 
     let routed = routed(
       dispatch_http(
         listener,
-        request(&ingress, &path, HttpRequestSemantics::Opaque { operation: None }),
+        request(&head, HttpRequestSemantics::Opaque { operation: None }),
         &ProviderAccess::All,
       )
       .unwrap(),
@@ -970,7 +1055,12 @@ mod tests {
       panic!("expected original relay destination");
     };
     assert_eq!(origin.as_str(), "https://origin.example");
+    assert_eq!(selected.request_kind(), ProviderRequestKind::Models);
     assert_eq!(selected.wire_identity(), Some(&AgentId::Opencode));
+    assert_eq!(
+      routed.head().path_and_query().as_str(),
+      "/v1/models?client_version=test"
+    );
   }
 
   #[test]
@@ -996,17 +1086,19 @@ mod tests {
     );
     let runtime = link(&plan, &[]);
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
-    let ingress = HttpIngress::direct(
-      HttpScheme::Http,
-      CanonicalAuthority::parse("[2001:db8::1]:8080").unwrap(),
+    let head = request_head(
+      HttpIngress::direct(
+        HttpScheme::Http,
+        CanonicalAuthority::parse("[2001:db8::1]:8080").unwrap(),
+      ),
+      "/opaque",
     );
-    let path = CanonicalHttpPath::parse("/opaque").unwrap();
     let denied = ProviderAccess::from_provider_ids(vec!["nothing".into()]).unwrap();
 
     let routed = routed(
       dispatch_http(
         listener,
-        request(&ingress, &path, HttpRequestSemantics::Opaque { operation: None }),
+        request(&head, HttpRequestSemantics::Opaque { operation: None }),
         &denied,
       )
       .unwrap(),
