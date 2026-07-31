@@ -4,7 +4,7 @@
 //! model-group references. This module applies the remaining request facts in
 //! a deliberate order: model candidate, operation candidate, then pool-local
 //! account/upstream selection. Selection never sleeps and does not commit
-//! session affinity until [`SelectionToken::record_success`] is called.
+//! session affinity until a [`SelectionToken`] is settled as healthy.
 
 use super::{
   AccountPoolRuntime, LinkedManagedRoute, LinkedModelCandidate, LinkedModelSelector, LinkedRelayRoute,
@@ -92,6 +92,23 @@ impl fmt::Display for NoEligibleReason {
   }
 }
 
+/// The outcome of one attempt made with a selected binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionOutcome {
+  Healthy,
+  Unauthorized,
+  Unavailable,
+  Unchanged,
+}
+
+/// The pool-local state transition applied while settling a selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionSettlement {
+  Healthy,
+  CoolingDown { retry_at: Instant },
+  Unchanged,
+}
+
 /// The exact pool-local selection state to update after an upstream attempt.
 ///
 /// Constructed only for a selected binding, this keeps the session id and
@@ -110,6 +127,20 @@ impl SelectionToken {
 
   pub fn session_id(&self) -> Option<&str> {
     self.session_id.as_deref()
+  }
+
+  /// Consume this token and apply exactly one pool-local attempt outcome.
+  pub fn settle(self, outcome: SelectionOutcome) -> PoolRuntimeResult<SelectionSettlement> {
+    match outcome {
+      SelectionOutcome::Healthy => self.record_success().map(|()| SelectionSettlement::Healthy),
+      SelectionOutcome::Unauthorized => self
+        .record_unauthorized()
+        .map(|retry_at| SelectionSettlement::CoolingDown { retry_at }),
+      SelectionOutcome::Unavailable => self
+        .record_failure()
+        .map(|retry_at| SelectionSettlement::CoolingDown { retry_at }),
+      SelectionOutcome::Unchanged => Ok(SelectionSettlement::Unchanged),
+    }
   }
 
   /// Commit successful use, clearing the exact cooldown and recording
@@ -957,6 +988,32 @@ mod tests {
     )
   }
 
+  fn affinity_managed_routes(provider: &str, registry: &Registry) -> LinkedRoutes {
+    let affinity = SessionAffinityPlan::new(Duration::from_secs(300), Duration::from_secs(60));
+    let gateway = gateway(
+      BTreeMap::from([(
+        route_id("managed"),
+        managed_route(ModelSelector::Capability, OperationPolicy::Preserve),
+      )]),
+      account_pool(Some(affinity)),
+      BTreeMap::from([(
+        upstream_id("upstream"),
+        upstream(provider, "https://upstream.example/v1/", &["first", "second"], &[]),
+      )]),
+      BTreeMap::new(),
+    );
+    let routes = link_with_registry(
+      &gateway,
+      &[
+        account("first", provider, AccountTier::Active),
+        account("second", provider, AccountTier::Active),
+      ],
+      registry,
+    );
+    warm(managed(&routes, "managed"), "upstream", &["model"]);
+    routes
+  }
+
   #[test]
   fn managed_orders_model_then_requested_and_stable_compatible_operations() {
     let group = group_id("ordered");
@@ -1162,40 +1219,96 @@ mod tests {
   }
 
   #[test]
-  fn selection_token_record_unauthorized_invalidates_and_cools_only_the_selected_binding() {
+  fn selection_token_settle_healthy_clears_cooldown_and_commits_affinity() {
+    let routes = affinity_managed_routes(ID_LLAMA_CPP, &Registry::builtin());
+    let route = managed(&routes, "managed");
+    let selected = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(selected.binding().account_id(), "first");
+    let token = selected.into_selection_token();
+    let pool = token.pool.clone();
+    let selected_key = token.key().clone();
+
+    pool.record_failure(&selected_key).unwrap();
+    assert_eq!(
+      token.settle(SelectionOutcome::Healthy).unwrap(),
+      SelectionSettlement::Healthy
+    );
+
+    assert!(matches!(
+      pool.acquire(None, |binding| binding.key() == &selected_key),
+      PoolAcquire::Selected(binding) if binding.key() == &selected_key
+    ));
+    let affinity_hit = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(affinity_hit.binding().account_id(), "first");
+  }
+
+  #[test]
+  fn selection_token_settle_unavailable_cools_without_committing_affinity() {
+    let routes = affinity_managed_routes(ID_LLAMA_CPP, &Registry::builtin());
+    let route = managed(&routes, "managed");
+    let selected = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(selected.binding().account_id(), "first");
+    let token = selected.into_selection_token();
+    let pool = token.pool.clone();
+    let selected_key = token.key().clone();
+
+    let SelectionSettlement::CoolingDown { retry_at } = token.settle(SelectionOutcome::Unavailable).unwrap() else {
+      panic!("unavailable selection did not enter cooldown");
+    };
+    assert!(matches!(
+      pool.acquire(Some("session"), |binding| binding.key() == &selected_key),
+      PoolAcquire::CoolingDown { retry_at: actual } if actual == retry_at
+    ));
+
+    pool.record_success(None, &selected_key).unwrap();
+    let retry = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(retry.binding().account_id(), "second");
+  }
+
+  #[test]
+  fn selection_token_settle_unchanged_does_not_mutate_pool_state() {
+    let routes = affinity_managed_routes(ID_LLAMA_CPP, &Registry::builtin());
+    let route = managed(&routes, "managed");
+    let selected = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(selected.binding().account_id(), "first");
+    let token = selected.into_selection_token();
+    let pool = token.pool.clone();
+    let selected_key = token.key().clone();
+
+    assert_eq!(
+      token.settle(SelectionOutcome::Unchanged).unwrap(),
+      SelectionSettlement::Unchanged
+    );
+
+    let retry = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(retry.binding().account_id(), "second");
+    assert!(matches!(
+      pool.acquire(None, |binding| binding.key() == &selected_key),
+      PoolAcquire::Selected(binding) if binding.key() == &selected_key
+    ));
+  }
+
+  #[test]
+  fn selection_token_settle_unauthorized_invalidates_and_cools_only_the_selected_binding() {
     FIRST_INVALIDATIONS.store(0, Ordering::Relaxed);
     SECOND_INVALIDATIONS.store(0, Ordering::Relaxed);
 
-    let affinity = SessionAffinityPlan::new(Duration::from_secs(300), Duration::from_secs(60));
-    let gateway = gateway(
-      BTreeMap::from([(
-        route_id("managed"),
-        managed_route(ModelSelector::Capability, OperationPolicy::Preserve),
-      )]),
-      account_pool(Some(affinity)),
-      BTreeMap::from([(
-        upstream_id("upstream"),
-        upstream(
-          INVALIDATING_PROVIDER_ID,
-          "https://upstream.example/v1/",
-          &["first", "second"],
-          &[],
-        ),
-      )]),
-      BTreeMap::new(),
-    );
     let mut registry = Registry::builtin();
     registry.register(&INVALIDATING_DESCRIPTOR);
-    let routes = link_with_registry(
-      &gateway,
-      &[
-        account("first", INVALIDATING_PROVIDER_ID, AccountTier::Active),
-        account("second", INVALIDATING_PROVIDER_ID, AccountTier::Active),
-      ],
-      &registry,
-    );
+    let routes = affinity_managed_routes(INVALIDATING_PROVIDER_ID, &registry);
     let route = managed(&routes, "managed");
-    warm(route, "upstream", &["model"]);
 
     let selected = selected_managed(
       resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
@@ -1205,7 +1318,9 @@ mod tests {
     let pool = token.pool.clone();
     let selected_key = token.key().clone();
 
-    let retry_at = token.record_unauthorized().unwrap();
+    let SelectionSettlement::CoolingDown { retry_at } = token.settle(SelectionOutcome::Unauthorized).unwrap() else {
+      panic!("unauthorized selection did not enter cooldown");
+    };
 
     assert_eq!(FIRST_INVALIDATIONS.load(Ordering::Relaxed), 1);
     assert_eq!(SECOND_INVALIDATIONS.load(Ordering::Relaxed), 0);
