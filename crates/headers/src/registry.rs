@@ -8,8 +8,10 @@
 //! Unknown agents for a known provider fall back to [`AgentKind::Opencode`]
 //! as a sensible default base. Unknown providers return [`None`].
 
-use crate::agent::AgentKind;
+use crate::agent::{build_agent_headers, AgentKind};
 use crate::map::HeaderMap;
+use crate::schemas::{CodexOverlay, CopilotOverlay};
+use crate::{HeaderSchema, TemplateVars};
 
 /// Closed enum of provider transport overlays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,6 +59,28 @@ pub fn lookup(provider: &str, agent_id: &str) -> Option<ResolvedSchema> {
     }),
     _ => None,
   }
+}
+
+/// Build the provider-aware headers for one explicit wire identity.
+///
+/// Unknown providers still receive headers from a known agent identity, while
+/// known providers may add their transport overlay. Callers decide whether
+/// these headers replace or overlay a sanitized inbound map.
+pub fn build_wire_identity_headers(
+  provider: &str,
+  agent_id: &str,
+  vars: &TemplateVars,
+  inbound: &HeaderMap,
+) -> HeaderMap {
+  let Some(schema) = lookup(provider, agent_id) else {
+    return build_agent_headers(agent_id, vars, inbound);
+  };
+  let persona = schema.agent.build_outbound(vars, inbound);
+  let overlay = schema.overlay.map(|kind| match kind {
+    OverlayKind::Copilot => CopilotOverlay::build(vars, inbound).dump(),
+    OverlayKind::Codex => CodexOverlay::build(vars, inbound).dump(),
+  });
+  ResolvedSchema::compose(persona, overlay)
 }
 
 #[cfg(test)]
@@ -143,5 +167,18 @@ mod tests {
     persona_map.insert("A", HeaderValue::from_string("1".into()));
     let composed = ResolvedSchema::compose(persona_map.clone(), None);
     assert_eq!(composed, persona_map);
+  }
+
+  #[test]
+  fn wire_identity_builder_applies_provider_overlay() {
+    let headers = build_wire_identity_headers(
+      "github-copilot",
+      "opencode",
+      &TemplateVars::default(),
+      &HeaderMap::new(),
+    );
+
+    assert!(headers.contains_key(&keys::EDITOR_VERSION));
+    assert!(headers.contains_key(&keys::COPILOT_INTEGRATION_ID));
   }
 }
