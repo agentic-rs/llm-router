@@ -123,6 +123,16 @@ impl SelectionToken {
     self.pool.record_failure(self.binding.key())
   }
 
+  /// Invalidate credentials and cool the exact selected binding after an
+  /// unauthorized upstream response.
+  ///
+  /// Like [`Self::record_failure`], this deliberately does not commit session
+  /// affinity. A later retry may therefore select another eligible binding.
+  pub fn record_unauthorized(self) -> PoolRuntimeResult<Instant> {
+    self.binding.handle().invalidate_credentials();
+    self.pool.record_failure(self.binding.key())
+  }
+
   fn new(pool: Arc<AccountPoolRuntime>, binding: Arc<ProviderBinding>, session_id: Option<&str>) -> Self {
     Self {
       pool,
@@ -678,16 +688,107 @@ mod tests {
     build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes, LinkedRouteKind, LinkedRoutes,
   };
   use crate::registry::Registry;
+  use async_trait::async_trait;
+  use serde_json::Value;
   use smol_str::SmolStr;
   use std::collections::{BTreeMap, BTreeSet, HashSet};
+  use std::sync::atomic::{AtomicUsize, Ordering};
   use std::time::Duration;
+  use tokn_auth::descriptor::{EndpointSpec, ProviderDescriptor};
   use tokn_core::account::{AccountConfig, AccountTier};
-  use tokn_core::provider::{ID_LLAMA_CPP, ID_OPENAI};
+  use tokn_core::provider::{AuthKind, Provider, ProviderInfo, RequestCtx, ID_LLAMA_CPP, ID_OPENAI};
   use tokn_policy::{
     AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, CanonicalAuthority, FallbackSelector,
     GatewayPlan, HttpScheme, ManagedRetry, ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan,
     ModelSelector, RelayRetry, RelayRoute, RelayTarget, RouteId, RoutePlan, SessionAffinityPlan, UpstreamOrigin,
     UpstreamPlan, UpstreamSelector,
+  };
+
+  const INVALIDATING_PROVIDER_ID: &str = "invalidating-test";
+  static FIRST_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+  static SECOND_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+  static INVALIDATING_ENDPOINTS: &[Endpoint] = &[Endpoint::ChatCompletions];
+  static INVALIDATING_ENDPOINT_SPECS: &[EndpointSpec] = &[EndpointSpec {
+    endpoint: Endpoint::ChatCompletions,
+    method: "POST",
+    path: "/v1/chat/completions",
+    aliases: &[],
+  }];
+
+  struct InvalidatingProvider {
+    info: ProviderInfo,
+    invalidations: &'static AtomicUsize,
+  }
+
+  #[async_trait]
+  impl Provider for InvalidatingProvider {
+    fn id(&self) -> &str {
+      &self.info.id
+    }
+
+    fn info(&self) -> &ProviderInfo {
+      &self.info
+    }
+
+    async fn list_models(&self, _http: &reqwest::Client) -> tokn_core::provider::Result<Value> {
+      Ok(Value::Null)
+    }
+
+    async fn chat(&self, _ctx: RequestCtx<'_>) -> tokn_core::provider::Result<reqwest::Response> {
+      unreachable!("selection test does not send upstream requests")
+    }
+
+    fn on_unauthorized(&self) {
+      self.invalidations.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  fn validate_invalidating_account(_account: &AccountConfig) -> tokn_core::provider::Result<()> {
+    Ok(())
+  }
+
+  fn build_invalidating_provider(
+    account: Arc<AccountConfig>,
+    target: ProviderTarget,
+  ) -> tokn_core::provider::Result<Arc<dyn Provider>> {
+    let invalidations = match account.id.as_str() {
+      "first" => &FIRST_INVALIDATIONS,
+      "second" => &SECOND_INVALIDATIONS,
+      account_id => panic!("unexpected invalidating test account '{account_id}'"),
+    };
+    Ok(Arc::new(InvalidatingProvider {
+      info: ProviderInfo {
+        id: INVALIDATING_PROVIDER_ID.into(),
+        aliases: &[],
+        display_name: "Invalidating test provider",
+        upstream_url: target.base_url().to_string(),
+        auth_kind: AuthKind::None,
+        default_models: Vec::new(),
+        default_endpoints: INVALIDATING_ENDPOINTS,
+        model_cache: target.model_cache().clone(),
+      },
+      invalidations,
+    }))
+  }
+
+  fn never_matches(_host: &str, _path: &str, _id: &'static str) -> bool {
+    false
+  }
+
+  static INVALIDATING_DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
+    id: INVALIDATING_PROVIDER_ID,
+    display_name: "Invalidating test provider",
+    hosts: &[],
+    base_url: "https://invalidating.example/v1",
+    credentials: &[],
+    endpoints: INVALIDATING_ENDPOINT_SPECS,
+    model_endpoint_rules: Some(&[]),
+    rewrites: &[],
+    auth_urls: &[],
+    matches_url: never_matches,
+    validate: validate_invalidating_account,
+    build: build_invalidating_provider,
+    build_auth: None,
   };
 
   fn route_id(value: &str) -> RouteId {
@@ -796,13 +897,16 @@ mod tests {
     )
   }
 
-  fn link(gateway: &GatewayPlan, accounts: &[AccountConfig]) -> LinkedRoutes {
-    let registry = Registry::builtin();
-    let providers = link_provider_graph(gateway, accounts, &registry).unwrap();
-    let pools = link_account_pools(gateway, &providers, &registry).unwrap();
+  fn link_with_registry(gateway: &GatewayPlan, accounts: &[AccountConfig], registry: &Registry) -> LinkedRoutes {
+    let providers = link_provider_graph(gateway, accounts, registry).unwrap();
+    let pools = link_account_pools(gateway, &providers, registry).unwrap();
     let runtimes = build_account_pool_runtimes(&pools);
     let reachable = gateway.routes().keys().cloned().collect::<BTreeSet<_>>();
     link_routes(gateway, &reachable, &providers, &runtimes).unwrap()
+  }
+
+  fn link(gateway: &GatewayPlan, accounts: &[AccountConfig]) -> LinkedRoutes {
+    link_with_registry(gateway, accounts, &Registry::builtin())
   }
 
   fn managed<'a>(routes: &'a LinkedRoutes, id: &str) -> &'a LinkedManagedRoute {
@@ -1055,6 +1159,71 @@ mod tests {
       resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
     );
     assert_eq!(exact_fallthrough.binding().account_id(), "first");
+  }
+
+  #[test]
+  fn selection_token_record_unauthorized_invalidates_and_cools_only_the_selected_binding() {
+    FIRST_INVALIDATIONS.store(0, Ordering::Relaxed);
+    SECOND_INVALIDATIONS.store(0, Ordering::Relaxed);
+
+    let affinity = SessionAffinityPlan::new(Duration::from_secs(300), Duration::from_secs(60));
+    let gateway = gateway(
+      BTreeMap::from([(
+        route_id("managed"),
+        managed_route(ModelSelector::Capability, OperationPolicy::Preserve),
+      )]),
+      account_pool(Some(affinity)),
+      BTreeMap::from([(
+        upstream_id("upstream"),
+        upstream(
+          INVALIDATING_PROVIDER_ID,
+          "https://upstream.example/v1/",
+          &["first", "second"],
+          &[],
+        ),
+      )]),
+      BTreeMap::new(),
+    );
+    let mut registry = Registry::builtin();
+    registry.register(&INVALIDATING_DESCRIPTOR);
+    let routes = link_with_registry(
+      &gateway,
+      &[
+        account("first", INVALIDATING_PROVIDER_ID, AccountTier::Active),
+        account("second", INVALIDATING_PROVIDER_ID, AccountTier::Active),
+      ],
+      &registry,
+    );
+    let route = managed(&routes, "managed");
+    warm(route, "upstream", &["model"]);
+
+    let selected = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(selected.binding().account_id(), "first");
+    let token = selected.into_selection_token();
+    let pool = token.pool.clone();
+    let selected_key = token.key().clone();
+
+    let retry_at = token.record_unauthorized().unwrap();
+
+    assert_eq!(FIRST_INVALIDATIONS.load(Ordering::Relaxed), 1);
+    assert_eq!(SECOND_INVALIDATIONS.load(Ordering::Relaxed), 0);
+    assert!(matches!(
+      pool.acquire(Some("session"), |binding| binding.key() == &selected_key),
+      PoolAcquire::CoolingDown { retry_at: actual } if actual == retry_at
+    ));
+
+    // Clear only the test cooldown without writing affinity. If the
+    // unauthorized outcome had committed affinity, the same session would
+    // select `first` again instead of advancing round-robin to `second`.
+    pool.record_success(None, &selected_key).unwrap();
+    let retry = selected_managed(
+      resolve_managed_target(route, "model", Endpoint::ChatCompletions, Some("session"), |_| true).unwrap(),
+    );
+    assert_eq!(retry.binding().account_id(), "second");
+    assert_eq!(FIRST_INVALIDATIONS.load(Ordering::Relaxed), 1);
+    assert_eq!(SECOND_INVALIDATIONS.load(Ordering::Relaxed), 0);
   }
 
   #[test]
