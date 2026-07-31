@@ -16,6 +16,7 @@ pub use zai::*;
 use std::sync::Arc;
 use tokn_auth::descriptor::{EndpointSpec, ProviderDescriptor};
 use tokn_auth::provider::CredentialFlavor;
+use tokn_core::provider::ProviderTarget;
 
 const ZAI_HOSTS: &[&str] = &["api.z.ai"];
 const ZHIPU_HOSTS: &[&str] = &["open.bigmodel.cn"];
@@ -124,6 +125,7 @@ pub fn validate(account: &tokn_core::account::AccountConfig) -> tokn_core::provi
 
 pub fn build(
   account: Arc<tokn_core::account::AccountConfig>,
+  target: ProviderTarget,
 ) -> tokn_core::provider::Result<Arc<dyn tokn_core::provider::Provider>> {
-  Ok(Arc::new(zai::ZaiProvider::from_account(account)?))
+  Ok(Arc::new(zai::ZaiProvider::from_account_at(account, target)?))
 }
