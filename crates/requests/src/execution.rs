@@ -4,8 +4,12 @@
 //! graph. These types borrow those exact decisions so execution cannot drift
 //! by reconstructing provider, account, upstream, or destination identity.
 
+mod managed;
 mod opaque;
 
+pub use managed::{
+  ManagedAttemptError, ManagedHttpAttempt, ManagedHttpExecutor, ManagedHttpResponse, ManagedResponseMetadata,
+};
 pub use opaque::{OpaqueAttemptError, OpaqueHttpAttempt, OpaqueHttpExecutor, OpaqueHttpTarget};
 
 use http::{uri::PathAndQuery, Method, StatusCode};
