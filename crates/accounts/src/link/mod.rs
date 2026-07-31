@@ -1,5 +1,6 @@
 mod pools;
 mod provider_graph;
+mod resolve;
 mod routes;
 mod selection;
 
@@ -9,6 +10,10 @@ pub use pools::{
 pub use provider_graph::{
   link_provider_graph, LinkError, LinkResult, LinkedAccount, ProviderBinding, ProviderBindingKey, ProviderGraph,
   UpstreamUrlSource,
+};
+pub use resolve::{
+  resolve_managed_target, resolve_relay_target, NoEligibleReason, QualificationSyntaxError, RelayDestination,
+  SelectedManagedTarget, SelectedRelayTarget, SelectionToken, TargetResolution, TargetResolveError,
 };
 pub use routes::{
   link_routes, LinkedFallbackSelector, LinkedManagedRoute, LinkedModelCandidate, LinkedModelGroup, LinkedModelSelector,
