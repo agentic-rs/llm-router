@@ -57,12 +57,17 @@ impl OpenAiProvider {
     })
   }
 
-  fn url(&self, path: &str) -> String {
-    common::url(self.target.base_url().as_str(), path)
+  fn operation_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+    Ok(self.target.base_url().operation_url(segments.iter().copied())?)
   }
 
-  async fn upstream_post(&self, ctx: RequestCtx<'_>, path: &str, what: &'static str) -> Result<reqwest::Response> {
-    let url = self.url(path);
+  async fn upstream_post(
+    &self,
+    ctx: RequestCtx<'_>,
+    segments: &[&str],
+    what: &'static str,
+  ) -> Result<reqwest::Response> {
+    let url = self.operation_url(segments)?;
     debug!(%url, "POST upstream");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -83,7 +88,7 @@ impl OpenAiProvider {
     crate::util::http::send(
       ctx.http,
       Method::POST,
-      &url,
+      url.as_str(),
       headers,
       Some(body_bytes),
       ctx.outbound.as_ref(),
@@ -136,6 +141,7 @@ impl Provider for OpenAiProvider {
   }
 
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
+    let url = self.operation_url(&["models"])?;
     let mut headers = HeaderMap::new();
     self.patch_headers(
       &mut headers,
@@ -151,27 +157,18 @@ impl Provider for OpenAiProvider {
         agent_id: &tokn_core::AgentId::Opencode,
       },
     )?;
-    let resp = crate::util::http::send(
-      http,
-      Method::GET,
-      &self.url("/models"),
-      headers,
-      None,
-      None,
-      "openai /models",
-    )
-    .await?;
+    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, None, "openai /models").await?;
     crate::util::http::read_json(resp, "openai /models").await
   }
 
   #[instrument(name = "openai_chat", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/chat/completions", "openai chat").await
+    self.upstream_post(ctx, &["chat", "completions"], "openai chat").await
   }
 
   #[instrument(name = "openai_responses", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn responses(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/responses", "openai responses").await
+    self.upstream_post(ctx, &["responses"], "openai responses").await
   }
 
   fn on_unauthorized(&self) {
@@ -271,7 +268,10 @@ mod tests {
 
     let openai = OpenAiProvider::from_account_at(Arc::new(account), target).unwrap();
 
-    assert_eq!(openai.url("/models"), "https://gateway.example/openai/v1/models");
+    assert_eq!(
+      openai.operation_url(&["models"]).unwrap().as_str(),
+      "https://gateway.example/openai/v1/models"
+    );
     assert_eq!(openai.info().upstream_url, "https://gateway.example/openai/v1/");
     assert!(Arc::ptr_eq(&openai.info().model_cache, &target_cache));
   }

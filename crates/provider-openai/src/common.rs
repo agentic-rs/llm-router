@@ -30,10 +30,6 @@ impl Credential {
   }
 }
 
-pub fn url(base_url: &str, path: &str) -> String {
-  format!("{}{}", base_url.trim_end_matches('/'), path)
-}
-
 pub fn inject_openai_credentials(headers: &mut HeaderMap, token: &str) {
   headers.insert(&AUTHORIZATION, HeaderValue::from_string(format!("Bearer {token}")));
 }

@@ -17,7 +17,6 @@ use crate::{
 
 pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CODEX_CLIENT_VERSION: &str = "0.130.0";
-const CODEX_MODELS_PATH: &str = "/models?client_version=0.130.0";
 
 pub struct CodexProvider {
   pub id: String,
@@ -67,12 +66,25 @@ impl CodexProvider {
     })
   }
 
-  fn url(&self, path: &str) -> String {
-    common::url(self.target.base_url().as_str(), path)
+  fn operation_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+    Ok(self.target.base_url().operation_url(segments.iter().copied())?)
   }
 
-  async fn upstream_post(&self, ctx: RequestCtx<'_>, path: &str, what: &'static str) -> Result<reqwest::Response> {
-    let url = self.url(path);
+  fn models_url(&self) -> Result<reqwest::Url> {
+    let mut url = self.operation_url(&["models"])?;
+    url
+      .query_pairs_mut()
+      .append_pair("client_version", CODEX_CLIENT_VERSION);
+    Ok(url)
+  }
+
+  async fn upstream_post(
+    &self,
+    ctx: RequestCtx<'_>,
+    segments: &[&str],
+    what: &'static str,
+  ) -> Result<reqwest::Response> {
+    let url = self.operation_url(segments)?;
     debug!(%url, "POST upstream");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -93,7 +105,7 @@ impl CodexProvider {
     crate::util::http::send(
       ctx.http,
       Method::POST,
-      &url,
+      url.as_str(),
       headers,
       Some(body_bytes),
       ctx.outbound.as_ref(),
@@ -219,24 +231,16 @@ impl Provider for CodexProvider {
   }
 
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
+    let url = self.models_url()?;
     let headers = self.models_headers()?;
-    let resp = crate::util::http::send(
-      http,
-      Method::GET,
-      &self.url(CODEX_MODELS_PATH),
-      headers,
-      None,
-      None,
-      "codex /models",
-    )
-    .await?;
+    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, None, "codex /models").await?;
     let value: Value = crate::util::http::read_json(resp, "codex /models").await?;
     Ok(normalize_models_response(value))
   }
 
   #[instrument(name = "codex_responses", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn responses(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/responses", "codex responses").await
+    self.upstream_post(ctx, &["responses"], "codex responses").await
   }
 
   async fn chat(&self, _ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
@@ -449,8 +453,8 @@ mod tests {
     let codex = CodexProvider::from_account_at(Arc::new(account), target).unwrap();
 
     assert_eq!(
-      codex.url(CODEX_MODELS_PATH),
-      "https://gateway.example/backend-api/codex/models?client_version=0.130.0"
+      codex.models_url().unwrap().as_str(),
+      format!("https://gateway.example/backend-api/codex/models?client_version={CODEX_CLIENT_VERSION}")
     );
     assert_eq!(codex.info().upstream_url, "https://gateway.example/backend-api/codex/");
     assert!(Arc::ptr_eq(&codex.info().model_cache, &target_cache));
@@ -601,10 +605,13 @@ mod tests {
   #[test]
   fn codex_models_url_uses_backend_api_path() {
     let codex = CodexProvider::from_account(Arc::new(acct(Some("atk-test")))).unwrap();
-    assert_eq!(codex.url("/models"), "https://chatgpt.com/backend-api/codex/models");
     assert_eq!(
-      codex.url(CODEX_MODELS_PATH),
-      "https://chatgpt.com/backend-api/codex/models?client_version=0.130.0"
+      codex.operation_url(&["models"]).unwrap().as_str(),
+      "https://chatgpt.com/backend-api/codex/models"
+    );
+    assert_eq!(
+      codex.models_url().unwrap().as_str(),
+      format!("https://chatgpt.com/backend-api/codex/models?client_version={CODEX_CLIENT_VERSION}")
     );
   }
 
