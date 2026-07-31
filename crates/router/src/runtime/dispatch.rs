@@ -67,45 +67,14 @@ impl HttpRequestHead {
   }
 }
 
-/// Payload-independent semantics available before a route is selected.
+/// Route-family-specific facts obtained after listener matching.
 ///
-/// Opaque traffic may still carry an inferred operation for listener
-/// matching. It deliberately cannot provide a model to managed routing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HttpRequestSemantics<'a> {
-  Opaque {
-    operation: Option<Endpoint>,
-  },
-  Structured {
-    requested_model: &'a str,
-    requested_operation: Endpoint,
-  },
-}
-
-impl HttpRequestSemantics<'_> {
-  pub fn operation(self) -> Option<Endpoint> {
-    match self {
-      Self::Opaque { operation } => operation,
-      Self::Structured {
-        requested_operation, ..
-      } => Some(requested_operation),
-    }
-  }
-
-  fn provider_request_kind(self, path_and_query: &PathAndQuery) -> ProviderRequestKind {
-    self
-      .operation()
-      .map(ProviderRequestKind::Operation)
-      .unwrap_or_else(|| ProviderRequestKind::from_provider_path(path_and_query.as_str()))
-  }
-}
-
-/// Typed facts required to dispatch one HTTP request.
-#[derive(Clone, Copy, Debug)]
-pub struct HttpDispatchRequest<'a> {
-  pub head: &'a HttpRequestHead,
-  pub semantics: HttpRequestSemantics<'a>,
-  pub session_id: Option<&'a str>,
+/// The operation is deliberately absent: [`MatchedHttpRoute`] already pins
+/// the authoritative method/path classification before the body is read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HttpRequestSemantics {
+  Opaque,
+  Managed { requested_model: SmolStr },
 }
 
 /// Stable listener location that made the dispatch decision.
@@ -190,7 +159,7 @@ impl MatchedHttpRoute {
   /// inspection.
   pub fn resolve(
     self,
-    semantics: HttpRequestSemantics<'_>,
+    semantics: HttpRequestSemantics,
     session_id: Option<&str>,
     provider_access: &ProviderAccess,
   ) -> HttpDispatchResult<RoutedHttpDispatch> {
@@ -209,22 +178,6 @@ impl MatchedHttpRoute {
       profile: self.profile,
       resolution: Box::new(resolution),
     })
-  }
-}
-
-/// Complete dispatch decision for one request.
-#[derive(Debug)]
-pub enum HttpDispatch {
-  Reject(HttpDispatchSite),
-  Routed(RoutedHttpDispatch),
-}
-
-impl HttpDispatch {
-  pub fn site(&self) -> &HttpDispatchSite {
-    match self {
-      Self::Reject(site) => site,
-      Self::Routed(routed) => routed.site(),
-    }
   }
 }
 
@@ -437,54 +390,26 @@ pub fn match_http(
   })
 }
 
-/// Dispatch one request through both matching and target-resolution stages.
-pub fn dispatch_http(
-  listener: &LinkedListener,
-  request: HttpDispatchRequest<'_>,
-  provider_access: &ProviderAccess,
-) -> HttpDispatchResult<HttpDispatch> {
-  let request_kind = request.semantics.provider_request_kind(request.head.path_and_query());
-  match match_http(listener, request.head.clone(), request_kind) {
-    HttpRouteMatch::Reject(site) => Ok(HttpDispatch::Reject(site)),
-    HttpRouteMatch::Route(route) => route
-      .resolve(request.semantics, request.session_id, provider_access)
-      .map(HttpDispatch::Routed),
-  }
-}
-
 fn resolve_profile(
   site: &HttpDispatchSite,
   head: &HttpRequestHead,
   profile: &LinkedProfile,
   request_kind: ProviderRequestKind,
-  semantics: HttpRequestSemantics<'_>,
+  semantics: HttpRequestSemantics,
   session_id: Option<&str>,
   provider_access: &ProviderAccess,
 ) -> HttpDispatchResult<TargetResolution<SelectedHttpTarget>> {
   match profile.route().kind() {
     LinkedRouteKind::Managed(route) => {
-      let HttpRequestSemantics::Structured {
-        requested_model,
-        requested_operation,
-      } = semantics
-      else {
-        return Err(HttpDispatchError::ManagedStructuredSemanticsRequired {
+      let HttpRequestSemantics::Managed { requested_model } = semantics else {
+        return Err(HttpDispatchError::ManagedSemanticsRequired {
           site: site.clone(),
           profile: profile.id().clone(),
           route: profile.route().id().clone(),
         });
       };
-      match request_kind {
-        ProviderRequestKind::Operation(matched_operation) if matched_operation == requested_operation => {}
-        ProviderRequestKind::Operation(matched_operation) => {
-          return Err(HttpDispatchError::ManagedOperationChangedAfterMatch {
-            site: site.clone(),
-            profile: profile.id().clone(),
-            route: profile.route().id().clone(),
-            matched_operation,
-            requested_operation,
-          });
-        }
+      let requested_operation = match request_kind {
+        ProviderRequestKind::Operation(operation) => operation,
         request_kind @ (ProviderRequestKind::Models | ProviderRequestKind::Opaque) => {
           return Err(HttpDispatchError::ManagedOperationRequestKindRequired {
             site: site.clone(),
@@ -493,10 +418,14 @@ fn resolve_profile(
             request_kind,
           });
         }
-      }
-      let resolution = resolve_managed_target(route, requested_model, requested_operation, session_id, |provider| {
-        provider_access.allows(provider.as_str())
-      })
+      };
+      let resolution = resolve_managed_target(
+        route,
+        requested_model.as_str(),
+        requested_operation,
+        session_id,
+        |provider| provider_access.allows(provider.as_str()),
+      )
       .map_err(|source| HttpDispatchError::ManagedTarget {
         site: site.clone(),
         profile: profile.id().clone(),
@@ -522,7 +451,7 @@ fn resolve_profile(
 fn map_managed_resolution(
   site: &HttpDispatchSite,
   profile: &LinkedProfile,
-  requested_model: &str,
+  requested_model: SmolStr,
   requested_operation: Endpoint,
   resolution: TargetResolution<SelectedManagedTarget>,
 ) -> HttpDispatchResult<TargetResolution<SelectedHttpTarget>> {
@@ -537,7 +466,7 @@ fn map_managed_resolution(
       )?;
       Ok(TargetResolution::Selected(SelectedHttpTarget::Managed(
         SelectedManagedHttpTarget {
-          requested_model: SmolStr::new(requested_model),
+          requested_model,
           requested_operation,
           target,
           wire_identity,
@@ -608,7 +537,7 @@ pub enum HttpDispatchError {
   #[snafu(display(
     "{site} selected managed profile '{profile}' route '{route}', but the request has opaque semantics"
   ))]
-  ManagedStructuredSemanticsRequired {
+  ManagedSemanticsRequired {
     site: HttpDispatchSite,
     profile: ProfileId,
     route: RouteId,
@@ -622,17 +551,6 @@ pub enum HttpDispatchError {
     profile: ProfileId,
     route: RouteId,
     request_kind: ProviderRequestKind,
-  },
-
-  #[snafu(display(
-    "{site} selected managed profile '{profile}' route '{route}' for operation {matched_operation}, but resolution supplied operation {requested_operation}"
-  ))]
-  ManagedOperationChangedAfterMatch {
-    site: HttpDispatchSite,
-    profile: ProfileId,
-    route: RouteId,
-    matched_operation: Endpoint,
-    requested_operation: Endpoint,
   },
 
   #[snafu(display("{site} failed to resolve managed profile '{profile}' route '{route}': {source}"))]
@@ -823,19 +741,18 @@ mod tests {
     HttpRequestHead::new(ingress, Method::POST, path_and_query.parse().unwrap()).unwrap()
   }
 
-  fn request<'a>(head: &'a HttpRequestHead, semantics: HttpRequestSemantics<'a>) -> HttpDispatchRequest<'a> {
-    HttpDispatchRequest {
-      head,
-      semantics,
-      session_id: Some("session"),
-    }
+  fn resolve_http(
+    listener: &LinkedListener,
+    head: &HttpRequestHead,
+    request_kind: ProviderRequestKind,
+    semantics: HttpRequestSemantics,
+    provider_access: &ProviderAccess,
+  ) -> HttpDispatchResult<RoutedHttpDispatch> {
+    matched(match_http(listener, head.clone(), request_kind)).resolve(semantics, Some("session"), provider_access)
   }
 
-  fn routed(dispatch: HttpDispatch) -> RoutedHttpDispatch {
-    let HttpDispatch::Routed(routed) = dispatch else {
-      panic!("expected routed dispatch, got {dispatch:?}");
-    };
-    routed
+  fn routed(result: HttpDispatchResult<RoutedHttpDispatch>) -> RoutedHttpDispatch {
+    result.unwrap()
   }
 
   fn matched(result: HttpRouteMatch) -> MatchedHttpRoute {
@@ -910,19 +827,15 @@ mod tests {
     let action_profile = listener.http().bindings()[0].action().profile().unwrap();
     let head = request_head(direct_ingress("client.example"), "/v1/responses?trace=one%2Ftwo");
 
-    let dispatch = dispatch_http(
+    let routed = routed(resolve_http(
       listener,
-      request(
-        &head,
-        HttpRequestSemantics::Structured {
-          requested_model: "inbound-model",
-          requested_operation: Endpoint::Responses,
-        },
-      ),
+      &head,
+      ProviderRequestKind::Operation(Endpoint::Responses),
+      HttpRequestSemantics::Managed {
+        requested_model: SmolStr::new("inbound-model"),
+      },
       &ProviderAccess::All,
-    )
-    .unwrap();
-    let routed = routed(dispatch);
+    ));
 
     assert_eq!(routed.site().listener_id(), &listener_key);
     assert_eq!(routed.site().binding_id().unwrap().as_str(), "managed-binding");
@@ -983,31 +896,16 @@ mod tests {
     let runtime = link(&plan, &[]);
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
     let head = request_head(direct_ingress("reject.example"), "/opaque");
-    let denied = ProviderAccess::from_provider_ids(vec!["nothing".into()]).unwrap();
-
     let matched = match_http(listener, head.clone(), ProviderRequestKind::Opaque);
     let HttpRouteMatch::Reject(site) = matched else {
       panic!("expected matching stage to reject");
     };
     assert_eq!(site.listener_id().as_str(), "listener");
     assert!(site.binding_id().is_none());
-
-    let dispatch = dispatch_http(
-      listener,
-      request(&head, HttpRequestSemantics::Opaque { operation: None }),
-      &denied,
-    )
-    .unwrap();
-
-    let HttpDispatch::Reject(site) = dispatch else {
-      panic!("expected reject");
-    };
-    assert_eq!(site.listener_id().as_str(), "listener");
-    assert!(site.binding_id().is_none());
   }
 
   #[test]
-  fn opaque_inferred_operations_match_relay_and_transparent_bindings() {
+  fn admitted_operations_match_relay_and_transparent_bindings() {
     let plan = gateway(
       proxy_listener(
         vec![
@@ -1058,13 +956,7 @@ mod tests {
       head.clone(),
       ProviderRequestKind::Operation(Endpoint::Responses),
     ))
-    .resolve(
-      HttpRequestSemantics::Opaque {
-        operation: Some(Endpoint::Messages),
-      },
-      Some("session"),
-      &ProviderAccess::All,
-    )
+    .resolve(HttpRequestSemantics::Opaque, Some("session"), &ProviderAccess::All)
     .unwrap();
     assert_eq!(relay.site().binding_id().unwrap().as_str(), "relay-binding");
     assert!(matches!(
@@ -1085,19 +977,13 @@ mod tests {
       "https://upstream.example/v1/opaque"
     );
 
-    let transparent = routed(
-      dispatch_http(
-        listener,
-        request(
-          &head,
-          HttpRequestSemantics::Opaque {
-            operation: Some(Endpoint::Messages),
-          },
-        ),
-        &ProviderAccess::All,
-      )
-      .unwrap(),
-    );
+    let transparent = routed(resolve_http(
+      listener,
+      &head,
+      ProviderRequestKind::Operation(Endpoint::Messages),
+      HttpRequestSemantics::Opaque,
+      &ProviderAccess::All,
+    ));
     assert_eq!(transparent.site().binding_id().unwrap().as_str(), "transparent-binding");
     assert!(matches!(
       transparent.resolution(),
@@ -1146,18 +1032,12 @@ mod tests {
     ));
 
     let error = route
-      .resolve(
-        HttpRequestSemantics::Opaque {
-          operation: Some(Endpoint::ChatCompletions),
-        },
-        Some("session"),
-        &ProviderAccess::All,
-      )
+      .resolve(HttpRequestSemantics::Opaque, Some("session"), &ProviderAccess::All)
       .unwrap_err();
 
     assert!(matches!(
       error,
-      HttpDispatchError::ManagedStructuredSemanticsRequired {
+      HttpDispatchError::ManagedSemanticsRequired {
         site,
         profile,
         route,
@@ -1169,7 +1049,7 @@ mod tests {
   }
 
   #[test]
-  fn managed_resolution_cannot_change_or_invent_the_matched_operation() {
+  fn managed_resolution_uses_only_the_matched_operation() {
     let plan = gateway(
       llm_listener(Vec::new(), HttpAction::Route(profile_id("managed-profile"))),
       BTreeMap::from([(
@@ -1197,34 +1077,29 @@ mod tests {
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
     let head = request_head(direct_ingress("managed.example"), "/v1/responses");
 
-    let changed = matched(match_http(
+    let routed = matched(match_http(
       listener,
       head.clone(),
       ProviderRequestKind::Operation(Endpoint::Responses),
     ))
     .resolve(
-      HttpRequestSemantics::Structured {
-        requested_model: "model",
-        requested_operation: Endpoint::ChatCompletions,
+      HttpRequestSemantics::Managed {
+        requested_model: SmolStr::new("model"),
       },
       None,
       &ProviderAccess::All,
     )
-    .unwrap_err();
+    .unwrap();
     assert!(matches!(
-      changed,
-      HttpDispatchError::ManagedOperationChangedAfterMatch {
-        matched_operation: Endpoint::Responses,
-        requested_operation: Endpoint::ChatCompletions,
-        ..
-      }
+      routed.resolution(),
+      TargetResolution::Selected(SelectedHttpTarget::Managed(selected))
+        if selected.requested_operation() == Endpoint::Responses
     ));
 
     let non_operation = matched(match_http(listener, head, ProviderRequestKind::Models))
       .resolve(
-        HttpRequestSemantics::Structured {
-          requested_model: "model",
-          requested_operation: Endpoint::Responses,
+        HttpRequestSemantics::Managed {
+          requested_model: SmolStr::new("model"),
         },
         None,
         &ProviderAccess::All,
@@ -1270,15 +1145,13 @@ mod tests {
     let listener = runtime.listeners().listener(&listener_id("listener")).unwrap();
     let head = request_head(direct_ingress("managed.example"), "/v1/chat/completions");
 
-    let malformed = dispatch_http(
+    let malformed = resolve_http(
       listener,
-      request(
-        &head,
-        HttpRequestSemantics::Structured {
-          requested_model: ID_LLAMA_CPP,
-          requested_operation: Endpoint::ChatCompletions,
-        },
-      ),
+      &head,
+      ProviderRequestKind::Operation(Endpoint::ChatCompletions),
+      HttpRequestSemantics::Managed {
+        requested_model: SmolStr::new(ID_LLAMA_CPP),
+      },
       &ProviderAccess::All,
     )
     .unwrap_err();
@@ -1294,20 +1167,15 @@ mod tests {
     ));
 
     let denied_access = ProviderAccess::from_provider_ids(vec!["openai".into()]).unwrap();
-    let denied = routed(
-      dispatch_http(
-        listener,
-        request(
-          &head,
-          HttpRequestSemantics::Structured {
-            requested_model: "llama-cpp/model",
-            requested_operation: Endpoint::ChatCompletions,
-          },
-        ),
-        &denied_access,
-      )
-      .unwrap(),
-    );
+    let denied = routed(resolve_http(
+      listener,
+      &head,
+      ProviderRequestKind::Operation(Endpoint::ChatCompletions),
+      HttpRequestSemantics::Managed {
+        requested_model: SmolStr::new("llama-cpp/model"),
+      },
+      &denied_access,
+    ));
     assert!(matches!(
       denied.resolution(),
       TargetResolution::NoEligible {
@@ -1354,14 +1222,13 @@ mod tests {
       HttpIngress::intercepted_https(&connect, CanonicalAuthority::parse("origin.example").unwrap()).unwrap();
     let head = request_head(ingress, "/v1/models?client_version=test");
 
-    let routed = routed(
-      dispatch_http(
-        listener,
-        request(&head, HttpRequestSemantics::Opaque { operation: None }),
-        &ProviderAccess::All,
-      )
-      .unwrap(),
-    );
+    let routed = routed(resolve_http(
+      listener,
+      &head,
+      ProviderRequestKind::Models,
+      HttpRequestSemantics::Opaque,
+      &ProviderAccess::All,
+    ));
     let TargetResolution::Selected(SelectedHttpTarget::Relay(selected)) = routed.resolution() else {
       panic!("expected relay selection, got {:?}", routed.resolution());
     };
@@ -1417,14 +1284,13 @@ mod tests {
     );
     let denied = ProviderAccess::from_provider_ids(vec!["nothing".into()]).unwrap();
 
-    let routed = routed(
-      dispatch_http(
-        listener,
-        request(&head, HttpRequestSemantics::Opaque { operation: None }),
-        &denied,
-      )
-      .unwrap(),
-    );
+    let routed = routed(resolve_http(
+      listener,
+      &head,
+      ProviderRequestKind::Opaque,
+      HttpRequestSemantics::Opaque,
+      &denied,
+    ));
     let TargetResolution::Selected(SelectedHttpTarget::Transparent(selected)) = routed.resolution() else {
       panic!("expected transparent selection, got {:?}", routed.resolution());
     };

@@ -12,10 +12,9 @@ pub use connect::{
   dispatch_connect, ConnectDispatch, ConnectDispatchError, ConnectDispatchResult, ConnectDispatchSite,
 };
 pub use dispatch::{
-  dispatch_http, match_http, HttpDispatch, HttpDispatchError, HttpDispatchRequest, HttpDispatchResult,
-  HttpDispatchSite, HttpExecutionView, HttpRequestHead, HttpRequestSemantics, HttpRouteMatch, MatchedHttpRoute,
-  RoutedHttpDispatch, SelectedHttpTarget, SelectedManagedHttpTarget, SelectedRelayHttpTarget,
-  SelectedTransparentHttpTarget,
+  match_http, HttpDispatchError, HttpDispatchResult, HttpDispatchSite, HttpExecutionView, HttpRequestHead,
+  HttpRequestSemantics, HttpRouteMatch, MatchedHttpRoute, RoutedHttpDispatch, SelectedHttpTarget,
+  SelectedManagedHttpTarget, SelectedRelayHttpTarget, SelectedTransparentHttpTarget,
 };
 pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
 pub use listeners::{
