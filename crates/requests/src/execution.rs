@@ -4,11 +4,27 @@
 //! graph. These types borrow those exact decisions so execution cannot drift
 //! by reconstructing provider, account, upstream, or destination identity.
 
-use http::{uri::PathAndQuery, Method};
-use tokn_accounts::link::{RelayDestination, SelectedManagedTarget, SelectedRelayTarget};
+use http::{uri::PathAndQuery, Method, StatusCode};
+use tokn_accounts::link::{RelayDestination, SelectedManagedTarget, SelectedRelayTarget, SelectionOutcome};
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, InvalidRequestUrl};
 use tokn_core::AgentId;
+
+/// Classify a received final response head for account-pool settlement.
+///
+/// This is deliberately independent from whether the response is forwarded
+/// as an HTTP success or error. Ordinary client errors still prove that the
+/// selected binding reached a responsive upstream. Statuses associated with
+/// credentials, throttling, timeout, early-data rejection, or server failure
+/// make another binding preferable for a later attempt.
+pub fn classify_selection_outcome(status: StatusCode) -> SelectionOutcome {
+  match status.as_u16() {
+    401 => SelectionOutcome::Unauthorized,
+    403 | 408 | 425 | 429 | 500..=599 => SelectionOutcome::Unavailable,
+    200..=499 => SelectionOutcome::Healthy,
+    _ => SelectionOutcome::Unchanged,
+  }
+}
 
 /// Exact request-line fields retained for one outbound attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,5 +265,35 @@ mod tests {
     assert!(std::ptr::eq(transparent.destination(), &destination));
     assert!(execution.as_managed().is_none());
     assert!(execution.as_relay().is_none());
+  }
+
+  #[test]
+  fn response_status_classification_is_independent_from_http_success() {
+    for status in [200, 299, 300, 400, 404, 422, 499] {
+      assert_eq!(
+        classify_selection_outcome(StatusCode::from_u16(status).unwrap()),
+        SelectionOutcome::Healthy,
+        "status {status}"
+      );
+    }
+
+    assert_eq!(
+      classify_selection_outcome(StatusCode::UNAUTHORIZED),
+      SelectionOutcome::Unauthorized
+    );
+    for status in [403, 408, 425, 429, 500, 503, 599] {
+      assert_eq!(
+        classify_selection_outcome(StatusCode::from_u16(status).unwrap()),
+        SelectionOutcome::Unavailable,
+        "status {status}"
+      );
+    }
+    for status in [199, 600] {
+      assert_eq!(
+        classify_selection_outcome(StatusCode::from_u16(status).unwrap()),
+        SelectionOutcome::Unchanged,
+        "status {status}"
+      );
+    }
   }
 }
