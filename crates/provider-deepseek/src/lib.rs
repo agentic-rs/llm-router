@@ -3,8 +3,8 @@ pub mod deepseek;
 
 pub use tokn_catalogue as catalogue;
 pub use tokn_core::provider::{
-  error, AuthKind, Endpoint, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
-  TemplateVars, ID_DEEPSEEK,
+  error, AuthKind, CredentialPatchCtx, Endpoint, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind,
+  RequestCtx, Result, TemplateVars, ID_DEEPSEEK,
 };
 pub use tokn_core::{account as config, provider, util};
 

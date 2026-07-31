@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock, RwLock};
+use tokn_headers::keys::{AUTHORIZATION, CHATGPT_ACCOUNT_ID, COOKIE, X_API_KEY};
 pub use tokn_headers::TemplateVars;
 use tokn_headers::{AgentId, HeaderMap};
 
@@ -366,6 +367,17 @@ impl ProviderRequestKind {
   }
 }
 
+/// Credential-only inputs for provider-owned authorization patches.
+///
+/// This deliberately excludes payload and header-normalization state so
+/// opaque relay requests can replace account credentials without changing
+/// the client's remaining wire headers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialPatchCtx<'a> {
+  pub request_kind: ProviderRequestKind,
+  pub bearer_token: Option<&'a str>,
+}
+
 pub struct HeaderPatchCtx<'a> {
   pub request_kind: ProviderRequestKind,
   pub body: &'a Value,
@@ -379,6 +391,13 @@ pub struct HeaderPatchCtx<'a> {
 }
 
 impl HeaderPatchCtx<'_> {
+  fn credential_patch_ctx(&self) -> CredentialPatchCtx<'_> {
+    CredentialPatchCtx {
+      request_kind: self.request_kind,
+      bearer_token: self.bearer_token,
+    }
+  }
+
   pub fn endpoint(&self) -> Option<Endpoint> {
     self.request_kind.endpoint()
   }
@@ -470,16 +489,54 @@ pub trait Provider: Send + Sync {
   /// bearer tokens, API keys, or provider account identifiers. These values
   /// are treated as credentials, not ordinary header fallbacks. Final
   /// transport/default enforcement belongs in [`Provider::normalize_headers`].
-  fn inject_credentials(&self, _headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  ///
+  /// Provider implementations must override this hook rather than relying on
+  /// a custom [`Provider::patch_headers`] implementation. Both managed header
+  /// patching and opaque request authorization call it through
+  /// [`Provider::replace_credentials`].
+  fn inject_credentials(&self, _headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     Ok(())
   }
 
+  /// Remove client account credentials, then inject the selected account's
+  /// provider-owned replacements.
+  ///
+  /// Cookie authentication is credential material too: retaining it beside a
+  /// selected bearer or API key could authenticate as a different account.
+  fn replace_credentials(&self, headers: &mut HeaderMap, ctx: &CredentialPatchCtx<'_>) -> Result<()> {
+    for name in [&AUTHORIZATION, &X_API_KEY, &CHATGPT_ACCOUNT_ID, &COOKIE] {
+      headers.remove(name);
+    }
+    self.inject_credentials(headers, ctx)
+  }
+
   fn patch_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
-    self.inject_credentials(headers, ctx)?;
+    self.replace_credentials(headers, &ctx.credential_patch_ctx())?;
     if let Some(new_headers) = self.normalize_headers(headers, ctx)? {
       *headers = new_headers;
     }
     Ok(())
+  }
+
+  /// Authorize a request without normalizing its remaining headers.
+  ///
+  /// This is the provider hook for opaque relay traffic. Static providers use
+  /// the default credential injector; providers with asynchronously refreshed
+  /// credentials can override it. Payload-dependent normalization must remain
+  /// in [`Provider::patch_headers`] and is intentionally not called here.
+  async fn authorize_request(
+    &self,
+    _http: &reqwest::Client,
+    headers: &mut HeaderMap,
+    request_kind: ProviderRequestKind,
+  ) -> Result<()> {
+    self.replace_credentials(
+      headers,
+      &CredentialPatchCtx {
+        request_kind,
+        bearer_token: None,
+      },
+    )
   }
 
   /// Final provider-owned header shape enforcement.

@@ -10,8 +10,8 @@ use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
 use crate::{
-  error, AuthKind, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result, TemplateVars,
-  ID_OPENAI,
+  error, AuthKind, CredentialPatchCtx, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
+  TemplateVars, ID_OPENAI,
 };
 
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -131,7 +131,7 @@ impl Provider for OpenAiProvider {
     &self.info
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     common::inject_openai_credentials(headers, self.credential.expose());
     Ok(())
   }
