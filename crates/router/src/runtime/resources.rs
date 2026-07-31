@@ -29,6 +29,11 @@ impl MaterializedListeners {
     self.listeners.iter()
   }
 
+  /// Consume the collection in deterministic listener-id order.
+  pub fn into_listeners(self) -> impl ExactSizeIterator<Item = (ListenerId, MaterializedListener)> {
+    self.listeners.into_iter()
+  }
+
   pub fn len(&self) -> usize {
     self.listeners.len()
   }
