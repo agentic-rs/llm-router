@@ -7,7 +7,8 @@
 //! poll the response body. It does not retry or map outcomes into downstream
 //! HTTP policy.
 
-use super::{HttpDispatchSite, RoutedHttpDispatch, SelectedHttpTarget};
+use super::dispatch::SelectedHttpTarget;
+use super::{HttpDispatchSite, RoutedHttpDispatch};
 use bytes::Bytes;
 use http::HeaderMap;
 use snafu::Snafu;
