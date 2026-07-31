@@ -45,6 +45,41 @@ impl CanonicalUpstreamUrl {
   pub fn origin(&self) -> CanonicalHttpOrigin {
     CanonicalHttpOrigin(SmolStr::new(self.url.origin().ascii_serialization()))
   }
+
+  /// Append operation path segments without allowing a relative reference to
+  /// replace the configured origin or discard its path prefix.
+  ///
+  /// Query parameters are intentionally separate: mutate the returned URL
+  /// with [`Url::query_pairs_mut`] so query data cannot be confused with path
+  /// structure.
+  pub fn operation_url<I, S>(&self, segments: I) -> Result<Url, InvalidOperationPath>
+  where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+  {
+    let mut segments = segments.into_iter().enumerate().peekable();
+    if segments.peek().is_none() {
+      return Err(InvalidOperationPath::Empty);
+    }
+
+    let mut url = self.url.clone();
+    let mut path = url
+      .path_segments_mut()
+      .map_err(|()| InvalidOperationPath::InvalidBase)?;
+    path.pop_if_empty();
+    for (index, segment) in segments {
+      let segment = segment.as_ref();
+      if segment.is_empty() {
+        return Err(InvalidOperationPath::EmptySegment { index });
+      }
+      if matches!(segment, "." | "..") {
+        return Err(InvalidOperationPath::DotSegment { index });
+      }
+      path.push(segment);
+    }
+    drop(path);
+    Ok(url)
+  }
 }
 
 impl AsRef<str> for CanonicalUpstreamUrl {
@@ -139,6 +174,27 @@ impl std::error::Error for InvalidUpstreamUrl {
     }
   }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvalidOperationPath {
+  Empty,
+  EmptySegment { index: usize },
+  DotSegment { index: usize },
+  InvalidBase,
+}
+
+impl fmt::Display for InvalidOperationPath {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Empty => formatter.write_str("operation path must contain at least one segment"),
+      Self::EmptySegment { index } => write!(formatter, "operation path segment {index} must not be empty"),
+      Self::DotSegment { index } => write!(formatter, "operation path segment {index} must not be '.' or '..'"),
+      Self::InvalidBase => formatter.write_str("upstream URL cannot be used as a path base"),
+    }
+  }
+}
+
+impl std::error::Error for InvalidOperationPath {}
 
 fn parse_http_url(raw: &str) -> Result<(Url, CanonicalAuthority), InvalidUpstreamUrl> {
   if !raw.is_ascii() {
@@ -280,6 +336,78 @@ mod tests {
     CanonicalUpstreamUrl::parse("http://[::1]:8080/v1", CleartextHttpPolicy::LoopbackOnly).unwrap();
     assert!(CanonicalUpstreamUrl::parse("http://localhost:8080/v1", CleartextHttpPolicy::LoopbackOnly).is_err());
     CanonicalUpstreamUrl::parse("http://api.example.com/v1", CleartextHttpPolicy::Allow).unwrap();
+  }
+
+  #[test]
+  fn operation_urls_preserve_the_configured_prefix() {
+    let base = CanonicalUpstreamUrl::parse(
+      "https://api.example.com/proxy/openai/v1",
+      CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+
+    assert_eq!(
+      base.operation_url(["chat", "completions"]).unwrap().as_str(),
+      "https://api.example.com/proxy/openai/v1/chat/completions"
+    );
+
+    let root = CanonicalUpstreamUrl::parse("https://api.example.com", CleartextHttpPolicy::LoopbackOnly).unwrap();
+    assert_eq!(
+      root.operation_url(["models"]).unwrap().as_str(),
+      "https://api.example.com/models"
+    );
+  }
+
+  #[test]
+  fn operation_segments_cannot_replace_authority_or_inject_url_structure() {
+    let base = CanonicalUpstreamUrl::parse("https://api.example.com/v1", CleartextHttpPolicy::LoopbackOnly).unwrap();
+
+    let authority = base.operation_url(["//evil.example", "models"]).unwrap();
+    assert_eq!(authority.origin().ascii_serialization(), "https://api.example.com");
+    assert_eq!(authority.path(), "/v1/%2F%2Fevil.example/models");
+
+    let reserved = base.operation_url(["model/id?x#y%2f"]).unwrap();
+    assert_eq!(reserved.path(), "/v1/model%2Fid%3Fx%23y%252f");
+    assert!(reserved.query().is_none());
+    assert!(reserved.fragment().is_none());
+
+    let encoded_dot = base.operation_url(["%2e%2e", "models"]).unwrap();
+    assert_eq!(encoded_dot.path(), "/v1/%252e%252e/models");
+  }
+
+  #[test]
+  fn operation_urls_reject_empty_and_dot_segments() {
+    let base = CanonicalUpstreamUrl::parse("https://api.example.com/v1", CleartextHttpPolicy::LoopbackOnly).unwrap();
+
+    assert_eq!(
+      base.operation_url::<[&str; 0], &str>([]),
+      Err(InvalidOperationPath::Empty)
+    );
+    assert_eq!(
+      base.operation_url(["models", ""]),
+      Err(InvalidOperationPath::EmptySegment { index: 1 })
+    );
+    assert_eq!(
+      base.operation_url(["models", "."]),
+      Err(InvalidOperationPath::DotSegment { index: 1 })
+    );
+    assert_eq!(
+      base.operation_url(["..", "models"]),
+      Err(InvalidOperationPath::DotSegment { index: 0 })
+    );
+  }
+
+  #[test]
+  fn operation_queries_are_encoded_separately() {
+    let base =
+      CanonicalUpstreamUrl::parse("https://api.example.com/backend", CleartextHttpPolicy::LoopbackOnly).unwrap();
+    let mut url = base.operation_url(["models"]).unwrap();
+    url.query_pairs_mut().append_pair("client_version", "0.130.0+dev");
+
+    assert_eq!(
+      url.as_str(),
+      "https://api.example.com/backend/models?client_version=0.130.0%2Bdev"
+    );
   }
 
   #[test]
