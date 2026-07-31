@@ -83,6 +83,9 @@ pub enum ModelSelector {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpstreamSelector {
+  /// Select from explicitly configured upstreams compatible with the route's
+  /// account pool. Provider catalogue defaults are resolved for those
+  /// upstreams during runtime linking; they do not create implicit entries.
   Any,
   Fixed(UpstreamId),
 }

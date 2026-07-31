@@ -9,11 +9,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A fully compiled gateway configuration.
+/// A configuration-compiled gateway plan.
 ///
-/// All cross-references and raw configuration values are expected to be
-/// validated before this value is constructed. Runtime crates consume this
-/// graph without knowing how it was represented on disk.
+/// References within the configuration and all raw syntax are validated
+/// before this value is constructed. A runtime linker must still resolve
+/// provider catalogue defaults and runtime-owned names (such as operations
+/// and wire identities), then reject an unusable plan before listeners bind.
+/// Runtime crates consume this graph without knowing how it was represented
+/// on disk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayPlan {
   listeners: BTreeMap<ListenerId, ListenerPlan>,
@@ -304,6 +307,11 @@ pub enum HttpAction {
 }
 
 /// A host selector in a binding rule.
+///
+/// Runtime matching uses a canonical, immutable ingress authority. For an
+/// intercepted request this is the original CONNECT authority, never an
+/// untrusted inner Host header. A conflicting inner authority must be rejected
+/// before binding or credential selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostPattern {
   Exact(SmolStr),
@@ -423,7 +431,8 @@ impl ConnectRulePlan {
 pub enum ConnectAction {
   /// Terminate TLS, then evaluate the decoded request against the listener's
   /// HTTP bindings. Those bindings may select any route family, including a
-  /// transparent route.
+  /// transparent route. The immutable CONNECT authority remains the request's
+  /// original destination; an inner authority mismatch is rejected.
   Intercept,
   /// Preserve the connection as an opaque byte stream.
   Tunnel,
@@ -593,14 +602,21 @@ pub struct UpstreamPlan {
   provider: ProviderId,
   base_url: Option<SmolStr>,
   origins: Box<[UpstreamOrigin]>,
+  allow_insecure_http: bool,
 }
 
 impl UpstreamPlan {
-  pub fn new(provider: ProviderId, base_url: Option<SmolStr>, origins: Box<[UpstreamOrigin]>) -> Self {
+  pub fn new(
+    provider: ProviderId,
+    base_url: Option<SmolStr>,
+    origins: Box<[UpstreamOrigin]>,
+    allow_insecure_http: bool,
+  ) -> Self {
     Self {
       provider,
       base_url,
       origins,
+      allow_insecure_http,
     }
   }
 
@@ -608,12 +624,21 @@ impl UpstreamPlan {
     &self.provider
   }
 
+  /// Canonical trailing-slash URL prefix. Runtime linking fills catalogue
+  /// defaults; request execution appends a relative operation or relay path.
   pub fn base_url(&self) -> Option<&str> {
     self.base_url.as_deref()
   }
 
   pub fn origins(&self) -> &[UpstreamOrigin] {
     &self.origins
+  }
+
+  /// Whether runtime linking may accept a non-loopback `http://` catalogue
+  /// default for this upstream. Explicit URLs are checked by the config
+  /// compiler; defaults must receive the same check after resolution.
+  pub fn allow_insecure_http(&self) -> bool {
+    self.allow_insecure_http
   }
 }
 
@@ -830,6 +855,7 @@ mod tests {
         UpstreamOrigin::new("https://chatgpt.com"),
       ]
       .into_boxed_slice(),
+      false,
     );
     let group = ModelGroupPlan::new(
       vec![
@@ -883,7 +909,7 @@ mod tests {
       )]),
       BTreeMap::from([(
         upstream_id.clone(),
-        UpstreamPlan::new(id("openai"), None, Box::default()),
+        UpstreamPlan::new(id("openai"), None, Box::default(), false),
       )]),
       BTreeMap::from([(
         group_id.clone(),
