@@ -4,10 +4,12 @@
 //! loader. Callers must opt into v2 until the runtime cutover and explicit
 //! migration command are complete.
 
+mod compile;
 mod error;
 mod raw;
 
 use std::path::Path;
+use tokn_policy::GatewayPlan;
 
 pub use error::{CompileError, Error, Result};
 pub use raw::SCHEMA_VERSION;
@@ -57,6 +59,42 @@ pub fn load_raw(path: &Path) -> Result<RawConfig> {
     source,
   })?;
   decode(&contents, path)
+}
+
+/// Compile a decoded version 2 document into the representation consumed by
+/// runtime crates.
+///
+/// This is the semantic boundary: identifiers are canonicalized, references
+/// are resolved, matcher precedence is preserved, and invalid combinations
+/// within the document are rejected. A separate runtime linker resolves
+/// provider catalogue defaults and runtime/plugin-owned names; it must also
+/// succeed before any listener starts.
+pub fn compile(raw: &RawConfig, source: &Path) -> Result<GatewayPlan> {
+  if raw.schema_version != SCHEMA_VERSION {
+    return Err(Error::UnsupportedSchemaVersion {
+      path: source.to_path_buf(),
+      found: i64::from(raw.schema_version),
+    });
+  }
+
+  compile::compile_plan(raw, source).map_err(|source_error| Error::Compile {
+    path: source.to_path_buf(),
+    source: Box::new(source_error),
+  })
+}
+
+/// Strictly decode and semantically compile a version 2 document.
+pub fn parse(contents: &str, source: &Path) -> Result<GatewayPlan> {
+  let raw = decode(contents, source)?;
+  compile(&raw, source)
+}
+
+/// Read, strictly decode, and semantically compile a version 2 document.
+///
+/// Unlike the legacy loader, a missing file is always an error.
+pub fn load(path: &Path) -> Result<GatewayPlan> {
+  let raw = load_raw(path)?;
+  compile(&raw, path)
 }
 
 #[cfg(test)]
