@@ -67,7 +67,7 @@ fn compile_account_pools(
         raw_pool.session_expired_retention_secs,
         MAX_SESSION_DURATION_SECS,
       )?;
-      let accounts = compile_account_filter(raw_pool.accounts.as_deref(), raw_id)?
+      let accounts = compile_account_filter(raw_pool.accounts.as_deref(), format!("account_pools.{raw_id}.accounts"))?
         .map(|accounts| accounts.into_iter().map(Into::into).collect());
       let providers = compile_provider_filter(raw_pool.providers.as_deref(), raw_id)?;
 
@@ -112,12 +112,12 @@ fn validate_duration(pool_id: &str, field: &str, seconds: u64, maximum: u64) -> 
 
 fn compile_account_filter(
   raw_values: Option<&[String]>,
-  pool_id: &str,
+  location: String,
 ) -> Result<Option<BTreeSet<String>>, CompileError> {
   let Some(raw_values) = raw_values else {
     return Ok(None);
   };
-  validate_selector_shape(raw_values, format!("account_pools.{pool_id}.accounts"))?;
+  validate_selector_shape(raw_values, location.clone())?;
   if raw_values == ["*"] {
     return Ok(None);
   }
@@ -126,12 +126,12 @@ fn compile_account_filter(
   for value in raw_values {
     if value.trim().is_empty() || value.trim() != value {
       return Err(invalid_value(
-        format!("account_pools.{pool_id}.accounts"),
+        location.clone(),
         "account ids must be non-empty and have no surrounding whitespace",
       ));
     }
     if !values.insert(value.clone()) {
-      return Err(duplicate_value(format!("account_pools.{pool_id}.accounts"), value));
+      return Err(duplicate_value(location.clone(), value));
     }
   }
   Ok(Some(values))
@@ -180,6 +180,9 @@ fn compile_upstreams(
   for (raw_id, raw_upstream) in raw_upstreams {
     let id = parse_id::<UpstreamId>("upstream id", raw_id)?;
     let provider = parse_id::<ProviderId>("upstream provider", &raw_upstream.provider)?;
+    let eligible_accounts =
+      compile_account_filter(raw_upstream.accounts.as_deref(), format!("upstreams.{raw_id}.accounts"))?
+        .map(|accounts| accounts.into_iter().map(Into::into).collect());
     let (base_url, base_origin) = raw_upstream
       .base_url
       .as_deref()
@@ -212,7 +215,8 @@ fn compile_upstreams(
       base_url.map(Into::into),
       origins.into_boxed_slice(),
       raw_upstream.allow_insecure_http,
-    );
+    )
+    .with_eligible_accounts(eligible_accounts);
     plans.insert(id, plan);
   }
 
