@@ -42,8 +42,9 @@ pub use server::{
   admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request,
   authenticate_forward_proxy_client, authenticate_llm_api_client, bind_gateway_listeners, buffer_matched_body,
   classify_request_kind, managed_response_to_axum, opaque_response_to_axum, AdmissionError, AdmittedHttpRequest,
-  AuthorityLocation, BoundGatewayListeners, BoundListener, BufferedRequestBody, ClientAuthError, ExpectedRequestTarget,
-  ForwardProxyAdmission, GatewayServerState, GatewayServerStateError, GatewayServerStateResult, GatewayServingDefaults,
-  ListenerBindError, ListenerBindResult, ListenerServerState, ManagedRequestBody,
+  AuthBoundary, AuthorityLocation, BoundGatewayListeners, BoundListener, BufferedRequestBody, ClientAuthError,
+  ExpectedRequestTarget, ForwardProxyAdmission, GatewayServerState, GatewayServerStateError, GatewayServerStateResult,
+  GatewayServingDefaults, ListenerBindError, ListenerBindResult, ListenerServerState, ManagedRequestBody,
   RequestBodyError, RequestBodyLimits, RequestBodyResult, RequestTargetForm, ResponseBridgeError, ResponseBridgeResult,
+  ServerError,
 };
