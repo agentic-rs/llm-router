@@ -4,6 +4,10 @@
 //! graph. These types borrow those exact decisions so execution cannot drift
 //! by reconstructing provider, account, upstream, or destination identity.
 
+mod opaque;
+
+pub use opaque::{OpaqueAttemptError, OpaqueHttpAttempt, OpaqueHttpExecutor, OpaqueHttpTarget};
+
 use http::{uri::PathAndQuery, Method, StatusCode};
 use std::collections::BTreeSet;
 use tokn_accounts::link::{RelayDestination, SelectedManagedTarget, SelectedRelayTarget, SelectionOutcome};
