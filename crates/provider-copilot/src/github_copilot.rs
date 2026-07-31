@@ -19,8 +19,8 @@ use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
 use tracing::{debug, instrument};
 
 use crate::{
-  error, AuthKind, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx,
-  Result, ID_GITHUB_COPILOT,
+  error, AuthKind, CredentialPatchCtx, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo,
+  ProviderRequestKind, RequestCtx, Result, ID_GITHUB_COPILOT,
 };
 
 #[allow(dead_code)]
@@ -200,12 +200,28 @@ impl Provider for CopilotProvider {
     crate::DESCRIPTOR.model_endpoint_rules
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     let token = ctx.bearer_token.ok_or_else(|| error::Error::Profiles {
-      message: "missing copilot bearer token for header patch".to_string(),
+      message: "missing copilot bearer token for credential injection".to_string(),
     })?;
     headers.insert(&AUTHORIZATION, HeaderValue::from_string(format!("Bearer {token}")));
     Ok(())
+  }
+
+  async fn authorize_request(
+    &self,
+    http: &reqwest::Client,
+    headers: &mut HeaderMap,
+    request_kind: ProviderRequestKind,
+  ) -> Result<()> {
+    let token = self.ensure_api_token(http).await?;
+    self.replace_credentials(
+      headers,
+      &CredentialPatchCtx {
+        request_kind,
+        bearer_token: Some(token.expose()),
+      },
+    )
   }
 
   fn normalize_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
@@ -513,6 +529,31 @@ mod tests {
     };
     let err = p.patch_headers(&mut h, &ctx).unwrap_err();
     assert!(err.to_string().contains("copilot bearer token"), "{err}");
+  }
+
+  #[tokio::test]
+  async fn copilot_authorize_request_uses_cached_token_without_normalizing_headers() {
+    let provider = CopilotProvider::from_account(Arc::new(acct_with_cached_api_token())).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("accept", "application/x-client-choice");
+    headers.insert("x-client-header", "preserved");
+    headers.insert("x-api-key", "client-api-key");
+    headers.insert("chatgpt-account-id", "client-account");
+    headers.insert("cookie", "session=client");
+
+    provider
+      .authorize_request(&reqwest::Client::new(), &mut headers, ProviderRequestKind::Opaque)
+      .await
+      .unwrap();
+
+    assert_eq!(headers.get("authorization").unwrap().as_str(), "Bearer api-tok-fixture");
+    assert_eq!(headers.get("accept").unwrap().as_str(), "application/x-client-choice");
+    assert_eq!(headers.get("x-client-header").unwrap().as_str(), "preserved");
+    assert!(headers.get("x-api-key").is_none());
+    assert!(headers.get("chatgpt-account-id").is_none());
+    assert!(headers.get("cookie").is_none());
+    assert!(headers.get("content-type").is_none());
+    assert!(headers.get("x-initiator").is_none());
   }
 
   #[test]

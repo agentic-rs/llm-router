@@ -11,8 +11,8 @@ use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
 use crate::{
-  error, AuthKind, Endpoint, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
-  TemplateVars, ID_CODEX,
+  error, AuthKind, CredentialPatchCtx, Endpoint, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind,
+  RequestCtx, Result, TemplateVars, ID_CODEX,
 };
 
 pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -221,7 +221,7 @@ impl Provider for CodexProvider {
     Some(self)
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     common::inject_codex_credentials(headers, self.credential.expose(), self.provider_account_id.as_deref());
     Ok(())
   }

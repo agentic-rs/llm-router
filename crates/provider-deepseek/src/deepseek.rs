@@ -12,8 +12,8 @@ use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-  error, AuthKind, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result, TemplateVars,
-  ID_DEEPSEEK,
+  error, AuthKind, CredentialPatchCtx, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
+  TemplateVars, ID_DEEPSEEK,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -152,7 +152,7 @@ impl Provider for DeepSeekProvider {
     Some(self)
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     headers.insert(
       &AUTHORIZATION,
       HeaderValue::from_string(format!("Bearer {}", self.api_key.expose())),

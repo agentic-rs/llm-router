@@ -11,8 +11,8 @@ pub mod config;
 
 pub use tokn_catalogue as catalogue;
 pub use tokn_core::provider::{
-  error, AuthKind, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx,
-  Result, TemplateVars, ID_GITHUB_COPILOT,
+  error, AuthKind, CredentialPatchCtx, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo,
+  ProviderRequestKind, RequestCtx, Result, TemplateVars, ID_GITHUB_COPILOT,
 };
 pub use tokn_core::{provider, util};
 

@@ -6,8 +6,9 @@ pub mod zai;
 
 pub use tokn_catalogue as catalogue;
 pub use tokn_core::provider::{
-  error, AuthKind, Endpoint, HeaderPatchCtx, ModelInfo, Provider, ProviderInfo, ProviderRequestKind, RequestCtx,
-  Result, TemplateVars, ID_ZAI, ID_ZAI_CODING_PLAN, ID_ZHIPUAI, ID_ZHIPUAI_CODING_PLAN, ZAI_PROVIDERS,
+  error, AuthKind, CredentialPatchCtx, Endpoint, HeaderPatchCtx, ModelInfo, Provider, ProviderInfo,
+  ProviderRequestKind, RequestCtx, Result, TemplateVars, ID_ZAI, ID_ZAI_CODING_PLAN, ID_ZHIPUAI,
+  ID_ZHIPUAI_CODING_PLAN, ZAI_PROVIDERS,
 };
 pub use tokn_core::{account as config, provider, util};
 

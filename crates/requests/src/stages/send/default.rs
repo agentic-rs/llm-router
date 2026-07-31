@@ -186,7 +186,7 @@ impl SendStage for DefaultSend {
 /// `dns error: failed to lookup address information`). Without this,
 /// reqwest's top-level `Display` hides everything below it and the user
 /// can't tell DNS failure from TLS failure from refused-connection.
-fn classify_provider_error(err: tokn_core::provider::Error) -> PipelineError {
+pub(super) fn classify_provider_error(err: tokn_core::provider::Error) -> PipelineError {
   use tokn_core::provider::Error as E;
   let recoverable = matches!(&err, E::Http { .. });
   let source = RequestsError::Provider {

@@ -8,8 +8,8 @@ pub mod openai;
 
 pub use tokn_catalogue as catalogue;
 pub use tokn_core::provider::{
-  error, AuthKind, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx,
-  Result, TemplateVars, ID_CODEX, ID_OPENAI,
+  error, AuthKind, CredentialPatchCtx, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo,
+  ProviderRequestKind, RequestCtx, Result, TemplateVars, ID_CODEX, ID_OPENAI,
 };
 pub use tokn_core::{account as config, provider, util};
 

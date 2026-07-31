@@ -11,8 +11,8 @@ use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-  error, AuthKind, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result, TemplateVars,
-  ID_LLAMA_CPP,
+  error, AuthKind, CredentialPatchCtx, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
+  TemplateVars, ID_LLAMA_CPP,
 };
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
@@ -106,7 +106,7 @@ impl Provider for LlamaCppProvider {
     self.info.default_models.is_empty() || self.info.default_models.iter().any(|m| m.id == model)
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     if let Some(key) = &self.api_key {
       headers.insert(
         &AUTHORIZATION,
@@ -307,9 +307,33 @@ mod tests {
   fn patch_headers_sets_authorization_with_api_key() {
     let provider = LlamaCppProvider::from_account(Arc::new(acct(Some("sk-test")))).unwrap();
     let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", "client-api-key");
+    headers.insert("chatgpt-account-id", "client-account");
+    headers.insert("cookie", "session=client");
     provider.patch_headers(&mut headers, &patch_ctx()).unwrap();
     assert_eq!(headers.get("authorization").map(|v| v.as_str()), Some("Bearer sk-test"));
+    assert!(headers.get("x-api-key").is_none());
+    assert!(headers.get("chatgpt-account-id").is_none());
+    assert!(headers.get("cookie").is_none());
     assert_eq!(provider.info().auth_kind, AuthKind::StaticApiKey);
+  }
+
+  #[tokio::test]
+  async fn authorize_request_injects_static_auth_without_normalizing_headers() {
+    let provider = LlamaCppProvider::from_account(Arc::new(acct(Some("sk-test")))).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("accept", "application/x-client-choice");
+    headers.insert("x-client-header", "preserved");
+
+    provider
+      .authorize_request(&reqwest::Client::new(), &mut headers, ProviderRequestKind::Opaque)
+      .await
+      .unwrap();
+
+    assert_eq!(headers.get("authorization").unwrap().as_str(), "Bearer sk-test");
+    assert_eq!(headers.get("accept").unwrap().as_str(), "application/x-client-choice");
+    assert_eq!(headers.get("x-client-header").unwrap().as_str(), "preserved");
+    assert!(headers.get("content-type").is_none());
   }
 
   #[tokio::test]

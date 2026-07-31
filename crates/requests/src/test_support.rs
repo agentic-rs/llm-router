@@ -9,12 +9,15 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokn_accounts::AccountHandle;
 use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
 use tokn_core::provider::error;
-use tokn_core::provider::{AuthKind, Endpoint, ModelCache, Provider, ProviderInfo, RequestCtx};
+use tokn_core::provider::{
+  AuthKind, CredentialPatchCtx, Endpoint, HeaderPatchCtx, ModelCache, Provider, ProviderInfo, RequestCtx,
+};
 use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
 
 /// One-shot canned response or error returned by a mocked provider endpoint.
@@ -31,6 +34,8 @@ pub struct MockProvider {
   responses_script: Mutex<Option<EndpointScript>>,
   messages_script: Mutex<Option<EndpointScript>>,
   header_patch: Vec<(String, String)>,
+  normalization_patch: Vec<(String, String)>,
+  credential_invalidations: Arc<AtomicUsize>,
 }
 
 impl MockProvider {
@@ -55,6 +60,8 @@ impl MockProvider {
       responses_script: Mutex::new(None),
       messages_script: Mutex::new(None),
       header_patch: Vec::new(),
+      normalization_patch: Vec::new(),
+      credential_invalidations: Arc::new(AtomicUsize::new(0)),
     }
   }
 
@@ -111,6 +118,15 @@ impl MockProvider {
     self.header_patch.push((name.to_string(), value.to_string()));
     self
   }
+
+  pub fn with_normalized_header(mut self, name: &str, value: &str) -> Self {
+    self.normalization_patch.push((name.to_string(), value.to_string()));
+    self
+  }
+
+  pub fn credential_invalidations(&self) -> Arc<AtomicUsize> {
+    self.credential_invalidations.clone()
+  }
 }
 
 #[async_trait]
@@ -124,15 +140,17 @@ impl Provider for MockProvider {
   fn input_transformer(&self) -> Option<&dyn InputTransformer> {
     self.transformer.as_deref()
   }
-  fn patch_headers(
-    &self,
-    headers: &mut HeaderMap,
-    _ctx: &tokn_core::provider::HeaderPatchCtx<'_>,
-  ) -> error::Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> error::Result<()> {
     for (name, value) in &self.header_patch {
       headers.insert(HeaderName::new(name.clone()), HeaderValue::from_string(value.clone()));
     }
     Ok(())
+  }
+  fn normalize_headers(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> error::Result<Option<HeaderMap>> {
+    for (name, value) in &self.normalization_patch {
+      headers.insert(HeaderName::new(name.clone()), HeaderValue::from_string(value.clone()));
+    }
+    Ok(None)
   }
   async fn list_models(&self, _http: &reqwest::Client) -> error::Result<Value> {
     Ok(Value::Null)
@@ -163,6 +181,9 @@ impl Provider for MockProvider {
         unimplemented!("MockProvider::messages: no script armed; call with_messages_response/with_messages_error")
       }
     }
+  }
+  fn on_unauthorized(&self) {
+    self.credential_invalidations.fetch_add(1, Ordering::Relaxed);
   }
 }
 

@@ -6,8 +6,9 @@
 //! from [`PipelineCtx::config`]), the HTTP method is the inbound method
 //! (also in the bag), and the headers are the pre-pruned [`BuiltHeaders`]
 //! from [`PassthroughBuildHeaders`](super::super::build_headers::PassthroughBuildHeaders)
-//! — including the client's own `Authorization`, which we preserve
-//! verbatim. No auth injection, no URL rewriting, no provider hooks.
+//! — including the client's own `Authorization`. Account-owned relay routes
+//! may replace only credential headers through `Provider::authorize_request`;
+//! provider normalization and URL rewriting are never applied here.
 //!
 //! The body sent on the wire is `ConvertedRequest::upstream_wire_body`,
 //! which for the passthrough variant is the inbound raw bytes
@@ -19,7 +20,7 @@
 
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
-use crate::pipeline::error::{PipelineError, ProviderError, RequestsError};
+use crate::pipeline::error::{PipelineError, RequestsError};
 use crate::pipeline::stages::{
   provider_request_kind, resolved_upstream_endpoint, BuiltHeaders, ConvertedRequest, Extracted, Resolved, SendStage,
   SentResponse,
@@ -27,10 +28,10 @@ use crate::pipeline::stages::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use smol_str::SmolStr;
-use tokn_core::provider::HeaderPatchCtx;
 use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
+use super::default::classify_provider_error;
 use crate::stages::resolve::proxy::keys;
 
 fn proxy_send_error_hint(err_text: &str, has_inner_source: bool) -> &'static str {
@@ -64,8 +65,8 @@ pub mod send_keys {
   /// `"http"` (test fixtures pointing at plain HTTP mock servers).
   /// Defaults to `"https"` when absent.
   pub const SCHEME: &str = "proxy.scheme";
-  /// When true, the selected provider patches auth onto the outbound
-  /// request before proxy dispatch.
+  /// When true, the selected provider replaces account-owned credentials on
+  /// the outbound request without normalizing any other relay headers.
   pub const INJECT_AUTH: &str = "proxy.inject_auth";
 }
 
@@ -121,31 +122,13 @@ impl SendStage for ProxySend {
       .unwrap_or(false);
     let mut outbound_headers = headers.headers.clone();
     if inject_auth {
+      let request_kind = provider_request_kind(ctx, resolved, Stage::Send)?;
       resolved
         .account_handle
         .provider
-        .patch_headers(
-          &mut outbound_headers,
-          &HeaderPatchCtx {
-            request_kind: provider_request_kind(ctx, resolved, Stage::Send)?,
-            body: body.upstream_body.as_ref(),
-            bearer_token: None,
-            content_encoding: body.content_encoding.map(|e| e.as_str()),
-            stream: extracted.stream,
-            initiator: extracted.initiator.as_deref().unwrap_or("user"),
-            inbound_headers: &HeaderMap::new(),
-            vars: &headers.vars,
-            agent_id: &headers.agent_id,
-          },
-        )
-        .map_err(|err| {
-          PipelineError::permanent(
-            Stage::Send,
-            RequestsError::Provider {
-              source: ProviderError::new(err),
-            },
-          )
-        })?;
+        .authorize_request(&self.http, &mut outbound_headers, request_kind)
+        .await
+        .map_err(classify_provider_error)?;
     }
 
     // The proxy build-header stage preserves Host so the request record
@@ -197,6 +180,10 @@ impl SendStage for ProxySend {
       status,
       headers: resp_headers.clone(),
     });
+
+    if status == 401 && inject_auth {
+      resolved.account_handle.invalidate_credentials();
+    }
 
     if status >= 500 {
       let body_text = match resp.text().await {
@@ -348,6 +335,12 @@ mod tests {
   }
 
   async fn one_shot_raw_http_server() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+    one_shot_raw_http_server_with_status("200 OK").await
+  }
+
+  async fn one_shot_raw_http_server_with_status(
+    status: &'static str,
+  ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
@@ -356,10 +349,8 @@ mod tests {
       let mut buf = vec![0_u8; 8192];
       let n = stream.read(&mut buf).await.unwrap();
       buf.truncate(n);
-      stream
-        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-        .await
-        .unwrap();
+      let response = format!("HTTP/1.1 {status}\r\ncontent-length: 2\r\n\r\nok");
+      stream.write_all(response.as_bytes()).await.unwrap();
       stream.flush().await.unwrap();
       let _ = tx.send(buf);
     });
@@ -405,13 +396,13 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn injects_router_managed_auth_when_enabled() {
+  async fn opaque_relay_injects_account_auth_without_normalizing_headers() {
     let (addr, rx) = one_shot_raw_http_server().await;
 
     let ctx = ctx_with(
       RunConfig::builder()
         .with_str(keys::HOST, addr.to_string())
-        .with_str(send_keys::PATH, "/v1/chat/completions")
+        .with_str(send_keys::PATH, "/v1/experimental/agents")
         .with_str(send_keys::METHOD, "POST")
         .with_str(send_keys::SCHEME, "http")
         .with(send_keys::INJECT_AUTH, true)
@@ -421,18 +412,31 @@ mod tests {
       agent_id: None,
       model: SmolStr::new("gpt-4"),
       upstream_model: SmolStr::new("gpt-4"),
-      route: ResolvedRoute::operation(Endpoint::ChatCompletions, Endpoint::ChatCompletions),
+      route: ResolvedRoute::provider_traffic(ProviderRequestKind::Opaque),
       account_id: SmolStr::new("acct"),
       provider_id: SmolStr::new("mock"),
       account_handle: mock_handle_with_provider(
         "acct",
-        MockProvider::new("mock").with_header("authorization", "Bearer router-token"),
+        MockProvider::new("mock")
+          .with_header("authorization", "Bearer router-token")
+          .with_normalized_header("x-provider-normalized", "must-not-appear"),
       ),
     };
 
     let send = ProxySend::new(reqwest::Client::new());
+    let mut request_headers = fake_headers();
+    request_headers
+      .headers
+      .insert(HeaderName::new("x-api-key"), HeaderValue::from_static("client-api-key"));
+    request_headers.headers.insert(
+      HeaderName::new("chatgpt-account-id"),
+      HeaderValue::from_static("client-account"),
+    );
+    request_headers
+      .headers
+      .insert(HeaderName::new("cookie"), HeaderValue::from_static("session=client"));
     let sent = send
-      .send(&ctx, &fake_extracted(), &resolved, &fake_headers(), &fake_body())
+      .send(&ctx, &fake_extracted(), &resolved, &request_headers, &fake_body())
       .await
       .unwrap();
     assert_eq!(sent.status, 200);
@@ -440,10 +444,49 @@ mod tests {
     let raw_req = String::from_utf8_lossy(&rx.await.unwrap()).to_ascii_lowercase();
     assert!(raw_req.contains("authorization: bearer router-token"));
     assert!(!raw_req.contains("authorization: bearer client-token"));
+    assert!(!raw_req.contains("x-api-key"));
+    assert!(!raw_req.contains("chatgpt-account-id"));
+    assert!(!raw_req.contains("cookie:"));
+    assert!(raw_req.contains("user-agent: test"));
+    assert!(!raw_req.contains("x-provider-normalized"));
   }
 
   #[tokio::test]
-  async fn injects_router_managed_auth_for_custom_paths() {
+  async fn account_authorized_401_invalidates_cached_provider_credentials() {
+    let (addr, rx) = one_shot_raw_http_server_with_status("401 Unauthorized").await;
+    let ctx = ctx_with(
+      RunConfig::builder()
+        .with_str(keys::HOST, addr.to_string())
+        .with_str(send_keys::PATH, "/v1/experimental/agents")
+        .with_str(send_keys::METHOD, "POST")
+        .with_str(send_keys::SCHEME, "http")
+        .with(send_keys::INJECT_AUTH, true)
+        .build(),
+    );
+    let provider = MockProvider::new("mock").with_header("authorization", "Bearer router-token");
+    let invalidations = provider.credential_invalidations();
+    let resolved = Resolved {
+      agent_id: None,
+      model: SmolStr::new("unknown"),
+      upstream_model: SmolStr::new("unknown"),
+      route: ResolvedRoute::provider_traffic(ProviderRequestKind::Opaque),
+      account_id: SmolStr::new("acct"),
+      provider_id: SmolStr::new("mock"),
+      account_handle: mock_handle_with_provider("acct", provider),
+    };
+
+    let sent = ProxySend::new(reqwest::Client::new())
+      .send(&ctx, &fake_extracted(), &resolved, &fake_headers(), &fake_body())
+      .await
+      .unwrap();
+
+    assert_eq!(sent.status, 401);
+    let _ = rx.await.unwrap();
+    assert_eq!(invalidations.load(std::sync::atomic::Ordering::Relaxed), 1);
+  }
+
+  #[tokio::test]
+  async fn relay_injects_account_auth_for_models_path() {
     let (addr, rx) = one_shot_raw_http_server().await;
 
     let ctx = ctx_with(
