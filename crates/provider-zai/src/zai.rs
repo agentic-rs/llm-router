@@ -211,12 +211,12 @@ impl Provider for ZaiProvider {
     fields(account = %self.id, key_fp = %self.api_key.fingerprint(), status = tracing::field::Empty, count = tracing::field::Empty),
   )]
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
-    let url = format!("{}models", self.target.base_url());
+    let url = self.target.base_url().operation_url(["models"])?;
     debug!(%url, "GET zai models");
     let resp = crate::util::http::send(
       http,
       Method::GET,
-      &url,
+      url.as_str(),
       self.auth_headers(false)?,
       None,
       None,
@@ -259,7 +259,7 @@ impl Provider for ZaiProvider {
     span.record("model", model_id);
     span.record("reasoning", reasoning);
 
-    let url = format!("{}chat/completions", self.target.base_url());
+    let url = self.target.base_url().operation_url(["chat", "completions"])?;
     debug!(%url, "POST zai chat");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -280,7 +280,7 @@ impl Provider for ZaiProvider {
     let resp = crate::util::http::send(
       ctx.http,
       Method::POST,
-      &url,
+      url.as_str(),
       headers,
       Some(body_bytes),
       ctx.outbound.as_ref(),
@@ -396,6 +396,15 @@ mod tests {
     let provider = ZaiProvider::from_account_at(std::sync::Arc::new(account), target).unwrap();
 
     assert_eq!(provider.target.base_url().as_str(), "https://gateway.example/zai/");
+    assert_eq!(
+      provider
+        .target
+        .base_url()
+        .operation_url(["chat", "completions"])
+        .unwrap()
+        .as_str(),
+      "https://gateway.example/zai/chat/completions"
+    );
     assert_eq!(provider.info().upstream_url, "https://gateway.example/zai/");
     assert!(std::sync::Arc::ptr_eq(&provider.info().model_cache, &cache));
   }
