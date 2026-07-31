@@ -13,7 +13,8 @@ pub use provider_graph::{
 };
 pub use resolve::{
   resolve_managed_target, resolve_relay_target, NoEligibleReason, QualificationSyntaxError, RelayDestination,
-  SelectedManagedTarget, SelectedRelayTarget, SelectionToken, TargetResolution, TargetResolveError,
+  SelectedManagedTarget, SelectedRelayTarget, SelectionOutcome, SelectionSettlement, SelectionToken, TargetResolution,
+  TargetResolveError,
 };
 pub use routes::{
   link_routes, LinkedFallbackSelector, LinkedManagedRoute, LinkedModelCandidate, LinkedModelGroup, LinkedModelSelector,
