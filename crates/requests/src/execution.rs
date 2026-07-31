@@ -13,13 +13,12 @@ pub use managed::{
 };
 pub use opaque::{OpaqueAttemptError, OpaqueHttpAttempt, OpaqueHttpExecutor, OpaqueHttpTarget};
 
-use http::{uri::PathAndQuery, Method, StatusCode};
+use http::{uri::PathAndQuery, HeaderMap, HeaderName, Method, StatusCode};
 use std::collections::BTreeSet;
 use tokn_accounts::link::{RelayDestination, SelectedManagedTarget, SelectedRelayTarget, SelectionOutcome};
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, InvalidRequestUrl};
 use tokn_core::AgentId;
-use tokn_headers::HeaderMap;
 
 const FORWARD_STRIPPED_HEADERS: &[&str] = &[
   "connection",
@@ -38,24 +37,23 @@ const FORWARD_STRIPPED_HEADERS: &[&str] = &[
 
 /// Copy end-to-end inbound headers for a new outbound HTTP connection.
 ///
-/// The returned map preserves order, original casing, duplicate values, and
-/// credentials. Relay authorization may replace credentials afterward;
-/// transparent forwarding leaves them untouched. Transport-derived fields,
-/// router controls, and every extension named by `Connection` are removed.
+/// The returned native map preserves duplicate and arbitrary byte-valued
+/// headers. Relay authorization may replace credentials afterward;
+/// transparent forwarding leaves end-to-end fields untouched.
+/// Transport-derived fields, router controls, and every valid extension name
+/// nominated by `Connection` are removed.
 pub fn sanitize_forward_headers(inbound: &HeaderMap) -> HeaderMap {
   let mut stripped = FORWARD_STRIPPED_HEADERS
     .iter()
     .map(|name| (*name).to_string())
     .collect::<BTreeSet<_>>();
   for value in inbound.get_all("connection") {
-    stripped.extend(
-      value
-        .as_str()
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_ascii_lowercase),
-    );
+    for token in value.as_bytes().split(|byte| *byte == b',') {
+      let token = trim_optional_whitespace(token);
+      if let Ok(name) = HeaderName::from_bytes(token) {
+        stripped.insert(name.as_str().to_string());
+      }
+    }
   }
 
   let mut outbound = HeaderMap::with_capacity(inbound.len());
@@ -67,6 +65,18 @@ pub fn sanitize_forward_headers(inbound: &HeaderMap) -> HeaderMap {
     outbound.append(name.clone(), value.clone());
   }
   outbound
+}
+
+fn trim_optional_whitespace(value: &[u8]) -> &[u8] {
+  let start = value
+    .iter()
+    .position(|byte| !matches!(*byte, b' ' | b'\t'))
+    .unwrap_or(value.len());
+  let end = value
+    .iter()
+    .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+    .map_or(start, |position| position + 1);
+  &value[start..end]
 }
 
 fn is_router_owned_header(name: &str) -> bool {
@@ -279,12 +289,11 @@ impl<'a> TransparentExecutionTarget<'a> {
 mod tests {
   use super::*;
   use tokn_core::upstream_url::CleartextHttpPolicy;
-  use tokn_headers::{HeaderName, HeaderValue};
 
   fn headers(values: &[(&str, &str)]) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in values {
-      headers.append(HeaderName::new(*name), HeaderValue::from_string((*value).to_string()));
+      headers.append(HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
     }
     headers
   }
@@ -325,20 +334,31 @@ mod tests {
       assert!(!outbound.contains_key(removed), "header {removed}");
     }
     assert_eq!(
-      outbound.get("authorization").map(|value| value.as_str()),
+      outbound.get("authorization").and_then(|value| value.to_str().ok()),
       Some("Bearer upstream-secret")
     );
     assert_eq!(
-      outbound.get("cookie").map(|value| value.as_str()),
+      outbound.get("cookie").and_then(|value| value.to_str().ok()),
       Some("session=upstream")
     );
     assert_eq!(
       outbound
         .get_all("x-end-to-end")
-        .map(|value| value.as_str())
+        .iter()
+        .map(|value| value.to_str().unwrap())
         .collect::<Vec<_>>(),
       ["first", "second"]
     );
+  }
+
+  #[test]
+  fn forward_sanitizer_preserves_non_utf8_end_to_end_values() {
+    let mut inbound = HeaderMap::new();
+    inbound.append("x-opaque", http::HeaderValue::from_bytes(b"\x80binary").unwrap());
+
+    let outbound = sanitize_forward_headers(&inbound);
+
+    assert_eq!(outbound["x-opaque"].as_bytes(), b"\x80binary");
   }
 
   #[test]
