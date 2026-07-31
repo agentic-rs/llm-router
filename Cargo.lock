@@ -3094,6 +3094,7 @@ dependencies = [
  "tokn-catalogue",
  "tokn-core",
  "tokn-headers",
+ "tokn-mock-server",
  "toml",
  "tracing",
 ]
