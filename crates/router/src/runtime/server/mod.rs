@@ -6,6 +6,7 @@
 mod admission;
 mod auth;
 mod bind;
+mod body;
 mod response;
 
 pub use admission::{
@@ -17,5 +18,8 @@ pub use auth::{authenticate_forward_proxy_client, authenticate_llm_api_client, C
 pub use bind::{
   bind_gateway_listeners, BoundGatewayListeners, BoundListener, ListenerBindError, ListenerBindResult,
   ListenerServerState,
+};
+pub use body::{
+  buffer_matched_body, BufferedRequestBody, ManagedRequestBody, RequestBodyError, RequestBodyLimits, RequestBodyResult,
 };
 pub use response::{managed_response_to_axum, opaque_response_to_axum, ResponseBridgeError, ResponseBridgeResult};
