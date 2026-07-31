@@ -7,6 +7,7 @@ mod admission;
 mod auth;
 mod bind;
 mod body;
+mod error;
 mod response;
 mod state;
 
@@ -20,6 +21,7 @@ pub use bind::{bind_gateway_listeners, BoundGatewayListeners, BoundListener, Lis
 pub use body::{
   buffer_matched_body, BufferedRequestBody, ManagedRequestBody, RequestBodyError, RequestBodyLimits, RequestBodyResult,
 };
+pub use error::{AuthBoundary, ServerError};
 pub use response::{managed_response_to_axum, opaque_response_to_axum, ResponseBridgeError, ResponseBridgeResult};
 pub use state::{
   GatewayServerState, GatewayServerStateError, GatewayServerStateResult, GatewayServingDefaults, ListenerServerState,
