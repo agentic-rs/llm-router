@@ -1,7 +1,13 @@
+mod listeners;
 mod matchers;
 mod names;
 mod profiles;
 
+pub use listeners::{
+  link_listeners, BindingKind, ConnectActionSite, HttpActionSite, LinkedConnectDecision, LinkedConnectPolicy,
+  LinkedConnectRule, LinkedForwardProxyPolicy, LinkedHttpAction, LinkedHttpBinding, LinkedHttpDecision,
+  LinkedHttpPolicy, LinkedListener, LinkedListenerKind, LinkedListeners, ListenerLinkError, ListenerLinkResult,
+};
 pub use matchers::{
   link_connect_matcher, link_http_matcher, ConnectFactsError, ConnectFactsResult, ConnectRequestFacts,
   HttpRequestFacts, LinkedConnectMatcher, LinkedHttpMatcher, MatcherLinkError, MatcherLinkResult,
