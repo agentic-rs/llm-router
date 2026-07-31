@@ -1,0 +1,19 @@
+//! Dependency-light request policy types shared by configuration and runtime crates.
+//!
+//! This crate deliberately contains no configuration-file representation and no
+//! request execution code. Configuration compilers produce these values, while
+//! runtime crates consume them without depending on TOML shape or compatibility
+//! aliases.
+
+mod id;
+mod route;
+
+pub use id::{
+  AccountPoolId, BindingId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId, ProfileId,
+  RetryPolicyId, RouteId, UpstreamId, WireIdentityId,
+};
+pub use route::{
+  CredentialPolicy, DestinationPolicy, FallbackSelector, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget,
+  ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, QualificationNamespace, RelayRetry, RelayRoute,
+  RelayTarget, RouteKind, RoutePlan, UpstreamSelector, WireIdentity,
+};

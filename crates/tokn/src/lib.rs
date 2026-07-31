@@ -11,6 +11,7 @@ pub mod endpoint {
   pub use tokn_endpoint_responses as responses;
 }
 pub use tokn_headers as headers;
+pub use tokn_policy as policy;
 pub mod provider {
   pub use tokn_provider_copilot as copilot;
   pub use tokn_provider_deepseek as deepseek;
