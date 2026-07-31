@@ -58,17 +58,21 @@ pub async fn authenticate_llm_api_client(
   Ok(context)
 }
 
-/// Authenticate a forward-proxy client and strip only its proxy credential on success.
+/// Authenticate a forward-proxy client and consume its proxy credential.
 ///
 /// Local-key proxy listeners accept exactly one bearer `Proxy-Authorization`
 /// value. `Authorization` and `x-api-key` belong to the origin request and are
-/// never consumed by this authentication boundary.
+/// never consumed by this authentication boundary. `Proxy-Authorization` is
+/// hop-by-hop, so it is also stripped when authentication is disabled.
 pub async fn authenticate_forward_proxy_client(
   client_auth: &MaterializedClientAuth,
   headers: &mut HeaderMap,
 ) -> Result<AccessContext, ClientAuthError> {
   let store = match client_auth {
-    MaterializedClientAuth::None => return Ok(AccessContext::unrestricted()),
+    MaterializedClientAuth::None => {
+      headers.remove(header::PROXY_AUTHORIZATION);
+      return Ok(AccessContext::unrestricted());
+    }
     MaterializedClientAuth::LocalKeys(store) => store,
   };
   let value = single_header(headers, header::PROXY_AUTHORIZATION.as_str())
@@ -148,7 +152,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn disabled_auth_is_unrestricted_and_preserves_headers() {
+  async fn disabled_auth_is_unrestricted_and_proxy_auth_is_consumed_at_proxy_boundary() {
     let mut headers = HeaderMap::new();
     headers.append(header::AUTHORIZATION, HeaderValue::from_static("Bearer origin-secret"));
     headers.append(API_KEY_HEADER, HeaderValue::from_static("origin-api-key"));
@@ -168,7 +172,9 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(access, AccessContext::unrestricted());
-    assert_eq!(headers, original);
+    assert_eq!(headers[header::AUTHORIZATION], original[header::AUTHORIZATION]);
+    assert_eq!(headers[API_KEY_HEADER], original[API_KEY_HEADER]);
+    assert!(!headers.contains_key(header::PROXY_AUTHORIZATION));
   }
 
   #[tokio::test]
