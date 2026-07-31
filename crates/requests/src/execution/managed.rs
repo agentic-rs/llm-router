@@ -10,7 +10,6 @@ mod response;
 pub use response::{ManagedClientBody, ManagedClientResponse, ManagedResponseAdapter, ManagedResponseError};
 
 use super::ManagedExecutionTarget;
-use crate::utils::codec::{decode_json_request, encode_body_bytes, CodecError, ContentEncodingKind};
 use bytes::Bytes;
 use serde_json::Value;
 use snafu::Snafu;
@@ -25,15 +24,18 @@ use tokn_headers::registry::build_wire_identity_headers;
 use tokn_headers::{HeaderMap, TemplateVars};
 
 /// Borrowed structured input for exactly one selected managed attempt.
+///
+/// Ingress has already decoded any content encoding and parsed `body`. Managed
+/// execution therefore works only from this authoritative semantic JSON value.
 #[derive(Clone, Copy, Debug)]
 pub struct ManagedHttpAttempt<'a> {
   target: ManagedExecutionTarget<'a>,
   headers: &'a HeaderMap,
-  body: &'a Bytes,
+  body: &'a Value,
 }
 
 impl<'a> ManagedHttpAttempt<'a> {
-  pub fn new(target: ManagedExecutionTarget<'a>, headers: &'a HeaderMap, body: &'a Bytes) -> Self {
+  pub fn new(target: ManagedExecutionTarget<'a>, headers: &'a HeaderMap, body: &'a Value) -> Self {
     Self { target, headers, body }
   }
 
@@ -45,7 +47,7 @@ impl<'a> ManagedHttpAttempt<'a> {
     self.headers
   }
 
-  pub fn body(&self) -> &'a Bytes {
+  pub fn body(&self) -> &'a Value {
     self.body
   }
 }
@@ -124,9 +126,6 @@ impl ManagedHttpResponse {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum ManagedAttemptError {
-  #[snafu(display("invalid managed request body: {source}"))]
-  InvalidRequest { source: CodecError },
-
   #[snafu(display("managed request body must be a JSON object"))]
   BodyObjectRequired,
 
@@ -152,9 +151,6 @@ pub enum ManagedAttemptError {
   #[snafu(display("could not serialize managed request: {source}"))]
   RequestSerialization { source: serde_json::Error },
 
-  #[snafu(display("could not encode managed request: {source}"))]
-  RequestEncoding { source: CodecError },
-
   #[snafu(display("provider '{provider}' could not send managed request: {source}"))]
   ProviderRequest { provider: String, source: ProviderError },
 }
@@ -164,13 +160,11 @@ impl ManagedAttemptError {
   pub fn selection_outcome(&self) -> SelectionOutcome {
     match self {
       Self::ProviderRequest { source, .. } => classify_provider_error(source),
-      Self::InvalidRequest { .. }
-      | Self::BodyObjectRequired
+      Self::BodyObjectRequired
       | Self::DispatchBodyMismatch { .. }
       | Self::RequestConversion { .. }
       | Self::InputTransform { .. }
-      | Self::RequestSerialization { .. }
-      | Self::RequestEncoding { .. } => SelectionOutcome::Unchanged,
+      | Self::RequestSerialization { .. } => SelectionOutcome::Unchanged,
     }
   }
 }
@@ -223,7 +217,7 @@ impl ManagedHttpExecutor {
       http: &self.http,
       body: &prepared.body,
       body_bytes: Some(&prepared.wire_body),
-      content_encoding: prepared.encoding.map(ContentEncodingKind::as_str),
+      content_encoding: None,
       stream: prepared.upstream_stream,
       initiator: prepared.initiator.as_deref().unwrap_or("user"),
       inbound_headers: attempt.headers(),
@@ -254,14 +248,13 @@ struct PrepareInput<'a> {
   upstream_model: &'a str,
   upstream_operation: Endpoint,
   headers: &'a HeaderMap,
-  body: &'a Bytes,
+  body: &'a Value,
   wire_identity: Option<&'a AgentId>,
 }
 
 struct PreparedManagedRequest {
   body: Value,
   wire_body: Bytes,
-  encoding: Option<ContentEncodingKind>,
   requested_stream: bool,
   upstream_stream: bool,
   initiator: Option<String>,
@@ -274,9 +267,7 @@ fn prepare_managed_request(
   provider_id: &str,
   transformer: Option<&dyn InputTransformer>,
 ) -> Result<PreparedManagedRequest, ManagedAttemptError> {
-  let decoded = decode_json_request(input.headers, input.body.clone())
-    .map_err(|source| ManagedAttemptError::InvalidRequest { source })?;
-  let Some(original) = decoded.value.as_object() else {
+  let Some(original) = input.body.as_object() else {
     return Err(ManagedAttemptError::BodyObjectRequired);
   };
   let actual_model = original.get("model").and_then(Value::as_str);
@@ -287,9 +278,9 @@ fn prepare_managed_request(
     });
   }
 
-  let requested_stream = infer_stream(input.headers, &decoded.value);
-  let initiator = infer_initiator(input.headers, &decoded.value);
-  let mut upstream_body = decoded.value.clone();
+  let requested_stream = infer_stream(input.headers, input.body);
+  let initiator = infer_initiator(input.headers, input.body);
+  let mut upstream_body = input.body.clone();
   apply_messages_compat_default(input.requested_operation, &mut upstream_body);
   upstream_body
     .as_object_mut()
@@ -316,14 +307,9 @@ fn prepare_managed_request(
     .get("stream")
     .and_then(Value::as_bool)
     .unwrap_or(requested_stream);
-  let wire_body = if upstream_body == decoded.value {
-    decoded.raw_body
-  } else {
-    let serialized =
-      serde_json::to_vec(&upstream_body).map_err(|source| ManagedAttemptError::RequestSerialization { source })?;
-    encode_body_bytes(&serialized, decoded.encoding)
-      .map_err(|source| ManagedAttemptError::RequestEncoding { source })?
-  };
+  let wire_body = serde_json::to_vec(&upstream_body)
+    .map(Bytes::from)
+    .map_err(|source| ManagedAttemptError::RequestSerialization { source })?;
   let vars = build_template_vars(input.headers);
   let client_headers = input
     .wire_identity
@@ -333,7 +319,6 @@ fn prepare_managed_request(
   Ok(PreparedManagedRequest {
     body: upstream_body,
     wire_body,
-    encoding: decoded.encoding,
     requested_stream,
     upstream_stream,
     initiator,
@@ -437,7 +422,7 @@ mod tests {
 
   fn input<'a>(
     headers: &'a HeaderMap,
-    body: &'a Bytes,
+    body: &'a Value,
     requested_operation: Endpoint,
     upstream_operation: Endpoint,
   ) -> PrepareInput<'a> {
@@ -453,14 +438,12 @@ mod tests {
   }
 
   #[test]
-  fn preparation_rewrites_model_reencodes_gzip_and_tracks_both_stream_modes() {
-    let inbound_json = serde_json::json!({
+  fn preparation_rewrites_model_serializes_identity_json_and_tracks_both_stream_modes() {
+    let body = serde_json::json!({
       "model": "client-model",
       "input": "hello",
       "stream": false
     });
-    let decoded = serde_json::to_vec(&inbound_json).unwrap();
-    let body = encode_body_bytes(&decoded, Some(ContentEncodingKind::Gzip)).unwrap();
     let headers = headers(&[("Content-Encoding", "gzip"), ("X-Initiator", " Agent ")]);
 
     let prepared = prepare_managed_request(
@@ -476,14 +459,21 @@ mod tests {
     assert!(prepared.upstream_stream);
     assert_eq!(prepared.initiator.as_deref(), Some("agent"));
     assert!(prepared.client_headers.is_empty());
-    let round_trip = decode_json_request(&headers, prepared.wire_body).unwrap();
-    assert_eq!(round_trip.value, prepared.body);
+    let round_trip: Value = serde_json::from_slice(&prepared.wire_body).unwrap();
+    assert_eq!(round_trip, prepared.body);
+    assert_eq!(
+      prepared.wire_body,
+      Bytes::from(serde_json::to_vec(&prepared.body).unwrap())
+    );
   }
 
   #[test]
   fn preparation_converts_operation_after_rewriting_model() {
-    let body =
-      Bytes::from_static(br#"{"model":"client-model","input":[{"role":"user","content":"hello"}],"stream":true}"#);
+    let body = serde_json::json!({
+      "model": "client-model",
+      "input": [{"role": "user", "content": "hello"}],
+      "stream": true
+    });
     let prepared = prepare_managed_request(
       input(&HeaderMap::new(), &body, Endpoint::Responses, Endpoint::ChatCompletions),
       "llama-cpp",
@@ -498,21 +488,21 @@ mod tests {
   }
 
   #[test]
-  fn unchanged_preparation_reuses_the_exact_wire_body() {
-    let body = Bytes::from_static(b"{ \"model\" : \"client-model\", \"messages\" : [] }");
+  fn unchanged_preparation_serializes_the_parsed_body() {
+    let body = serde_json::json!({"model": "client-model", "messages": []});
     let headers = HeaderMap::new();
     let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
     input.upstream_model = "client-model";
 
     let prepared = prepare_managed_request(input, "llama-cpp", None).unwrap();
 
-    assert_eq!(prepared.wire_body, body);
-    assert_eq!(prepared.wire_body.as_ptr(), body.as_ptr());
+    assert_eq!(prepared.body, body);
+    assert_eq!(prepared.wire_body, Bytes::from(serde_json::to_vec(&body).unwrap()));
   }
 
   #[test]
   fn messages_default_is_applied_before_sending() {
-    let body = Bytes::from_static(br#"{"model":"client-model","messages":[]}"#);
+    let body = serde_json::json!({"model": "client-model", "messages": []});
     let prepared = prepare_managed_request(
       input(&HeaderMap::new(), &body, Endpoint::Messages, Endpoint::Messages),
       "deepseek",
@@ -525,7 +515,7 @@ mod tests {
 
   #[test]
   fn dispatch_body_mismatch_is_local_and_does_not_penalize_selection() {
-    let body = Bytes::from_static(br#"{"model":"different"}"#);
+    let body = serde_json::json!({"model": "different"});
     let error = prepare_managed_request(
       input(
         &HeaderMap::new(),
@@ -544,8 +534,28 @@ mod tests {
   }
 
   #[test]
+  fn non_object_body_is_rejected_without_penalizing_selection() {
+    let body = serde_json::json!([{"model": "client-model"}]);
+    let error = prepare_managed_request(
+      input(
+        &HeaderMap::new(),
+        &body,
+        Endpoint::ChatCompletions,
+        Endpoint::ChatCompletions,
+      ),
+      "openai",
+      None,
+    )
+    .err()
+    .unwrap();
+
+    assert!(matches!(error, ManagedAttemptError::BodyObjectRequired));
+    assert_eq!(error.selection_outcome(), SelectionOutcome::Unchanged);
+  }
+
+  #[test]
   fn explicit_wire_identity_builds_headers_from_inbound_correlation() {
-    let body = Bytes::from_static(br#"{"model":"client-model","messages":[]}"#);
+    let body = serde_json::json!({"model": "client-model", "messages": []});
     let headers = headers(&[("X-Session-Id", "session-1")]);
     let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
     input.wire_identity = Some(&AgentId::Opencode);

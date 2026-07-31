@@ -16,7 +16,9 @@ pub use dispatch::{
   match_http, HttpDispatchError, HttpDispatchResult, HttpDispatchSite, HttpRequestHead, HttpRequestSemantics,
   HttpRouteMatch, MatchedHttpRoute, RoutedHttpDispatch,
 };
-pub use execution::{HttpExecutionCoordinator, HttpExecutionError, HttpExecutionOutcome, HttpExecutionResult};
+pub use execution::{
+  HttpExecutionCoordinator, HttpExecutionError, HttpExecutionOutcome, HttpExecutionRequest, HttpExecutionResult,
+};
 pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
 pub use listeners::{
   link_listeners, BindingKind, ConnectActionSite, HttpActionSite, LinkedConnectDecision, LinkedConnectPolicy,
