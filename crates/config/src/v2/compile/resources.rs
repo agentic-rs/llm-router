@@ -3,15 +3,14 @@ use crate::v2::{
   RawOperationPolicy, RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget, RawRoute, RawUpstream,
   RawUpstreamSelector, RawWireIdentity,
 };
-use reqwest::Url;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_policy::{
-  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, CanonicalAuthority, CanonicalHost,
-  FallbackSelector, ManagedRetry, ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan,
-  ModelSelector, OperationPolicy, ProfileId, ProfilePlan, ProviderId, QualificationNamespace, RelayRetry, RelayRoute,
-  RelayTarget, RouteId, RouteKind, RoutePlan, SessionAffinityPlan, UpstreamId, UpstreamOrigin, UpstreamPlan,
-  UpstreamSelector, WireIdentity, WireIdentityId,
+  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, FallbackSelector, ManagedRetry,
+  ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan, ModelSelector, OperationPolicy, ProfileId,
+  ProfilePlan, ProviderId, QualificationNamespace, RelayRetry, RelayRoute, RelayTarget, RouteId, RouteKind, RoutePlan,
+  SessionAffinityPlan, UpstreamId, UpstreamOrigin, UpstreamPlan, UpstreamSelector, WireIdentity, WireIdentityId,
 };
 
 const MAX_FAILURE_COOLDOWN_SECS: u64 = 86_400;
@@ -245,126 +244,24 @@ fn canonical_base_url(
   location: String,
   allow_insecure_http: bool,
 ) -> Result<(String, String), CompileError> {
-  let parsed = parse_http_url(value, &location, allow_insecure_http)?;
-  if parsed.query().is_some() || parsed.fragment().is_some() {
-    return Err(invalid_value(location, "base URL must not contain a query or fragment"));
-  }
-
-  let origin = parsed.origin().ascii_serialization();
-  let mut base_url = parsed.to_string();
-  if !base_url.ends_with('/') {
-    base_url.push('/');
-  }
-  Ok((base_url, origin))
+  let parsed = CanonicalUpstreamUrl::parse(value, cleartext_policy(allow_insecure_http))
+    .map_err(|error| invalid_value(location, error.to_string()))?;
+  let origin = parsed.origin().to_string();
+  Ok((parsed.to_string(), origin))
 }
 
 fn canonical_origin(value: &str, location: String, allow_insecure_http: bool) -> Result<String, CompileError> {
-  let parsed = parse_http_url(value, &location, allow_insecure_http)?;
-  if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
-    return Err(invalid_value(location, "expected only scheme, host, and optional port"));
-  }
-  Ok(parsed.origin().ascii_serialization())
+  CanonicalHttpOrigin::parse(value, cleartext_policy(allow_insecure_http))
+    .map(|origin| origin.to_string())
+    .map_err(|error| invalid_value(location, error.to_string()))
 }
 
-fn parse_http_url(value: &str, location: &str, allow_insecure_http: bool) -> Result<Url, CompileError> {
-  let raw_authority = validate_raw_http_url(value, location)?;
-  let parsed =
-    Url::parse(value).map_err(|error| invalid_value(location.to_string(), format!("invalid URL: {error}")))?;
-  if !matches!(parsed.scheme(), "http" | "https") {
-    return Err(invalid_value(location.to_string(), "scheme must be http or https"));
+fn cleartext_policy(allow_insecure_http: bool) -> CleartextHttpPolicy {
+  if allow_insecure_http {
+    CleartextHttpPolicy::Allow
+  } else {
+    CleartextHttpPolicy::LoopbackOnly
   }
-  if parsed.host().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must contain a host and must not contain credentials",
-    ));
-  }
-  if parsed.port() == Some(0) {
-    return Err(invalid_value(location.to_string(), "port zero is not allowed"));
-  }
-  let parsed_host = CanonicalHost::parse(parsed.host_str().expect("host presence was checked"))
-    .map_err(|error| invalid_value(location.to_string(), format!("invalid URL host after parsing: {error}")))?;
-  if raw_authority.host() != &parsed_host {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL parser changed the host representation; use a canonical DNS name or IP address",
-    ));
-  }
-  if parsed.scheme() == "http" && !allow_insecure_http && !raw_authority.host().is_loopback() {
-    return Err(invalid_value(
-      location.to_string(),
-      "non-loopback HTTP can expose account credentials; use HTTPS or set allow_insecure_http = true",
-    ));
-  }
-  Ok(parsed)
-}
-
-fn validate_raw_http_url(value: &str, location: &str) -> Result<CanonicalAuthority, CompileError> {
-  if !value.is_ascii() {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must be ASCII; use an ASCII domain and percent-encoded path",
-    ));
-  }
-  if value
-    .bytes()
-    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-    || value.contains('\\')
-  {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must not contain whitespace, control characters, or backslashes",
-    ));
-  }
-
-  let remainder = value
-    .strip_prefix("https://")
-    .or_else(|| value.strip_prefix("http://"))
-    .ok_or_else(|| {
-      invalid_value(
-        location.to_string(),
-        "scheme must use canonical `https://` or `http://` syntax",
-      )
-    })?;
-  let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-  let authority = &remainder[..authority_end];
-  let canonical_authority = CanonicalAuthority::parse(authority)
-    .map_err(|error| invalid_value(location.to_string(), format!("invalid URL authority: {error}")))?;
-
-  let raw_path_and_suffix = &remainder[authority_end..];
-  let raw_path = raw_path_and_suffix
-    .split(['?', '#'])
-    .next()
-    .unwrap_or(raw_path_and_suffix);
-  if raw_path.split('/').any(is_raw_dot_segment) {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL path must not contain literal or percent-encoded `.` or `..` segments",
-    ));
-  }
-
-  Ok(canonical_authority)
-}
-
-fn is_raw_dot_segment(segment: &str) -> bool {
-  let bytes = segment.as_bytes();
-  let mut dots = 0;
-  let mut index = 0;
-  while index < bytes.len() {
-    if bytes[index] == b'.' {
-      dots += 1;
-      index += 1;
-    } else if bytes
-      .get(index..index + 3)
-      .is_some_and(|encoded| encoded[0] == b'%' && encoded[1] == b'2' && encoded[2].eq_ignore_ascii_case(&b'e'))
-    {
-      dots += 1;
-      index += 3;
-    } else {
-      return false;
-    }
-  }
-  matches!(dots, 1 | 2)
 }
 
 fn compile_model_groups(
