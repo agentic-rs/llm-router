@@ -4,8 +4,10 @@
 //! configured socket before any listener begins accepting connections.
 
 mod bind;
+mod response;
 
 pub use bind::{
   bind_gateway_listeners, BoundGatewayListeners, BoundListener, ListenerBindError, ListenerBindResult,
   ListenerServerState,
 };
+pub use response::{managed_response_to_axum, opaque_response_to_axum, ResponseBridgeError, ResponseBridgeResult};

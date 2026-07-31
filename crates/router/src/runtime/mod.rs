@@ -32,6 +32,6 @@ pub use resources::{
   MaterializedListenerKind, MaterializedListeners,
 };
 pub use server::{
-  bind_gateway_listeners, BoundGatewayListeners, BoundListener, ListenerBindError, ListenerBindResult,
-  ListenerServerState,
+  bind_gateway_listeners, managed_response_to_axum, opaque_response_to_axum, BoundGatewayListeners, BoundListener,
+  ListenerBindError, ListenerBindResult, ListenerServerState, ResponseBridgeError, ResponseBridgeResult,
 };
