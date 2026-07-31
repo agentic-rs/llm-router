@@ -1,5 +1,6 @@
 mod pools;
 mod provider_graph;
+mod routes;
 mod selection;
 
 pub use pools::{
@@ -8,6 +9,11 @@ pub use pools::{
 pub use provider_graph::{
   link_provider_graph, LinkError, LinkResult, LinkedAccount, ProviderBinding, ProviderBindingKey, ProviderGraph,
   UpstreamUrlSource,
+};
+pub use routes::{
+  link_routes, LinkedFallbackSelector, LinkedManagedRoute, LinkedModelCandidate, LinkedModelGroup, LinkedModelSelector,
+  LinkedRelayRoute, LinkedRelayTarget, LinkedRoute, LinkedRouteKind, LinkedRoutes, LinkedTransparentRoute,
+  LinkedUpstream, LinkedUpstreamDomain, RouteLinkError, RouteLinkResult,
 };
 pub use selection::{
   build_account_pool_runtimes, AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, PoolRuntimeError,
