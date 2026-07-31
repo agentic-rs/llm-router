@@ -108,7 +108,6 @@ fn with_decompression(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder
     .deflate(true)
     .zstd(true)
 }
-
 fn build_client_with_options(
   mut builder: reqwest::ClientBuilder,
   options: &HttpClientOptions,
@@ -394,7 +393,6 @@ mod tests {
     });
     address
   }
-
   async fn serve_once(content_encoding: &'static str, body: &'static [u8]) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
