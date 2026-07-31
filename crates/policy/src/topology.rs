@@ -1,6 +1,6 @@
 use crate::{
-  AccountPoolId, BindingId, CanonicalHost, ListenerId, ModelGroupId, OperationId, ProfileId, ProfilePlan, ProviderId,
-  RouteId, RoutePlan, UpstreamId,
+  AccountPoolId, BindingId, CanonicalHost, HttpPathPrefix, ListenerId, ModelGroupId, OperationId, ProfileId,
+  ProfilePlan, ProviderId, RouteId, RoutePlan, UpstreamId,
 };
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
@@ -395,7 +395,7 @@ impl std::error::Error for EmptyHttpMatch {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpMatch {
   hosts: Box<[HostPattern]>,
-  path_prefixes: Box<[SmolStr]>,
+  path_prefixes: Box<[HttpPathPrefix]>,
   methods: Box<[SmolStr]>,
   operations: Box<[OperationId]>,
 }
@@ -403,7 +403,7 @@ pub struct HttpMatch {
 impl HttpMatch {
   pub fn new(
     hosts: Box<[HostPattern]>,
-    path_prefixes: Box<[SmolStr]>,
+    path_prefixes: Box<[HttpPathPrefix]>,
     methods: Box<[SmolStr]>,
     operations: Box<[OperationId]>,
   ) -> Result<Self, EmptyHttpMatch> {
@@ -423,7 +423,7 @@ impl HttpMatch {
     &self.hosts
   }
 
-  pub fn path_prefixes(&self) -> &[SmolStr] {
+  pub fn path_prefixes(&self) -> &[HttpPathPrefix] {
     &self.path_prefixes
   }
 
@@ -845,7 +845,11 @@ mod tests {
 
     let rule = HttpMatch::new(
       vec![exact_host("api.example.com")].into_boxed_slice(),
-      vec![SmolStr::new("/v1"), SmolStr::new("/compatible")].into_boxed_slice(),
+      vec![
+        HttpPathPrefix::parse("/v1").unwrap(),
+        HttpPathPrefix::parse("/compatible").unwrap(),
+      ]
+      .into_boxed_slice(),
       vec![SmolStr::new("POST")].into_boxed_slice(),
       vec![id("responses"), id("chat-completions")].into_boxed_slice(),
     )
