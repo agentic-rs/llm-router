@@ -19,7 +19,8 @@ pub use route::{
   RelayTarget, RouteKind, RoutePlan, UpstreamSelector, WireIdentity,
 };
 pub use topology::{
-  AccountPoolPlan, AccountSelectionStrategy, AccountSelector, BindingAction, BindingMatch, BindingPlan, ClientAuthPlan,
-  EmptyBindingMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, ListenerKind, ListenerPlan,
-  LlmApiListenerPlan, ModelCandidate, ModelGroupPlan, SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
+  AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
+  ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, HttpAction,
+  HttpBindingPlan, HttpMatch, ListenerKind, ListenerPlan, LlmApiListenerPlan, ModelCandidate, ModelGroupPlan,
+  SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
 };

@@ -12,9 +12,9 @@ use std::path::Path;
 pub use error::{CompileError, Error, Result};
 pub use raw::SCHEMA_VERSION;
 pub use raw::{
-  RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawFallbackSelector, RawListener,
-  RawModelCandidate, RawModelSelector, RawOperationPolicy, RawPoolStrategy, RawProfile, RawQualificationNamespace,
-  RawRelayTarget, RawRoute, RawUpstream, RawUpstreamSelector, RawWireIdentity,
+  RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
+  RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawPoolStrategy,
+  RawProfile, RawQualificationNamespace, RawRelayTarget, RawRoute, RawUpstream, RawUpstreamSelector, RawWireIdentity,
 };
 
 /// Decode a version 2 document without compiling references.

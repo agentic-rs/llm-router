@@ -126,25 +126,18 @@ impl ListenerPlan {
     }
   }
 
-  /// Match rules in evaluation order. The first matching rule wins.
-  pub fn bindings(&self) -> &[BindingPlan] {
+  /// HTTP match rules in evaluation order. The first matching rule wins.
+  pub fn http_bindings(&self) -> &[HttpBindingPlan] {
     match self {
-      Self::LlmApi(listener) => listener.bindings(),
-      Self::ForwardProxy(listener) => listener.bindings(),
+      Self::LlmApi(listener) => listener.http_bindings(),
+      Self::ForwardProxy(listener) => listener.http_bindings(),
     }
   }
 
-  pub fn default_action(&self) -> &BindingAction {
+  pub fn default_http_action(&self) -> &HttpAction {
     match self {
-      Self::LlmApi(listener) => listener.default_action(),
-      Self::ForwardProxy(listener) => listener.default_action(),
-    }
-  }
-
-  pub fn tls(&self) -> Option<&TlsPlan> {
-    match self {
-      Self::LlmApi(_) => None,
-      Self::ForwardProxy(listener) => listener.tls(),
+      Self::LlmApi(listener) => listener.default_http_action(),
+      Self::ForwardProxy(listener) => listener.default_http_action(),
     }
   }
 }
@@ -153,22 +146,22 @@ impl ListenerPlan {
 pub struct LlmApiListenerPlan {
   bind: SocketAddr,
   client_auth: ClientAuthPlan,
-  bindings: Box<[BindingPlan]>,
-  default_action: BindingAction,
+  http_bindings: Box<[HttpBindingPlan]>,
+  default_http_action: HttpAction,
 }
 
 impl LlmApiListenerPlan {
   pub fn new(
     bind: SocketAddr,
     client_auth: ClientAuthPlan,
-    bindings: Box<[BindingPlan]>,
-    default_action: BindingAction,
+    http_bindings: Box<[HttpBindingPlan]>,
+    default_http_action: HttpAction,
   ) -> Self {
     Self {
       bind,
       client_auth,
-      bindings,
-      default_action,
+      http_bindings,
+      default_http_action,
     }
   }
 
@@ -180,12 +173,12 @@ impl LlmApiListenerPlan {
     self.client_auth
   }
 
-  pub fn bindings(&self) -> &[BindingPlan] {
-    &self.bindings
+  pub fn http_bindings(&self) -> &[HttpBindingPlan] {
+    &self.http_bindings
   }
 
-  pub fn default_action(&self) -> &BindingAction {
-    &self.default_action
+  pub fn default_http_action(&self) -> &HttpAction {
+    &self.default_http_action
   }
 }
 
@@ -193,8 +186,10 @@ impl LlmApiListenerPlan {
 pub struct ForwardProxyListenerPlan {
   bind: SocketAddr,
   client_auth: ClientAuthPlan,
-  bindings: Box<[BindingPlan]>,
-  default_action: BindingAction,
+  http_bindings: Box<[HttpBindingPlan]>,
+  default_http_action: HttpAction,
+  connect_rules: Box<[ConnectRulePlan]>,
+  default_connect_action: ConnectAction,
   tls: Option<TlsPlan>,
 }
 
@@ -202,15 +197,19 @@ impl ForwardProxyListenerPlan {
   pub fn new(
     bind: SocketAddr,
     client_auth: ClientAuthPlan,
-    bindings: Box<[BindingPlan]>,
-    default_action: BindingAction,
+    http_bindings: Box<[HttpBindingPlan]>,
+    default_http_action: HttpAction,
+    connect_rules: Box<[ConnectRulePlan]>,
+    default_connect_action: ConnectAction,
     tls: Option<TlsPlan>,
   ) -> Self {
     Self {
       bind,
       client_auth,
-      bindings,
-      default_action,
+      http_bindings,
+      default_http_action,
+      connect_rules,
+      default_connect_action,
       tls,
     }
   }
@@ -223,12 +222,21 @@ impl ForwardProxyListenerPlan {
     self.client_auth
   }
 
-  pub fn bindings(&self) -> &[BindingPlan] {
-    &self.bindings
+  pub fn http_bindings(&self) -> &[HttpBindingPlan] {
+    &self.http_bindings
   }
 
-  pub fn default_action(&self) -> &BindingAction {
-    &self.default_action
+  pub fn default_http_action(&self) -> &HttpAction {
+    &self.default_http_action
+  }
+
+  /// CONNECT match rules in evaluation order. The first matching rule wins.
+  pub fn connect_rules(&self) -> &[ConnectRulePlan] {
+    &self.connect_rules
+  }
+
+  pub fn default_connect_action(&self) -> ConnectAction {
+    self.default_connect_action
   }
 
   pub fn tls(&self) -> Option<&TlsPlan> {
@@ -247,9 +255,8 @@ pub enum ClientAuthPlan {
   LocalKeys,
 }
 
-/// Material needed to terminate intercepted forward-proxy TLS connections.
-/// Host selection is expressed once through [`BindingAction`], not duplicated
-/// in a second TLS-specific rule list.
+/// Material needed to terminate forward-proxy TLS connections selected for
+/// [`ConnectAction::Intercept`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TlsPlan {
   ca_dir: PathBuf,
@@ -266,14 +273,14 @@ impl TlsPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BindingPlan {
+pub struct HttpBindingPlan {
   id: BindingId,
-  matcher: BindingMatch,
-  action: BindingAction,
+  matcher: HttpMatch,
+  action: HttpAction,
 }
 
-impl BindingPlan {
-  pub fn new(id: BindingId, matcher: BindingMatch, action: BindingAction) -> Self {
+impl HttpBindingPlan {
+  pub fn new(id: BindingId, matcher: HttpMatch, action: HttpAction) -> Self {
     Self { id, matcher, action }
   }
 
@@ -281,22 +288,18 @@ impl BindingPlan {
     &self.id
   }
 
-  pub fn matcher(&self) -> &BindingMatch {
+  pub fn matcher(&self) -> &HttpMatch {
     &self.matcher
   }
 
-  pub fn action(&self) -> &BindingAction {
+  pub fn action(&self) -> &HttpAction {
     &self.action
   }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BindingAction {
-  /// Select a profile. On a forward-proxy CONNECT request, this also means
-  /// intercepting TLS before routing the decoded HTTP request.
+pub enum HttpAction {
   Route(ProfileId),
-  /// Preserve the connection as an opaque byte stream.
-  Tunnel,
   Reject,
 }
 
@@ -333,37 +336,37 @@ impl HostPattern {
 
 /// Error returned when a binding tries to act as an implicit catch-all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EmptyBindingMatch;
+pub struct EmptyHttpMatch;
 
-impl fmt::Display for EmptyBindingMatch {
+impl fmt::Display for EmptyHttpMatch {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter.write_str(
-      "a binding must constrain at least one match dimension; use the listener default action for catch-all behavior",
+      "an HTTP binding must constrain at least one match dimension; use the listener default HTTP action for catch-all behavior",
     )
   }
 }
 
-impl std::error::Error for EmptyBindingMatch {}
+impl std::error::Error for EmptyHttpMatch {}
 
 /// Match dimensions are combined with AND. Values within one dimension are
 /// combined with OR. An empty dimension is unconstrained.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BindingMatch {
+pub struct HttpMatch {
   hosts: Box<[HostPattern]>,
   path_prefixes: Box<[SmolStr]>,
   methods: Box<[SmolStr]>,
   operations: Box<[OperationId]>,
 }
 
-impl BindingMatch {
+impl HttpMatch {
   pub fn new(
     hosts: Box<[HostPattern]>,
     path_prefixes: Box<[SmolStr]>,
     methods: Box<[SmolStr]>,
     operations: Box<[OperationId]>,
-  ) -> Result<Self, EmptyBindingMatch> {
+  ) -> Result<Self, EmptyHttpMatch> {
     if hosts.is_empty() && path_prefixes.is_empty() && methods.is_empty() && operations.is_empty() {
-      return Err(EmptyBindingMatch);
+      return Err(EmptyHttpMatch);
     }
 
     Ok(Self {
@@ -388,6 +391,82 @@ impl BindingMatch {
 
   pub fn operations(&self) -> &[OperationId] {
     &self.operations
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectRulePlan {
+  id: BindingId,
+  matcher: ConnectMatch,
+  action: ConnectAction,
+}
+
+impl ConnectRulePlan {
+  pub fn new(id: BindingId, matcher: ConnectMatch, action: ConnectAction) -> Self {
+    Self { id, matcher, action }
+  }
+
+  pub fn id(&self) -> &BindingId {
+    &self.id
+  }
+
+  pub fn matcher(&self) -> &ConnectMatch {
+    &self.matcher
+  }
+
+  pub fn action(&self) -> ConnectAction {
+    self.action
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectAction {
+  /// Terminate TLS, then evaluate the decoded request against the listener's
+  /// HTTP bindings. Those bindings may select any route family, including a
+  /// transparent route.
+  Intercept,
+  /// Preserve the connection as an opaque byte stream.
+  Tunnel,
+  Reject,
+}
+
+/// Error returned when a CONNECT rule tries to act as an implicit catch-all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmptyConnectMatch;
+
+impl fmt::Display for EmptyConnectMatch {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(
+      "a CONNECT rule must constrain hosts or ports; use the listener default CONNECT action for catch-all behavior",
+    )
+  }
+}
+
+impl std::error::Error for EmptyConnectMatch {}
+
+/// CONNECT match dimensions are combined with AND. Values within one
+/// dimension are combined with OR. An empty dimension is unconstrained.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectMatch {
+  hosts: Box<[HostPattern]>,
+  ports: Box<[u16]>,
+}
+
+impl ConnectMatch {
+  pub fn new(hosts: Box<[HostPattern]>, ports: Box<[u16]>) -> Result<Self, EmptyConnectMatch> {
+    if hosts.is_empty() && ports.is_empty() {
+      return Err(EmptyConnectMatch);
+    }
+
+    Ok(Self { hosts, ports })
+  }
+
+  pub fn hosts(&self) -> &[HostPattern] {
+    &self.hosts
+  }
+
+  pub fn ports(&self) -> &[u16] {
+    &self.ports
   }
 }
 
@@ -592,8 +671,8 @@ mod tests {
     T::try_from(value.to_string()).unwrap()
   }
 
-  fn matcher(host: &str) -> BindingMatch {
-    BindingMatch::new(
+  fn http_matcher(host: &str) -> HttpMatch {
+    HttpMatch::new(
       vec![HostPattern::exact(host)].into_boxed_slice(),
       Box::default(),
       Box::default(),
@@ -603,46 +682,75 @@ mod tests {
   }
 
   #[test]
-  fn listener_preserves_binding_order_and_separate_default() {
-    let first = BindingPlan::new(
+  fn forward_proxy_keeps_connect_and_http_decisions_separate() {
+    let first_http = HttpBindingPlan::new(
       id("specific"),
-      matcher("api.example.com"),
-      BindingAction::Route(id("managed")),
+      http_matcher("api.example.com"),
+      HttpAction::Route(id("transparent")),
     );
-    let second = BindingPlan::new(
+    let second_http = HttpBindingPlan::new(
       id("wildcard"),
-      BindingMatch::new(
+      HttpMatch::new(
         vec![HostPattern::subdomains_of("example.com")].into_boxed_slice(),
         Box::default(),
         Box::default(),
         Box::default(),
       )
       .unwrap(),
-      BindingAction::Tunnel,
+      HttpAction::Reject,
+    );
+    let first_connect = ConnectRulePlan::new(
+      id("tunnel-internal"),
+      ConnectMatch::new(
+        vec![HostPattern::subdomains_of("internal.example")].into_boxed_slice(),
+        vec![443].into_boxed_slice(),
+      )
+      .unwrap(),
+      ConnectAction::Tunnel,
+    );
+    let second_connect = ConnectRulePlan::new(
+      id("intercept-public"),
+      ConnectMatch::new(
+        vec![HostPattern::subdomains_of("example.com")].into_boxed_slice(),
+        vec![443, 8443].into_boxed_slice(),
+      )
+      .unwrap(),
+      ConnectAction::Intercept,
     );
     let listener = ListenerPlan::ForwardProxy(ForwardProxyListenerPlan::new(
       "127.0.0.1:8080".parse().unwrap(),
       ClientAuthPlan::LocalKeys,
-      vec![first, second].into_boxed_slice(),
-      BindingAction::Reject,
+      vec![first_http, second_http].into_boxed_slice(),
+      HttpAction::Reject,
+      vec![first_connect, second_connect].into_boxed_slice(),
+      ConnectAction::Reject,
       Some(TlsPlan::new(PathBuf::from("/tmp/tokn-ca"))),
     ));
 
     assert_eq!(listener.kind(), ListenerKind::ForwardProxy);
-    assert_eq!(listener.bindings()[0].id().as_str(), "specific");
-    assert_eq!(listener.bindings()[1].id().as_str(), "wildcard");
-    assert_eq!(listener.default_action(), &BindingAction::Reject);
-    assert_eq!(listener.tls().unwrap().ca_dir(), Path::new("/tmp/tokn-ca"));
+    assert_eq!(listener.http_bindings()[0].id().as_str(), "specific");
+    assert_eq!(listener.http_bindings()[1].id().as_str(), "wildcard");
+    assert_eq!(listener.default_http_action(), &HttpAction::Reject);
+
+    let ListenerPlan::ForwardProxy(proxy) = listener else {
+      panic!("expected forward-proxy listener");
+    };
+    assert_eq!(proxy.connect_rules()[0].id().as_str(), "tunnel-internal");
+    assert_eq!(proxy.connect_rules()[0].action(), ConnectAction::Tunnel);
+    assert_eq!(proxy.connect_rules()[1].id().as_str(), "intercept-public");
+    assert_eq!(proxy.connect_rules()[1].action(), ConnectAction::Intercept);
+    assert_eq!(proxy.default_connect_action(), ConnectAction::Reject);
+    assert_eq!(proxy.tls().unwrap().ca_dir(), Path::new("/tmp/tokn-ca"));
   }
 
   #[test]
-  fn match_requires_a_dimension_and_exposes_and_or_groups() {
+  fn http_match_requires_a_dimension_and_exposes_and_or_groups() {
     assert_eq!(
-      BindingMatch::new(Box::default(), Box::default(), Box::default(), Box::default()),
-      Err(EmptyBindingMatch)
+      HttpMatch::new(Box::default(), Box::default(), Box::default(), Box::default()),
+      Err(EmptyHttpMatch)
     );
 
-    let rule = BindingMatch::new(
+    let rule = HttpMatch::new(
       vec![HostPattern::exact("api.example.com")].into_boxed_slice(),
       vec![SmolStr::new("/v1"), SmolStr::new("/compatible")].into_boxed_slice(),
       vec![SmolStr::new("POST")].into_boxed_slice(),
@@ -654,6 +762,23 @@ mod tests {
     assert_eq!(rule.path_prefixes().len(), 2);
     assert_eq!(rule.methods(), &[SmolStr::new("POST")]);
     assert_eq!(rule.operations().len(), 2);
+  }
+
+  #[test]
+  fn connect_match_requires_a_dimension_and_exposes_host_and_port_groups() {
+    assert_eq!(
+      ConnectMatch::new(Box::default(), Box::default()),
+      Err(EmptyConnectMatch)
+    );
+
+    let rule = ConnectMatch::new(
+      vec![HostPattern::exact("api.example.com")].into_boxed_slice(),
+      vec![443, 8443].into_boxed_slice(),
+    )
+    .unwrap();
+
+    assert_eq!(rule.hosts(), &[HostPattern::exact("api.example.com")]);
+    assert_eq!(rule.ports(), &[443, 8443]);
   }
 
   #[test]
@@ -733,7 +858,7 @@ mod tests {
       "127.0.0.1:3000".parse().unwrap(),
       ClientAuthPlan::None,
       Vec::new().into_boxed_slice(),
-      BindingAction::Route(profile_id.clone()),
+      HttpAction::Route(profile_id.clone()),
     ));
     let profile = ProfilePlan::new(route_id.clone(), WireIdentity::ProviderDefault);
     let route = RoutePlan::Managed(ManagedRoute::new(

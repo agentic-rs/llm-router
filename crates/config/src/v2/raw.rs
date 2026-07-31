@@ -25,6 +25,10 @@ pub struct RawConfig {
   /// that routing precedence, so this intentionally remains a vector.
   #[serde(default)]
   pub bindings: Vec<RawBinding>,
+  /// Forward-proxy CONNECT rules are separate from decoded HTTP bindings so
+  /// transport interception and request routing cannot be confused.
+  #[serde(default)]
+  pub connect_rules: Vec<RawConnectRule>,
   #[serde(default)]
   pub profiles: BTreeMap<String, RawProfile>,
   #[serde(default)]
@@ -45,12 +49,13 @@ pub enum RawListener {
   LlmApi {
     bind: String,
     client_auth: RawClientAuth,
-    default_action: RawBindingAction,
+    default_http_action: RawBindingAction,
   },
   ForwardProxy {
     bind: String,
     client_auth: RawClientAuth,
-    default_action: RawBindingAction,
+    default_http_action: RawBindingAction,
+    default_connect: RawConnectAction,
     #[serde(default)]
     ca_dir: Option<PathBuf>,
   },
@@ -88,10 +93,34 @@ pub struct RawBinding {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawBindingAction {
   Route { profile: String },
-  // Empty struct variants, rather than unit variants, make Serde enforce
-  // `deny_unknown_fields` while retaining `{ kind = "tunnel" }` syntax.
-  Tunnel {},
+  // An empty struct variant, rather than a unit variant, makes Serde enforce
+  // `deny_unknown_fields` while retaining `{ kind = "reject" }` syntax.
   Reject {},
+}
+
+/// One ordered forward-proxy CONNECT negotiation rule. Matcher dimensions
+/// are combined with AND, while entries inside a dimension are alternatives.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawConnectRule {
+  pub id: String,
+  pub listener: String,
+  pub action: RawConnectAction,
+  #[serde(default)]
+  pub hosts: Vec<String>,
+  #[serde(default)]
+  pub ports: Vec<u16>,
+}
+
+/// Transport-level handling for an HTTP CONNECT request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawConnectAction {
+  /// Terminate TLS, then select a profile through the listener's normal HTTP
+  /// bindings after the inner request is decoded.
+  Intercept,
+  Tunnel,
+  Reject,
 }
 
 /// Client-facing policy selection. A profile deliberately contains no
@@ -247,7 +276,7 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_action = { kind = "route", profile = "default" }
+default_http_action = { kind = "route", profile = "default" }
 
 [profiles.default]
 route = "default"
@@ -294,14 +323,26 @@ schema_version = 2
 [[bindings]]
 id = "first"
 listener = "proxy"
-action = { kind = "tunnel" }
+action = { kind = "route", profile = "managed" }
 hosts = ["*.example.com"]
 
 [[bindings]]
 id = "second"
 listener = "proxy"
 action = { kind = "reject" }
-methods = ["CONNECT"]
+methods = ["POST"]
+
+[[connect_rules]]
+id = "intercept"
+listener = "proxy"
+action = "intercept"
+hosts = ["api.example.com"]
+
+[[connect_rules]]
+id = "tunnel"
+listener = "proxy"
+action = "tunnel"
+ports = [443]
 
 [[model_groups.coding]]
 model = "claude-sonnet-4"
@@ -315,6 +356,8 @@ model = "gpt-5"
 
     assert_eq!(config.bindings[0].id, "first");
     assert_eq!(config.bindings[1].id, "second");
+    assert_eq!(config.connect_rules[0].id, "intercept");
+    assert_eq!(config.connect_rules[1].id, "tunnel");
     assert_eq!(config.model_groups["coding"][0].model, "claude-sonnet-4");
     assert_eq!(config.model_groups["coding"][1].model, "gpt-5");
   }
