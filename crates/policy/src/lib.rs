@@ -12,8 +12,8 @@ mod route;
 mod topology;
 
 pub use authority::{
-  AuthorityMismatch, CanonicalAuthority, CanonicalHost, IngressAuthority, IngressAuthoritySource, InvalidAuthority,
-  InvalidHost, ResolvedAuthority,
+  AuthorityMismatch, CanonicalAuthority, CanonicalHost, HttpIngress, HttpIngressError, HttpScheme, IngressAuthority,
+  IngressAuthoritySource, InvalidAuthority, InvalidHost, ResolvedAuthority,
 };
 pub use id::{
   AccountPoolId, BindingId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId, ProfileId,

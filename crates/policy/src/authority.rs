@@ -422,6 +422,36 @@ impl fmt::Display for ResolvedAuthority {
   }
 }
 
+/// The transport scheme of a validated HTTP request.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HttpScheme {
+  Http,
+  Https,
+}
+
+impl HttpScheme {
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Http => "http",
+      Self::Https => "https",
+    }
+  }
+
+  pub fn default_port(self) -> NonZeroU16 {
+    let port = match self {
+      Self::Http => 80,
+      Self::Https => 443,
+    };
+    NonZeroU16::new(port).expect("HTTP scheme default ports are nonzero")
+  }
+}
+
+impl fmt::Display for HttpScheme {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(self.as_str())
+  }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IngressAuthoritySource {
   DirectHttp,
@@ -526,6 +556,87 @@ impl fmt::Display for AuthorityMismatch {
 }
 
 impl std::error::Error for AuthorityMismatch {}
+
+/// A scheme and immutable authority admitted through the HTTP trust boundary.
+///
+/// Direct traffic resolves omitted ports from its typed scheme. Intercepted
+/// HTTPS traffic retains the original CONNECT authority only after verifying
+/// that the inner request authority names the same destination.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HttpIngress {
+  scheme: HttpScheme,
+  authority: IngressAuthority,
+}
+
+impl HttpIngress {
+  pub fn direct(scheme: HttpScheme, authority: CanonicalAuthority) -> Self {
+    Self {
+      scheme,
+      authority: IngressAuthority::from_http(authority, scheme.default_port()),
+    }
+  }
+
+  pub fn intercepted_https(connect: &IngressAuthority, inner: CanonicalAuthority) -> Result<Self, HttpIngressError> {
+    if connect.source() != IngressAuthoritySource::Connect {
+      return Err(HttpIngressError::ConnectIngressRequired {
+        found: connect.source(),
+      });
+    }
+    connect
+      .validate_inner(inner, HttpScheme::Https.default_port())
+      .map_err(HttpIngressError::AuthorityMismatch)?;
+    Ok(Self {
+      scheme: HttpScheme::Https,
+      authority: connect.clone(),
+    })
+  }
+
+  pub fn scheme(&self) -> HttpScheme {
+    self.scheme
+  }
+
+  pub fn authority(&self) -> &IngressAuthority {
+    &self.authority
+  }
+
+  pub fn host(&self) -> &CanonicalHost {
+    self.authority.host()
+  }
+
+  pub fn port(&self) -> u16 {
+    self.authority.port()
+  }
+}
+
+/// Failure to admit an intercepted request into the HTTP trust boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HttpIngressError {
+  ConnectIngressRequired { found: IngressAuthoritySource },
+  AuthorityMismatch(AuthorityMismatch),
+}
+
+impl fmt::Display for HttpIngressError {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::ConnectIngressRequired { found } => {
+        write!(
+          formatter,
+          "intercepted HTTPS ingress requires a CONNECT authority, found {found:?}"
+        )
+      }
+      Self::AuthorityMismatch(source) => source.fmt(formatter),
+    }
+  }
+}
+
+impl std::error::Error for HttpIngressError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::ConnectIngressRequired { .. } => None,
+      Self::AuthorityMismatch(source) => Some(source),
+    }
+  }
+}
 
 #[cfg(test)]
 mod tests {
@@ -634,6 +745,61 @@ mod tests {
     let ingress = IngressAuthority::from_http(CanonicalAuthority::parse("example.com").unwrap(), default_port);
     assert_eq!(ingress.to_string(), "example.com:443");
     assert_eq!(ingress.source(), IngressAuthoritySource::DirectHttp);
+  }
+
+  #[test]
+  fn http_ingress_resolves_typed_scheme_defaults_and_preserves_explicit_ports() {
+    assert_eq!(HttpScheme::Http.as_str(), "http");
+    assert_eq!(HttpScheme::Https.to_string(), "https");
+    assert_eq!(HttpScheme::Http.default_port().get(), 80);
+    assert_eq!(HttpScheme::Https.default_port().get(), 443);
+
+    let http = HttpIngress::direct(HttpScheme::Http, CanonicalAuthority::parse("example.com").unwrap());
+    let https = HttpIngress::direct(HttpScheme::Https, CanonicalAuthority::parse("example.com").unwrap());
+    let nondefault = HttpIngress::direct(
+      HttpScheme::Https,
+      CanonicalAuthority::parse("example.com:8443").unwrap(),
+    );
+
+    assert_eq!(http.scheme(), HttpScheme::Http);
+    assert_eq!(http.host().as_str(), "example.com");
+    assert_eq!(http.port(), 80);
+    assert_eq!(http.authority().source(), IngressAuthoritySource::DirectHttp);
+    assert_eq!(https.port(), 443);
+    assert_eq!(nondefault.port(), 8443);
+  }
+
+  #[test]
+  fn intercepted_https_validates_then_retains_the_connect_authority() {
+    let connect = IngressAuthority::from_connect("example.com:443").unwrap();
+    let ingress = HttpIngress::intercepted_https(&connect, CanonicalAuthority::parse("example.com").unwrap()).unwrap();
+
+    assert_eq!(ingress.scheme(), HttpScheme::Https);
+    assert_eq!(ingress.authority(), &connect);
+    assert_eq!(ingress.authority().source(), IngressAuthoritySource::Connect);
+  }
+
+  #[test]
+  fn intercepted_https_distinguishes_wrong_source_from_authority_mismatch() {
+    let direct = IngressAuthority::from_http(
+      CanonicalAuthority::parse("example.com").unwrap(),
+      HttpScheme::Https.default_port(),
+    );
+    assert_eq!(
+      HttpIngress::intercepted_https(&direct, CanonicalAuthority::parse("example.com").unwrap()).unwrap_err(),
+      HttpIngressError::ConnectIngressRequired {
+        found: IngressAuthoritySource::DirectHttp,
+      }
+    );
+
+    let connect = IngressAuthority::from_connect("example.com:8443").unwrap();
+    let error =
+      HttpIngress::intercepted_https(&connect, CanonicalAuthority::parse("example.com").unwrap()).unwrap_err();
+    let HttpIngressError::AuthorityMismatch(mismatch) = error else {
+      panic!("expected an authority mismatch");
+    };
+    assert_eq!(mismatch.expected().to_string(), "example.com:8443");
+    assert_eq!(mismatch.found().to_string(), "example.com:443");
   }
 
   #[test]
