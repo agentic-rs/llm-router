@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+use http::HeaderMap as NativeHeaderMap;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use snafu::ResultExt;
@@ -137,11 +138,53 @@ pub async fn send(
       resp_body: Bytes::new(),
     });
   }
-  let mut request = client.request(method, url).headers(headers.into());
-  if let Some(body) = body {
-    request = request.body(body);
+  send_native(client, method, url, headers.into(), body, what).await
+}
+
+/// Send one request from a native HTTP header map without a lossy conversion.
+///
+/// This boundary is intended for opaque v2 transport, where duplicate values
+/// and non-UTF-8 header bytes must reach reqwest unchanged. `Host` and
+/// `Content-Length` are always discarded so reqwest derives connection and
+/// framing metadata from the selected URL and actual body.
+pub async fn send_native(
+  client: &reqwest::Client,
+  method: Method,
+  url: &str,
+  headers: NativeHeaderMap,
+  body: Option<Bytes>,
+  what: &'static str,
+) -> crate::provider::Result<reqwest::Response> {
+  build_native_request(client, method, url, headers, body, what)
+    .send()
+    .await
+    .context(crate::provider::error::HttpSnafu { what })
+}
+
+fn build_native_request(
+  client: &reqwest::Client,
+  method: Method,
+  url: &str,
+  mut headers: NativeHeaderMap,
+  body: Option<Bytes>,
+  what: &'static str,
+) -> reqwest::RequestBuilder {
+  let stripped_host = headers.remove(http::header::HOST).is_some();
+  let stripped_content_length = headers.remove(http::header::CONTENT_LENGTH).is_some();
+  if stripped_host || stripped_content_length {
+    tracing::trace!(
+      what,
+      stripped_host,
+      stripped_content_length,
+      "stripped native transport headers before reqwest dispatch"
+    );
   }
-  request.send().await.context(crate::provider::error::HttpSnafu { what })
+
+  let request = client.request(method, url).headers(headers);
+  match body {
+    Some(body) => request.body(body),
+    None => request,
+  }
 }
 
 pub async fn read_json<T>(resp: reqwest::Response, what: &'static str) -> crate::provider::Result<T>
@@ -180,6 +223,52 @@ mod tests {
   #[test]
   fn managed_client_builds_without_proxy() {
     build_managed_client(&HttpClientOptions::default()).expect("managed client should build");
+  }
+
+  #[test]
+  fn native_request_preserves_duplicate_and_raw_header_values() {
+    let client = build_opaque_client(&HttpClientOptions::default()).unwrap();
+    let mut headers = NativeHeaderMap::new();
+    headers.append("x-duplicate", reqwest::header::HeaderValue::from_static("first"));
+    headers.append("x-duplicate", reqwest::header::HeaderValue::from_static("second"));
+    headers.insert(
+      "x-raw",
+      reqwest::header::HeaderValue::from_bytes(&[0x80, 0xff]).unwrap(),
+    );
+    headers.insert(
+      http::header::HOST,
+      reqwest::header::HeaderValue::from_static("wrong.invalid"),
+    );
+    headers.insert(
+      http::header::CONTENT_LENGTH,
+      reqwest::header::HeaderValue::from_static("999"),
+    );
+    let body = Bytes::from_static(b"payload");
+
+    let request = build_native_request(
+      &client,
+      Method::POST,
+      "https://upstream.invalid/v1/raw",
+      headers,
+      Some(body.clone()),
+      "native header test",
+    )
+    .build()
+    .unwrap();
+
+    assert_eq!(
+      request
+        .headers()
+        .get_all("x-duplicate")
+        .iter()
+        .map(|value| value.as_bytes())
+        .collect::<Vec<_>>(),
+      [b"first".as_slice(), b"second".as_slice()]
+    );
+    assert_eq!(request.headers()["x-raw"].as_bytes(), [0x80, 0xff]);
+    assert!(!request.headers().contains_key(http::header::HOST));
+    assert!(!request.headers().contains_key(http::header::CONTENT_LENGTH));
+    assert_eq!(request.body().and_then(reqwest::Body::as_bytes), Some(body.as_ref()));
   }
 
   #[tokio::test]
