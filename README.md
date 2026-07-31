@@ -402,9 +402,11 @@ providers. Raw `passthrough` and `switch` links also discover every enabled
 provider when `--provider` is omitted. Each provider must support OpenCode's
 Chat Completions endpoint. Pass `--provider ID` to intentionally pin a raw
 link to one provider; that choice is persisted as `[agents.opencode].provider`
-and the generated profile's `default_provider_id` is only its runtime snapshot.
-This means sync and status retain an explicit raw target even when generated
-profile state drifts.
+and the generated profile's `default_provider_id` is its runtime snapshot.
+Without that pin, every generated OpenCode provider uses a provider-specific
+gateway profile, whose `default_provider_id` selects that provider. The binding
+profile retains a deterministic fallback solely for direct requests and router
+validation; generated OpenCode providers do not target it.
 `provider` and `provider_filter` are mutually exclusive: `provider` is
 valid only for main-account `switch`/`passthrough`, while `provider_filter` is
 valid only for main-account `route`/`fuzzy`/`exact`. Older raw bindings without
@@ -429,10 +431,11 @@ provider but publishes provider-qualified model IDs such as
 provider entry per selected provider, such as `tokn-router-openai`, backed by
 provider-specific profiles.
 The provider/profile layout is derived rather than configured independently:
-normalized modes use one shared profile, raw main-account modes use one
-provider-scoped profile (pinned only with `--provider`), and raw agent-owned
-modes use one profile per provider. The generated profiles are the runtime
-materialization of `[agents.opencode].mode`; a mismatch is configuration drift.
+normalized modes use one shared profile. An unpinned raw main-account link and
+a raw agent-owned link each use one child profile per provider; an explicit
+main-account `--provider` pin uses only the binding profile. The generated
+profiles are the runtime materialization of `[agents.opencode].mode`; a
+mismatch is configuration drift.
 Providers without a static model catalogue remain usable with an existing custom
 selection, but cannot add discoverable entries to OpenCode's model picker and
 produce a link warning.

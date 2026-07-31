@@ -3,7 +3,7 @@ use crate::adapters::opencode::projected_config_matches;
 #[cfg(test)]
 use crate::projection::SHARED_PROVIDER_ID;
 use crate::projection::{compile_opencode_publications, AgentConfigProjection};
-use crate::reconcile::{imported_account_ids, is_source_managed_account};
+use crate::reconcile::{imported_account_ids, is_source_managed_account, main_provider_routes};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -339,17 +339,17 @@ fn with_opencode_projection<T>(
         .into_iter()
         .filter(|account| provider_scope.contains(account.provider.as_str()))
         .collect::<Vec<_>>();
-      let routes: Vec<ProviderRoute> = provider_ids
-        .iter()
-        .map(|provider| ProviderRoute {
-          source_provider_id: crate::adapters::opencode::source_namespace_for_gateway(provider).to_string(),
-          gateway_provider_id: provider.to_string(),
-          account_id: String::new(),
-          profile: profile_name.to_string(),
-          base_url: target_base_url.clone(),
-          transfer_source_auth: false,
-        })
-        .collect();
+      let per_provider_profiles = mode.is_verbatim() && binding.provider.is_none();
+      let routes = main_provider_routes(cfg, Some(profile_name), &provider_ids, per_provider_profiles);
+      if per_provider_profiles {
+        for provider in &provider_ids {
+          if !materialized_main_provider_profile_matches_binding(cfg, agent, binding, mode, provider) {
+            return Err(anyhow!(
+              "OpenCode provider profile for '{provider}' does not match its main-account route"
+            ));
+          }
+        }
+      }
       (accounts, routes.clone(), routes)
     }
     AgentAccountSource::Agent => {
@@ -456,8 +456,12 @@ fn materialized_profile_matches_binding(
         return profile.default_provider_id.as_deref() == Some(provider)
           && option_string_set(profile.providers.as_deref()) == Some(BTreeSet::from([provider]));
       }
-      return profile.default_provider_id.is_none()
-        && option_string_set(profile.providers.as_deref()) == Some(effective_main_provider_ids(cfg, store));
+      let provider_ids = effective_main_provider_ids(cfg, store);
+      return profile.default_provider_id.as_deref() == provider_ids.first().copied()
+        && option_string_set(profile.providers.as_deref()) == Some(provider_ids.clone())
+        && provider_ids
+          .iter()
+          .all(|provider| materialized_main_provider_profile_matches_binding(cfg, agent, binding, mode, provider));
     }
     let expected_provider_ids = binding
       .provider_filter
@@ -531,6 +535,26 @@ fn materialized_provider_profile_matches_binding(
       && profile.default_provider_id.as_deref() == Some(provider)
       && option_string_set(profile.providers.as_deref()) == Some(BTreeSet::from([provider]))
       && option_string_set(profile.accounts.as_deref()) == Some(account_ids.clone())
+  })
+}
+
+fn materialized_main_provider_profile_matches_binding(
+  cfg: &Config,
+  agent: &AgentId,
+  binding: &AgentConfig,
+  mode: RouteMode,
+  provider: &str,
+) -> bool {
+  let Some(profile_name) = binding.profile.as_deref() else {
+    return false;
+  };
+  let provider_profile_name = format!("{profile_name}-{provider}");
+  cfg.profiles.get(&provider_profile_name).is_some_and(|profile| {
+    profile.agent_id.as_ref() == Some(agent)
+      && profile.mode == Some(mode)
+      && profile.default_provider_id.as_deref() == Some(provider)
+      && option_string_set(profile.providers.as_deref()) == Some(BTreeSet::from([provider]))
+      && profile.accounts.is_none()
   })
 }
 
@@ -681,6 +705,20 @@ mod tests {
         default_provider_id: Some(provider.into()),
         providers: Some(vec![provider.into()]),
         accounts: Some(vec![format!("opencode-{provider}")]),
+        model_families: None,
+      },
+    );
+  }
+
+  fn add_generated_main_provider_profile(cfg: &mut Config, mode: RouteMode, provider: &str) {
+    cfg.profiles.insert(
+      format!("work-{provider}"),
+      tokn_config::ProfileConfig {
+        mode: Some(mode),
+        agent_id: Some(AgentId::Opencode),
+        default_provider_id: Some(provider.into()),
+        providers: Some(vec![provider.into()]),
+        accounts: None,
         model_families: None,
       },
     );
@@ -1213,11 +1251,15 @@ accounts = ["opencode-openai"]
 
     for mode in [RouteMode::Switch, RouteMode::Passthrough] {
       let mut cfg = config_with_opencode_binding(mode, AgentAccountSource::Main, None, &[]);
-      cfg.profiles.get_mut("work").unwrap().providers = Some(vec!["deepseek".into(), "openai".into()]);
+      let profile = cfg.profiles.get_mut("work").unwrap();
+      profile.default_provider_id = Some("deepseek".into());
+      profile.providers = Some(vec!["deepseek".into(), "openai".into()]);
+      add_generated_main_provider_profile(&mut cfg, mode, "deepseek");
+      add_generated_main_provider_profile(&mut cfg, mode, "openai");
       write_synced_opencode_config(&config_path, &cfg, &store);
       assert!(config_points_at_gateway(&config_path, &AgentId::Opencode, &cfg, &store));
 
-      cfg.profiles.get_mut("work").unwrap().providers = Some(vec!["openai".into()]);
+      cfg.profiles.remove("work-deepseek");
       assert!(!config_points_at_gateway(
         &config_path,
         &AgentId::Opencode,

@@ -324,7 +324,7 @@ fn print_status(status: &AgentStatus, gateway_config_path: Option<&Path>, api_ke
       println!("  account_source: {}", account_source_as_str(binding.account_source));
       println!(
         "  profile_layout: {}",
-        profile_layout(binding.mode, binding.account_source)
+        profile_layout(binding.mode, binding.account_source, binding.provider.as_deref())
       );
       if let Some(provider) = binding.provider.as_deref() {
         println!("  provider: {provider}");
@@ -474,8 +474,8 @@ fn route_mode_as_str(mode: RouteMode) -> &'static str {
   }
 }
 
-fn profile_layout(mode: RouteMode, account_source: AgentAccountSource) -> AgentProfileLayout {
-  AgentProfileLayout::for_binding(mode, account_source)
+fn profile_layout(mode: RouteMode, account_source: AgentAccountSource, provider: Option<&str>) -> AgentProfileLayout {
+  AgentProfileLayout::for_binding(mode, account_source, provider)
 }
 
 fn requested_account_source(use_main_accounts: bool) -> Option<AgentAccountSource> {
@@ -697,16 +697,20 @@ mod tests {
   fn profile_layout_is_derived_from_mode_and_account_source() {
     for mode in [RouteMode::Route, RouteMode::Fuzzy, RouteMode::Exact] {
       for source in [AgentAccountSource::Agent, AgentAccountSource::Main] {
-        assert_eq!(profile_layout(mode, source), AgentProfileLayout::Single);
+        assert_eq!(profile_layout(mode, source, None), AgentProfileLayout::Single);
       }
     }
     for mode in [RouteMode::Switch, RouteMode::Passthrough] {
       assert_eq!(
-        profile_layout(mode, AgentAccountSource::Main),
-        AgentProfileLayout::Single
+        profile_layout(mode, AgentAccountSource::Main, None),
+        AgentProfileLayout::PerProvider
       );
       assert_eq!(
-        profile_layout(mode, AgentAccountSource::Agent),
+        profile_layout(mode, AgentAccountSource::Main, Some("deepseek")),
+        AgentProfileLayout::SinglePinned
+      );
+      assert_eq!(
+        profile_layout(mode, AgentAccountSource::Agent, None),
         AgentProfileLayout::PerProvider
       );
     }
