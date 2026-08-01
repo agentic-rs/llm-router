@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
 use tokn_core::generation::GenerationOptions;
-use tokn_core::provider::Endpoint;
+use tokn_endpoint_core::Endpoint;
 use tokn_policy::{ProfileId, RouteKind};
 use tokn_router::runtime::{
   link_builtin_gateway_runtime_with_profile_roots, EmbeddedProfileRoots, ManagedGatewayExecutor, ManagedGatewayOutcome,

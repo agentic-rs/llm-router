@@ -5,8 +5,8 @@ use tempfile::TempDir;
 use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 use tokn_sdk::chat_completions::{ChatRequest, ChatResponse};
 use tokn_sdk::{
-  Client, Error, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary, RequestOptions, Tool,
-  ToolCall, ToolChoice,
+  Client, Endpoint, Error, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary, RequestOptions,
+  Tool, ToolCall, ToolChoice,
 };
 
 struct Fixture {
@@ -608,7 +608,7 @@ async fn raw_request_and_client_lifecycle_use_explicit_paths() {
     .with_header("x-sdk-test", "raw");
   let response = client
     .execute(
-      tokn_core::provider::Endpoint::ChatCompletions,
+      Endpoint::ChatCompletions,
       serde_json::to_value(chat_request()).expect("serialize chat request"),
       options,
     )
@@ -770,7 +770,7 @@ async fn invalid_request_header_is_rejected_before_transport() {
 
   let error = client
     .execute(
-      tokn_core::provider::Endpoint::ChatCompletions,
+      Endpoint::ChatCompletions,
       serde_json::to_value(chat_request()).expect("serialize chat request"),
       RequestOptions::default().with_header("invalid header", "value"),
     )

@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use tokn_convert::ir::IrDelta;
 use tokn_convert::sse::SseAccumulator;
-use tokn_core::provider::Endpoint;
+use tokn_endpoint_core::Endpoint;
 
 use super::response::finish_reason;
 use super::Usage;

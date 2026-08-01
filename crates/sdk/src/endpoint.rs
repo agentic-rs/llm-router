@@ -1,7 +1,7 @@
 use crate::response::{BufferedResponse, StreamResponse};
 use crate::{Client, RequestOptions, Result};
-use tokn_core::provider::Endpoint;
 use tokn_endpoint_chat_completions::{ChatRequest, ChatResponse};
+use tokn_endpoint_core::Endpoint;
 use tokn_endpoint_messages::{MessagesRequest, MessagesResponse};
 use tokn_endpoint_responses::{ResponsesRequest, ResponsesResponse};
 
