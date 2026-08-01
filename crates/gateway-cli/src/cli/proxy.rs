@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -45,6 +45,9 @@ pub enum ProxyCmd {
 pub struct EnvArgs {
   #[arg(long, value_enum, default_value_t = Shell::Sh)]
   pub shell: Shell,
+  /// Output encoding. JSON is the stable machine-readable interface.
+  #[arg(long, value_enum, default_value_t = EnvFormat::Shell)]
+  pub format: EnvFormat,
 }
 
 #[derive(Args, Debug)]
@@ -108,6 +111,12 @@ pub enum Shell {
   Zsh,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum EnvFormat {
+  Shell,
+  Json,
+}
+
 pub async fn run(cfg_path: Option<PathBuf>, args: ProxyArgs) -> Result<()> {
   let listener = resolve_proxy_listener(cfg_path.as_deref(), args.listener.as_deref())?;
   match args.cmd {
@@ -134,10 +143,13 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ProxyArgs) -> Result<()> {
 
 async fn env(listener: &ProxyListenerConfig, args: EnvArgs) -> Result<()> {
   let env = resolved_proxy_env(listener)?;
-  match args.shell {
-    Shell::Sh | Shell::Bash | Shell::Zsh => print_sh(&env),
-    Shell::Fish => print_fish(&env),
-    Shell::Pwsh => print_pwsh(&env),
+  match args.format {
+    EnvFormat::Json => print_json(&env)?,
+    EnvFormat::Shell => match args.shell {
+      Shell::Sh | Shell::Bash | Shell::Zsh => print_sh(&env),
+      Shell::Fish => print_fish(&env),
+      Shell::Pwsh => print_pwsh(&env),
+    },
   }
   Ok(())
 }
@@ -218,20 +230,42 @@ async fn ca(listener: &ProxyListenerConfig, args: CaArgs) -> Result<()> {
 
 fn print_sh(env: &ProxyEnv) {
   for (key, value) in &env.vars {
-    println!("export {key}={value}");
+    println!("export {key}={}", quote_sh(value));
   }
 }
 
 fn print_fish(env: &ProxyEnv) {
   for (key, value) in &env.vars {
-    println!("set -gx {key} {value}");
+    println!("set -gx {key} {}", quote_fish(value));
   }
 }
 
 fn print_pwsh(env: &ProxyEnv) {
   for (key, value) in &env.vars {
-    println!("$Env:{key} = '{value}'");
+    println!("$Env:{key} = {}", quote_pwsh(value));
   }
+}
+
+fn print_json(env: &ProxyEnv) -> Result<()> {
+  let vars = env
+    .vars
+    .iter()
+    .map(|(key, value)| (key.as_str(), value.as_str()))
+    .collect::<BTreeMap<_, _>>();
+  println!("{}", serde_json::to_string(&vars)?);
+  Ok(())
+}
+
+fn quote_sh(value: &str) -> String {
+  format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn quote_fish(value: &str) -> String {
+  format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn quote_pwsh(value: &str) -> String {
+  format!("'{}'", value.replace('\'', "''"))
 }
 
 fn resolved_proxy_env(listener: &ProxyListenerConfig) -> Result<ProxyEnv> {
@@ -634,6 +668,15 @@ default_http_action = { kind = "reject" }
   #[test]
   fn command_spec_rejects_empty_argv() {
     assert!(CommandSpec::from_argv(Vec::new()).is_err());
+  }
+
+  #[test]
+  fn shell_exports_quote_untrusted_values() {
+    let value = "path with spaces/'quoted'/$HOME\\bundle";
+
+    assert_eq!(quote_sh(value), r#"'path with spaces/'"'"'quoted'"'"'/$HOME\bundle'"#);
+    assert_eq!(quote_fish(value), r#"'path with spaces/\'quoted\'/$HOME\\bundle'"#);
+    assert_eq!(quote_pwsh(value), r#"'path with spaces/''quoted''/$HOME\bundle'"#);
   }
 
   #[test]

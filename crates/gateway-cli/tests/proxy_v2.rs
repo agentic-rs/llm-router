@@ -49,11 +49,19 @@ fn stderr(output: &Output) -> &str {
   std::str::from_utf8(&output.stderr).expect("stderr should be UTF-8")
 }
 
+fn json_env(output: &Output) -> serde_json::Map<String, serde_json::Value> {
+  serde_json::from_slice::<serde_json::Value>(&output.stdout)
+    .expect("stdout should be JSON")
+    .as_object()
+    .expect("proxy env JSON should be an object")
+    .clone()
+}
+
 fn assert_export(output: &Output, key: &str, value: &str) {
   assert!(
     stdout(output)
       .lines()
-      .any(|line| line == format!("export {key}={value}")),
+      .any(|line| line == format!("export {key}='{value}'")),
     "missing {key} export in stdout:\n{}",
     stdout(output)
   );
@@ -131,9 +139,11 @@ default_connect = "tunnel"
   );
   assert!(stdout(&ambiguous).is_empty());
 
-  let selected = fixture.run(&["--listener", "beta", "env"]);
+  let selected = fixture.run(&["--listener", "beta", "env", "--format", "json"]);
   assert!(selected.status.success(), "stderr: {}", stderr(&selected));
-  assert_export(&selected, "HTTP_PROXY", "http://127.0.0.1:4242");
-  assert_export(&selected, "HTTPS_PROXY", "http://127.0.0.1:4242");
+  let env = json_env(&selected);
+  assert_eq!(env["HTTP_PROXY"], "http://127.0.0.1:4242");
+  assert_eq!(env["HTTPS_PROXY"], "http://127.0.0.1:4242");
+  assert!(!env.contains_key("SSL_CERT_FILE"));
   fixture.assert_no_legacy_state();
 }
