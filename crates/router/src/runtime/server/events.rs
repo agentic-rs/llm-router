@@ -6,20 +6,17 @@
 //! fact actually occurs.
 
 use super::{AdmittedHttpRequest, ServerError};
-use crate::runtime::observation::capture_headers;
+use crate::runtime::observation::{capture_headers, native_correlation};
 use crate::runtime::{ConnectDispatch, HttpRouteMatch, LinkedRouteKind};
 use axum::response::Response;
-use http::{HeaderMap, Request};
+use http::Request;
 use smol_str::SmolStr;
 use tokn_access::AccessContext;
 use tokn_core::provider::ProviderRequestKind;
 use tokn_events::{
-  CapturedUri, ClientIdentity, ConnectAction as EventConnectAction, Correlation, EventFailure, HttpFamily,
-  HttpResponseHead, PolicySelection, RequestAdmitted, RequestOutcome, RequestPhase, RequestSource, RequestStarted,
-  SelectedAction,
+  CapturedUri, ClientIdentity, ConnectAction as EventConnectAction, EventFailure, HttpFamily, HttpResponseHead,
+  PolicySelection, RequestAdmitted, RequestOutcome, RequestPhase, RequestSource, RequestStarted, SelectedAction,
 };
-use tokn_headers::inbound::{first_present_smol, inbound_correlation, PROJECT_ID_HEADERS, REQUEST_ID_HEADERS};
-use tokn_headers::keys::{X_CLIENT_REQUEST_ID, X_PARENT_SESSION_ID};
 use tokn_policy::IngressAuthority;
 use tokn_requests::{RequestCompletion, RequestTermination};
 
@@ -33,29 +30,7 @@ pub(super) fn request_started<B>(source: RequestSource, request: &Request<B>, bo
     target: CapturedUri::exact(request.uri().to_string()),
     headers: capture_headers(request.headers()),
     body_present,
-    correlation: correlation(request.headers()),
-  }
-}
-
-/// Resolve all supported request-correlation inputs without interpreting a
-/// non-UTF-8 field as lossy text.
-fn correlation(headers: &HeaderMap) -> Correlation {
-  // The header-domain conversion deliberately skips non-UTF-8 values. Raw
-  // bytes remain available in `RequestStarted.headers`, while identifier
-  // extraction stays exact and best-effort.
-  let inbound_headers = tokn_headers::HeaderMap::from(headers);
-  let inbound = inbound_correlation(&inbound_headers);
-  let client_request_id = first_present_smol(&inbound_headers, &[X_CLIENT_REQUEST_ID.as_str()])
-    .or_else(|| first_present_smol(&inbound_headers, REQUEST_ID_HEADERS));
-
-  Correlation {
-    client_request_id,
-    session_id: inbound.session_id,
-    thread_id: inbound.thread_id,
-    parent_thread_id: inbound.parent_thread_id,
-    parent_session_id: first_present_smol(&inbound_headers, &[X_PARENT_SESSION_ID.as_str()]),
-    project_id: first_present_smol(&inbound_headers, PROJECT_ID_HEADERS),
-    turn_id: inbound.turn_id,
+    correlation: native_correlation(request.headers()),
   }
 }
 

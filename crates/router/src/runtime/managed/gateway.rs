@@ -10,21 +10,37 @@ use super::{
   ManagedAttemptCoordinatorError, ManagedProfileResolveError, ManagedProfileSite, ManagedRequestBody,
   ManagedRequestBodyError, ManagedSelectionSummary,
 };
+use crate::runtime::attempts::{capture_bytes, AttemptBodyPlan};
+use crate::runtime::downstream::{downstream_body_failure, DownstreamLifecycle};
+use crate::runtime::observation::{body_json_facts, capture_headers, correlation};
 use crate::runtime::LinkedGatewayRuntime;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
+use futures_util::Stream;
 use http::HeaderMap;
 use serde_json::Value;
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokn_access::ProviderAccess;
 use tokn_accounts::link::{NoEligibleReason, TargetResolution};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::util::http::{build_managed_client, HttpClientOptions};
+use tokn_events::{
+  BodyCapture, BodyOutcome, ClientIdentity, EventFailure, HttpFamily, HttpResponseHead, PolicySelection,
+  RequestBodyObservation, RequestOutcome, RequestPhase, RequestSource, RequestStarted, SelectedAction,
+  TrafficEventKind,
+};
 use tokn_policy::ProfileId;
-use tokn_requests::execution::{ManagedAttemptError, ManagedClientResponse, ManagedHttpExecutor, ManagedResponseError};
+use tokn_requests::execution::{
+  ManagedAttemptError, ManagedClientBody, ManagedClientResponse, ManagedHttpExecutor, ManagedResponseError,
+};
+use tokn_requests::{RequestCompletion, RequestLifecycle, RequestLifecycleEmitter, RequestTermination};
 
 /// One listener-free managed request against an explicit linked profile.
 #[derive(Clone)]
@@ -115,6 +131,8 @@ impl ManagedGatewayRequest {
 pub struct ManagedGatewayExecutor {
   runtime: Arc<LinkedGatewayRuntime>,
   attempts: ManagedAttemptCoordinator,
+  events: RequestLifecycleEmitter,
+  body_capture_limit: usize,
 }
 
 impl fmt::Debug for ManagedGatewayExecutor {
@@ -122,6 +140,8 @@ impl fmt::Debug for ManagedGatewayExecutor {
     formatter
       .debug_struct("ManagedGatewayExecutor")
       .field("linked_profiles", &self.runtime.profiles().len())
+      .field("events_enabled", &self.events.is_enabled())
+      .field("body_capture_limit", &self.body_capture_limit)
       .finish_non_exhaustive()
   }
 }
@@ -137,10 +157,47 @@ impl ManagedGatewayExecutor {
     Ok(Self::new(runtime, ManagedHttpExecutor::new(http)))
   }
 
+  /// Build an embedded managed executor that publishes request lifecycles.
+  ///
+  /// `events` connects this executor to a caller-owned event hub. The caller
+  /// retains the hub, chooses its consumers and ingress capacity, observes
+  /// consumer/backpressure failures, and shuts it down after all executors and
+  /// response streams have been dropped.
+  ///
+  /// `body_capture_limit` bounds only the request, upstream-response, and
+  /// downstream-response byte prefixes retained in lifecycle events. It never
+  /// rejects a body or truncates bytes delivered to an upstream or caller.
+  pub fn build_with_events(
+    runtime: Arc<LinkedGatewayRuntime>,
+    http_options: &HttpClientOptions,
+    events: RequestLifecycleEmitter,
+    body_capture_limit: usize,
+  ) -> ManagedGatewayBuildResult<Self> {
+    let http =
+      build_managed_client(http_options).map_err(|source| ManagedGatewayBuildError::ManagedHttpClient { source })?;
+    Ok(Self::new_with_events(
+      runtime,
+      ManagedHttpExecutor::new(http),
+      events,
+      body_capture_limit,
+    ))
+  }
+
   pub(crate) fn new(runtime: Arc<LinkedGatewayRuntime>, executor: ManagedHttpExecutor) -> Self {
+    Self::new_with_events(runtime, executor, RequestLifecycleEmitter::disabled(), 0)
+  }
+
+  pub(crate) fn new_with_events(
+    runtime: Arc<LinkedGatewayRuntime>,
+    executor: ManagedHttpExecutor,
+    events: RequestLifecycleEmitter,
+    body_capture_limit: usize,
+  ) -> Self {
     Self {
       runtime,
       attempts: ManagedAttemptCoordinator::new(executor),
+      events,
+      body_capture_limit,
     }
   }
 
@@ -150,6 +207,18 @@ impl ManagedGatewayExecutor {
 
   /// Resolve and execute exactly one attempt for `profile_id`.
   pub async fn execute(
+    &self,
+    profile_id: &ProfileId,
+    request: ManagedGatewayRequest,
+  ) -> ManagedGatewayResult<ManagedGatewayOutcome> {
+    if self.events.is_enabled() {
+      self.execute_with_events(profile_id, request).await
+    } else {
+      self.execute_unobserved(profile_id, request).await
+    }
+  }
+
+  async fn execute_unobserved(
     &self,
     profile_id: &ProfileId,
     request: ManagedGatewayRequest,
@@ -221,7 +290,424 @@ impl ManagedGatewayExecutor {
         selection: summary,
         source,
       }),
+      Err(ManagedAttemptCoordinatorError::Lifecycle { .. }) => {
+        unreachable!("disabled embedded execution cannot publish a lifecycle")
+      }
     }
+  }
+
+  async fn execute_with_events(
+    &self,
+    profile_id: &ProfileId,
+    request: ManagedGatewayRequest,
+  ) -> ManagedGatewayResult<ManagedGatewayOutcome> {
+    let ManagedGatewayRequest {
+      endpoint,
+      body,
+      headers,
+      session_id,
+      provider_access,
+      generation_options,
+    } = request;
+    let event_headers = headers.clone();
+    let (headers, session_id) = prepare_semantic_headers(headers, session_id);
+    let started = RequestStarted {
+      source: RequestSource::Embedded {
+        profile_id: profile_id.as_str().into(),
+      },
+      http_version: None,
+      method: "POST".into(),
+      target: tokn_events::CapturedUri::exact(endpoint_target(endpoint)),
+      headers: capture_headers(&event_headers),
+      body_present: true,
+      correlation: correlation(&headers),
+    };
+    let mut lifecycle = self
+      .events
+      .begin(started)
+      .await
+      .map_err(|source| lifecycle_error(RequestPhase::Admission, source))?;
+    publish_embedded_boundary(
+      &mut lifecycle,
+      TrafficEventKind::Authenticated(ClientIdentity::Embedded),
+      RequestPhase::Authentication,
+    )
+    .await?;
+
+    let profile = match self.runtime.profiles().profile(profile_id) {
+      Some(profile) => profile,
+      None => {
+        let error = ManagedGatewayError::ProfileNotLinked {
+          profile: profile_id.clone(),
+        };
+        return Err(finish_embedded_error(lifecycle, error));
+      }
+    };
+    let (site, _) = match managed_profile_route(profile) {
+      Ok(route) => route,
+      Err(source) => {
+        return Err(finish_embedded_error(
+          lifecycle,
+          ManagedGatewayError::Resolve { source },
+        ));
+      }
+    };
+    publish_embedded_boundary(
+      &mut lifecycle,
+      TrafficEventKind::PolicySelected(PolicySelection {
+        binding_id: None,
+        action: SelectedAction::Http {
+          profile_id: site.profile_id().as_str().into(),
+          route_id: site.route_id().as_str().into(),
+          family: HttpFamily::Managed,
+        },
+      }),
+      RequestPhase::Policy,
+    )
+    .await?;
+
+    let (requested_model, stream, initiator) = body_json_facts(&event_headers, &body);
+    let decoded = match serde_json::to_vec(&body) {
+      Ok(decoded) => decoded,
+      Err(source) => {
+        let failure = EventFailure {
+          code: "internal_error".into(),
+          message: "the embedded request body could not be recorded".into(),
+        };
+        publish_embedded_boundary(
+          &mut lifecycle,
+          TrafficEventKind::RequestBody(RequestBodyObservation {
+            wire: BodyCapture::Absent,
+            decoded: None,
+            requested_model,
+            stream,
+            initiator,
+            outcome: BodyOutcome::Rejected(failure),
+          }),
+          RequestPhase::RequestBody,
+        )
+        .await?;
+        return Err(finish_embedded_error(
+          lifecycle,
+          ManagedGatewayError::BodySerialization { site, source },
+        ));
+      }
+    };
+    let body_result = ManagedRequestBody::try_from(body);
+    let body_failure = body_result.as_ref().err().map(managed_body_failure);
+    publish_embedded_boundary(
+      &mut lifecycle,
+      TrafficEventKind::RequestBody(RequestBodyObservation {
+        wire: BodyCapture::Absent,
+        decoded: Some(capture_bytes(&decoded, self.body_capture_limit)),
+        requested_model,
+        stream,
+        initiator,
+        outcome: match body_failure {
+          Some(failure) => BodyOutcome::Rejected(failure),
+          None => BodyOutcome::Accepted,
+        },
+      }),
+      RequestPhase::RequestBody,
+    )
+    .await?;
+    let body = match body_result {
+      Ok(body) => body,
+      Err(source) => {
+        return Err(finish_embedded_error(
+          lifecycle,
+          ManagedGatewayError::InvalidBody {
+            site: site.clone(),
+            source,
+          },
+        ));
+      }
+    };
+
+    let resolution = match resolve_managed_profile(
+      profile,
+      SmolStr::new(body.requested_model()),
+      endpoint,
+      session_id.as_deref(),
+      &provider_access,
+    ) {
+      Ok(resolution) => resolution,
+      Err(source) => {
+        return Err(finish_embedded_error(
+          lifecycle,
+          ManagedGatewayError::Resolve { source },
+        ));
+      }
+    };
+    let target = match resolution {
+      TargetResolution::Selected(target) => target,
+      TargetResolution::CoolingDown { retry_at } => {
+        if let Some(error) = finish_embedded_outcome(
+          lifecycle,
+          selection_completion(
+            RequestOutcome::Failed,
+            "temporarily_unavailable",
+            "no upstream target is currently available",
+          ),
+        ) {
+          return Err(error);
+        }
+        return Ok(ManagedGatewayOutcome::CoolingDown { site, retry_at });
+      }
+      TargetResolution::NoEligible { reason } => {
+        let completion = no_eligible_completion(&reason);
+        if let Some(error) = finish_embedded_outcome(lifecycle, completion) {
+          return Err(error);
+        }
+        return Ok(ManagedGatewayOutcome::NoEligible { site, reason });
+      }
+    };
+
+    let success = match self
+      .attempts
+      .execute_observed(
+        target,
+        &headers,
+        body.value(),
+        generation_options.as_ref(),
+        &mut lifecycle,
+        self.body_capture_limit,
+      )
+      .await
+    {
+      Ok(success) => success,
+      Err(ManagedAttemptCoordinatorError::Attempt { site, summary, source }) => {
+        return Err(finish_embedded_error(
+          lifecycle,
+          ManagedGatewayError::Attempt {
+            site,
+            selection: summary,
+            source,
+          },
+        ));
+      }
+      Err(ManagedAttemptCoordinatorError::Response { site, summary, source }) => {
+        return Err(finish_embedded_error(
+          lifecycle,
+          ManagedGatewayError::Response {
+            site,
+            selection: summary,
+            source,
+          },
+        ));
+      }
+      Err(ManagedAttemptCoordinatorError::Lifecycle { phase, source }) => {
+        return Err(lifecycle_error(phase, source));
+      }
+    };
+    let (site, selection, response, attempt) = success.into_parts();
+    publish_embedded_boundary(
+      &mut lifecycle,
+      TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: response.status().as_u16(),
+        headers: capture_headers(response.headers()),
+      }),
+      RequestPhase::DownstreamResponse,
+    )
+    .await?;
+
+    let status = response.status().as_u16();
+    let termination = RequestTermination::new(RequestCompletion::new(
+      RequestOutcome::Delivered,
+      RequestPhase::Complete,
+      Some(status),
+      None,
+    ));
+    match response.body() {
+      ManagedClientBody::Buffered(body) => {
+        let body = body.clone();
+        let mut downstream = DownstreamLifecycle::new(lifecycle, termination, self.body_capture_limit, attempt);
+        downstream
+          .publish_attempt_progress()
+          .map_err(|source| lifecycle_error(RequestPhase::UpstreamResponse, source))?;
+        if !body.is_empty() {
+          downstream
+            .observe_data(&body)
+            .map_err(|source| lifecycle_error(RequestPhase::DownstreamResponse, source))?;
+        }
+        downstream
+          .finish_complete()
+          .map_err(|source| lifecycle_error(RequestPhase::DownstreamResponse, source))?;
+        Ok(ManagedGatewayOutcome::Response {
+          site,
+          selection,
+          response,
+        })
+      }
+      ManagedClientBody::Stream(_) => {
+        let response = response.map_body(|body| {
+          let ManagedClientBody::Stream(stream) = body else {
+            unreachable!("managed response body variant changed while installing lifecycle ownership")
+          };
+          ManagedClientBody::Stream(Box::pin(EmbeddedLifecycleStream::new(
+            stream,
+            lifecycle,
+            termination,
+            self.body_capture_limit,
+            attempt,
+          )))
+        });
+        Ok(ManagedGatewayOutcome::Response {
+          site,
+          selection,
+          response,
+        })
+      }
+    }
+  }
+}
+
+struct EmbeddedLifecycleStream {
+  inner: BoxStream<'static, std::io::Result<Bytes>>,
+  state: DownstreamLifecycle,
+}
+
+impl EmbeddedLifecycleStream {
+  fn new(
+    inner: BoxStream<'static, std::io::Result<Bytes>>,
+    lifecycle: RequestLifecycle,
+    termination: RequestTermination,
+    capture_limit: usize,
+    attempt: Option<AttemptBodyPlan>,
+  ) -> Self {
+    Self {
+      inner,
+      state: DownstreamLifecycle::new(lifecycle, termination, capture_limit, attempt),
+    }
+  }
+
+  fn publish_attempt_progress(&mut self) {
+    if let Err(error) = self.state.publish_attempt_progress() {
+      tracing::warn!(error = %error, "embedded upstream body progress publication failed");
+    }
+  }
+}
+
+impl Stream for EmbeddedLifecycleStream {
+  type Item = std::io::Result<Bytes>;
+
+  fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    if !self.state.is_active() {
+      return Poll::Ready(None);
+    }
+    match self.inner.as_mut().poll_next(context) {
+      Poll::Ready(Some(Ok(data))) => {
+        self.publish_attempt_progress();
+        if let Err(error) = self.state.observe_data(&data) {
+          tracing::warn!(error = %error, "embedded downstream body progress publication failed");
+        }
+        Poll::Ready(Some(Ok(data)))
+      }
+      Poll::Ready(Some(Err(error))) => {
+        self.publish_attempt_progress();
+        if let Err(terminal_error) = self.state.finish_failed(downstream_body_failure()) {
+          tracing::warn!(error = %terminal_error, "embedded downstream body terminal publication failed");
+        }
+        Poll::Ready(Some(Err(error)))
+      }
+      Poll::Ready(None) => {
+        self.publish_attempt_progress();
+        if let Err(error) = self.state.finish_complete() {
+          tracing::warn!(error = %error, "embedded downstream body terminal publication failed");
+        }
+        Poll::Ready(None)
+      }
+      Poll::Pending => {
+        self.publish_attempt_progress();
+        Poll::Pending
+      }
+    }
+  }
+}
+
+async fn publish_embedded_boundary(
+  lifecycle: &mut RequestLifecycle,
+  kind: TrafficEventKind,
+  phase: RequestPhase,
+) -> ManagedGatewayResult<()> {
+  lifecycle
+    .publish_boundary(kind)
+    .await
+    .map(|_| ())
+    .map_err(|source| lifecycle_error(phase, source))
+}
+
+fn finish_embedded_error(lifecycle: RequestLifecycle, error: ManagedGatewayError) -> ManagedGatewayError {
+  let completion = error.completion();
+  let phase = completion.phase;
+  match lifecycle.finish(RequestTermination::new(completion)) {
+    Ok(_) => error,
+    Err(source) => lifecycle_error(phase, source),
+  }
+}
+
+fn finish_embedded_outcome(lifecycle: RequestLifecycle, completion: RequestCompletion) -> Option<ManagedGatewayError> {
+  let phase = completion.phase;
+  lifecycle
+    .finish(RequestTermination::new(completion))
+    .err()
+    .map(|source| lifecycle_error(phase, source))
+}
+
+fn lifecycle_error(phase: RequestPhase, source: impl Into<anyhow::Error>) -> ManagedGatewayError {
+  ManagedGatewayError::Lifecycle {
+    phase,
+    source: source.into(),
+  }
+}
+
+fn endpoint_target(endpoint: Endpoint) -> &'static str {
+  match endpoint {
+    Endpoint::ChatCompletions => "/v1/chat/completions",
+    Endpoint::Responses => "/v1/responses",
+    Endpoint::Messages => "/v1/messages",
+  }
+}
+
+fn managed_body_failure(_source: &ManagedRequestBodyError) -> EventFailure {
+  EventFailure {
+    code: "invalid_managed_body".into(),
+    message: "the managed request body is invalid".into(),
+  }
+}
+
+fn selection_completion(outcome: RequestOutcome, code: &'static str, message: &'static str) -> RequestCompletion {
+  RequestCompletion::new(
+    outcome,
+    RequestPhase::TargetSelection,
+    None,
+    Some(EventFailure {
+      code: code.into(),
+      message: message.into(),
+    }),
+  )
+}
+
+fn no_eligible_completion(reason: &NoEligibleReason) -> RequestCompletion {
+  match reason {
+    NoEligibleReason::ProviderAccessDenied => selection_completion(
+      RequestOutcome::Rejected,
+      "provider_access_denied",
+      "the embedded caller cannot use the requested provider",
+    ),
+    NoEligibleReason::ModelSelectorNoMatch { .. }
+    | NoEligibleReason::QualifiedTargetUnavailable { .. }
+    | NoEligibleReason::CapabilityUnavailable { .. }
+    | NoEligibleReason::OriginNotConfigured { .. } => selection_completion(
+      RequestOutcome::Rejected,
+      "target_unavailable",
+      "no configured target supports the requested model and operation",
+    ),
+    NoEligibleReason::NoPoolBinding { .. } => selection_completion(
+      RequestOutcome::Failed,
+      "internal_error",
+      "the selected route could not resolve an upstream target",
+    ),
   }
 }
 
@@ -297,6 +783,9 @@ pub type ManagedGatewayBuildResult<T> = std::result::Result<T, ManagedGatewayBui
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum ManagedGatewayError {
+  #[snafu(display("embedded request lifecycle publication failed during {phase:?}: {source}"))]
+  Lifecycle { phase: RequestPhase, source: anyhow::Error },
+
   #[snafu(display("profile '{profile}' is not linked into this gateway runtime"))]
   ProfileNotLinked { profile: ProfileId },
 
@@ -304,6 +793,12 @@ pub enum ManagedGatewayError {
   InvalidBody {
     site: ManagedProfileSite,
     source: ManagedRequestBodyError,
+  },
+
+  #[snafu(display("{site} request body could not be serialized for lifecycle capture: {source}"))]
+  BodySerialization {
+    site: ManagedProfileSite,
+    source: serde_json::Error,
   },
 
   #[snafu(display("could not resolve embedded managed request: {source}"))]
@@ -329,8 +824,11 @@ pub type ManagedGatewayResult<T> = std::result::Result<T, ManagedGatewayError>;
 impl ManagedGatewayError {
   pub fn site(&self) -> Option<&ManagedProfileSite> {
     match self {
-      Self::ProfileNotLinked { .. } => None,
-      Self::InvalidBody { site, .. } | Self::Attempt { site, .. } | Self::Response { site, .. } => Some(site),
+      Self::Lifecycle { .. } | Self::ProfileNotLinked { .. } => None,
+      Self::InvalidBody { site, .. }
+      | Self::BodySerialization { site, .. }
+      | Self::Attempt { site, .. }
+      | Self::Response { site, .. } => Some(site),
       Self::Resolve { source } => Some(source.site()),
     }
   }
@@ -338,15 +836,174 @@ impl ManagedGatewayError {
   pub fn selection(&self) -> Option<&ManagedSelectionSummary> {
     match self {
       Self::Attempt { selection, .. } | Self::Response { selection, .. } => Some(selection),
-      Self::ProfileNotLinked { .. } | Self::InvalidBody { .. } | Self::Resolve { .. } => None,
+      Self::Lifecycle { .. }
+      | Self::ProfileNotLinked { .. }
+      | Self::InvalidBody { .. }
+      | Self::BodySerialization { .. }
+      | Self::Resolve { .. } => None,
     }
+  }
+
+  pub fn phase(&self) -> RequestPhase {
+    match self {
+      Self::Lifecycle { phase, .. } => *phase,
+      Self::ProfileNotLinked { .. } => RequestPhase::Policy,
+      Self::InvalidBody { .. } | Self::BodySerialization { .. } => RequestPhase::RequestBody,
+      Self::Resolve {
+        source: ManagedProfileResolveError::NonManagedRoute { .. },
+      } => RequestPhase::Policy,
+      Self::Resolve { .. } => RequestPhase::TargetSelection,
+      Self::Attempt { .. } => RequestPhase::UpstreamRequest,
+      Self::Response { .. } => RequestPhase::UpstreamResponse,
+    }
+  }
+
+  fn completion(&self) -> RequestCompletion {
+    let phase = self.phase();
+    let (outcome, code, message) = match self {
+      Self::Lifecycle { .. } => (
+        RequestOutcome::Failed,
+        "event_publication_failed",
+        "the request lifecycle could not be recorded",
+      ),
+      Self::ProfileNotLinked { .. } => (
+        RequestOutcome::Failed,
+        "profile_not_linked",
+        "the embedded profile is not linked into this gateway runtime",
+      ),
+      Self::InvalidBody { .. } => (
+        RequestOutcome::Rejected,
+        "invalid_managed_body",
+        "the managed request body is invalid",
+      ),
+      Self::BodySerialization { .. } => (
+        RequestOutcome::Failed,
+        "internal_error",
+        "the embedded request body could not be recorded",
+      ),
+      Self::Resolve {
+        source: ManagedProfileResolveError::MalformedQualification { .. },
+      } => (
+        RequestOutcome::Rejected,
+        "invalid_managed_request",
+        "the requested model qualification is invalid",
+      ),
+      Self::Resolve { .. } => (
+        RequestOutcome::Failed,
+        "internal_error",
+        "the embedded managed profile could not resolve a target",
+      ),
+      Self::Attempt { source, .. } => managed_attempt_completion(source),
+      Self::Response { .. } => (
+        RequestOutcome::Failed,
+        "invalid_upstream_response",
+        "the upstream response could not be processed",
+      ),
+    };
+    RequestCompletion::new(
+      outcome,
+      phase,
+      None,
+      Some(EventFailure {
+        code: code.into(),
+        message: message.into(),
+      }),
+    )
+  }
+}
+
+fn managed_attempt_completion(source: &ManagedAttemptError) -> (RequestOutcome, &'static str, &'static str) {
+  match source {
+    ManagedAttemptError::RequestConversion { .. } | ManagedAttemptError::GenerationControl { .. } => (
+      RequestOutcome::Rejected,
+      "invalid_managed_request",
+      "the managed request is not valid for the selected operation",
+    ),
+    ManagedAttemptError::ProviderRequest { .. } => (
+      RequestOutcome::Failed,
+      "upstream_unavailable",
+      "the upstream request could not be completed",
+    ),
+    ManagedAttemptError::BodyObjectRequired
+    | ManagedAttemptError::DispatchBodyMismatch { .. }
+    | ManagedAttemptError::InputTransform { .. }
+    | ManagedAttemptError::RequestSerialization { .. } => (
+      RequestOutcome::Failed,
+      "internal_error",
+      "the managed request could not be prepared",
+    ),
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::runtime::attempts::{ObservedUpstreamBody, UpstreamBodyObservation};
+  use futures_util::{stream, StreamExt};
   use http::header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
+  use hyper::body::{Body as HttpBody, Frame};
+  use std::io;
+  use std::sync::{Arc, Mutex};
+  use tokn_events::{
+    AttemptHttpRequest, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted, BodyFinished, BodyLeg,
+    BodyResult, CapturedHeaders, CapturedUri, ConsumerResult, Correlation, EventConsumer, EventSeq, GatewayEvent,
+    HttpRequestSnapshot, HubBuilder, RequestOutcome, RequestSource, RequestStarted, TargetSelection, TrafficEvent,
+  };
+
+  struct CaptureConsumer {
+    events: Arc<Mutex<Vec<GatewayEvent>>>,
+  }
+
+  struct ErrorBody(Option<io::Error>);
+
+  impl HttpBody for ErrorBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+      mut self: Pin<&mut Self>,
+      _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+      Poll::Ready(self.0.take().map(Err))
+    }
+  }
+
+  impl EventConsumer<GatewayEvent> for CaptureConsumer {
+    fn name(&self) -> &str {
+      "embedded-stream-test"
+    }
+
+    fn handle(&mut self, _sequence: EventSeq, event: &GatewayEvent) -> ConsumerResult {
+      self.events.lock().unwrap().push(event.clone());
+      Ok(())
+    }
+  }
+
+  fn embedded_started() -> RequestStarted {
+    RequestStarted {
+      source: RequestSource::Embedded {
+        profile_id: "test".into(),
+      },
+      http_version: None,
+      method: "POST".into(),
+      target: CapturedUri::exact("/v1/responses"),
+      headers: CapturedHeaders::default(),
+      body_present: true,
+      correlation: Correlation::default(),
+    }
+  }
+
+  fn captured_traffic(events: &Arc<Mutex<Vec<GatewayEvent>>>) -> Vec<TrafficEvent> {
+    events
+      .lock()
+      .unwrap()
+      .iter()
+      .filter_map(|event| match event {
+        GatewayEvent::Traffic(event) => Some(event.clone()),
+        _ => None,
+      })
+      .collect()
+  }
 
   #[test]
   fn explicit_session_replaces_header_correlation_and_strips_wire_metadata() {
@@ -383,5 +1040,143 @@ mod tests {
       Some("header-session")
     );
     assert!(!headers.contains_key(&tokn_headers::keys::X_SESSION_ID));
+  }
+
+  #[tokio::test]
+  async fn embedded_stream_error_is_preserved_and_closes_both_body_legs_and_attempt() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(CaptureConsumer {
+        events: Arc::clone(&events),
+      })
+      .start()
+      .unwrap();
+    let emitter = RequestLifecycleEmitter::new(publisher);
+    let mut lifecycle = emitter.begin(embedded_started()).await.unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::AttemptStarted(AttemptStarted {
+        attempt: AttemptNo::FIRST,
+        target: TargetSelection {
+          family: HttpFamily::Managed,
+          account_id: None,
+          provider_id: None,
+          upstream_id: None,
+          requested_model: None,
+          upstream_model: None,
+          requested_operation: None,
+          upstream_operation: None,
+        },
+      }))
+      .await
+      .unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::AttemptRequest(AttemptHttpRequest {
+        attempt: AttemptNo::FIRST,
+        request: HttpRequestSnapshot {
+          method: "POST".into(),
+          uri: CapturedUri::exact("http://upstream.test/v1/chat/completions"),
+          headers: CapturedHeaders::default(),
+          body: BodyCapture::Absent,
+        },
+      }))
+      .await
+      .unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::AttemptResponseHead(AttemptHttpResponseHead {
+        attempt: AttemptNo::FIRST,
+        response: HttpResponseHead {
+          status: 502,
+          headers: CapturedHeaders::default(),
+        },
+      }))
+      .await
+      .unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: 200,
+        headers: CapturedHeaders::default(),
+      }))
+      .await
+      .unwrap();
+
+    let upstream = UpstreamBodyObservation::new(AttemptNo::FIRST, 2, None, false);
+    let raw_error = io::Error::new(io::ErrorKind::ConnectionReset, "raw upstream reset");
+    let mut raw = ObservedUpstreamBody::new(ErrorBody(Some(raw_error)), upstream.clone());
+    let observed_error = std::future::poll_fn(|context| Pin::new(&mut raw).poll_frame(context))
+      .await
+      .expect("the raw body yields an error")
+      .expect_err("the raw body error is preserved");
+    assert_eq!(observed_error.kind(), io::ErrorKind::ConnectionReset);
+    assert_eq!(observed_error.to_string(), "raw upstream reset");
+    let attempt = AttemptBodyPlan::new(upstream, 502);
+
+    let downstream_error = io::Error::new(io::ErrorKind::BrokenPipe, "embedded output failed");
+    let inner = stream::iter([Err(downstream_error)]).boxed();
+    let termination = RequestTermination::new(RequestCompletion::new(
+      RequestOutcome::Delivered,
+      RequestPhase::Complete,
+      Some(200),
+      None,
+    ));
+    let mut stream = EmbeddedLifecycleStream::new(inner, lifecycle, termination, 2, Some(attempt));
+    let propagated = stream
+      .next()
+      .await
+      .expect("the embedded stream yields its error")
+      .expect_err("the embedded stream error is preserved");
+    assert_eq!(propagated.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(propagated.to_string(), "embedded output failed");
+    assert!(stream.next().await.is_none());
+    drop(stream);
+    hub.shutdown().await.unwrap();
+
+    let traffic = captured_traffic(&events);
+    let upstream_finished = traffic
+      .iter()
+      .position(|event| {
+        matches!(
+          &event.kind,
+          TrafficEventKind::BodyFinished(BodyFinished {
+            leg: BodyLeg::Upstream { .. },
+            result: BodyResult::Failed(_),
+            ..
+          })
+        )
+      })
+      .expect("upstream body failure");
+    let attempt_finished = traffic
+      .iter()
+      .position(|event| {
+        matches!(
+          &event.kind,
+          TrafficEventKind::AttemptFinished(event) if event.outcome == AttemptOutcome::Failed
+        )
+      })
+      .expect("attempt failure");
+    let downstream_finished = traffic
+      .iter()
+      .position(|event| {
+        matches!(
+          &event.kind,
+          TrafficEventKind::BodyFinished(BodyFinished {
+            leg: BodyLeg::Downstream,
+            capture: BodyCapture::Truncated { prefix, bytes_seen: 0 },
+            result: BodyResult::Failed(_),
+          }) if prefix.is_empty()
+        )
+      })
+      .expect("downstream body failure");
+    let request_finished = traffic
+      .iter()
+      .position(|event| {
+        matches!(
+          &event.kind,
+          TrafficEventKind::Finished(event) if event.outcome == RequestOutcome::Failed
+        )
+      })
+      .expect("request failure");
+    assert!(upstream_finished < attempt_finished);
+    assert!(attempt_finished < downstream_finished);
+    assert!(downstream_finished < request_finished);
   }
 }

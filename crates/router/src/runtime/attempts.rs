@@ -90,6 +90,7 @@ pub(crate) struct AttemptRequestObserver<'a> {
   lifecycle: &'a mut RequestLifecycle,
   attempt: AttemptNo,
   capture_limit: usize,
+  publication_error: Option<BoundaryPublishError>,
 }
 
 impl<'a> AttemptRequestObserver<'a> {
@@ -98,7 +99,12 @@ impl<'a> AttemptRequestObserver<'a> {
       lifecycle,
       attempt,
       capture_limit,
+      publication_error: None,
     }
+  }
+
+  pub(crate) fn take_publication_error(&mut self) -> Option<BoundaryPublishError> {
+    self.publication_error.take()
   }
 }
 
@@ -122,17 +128,20 @@ impl OutboundRequestObserver for AttemptRequestObserver<'_> {
         body,
       },
     };
-    self
+    match self
       .lifecycle
       .publish_boundary(TrafficEventKind::AttemptRequest(snapshot))
       .await
-      .map(|_| ())
-      .map_err(|source| {
+    {
+      Ok(_) => Ok(()),
+      Err(source) => {
         tracing::error!(error = %source, "could not publish final upstream request observation");
-        ProviderError::RequestObservation {
+        self.publication_error = Some(source);
+        Err(ProviderError::RequestObservation {
           message: REQUEST_OBSERVATION_FAILURE_MESSAGE.to_string(),
-        }
-      })
+        })
+      }
+    }
   }
 }
 

@@ -6,11 +6,12 @@
 //! without allowing payload facts to change the matched route.
 
 use super::super::{LinkedRouteKind, ManagedRequestBody, ManagedRequestBodyError, MatchedHttpRoute};
+use crate::runtime::observation::{body_header_facts, merge_body_json_facts};
 use axum::body::Body;
 use bytes::{Bytes, BytesMut};
 use flate2::read::MultiGzDecoder;
 use futures_util::StreamExt;
-use http::header::{ACCEPT, CONTENT_ENCODING};
+use http::header::CONTENT_ENCODING;
 use http::HeaderMap;
 use serde_json::Value;
 use smol_str::SmolStr;
@@ -178,24 +179,19 @@ struct RequestBodyFacts {
 
 impl RequestBodyFacts {
   fn from_headers(headers: &HeaderMap) -> Self {
+    let (stream, initiator) = body_header_facts(headers);
     Self {
       requested_model: None,
-      stream: accepts_event_stream(headers).then_some(true),
-      initiator: header_initiator(headers),
+      stream,
+      initiator,
     }
   }
 
   fn observe_json(mut self, value: &Value) -> Self {
-    self.requested_model = value.get("model").and_then(Value::as_str).map(SmolStr::new);
-    self.stream = Some(
-      value
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(self.stream == Some(true)),
-    );
-    if self.initiator.is_none() {
-      self.initiator = infer_body_initiator(value).map(SmolStr::new);
-    }
+    let (requested_model, stream, initiator) = merge_body_json_facts(self.stream, self.initiator.take(), value);
+    self.requested_model = requested_model;
+    self.stream = stream;
+    self.initiator = initiator;
     self
   }
 
@@ -407,38 +403,6 @@ fn parse_content_encodings(headers: &HeaderMap) -> RequestBodyResult<Vec<Content
     }
   }
   Ok(encodings)
-}
-
-fn accepts_event_stream(headers: &HeaderMap) -> bool {
-  headers.get_all(ACCEPT).iter().any(|value| {
-    value.to_str().is_ok_and(|value| {
-      value.split(',').any(|part| {
-        part
-          .split(';')
-          .next()
-          .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
-      })
-    })
-  })
-}
-
-fn header_initiator(headers: &HeaderMap) -> Option<SmolStr> {
-  let value = headers.get("x-initiator")?.to_str().ok()?.trim().to_ascii_lowercase();
-  matches!(value.as_str(), "user" | "agent").then(|| SmolStr::new(value))
-}
-
-fn infer_body_initiator(body: &Value) -> Option<&'static str> {
-  if body.get("input").is_some() {
-    tokn_core::util::initiator::classify_initiator_responses(body)
-  } else {
-    tokn_core::util::initiator::classify_initiator(body).or_else(|| {
-      body
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty())
-        .then_some("agent")
-    })
-  }
 }
 
 fn unpolled_wire_capture(body_present: bool) -> BodyCapture {
@@ -821,6 +785,7 @@ mod tests {
   };
   use flate2::write::GzEncoder;
   use flate2::Compression;
+  use http::header::ACCEPT;
   use http::{HeaderValue, Method};
   use hyper::body::{Body as HttpBody, Frame};
   use smol_str::SmolStr;

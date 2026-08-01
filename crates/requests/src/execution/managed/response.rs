@@ -59,6 +59,16 @@ impl ManagedClientResponse {
   pub fn into_parts(self) -> (StatusCode, HeaderMap, ManagedClientBody) {
     (self.status, self.headers, self.body)
   }
+
+  /// Replace the client-facing body while preserving the adapted response
+  /// status and headers.
+  pub fn map_body(self, map: impl FnOnce(ManagedClientBody) -> ManagedClientBody) -> Self {
+    Self {
+      status: self.status,
+      headers: self.headers,
+      body: map(self.body),
+    }
+  }
 }
 
 /// Failure while adapting a response body after its head was received.

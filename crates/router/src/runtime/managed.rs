@@ -15,12 +15,17 @@ pub use gateway::{
 };
 
 use super::{LinkedManagedRoute, LinkedProfile, LinkedRouteKind, LinkedWireIdentity};
+use crate::runtime::attempts::{
+  close_pre_head_failure, endpoint_usage_kind, observe_upstream_response, publish_attempt_started,
+  publish_response_head, AttemptBodyPlan, AttemptRequestObserver,
+};
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderMap;
 use serde_json::Value;
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::fmt;
+use std::future::Future;
 use tokn_access::ProviderAccess;
 use tokn_accounts::link::{
   resolve_managed_target, PoolRuntimeResult, SelectedManagedTarget, SelectionOutcome, SelectionSettlement,
@@ -30,12 +35,14 @@ use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::provider::OutboundRequestObserver;
 use tokn_core::AgentId;
+use tokn_events::{AttemptNo, HttpFamily, RequestPhase, TargetSelection};
 use tokn_headers::HeaderMap as SemanticHeaderMap;
 use tokn_policy::{ProfileId, ProviderId, RouteId, RouteKind, UpstreamId};
 use tokn_requests::execution::{
   ManagedAttemptError, ManagedClientResponse, ManagedExecutionTarget, ManagedHttpAttempt, ManagedHttpExecutor,
   ManagedHttpResponse, ManagedResponseAdapter, ManagedResponseError,
 };
+use tokn_requests::{BoundaryPublishError, RequestLifecycle};
 
 /// Stable, non-secret location of a managed profile in the linked runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,6 +195,19 @@ impl RoutedManagedTarget {
     )
   }
 
+  pub(crate) fn event_selection(&self) -> TargetSelection {
+    TargetSelection {
+      family: HttpFamily::Managed,
+      account_id: Some(self.target.binding().account_id().into()),
+      provider_id: Some(self.target.upstream().provider_id().as_str().into()),
+      upstream_id: Some(self.target.upstream().id().as_str().into()),
+      requested_model: Some(self.requested_model().into()),
+      upstream_model: Some(self.target.model().into()),
+      requested_operation: Some(self.requested_operation().as_str().into()),
+      upstream_operation: Some(self.target.operation().as_str().into()),
+    }
+  }
+
   pub(crate) fn settle(self, outcome: SelectionOutcome) -> PoolRuntimeResult<SelectionSettlement> {
     self.target.into_selection_token().settle(outcome)
   }
@@ -222,6 +242,129 @@ impl ManagedAttemptCoordinator {
       .receive_observed(target, headers, body, generation_options, None)
       .await?;
     self.adapt(received).await
+  }
+
+  /// Execute one managed attempt with the same stable event boundaries for
+  /// listener-backed and embedded callers.
+  pub(crate) async fn execute_observed(
+    &self,
+    target: RoutedManagedTarget,
+    headers: &SemanticHeaderMap,
+    body: &Value,
+    generation_options: Option<&GenerationOptions>,
+    lifecycle: &mut RequestLifecycle,
+    capture_limit: usize,
+  ) -> Result<ManagedObservedAttemptSuccess, ManagedAttemptCoordinatorError> {
+    if let Err(source) = publish_attempt_started(lifecycle, target.event_selection()).await {
+      let site = target.site().clone();
+      let summary = ManagedSelectionSummary::from_target(&target);
+      settle_managed_selection(&site, &summary, target, SelectionOutcome::Unchanged);
+      return Err(ManagedAttemptCoordinatorError::Lifecycle {
+        phase: RequestPhase::TargetSelection,
+        source: Box::new(source),
+      });
+    }
+
+    let (received, request_publication_error) = {
+      let mut observer = AttemptRequestObserver::new(lifecycle, AttemptNo::FIRST, capture_limit);
+      let received = self
+        .receive_observed(target, headers, body, generation_options, Some(&mut observer))
+        .await;
+      let publication_error = observer.take_publication_error();
+      (received, publication_error)
+    };
+    if let Some(source) = request_publication_error {
+      let _ = close_pre_head_failure(lifecycle, RequestPhase::UpstreamRequest).await;
+      return Err(ManagedAttemptCoordinatorError::Lifecycle {
+        phase: RequestPhase::UpstreamRequest,
+        source: Box::new(source),
+      });
+    }
+    let received = match received {
+      Ok(received) => received,
+      Err(error @ ManagedAttemptCoordinatorError::Attempt { .. }) => {
+        close_pre_head_failure(lifecycle, RequestPhase::UpstreamRequest)
+          .await
+          .map_err(|source| ManagedAttemptCoordinatorError::Lifecycle {
+            phase: RequestPhase::UpstreamRequest,
+            source: Box::new(source),
+          })?;
+        return Err(error);
+      }
+      Err(ManagedAttemptCoordinatorError::Response { .. } | ManagedAttemptCoordinatorError::Lifecycle { .. }) => {
+        unreachable!("receiving a managed response cannot adapt its body or publish another lifecycle")
+      }
+    };
+
+    publish_response_head(lifecycle, received.response().response())
+      .await
+      .map_err(|source| ManagedAttemptCoordinatorError::Lifecycle {
+        phase: RequestPhase::UpstreamResponse,
+        source: Box::new(source),
+      })?;
+    let usage_kind = Some(endpoint_usage_kind(received.response().metadata().upstream_operation()));
+    let mut plan = None;
+    let received = received.map_response(|response| {
+      let (response, metadata) = response.into_parts();
+      let (response, body_plan) = observe_upstream_response(response, capture_limit, usage_kind);
+      plan = Some(body_plan);
+      ManagedHttpResponse::new(response, metadata)
+    });
+    let body_plan = plan.expect("managed response observation plan is installed before adaptation");
+    body_plan.arm(lifecycle);
+
+    let mut adaptation = Box::pin(self.adapt(received));
+    let mut progress_available = true;
+    let adapted = std::future::poll_fn(|context| {
+      let result = adaptation.as_mut().poll(context);
+      if progress_available {
+        if let Some(progress) = body_plan.take_progress() {
+          if let Err(error) = lifecycle.try_publish_progress(progress) {
+            progress_available = false;
+            tracing::warn!(error = %error, "upstream body progress publication failed during managed adaptation");
+          }
+        }
+      }
+      result
+    })
+    .await;
+
+    match adapted {
+      Ok(success) => {
+        let (site, summary, response) = success.into_parts();
+        let attempt = if body_plan.is_finished() {
+          body_plan
+            .publish_terminal(lifecycle)
+            .await
+            .map_err(|source| ManagedAttemptCoordinatorError::Lifecycle {
+              phase: RequestPhase::UpstreamResponse,
+              source: Box::new(source),
+            })?;
+          None
+        } else {
+          Some(body_plan)
+        };
+        Ok(ManagedObservedAttemptSuccess {
+          site,
+          summary,
+          response,
+          attempt,
+        })
+      }
+      Err(error @ ManagedAttemptCoordinatorError::Response { .. }) => {
+        body_plan
+          .publish_terminal(lifecycle)
+          .await
+          .map_err(|source| ManagedAttemptCoordinatorError::Lifecycle {
+            phase: RequestPhase::UpstreamResponse,
+            source: Box::new(source),
+          })?;
+        Err(error)
+      }
+      Err(ManagedAttemptCoordinatorError::Attempt { .. } | ManagedAttemptCoordinatorError::Lifecycle { .. }) => {
+        unreachable!("adapting a received managed response cannot send another attempt or publish a boundary")
+      }
+    }
   }
 
   /// Send and settle one managed attempt without polling its response body.
@@ -311,6 +454,26 @@ pub(crate) struct ManagedAttemptSuccess {
   response: ManagedClientResponse,
 }
 
+pub(crate) struct ManagedObservedAttemptSuccess {
+  site: ManagedProfileSite,
+  summary: ManagedSelectionSummary,
+  response: ManagedClientResponse,
+  attempt: Option<AttemptBodyPlan>,
+}
+
+impl ManagedObservedAttemptSuccess {
+  pub(crate) fn into_parts(
+    self,
+  ) -> (
+    ManagedProfileSite,
+    ManagedSelectionSummary,
+    ManagedClientResponse,
+    Option<AttemptBodyPlan>,
+  ) {
+    (self.site, self.summary, self.response, self.attempt)
+  }
+}
+
 impl ManagedAttemptSuccess {
   pub(crate) fn into_parts(self) -> (ManagedProfileSite, ManagedSelectionSummary, ManagedClientResponse) {
     (self.site, self.summary, self.response)
@@ -328,6 +491,10 @@ pub(crate) enum ManagedAttemptCoordinatorError {
     site: ManagedProfileSite,
     summary: ManagedSelectionSummary,
     source: ManagedResponseError,
+  },
+  Lifecycle {
+    phase: RequestPhase,
+    source: Box<BoundaryPublishError>,
   },
 }
 

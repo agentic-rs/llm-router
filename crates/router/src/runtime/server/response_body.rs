@@ -5,20 +5,15 @@
 //! the downstream body reaches EOF, fails, or is dropped by the client.
 
 use crate::runtime::attempts::AttemptBodyPlan;
+use crate::runtime::downstream::{downstream_body_failure, DownstreamLifecycle};
 use axum::body::Body;
 use axum::response::Response;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokn_events::{
-  BodyCapture, BodyFinished, BodyLeg, BodyProgress, BodyResult, EventFailure, RequestOutcome, RequestPhase,
-};
-use tokn_requests::{RequestCompletion, RequestLifecycle, RequestTerminalEvent, RequestTermination};
-
-const DOWNSTREAM_BODY_FAILURE_CODE: &str = "downstream_body_read_failed";
-const DOWNSTREAM_BODY_FAILURE_MESSAGE: &str = "the downstream response body could not be read";
+use tokn_requests::{RequestLifecycle, RequestTermination};
 
 /// Move a request lifecycle into an observer for an already-materialized response.
 ///
@@ -49,15 +44,7 @@ pub(super) fn observe_downstream_body(
 /// A transparent frame observer that owns terminal request publication.
 struct DownstreamLifecycleBody<B> {
   inner: Pin<Box<B>>,
-  lifecycle: Option<RequestLifecycle>,
-  termination: Option<RequestTermination>,
-  capture: BytesMut,
-  capture_limit: usize,
-  bytes_seen: u64,
-  chunks: u64,
-  progress_available: bool,
-  attempt_progress_available: bool,
-  attempt: Option<AttemptBodyPlan>,
+  state: DownstreamLifecycle,
 }
 
 impl<B> DownstreamLifecycleBody<B> {
@@ -68,129 +55,14 @@ impl<B> DownstreamLifecycleBody<B> {
 
   fn with_attempt(
     inner: B,
-    mut lifecycle: RequestLifecycle,
+    lifecycle: RequestLifecycle,
     termination: RequestTermination,
     capture_limit: usize,
     attempt: Option<AttemptBodyPlan>,
   ) -> Self {
-    if let Some(attempt) = &attempt {
-      attempt.arm(&mut lifecycle);
-    }
-    lifecycle.arm_body(BodyLeg::Downstream);
     Self {
       inner: Box::pin(inner),
-      lifecycle: Some(lifecycle),
-      termination: Some(termination),
-      capture: BytesMut::with_capacity(capture_limit.min(8 * 1024)),
-      capture_limit,
-      bytes_seen: 0,
-      chunks: 0,
-      progress_available: true,
-      attempt_progress_available: true,
-      attempt,
-    }
-  }
-
-  fn publish_attempt_progress(&mut self) {
-    if !self.attempt_progress_available {
-      return;
-    }
-    let Some(progress) = self.attempt.as_ref().and_then(AttemptBodyPlan::take_progress) else {
-      return;
-    };
-    let Some(lifecycle) = &mut self.lifecycle else {
-      return;
-    };
-    if let Err(error) = lifecycle.try_publish_progress(progress) {
-      self.attempt_progress_available = false;
-      tracing::warn!(error = %error, "upstream body progress publication failed");
-    }
-  }
-
-  fn observe_data(&mut self, data: &Bytes) {
-    let chunk_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
-    self.bytes_seen = self.bytes_seen.saturating_add(chunk_bytes);
-    self.chunks = self.chunks.saturating_add(1);
-
-    let remaining = self.capture_limit.saturating_sub(self.capture.len());
-    let retained = remaining.min(data.len());
-    self.capture.extend_from_slice(&data[..retained]);
-
-    if !self.progress_available {
-      return;
-    }
-    let progress = BodyProgress {
-      leg: BodyLeg::Downstream,
-      bytes_seen: self.bytes_seen,
-      chunks: self.chunks,
-    };
-    let Some(lifecycle) = &mut self.lifecycle else {
-      return;
-    };
-    if let Err(error) = lifecycle.try_publish_progress(progress) {
-      self.progress_available = false;
-      tracing::warn!(error = %error, "downstream body progress publication failed");
-    }
-  }
-
-  fn finish_complete(&mut self) {
-    let capture = if self.bytes_seen == u64::try_from(self.capture.len()).unwrap_or(u64::MAX) {
-      BodyCapture::Complete(self.capture.split().freeze())
-    } else {
-      self.incomplete_capture()
-    };
-    self.finish(capture, BodyResult::Complete);
-  }
-
-  fn finish_incomplete(&mut self, result: BodyResult) {
-    let capture = self.incomplete_capture();
-    self.finish(capture, result);
-  }
-
-  fn incomplete_capture(&mut self) -> BodyCapture {
-    BodyCapture::Truncated {
-      prefix: self.capture.split().freeze(),
-      bytes_seen: self.bytes_seen,
-    }
-  }
-
-  fn finish(&mut self, capture: BodyCapture, result: BodyResult) {
-    let Some(lifecycle) = self.lifecycle.take() else {
-      return;
-    };
-    let mut termination = self
-      .termination
-      .take()
-      .expect("a live downstream lifecycle always has a terminal plan");
-    if termination.completion().outcome == RequestOutcome::Delivered {
-      match &result {
-        BodyResult::Failed(failure) => termination.replace_completion(RequestCompletion::new(
-          RequestOutcome::Failed,
-          RequestPhase::DownstreamResponse,
-          None,
-          Some(failure.clone()),
-        )),
-        BodyResult::Cancelled => termination.replace_completion(RequestCompletion::new(
-          RequestOutcome::Cancelled,
-          RequestPhase::DownstreamResponse,
-          None,
-          None,
-        )),
-        BodyResult::Complete => {}
-        _ => {}
-      }
-    }
-    if let Some(attempt) = &self.attempt {
-      attempt.append_terminal(&mut termination);
-    }
-    termination.push(RequestTerminalEvent::BodyFinished(BodyFinished {
-      leg: BodyLeg::Downstream,
-      capture,
-      result,
-    }));
-    let request_id = lifecycle.request_id().clone();
-    if let Err(error) = lifecycle.finish(termination) {
-      tracing::warn!(%request_id, error = %error, "downstream body terminal publication failed");
+      state: DownstreamLifecycle::new(lifecycle, termination, capture_limit, attempt),
     }
   }
 }
@@ -208,35 +80,45 @@ where
     context: &mut Context<'_>,
   ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
     let this = &mut *self;
-    if this.lifecycle.is_none() {
+    if !this.state.is_active() {
       return Poll::Ready(None);
     }
 
     match this.inner.as_mut().poll_frame(context) {
       Poll::Ready(Some(Ok(frame))) => {
-        this.publish_attempt_progress();
+        if let Err(error) = this.state.publish_attempt_progress() {
+          tracing::warn!(error = %error, "upstream body progress publication failed");
+        }
         if let Some(data) = frame.data_ref() {
-          this.observe_data(data);
+          if let Err(error) = this.state.observe_data(data) {
+            tracing::warn!(error = %error, "downstream body progress publication failed");
+          }
         }
         Poll::Ready(Some(Ok(frame)))
       }
       Poll::Ready(Some(Err(error))) => {
-        this.publish_attempt_progress();
+        if let Err(progress_error) = this.state.publish_attempt_progress() {
+          tracing::warn!(error = %progress_error, "upstream body progress publication failed");
+        }
         tracing::warn!(error = %error, "downstream response body read failed");
-        let failure = EventFailure {
-          code: DOWNSTREAM_BODY_FAILURE_CODE.into(),
-          message: DOWNSTREAM_BODY_FAILURE_MESSAGE.into(),
-        };
-        this.finish_incomplete(BodyResult::Failed(failure));
+        if let Err(terminal_error) = this.state.finish_failed(downstream_body_failure()) {
+          tracing::warn!(error = %terminal_error, "downstream body terminal publication failed");
+        }
         Poll::Ready(Some(Err(error)))
       }
       Poll::Ready(None) => {
-        this.publish_attempt_progress();
-        this.finish_complete();
+        if let Err(error) = this.state.publish_attempt_progress() {
+          tracing::warn!(error = %error, "upstream body progress publication failed");
+        }
+        if let Err(error) = this.state.finish_complete() {
+          tracing::warn!(error = %error, "downstream body terminal publication failed");
+        }
         Poll::Ready(None)
       }
       Poll::Pending => {
-        this.publish_attempt_progress();
+        if let Err(error) = this.state.publish_attempt_progress() {
+          tracing::warn!(error = %error, "upstream body progress publication failed");
+        }
         Poll::Pending
       }
     }
@@ -246,7 +128,7 @@ where
     // Keep an empty inner body pollable until it can publish Complete. Once
     // terminalized, no more frames may be observed even if a broken upstream
     // body were to yield frames after an error.
-    self.lifecycle.is_none()
+    !self.state.is_active()
   }
 
   fn size_hint(&self) -> SizeHint {
@@ -254,26 +136,20 @@ where
   }
 }
 
-impl<B> Drop for DownstreamLifecycleBody<B> {
-  fn drop(&mut self) {
-    if self.lifecycle.is_some() {
-      self.finish_incomplete(BodyResult::Cancelled);
-    }
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::runtime::downstream::{DOWNSTREAM_BODY_FAILURE_CODE, DOWNSTREAM_BODY_FAILURE_MESSAGE};
   use http::{HeaderMap, HeaderValue, StatusCode};
   use std::collections::VecDeque;
   use std::error::Error;
   use std::sync::{Arc, Mutex};
   use tokn_events::{
     AttemptFinished, AttemptHttpRequest, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted,
-    CapturedHeaders, CapturedUri, ConsumerResult, Correlation, EventConsumer, EventSeq, GatewayEvent, HttpFamily,
-    HttpRequestSnapshot, HttpResponseHead, HubBuilder, IngressKind, RequestOutcome, RequestPhase, RequestSource,
-    RequestStarted, TargetSelection, TrafficEvent, TrafficEventKind,
+    BodyCapture, BodyFinished, BodyLeg, BodyProgress, BodyResult, CapturedHeaders, CapturedUri, ConsumerResult,
+    Correlation, EventConsumer, EventFailure, EventSeq, GatewayEvent, HttpFamily, HttpRequestSnapshot,
+    HttpResponseHead, HubBuilder, IngressKind, RequestOutcome, RequestPhase, RequestSource, RequestStarted,
+    TargetSelection, TrafficEvent, TrafficEventKind,
   };
   use tokn_requests::{RequestCompletion, RequestLifecycleEmitter};
 

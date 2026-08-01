@@ -247,19 +247,7 @@ pub(super) enum SelectedHttpTarget {
 impl SelectedHttpTarget {
   pub(super) fn event_selection(&self) -> TargetSelection {
     match self {
-      Self::Managed(selected) => {
-        let target = selected.target();
-        TargetSelection {
-          family: HttpFamily::Managed,
-          account_id: Some(target.binding().account_id().into()),
-          provider_id: Some(target.upstream().provider_id().as_str().into()),
-          upstream_id: Some(target.upstream().id().as_str().into()),
-          requested_model: Some(selected.requested_model().into()),
-          upstream_model: Some(target.model().into()),
-          requested_operation: Some(selected.requested_operation().as_str().into()),
-          upstream_operation: Some(target.operation().as_str().into()),
-        }
-      }
+      Self::Managed(selected) => selected.event_selection(),
       Self::Relay(selected) => TargetSelection {
         family: HttpFamily::Relay,
         account_id: Some(selected.target().binding().account_id().into()),
