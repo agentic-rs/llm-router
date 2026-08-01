@@ -83,6 +83,16 @@ impl Cli {
       return serve::run(cfg_path).await.map_err(Error::from);
     }
 
+    // Config migration must observe legacy files exactly as they are. In
+    // particular, do not extract embedded accounts or initialize configured
+    // logging before its read-only planner runs.
+    if matches!(&self.cmd, Cmd::Config(args) if args.requires_pristine_startup()) {
+      let Cmd::Config(args) = self.cmd else {
+        unreachable!("the pristine startup predicate only matches config commands")
+      };
+      return config_cmd::run(cfg_path, args).await.map_err(Error::from);
+    }
+
     let is_inspect = matches!(&self.cmd, Cmd::Inspect(_));
     if !is_inspect {
       prepare_legacy_default_config_home(cfg_path.as_deref())?;

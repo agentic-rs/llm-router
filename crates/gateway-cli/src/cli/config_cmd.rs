@@ -11,10 +11,18 @@ use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value as EditValue};
 
+mod migrate_v2;
+
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
   #[command(subcommand)]
   pub cmd: ConfigCmd,
+}
+
+impl ConfigArgs {
+  pub(super) fn requires_pristine_startup(&self) -> bool {
+    matches!(self.cmd, ConfigCmd::MigrateV2(_))
+  }
 }
 
 #[derive(Subcommand, Debug)]
@@ -33,6 +41,26 @@ pub enum ConfigCmd {
   Path,
   /// Initialize config with onboarding wizard
   Init(InitArgs),
+  /// Render a validated version 2 config without modifying any files
+  #[command(name = "migrate-v2")]
+  MigrateV2(MigrateV2Args),
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateV2Args {
+  /// Legacy listener surface to represent in the generated config
+  #[arg(long, value_enum)]
+  pub activate: V2ActivationArg,
+  /// Permit non-loopback cleartext HTTP account upstreams
+  #[arg(long)]
+  pub allow_insecure_upstreams: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum V2ActivationArg {
+  Api,
+  Proxy,
+  Both,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -127,6 +155,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
     ConfigCmd::Edit => cmd_edit(&path),
     ConfigCmd::Path => cmd_path(&path),
     ConfigCmd::Init(a) => cmd_init(&path, a).await,
+    ConfigCmd::MigrateV2(a) => migrate_v2::run(&path, &a),
   }
 }
 
