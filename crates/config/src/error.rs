@@ -91,6 +91,28 @@ pub enum Error {
   #[snafu(display("refusing to replace config symlink `{}`", path.display()))]
   ConfigSymlink { path: PathBuf },
 
+  #[snafu(display("refusing to read symbolic-link config source `{}`", path.display()))]
+  ConfigSourceSymlink { path: PathBuf },
+
+  #[snafu(display("config source `{}` must be {expected}", path.display()))]
+  InvalidConfigSourceType { path: PathBuf, expected: &'static str },
+
+  #[snafu(display("config source `{}` changed while it was being captured; retry the operation", path.display()))]
+  ConfigSourceChanged { path: PathBuf },
+
+  #[snafu(display(
+    "effective config sources for `{}` changed while they were being loaded or validated; retry the operation",
+    path.display()
+  ))]
+  ConfigSourcesChanged { path: PathBuf },
+
+  #[snafu(display(
+    "config lock for `{}` cannot validate source snapshot for `{}`",
+    lock_root.display(),
+    snapshot_root.display()
+  ))]
+  ConfigSnapshotLockMismatch { snapshot_root: PathBuf, lock_root: PathBuf },
+
   #[snafu(display("set permissions on `{}`", path.display()))]
   SetPermissions { path: PathBuf, source: std::io::Error },
 

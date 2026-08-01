@@ -1,9 +1,11 @@
 pub mod error;
 pub mod paths;
 mod schema;
+mod snapshot;
 pub mod v2;
 
 pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
+pub use snapshot::{ConfigSourcesSnapshot, StableLoadedConfig};
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
 pub use tokn_core::AgentId;
 
@@ -55,6 +57,7 @@ impl<'a> ConfigEditPreimage<'a> {
 pub struct ConfigFileLock {
   path: PathBuf,
   requested_path: PathBuf,
+  lock_path: PathBuf,
   file: File,
 }
 
@@ -73,7 +76,12 @@ impl ConfigFileLock {
   /// symbolic link. That condition is checked before the initial read and
   /// again immediately before the final preimage check and atomic replace.
   pub fn replace_contents_if_unchanged(&self, expected: Option<&[u8]>, contents: &[u8]) -> GuardedEditResult<()> {
+    self.validate_identity()?;
     replace_contents_if_unchanged_locked(&self.path, &self.requested_path, expected, contents)
+  }
+
+  fn validate_identity(&self) -> Result<()> {
+    validate_open_config_lock(&self.requested_path, &self.lock_path, &self.file)
   }
 }
 
@@ -113,6 +121,7 @@ pub fn lock_config_file(path: &Path) -> Result<ConfigFileLock> {
       Ok(ConfigFileLock {
         path,
         requested_path: requested_path.to_path_buf(),
+        lock_path,
         file,
       })
     }
@@ -207,31 +216,33 @@ fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Resu
     }
   };
 
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::MetadataExt;
-    if opened.dev() != linked.dev() || opened.ino() != linked.ino() {
-      return Err(Error::ConfigLockChanged {
-        path: path.to_path_buf(),
-        lock_path: lock_path.to_path_buf(),
-      });
-    }
-  }
-
-  #[cfg(windows)]
-  {
-    use std::os::windows::fs::MetadataExt;
-    let opened_identity = (opened.volume_serial_number(), opened.file_index());
-    let linked_identity = (linked.volume_serial_number(), linked.file_index());
-    if opened_identity.0.is_some() && opened_identity.1.is_some() && opened_identity != linked_identity {
-      return Err(Error::ConfigLockChanged {
-        path: path.to_path_buf(),
-        lock_path: lock_path.to_path_buf(),
-      });
-    }
+  if !metadata_is_same_file(&opened, &linked) {
+    return Err(Error::ConfigLockChanged {
+      path: path.to_path_buf(),
+      lock_path: lock_path.to_path_buf(),
+    });
   }
 
   Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_is_same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+  use std::os::unix::fs::MetadataExt;
+  left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn metadata_is_same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+  use std::os::windows::fs::MetadataExt;
+  let left_identity = (left.volume_serial_number(), left.file_index());
+  let right_identity = (right.volume_serial_number(), right.file_index());
+  left_identity.0.is_none() || left_identity.1.is_none() || left_identity == right_identity
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_is_same_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+  true
 }
 
 fn invalid_config_lock_file(path: &Path, lock_path: &Path, reason: &str) -> Error {
@@ -843,7 +854,7 @@ impl Config {
     let path = resolve_config_path(explicit)?;
     let mut cfg = load_primary_config(&path)?;
     let fragment_dir = paths::config_fragment_dir(&path);
-    let fragments = load_fragment_paths(&fragment_dir)?;
+    let fragments = snapshot::load_fragment_paths(&fragment_dir)?;
     let sources = ConfigSources {
       root: path.clone(),
       fragment_dir,
@@ -1117,32 +1128,6 @@ fn require_legacy_schema(schema: std::result::Result<ConfigSchema, SchemaMarkerE
       found,
     }),
   }
-}
-
-fn load_fragment_paths(fragment_dir: &Path) -> Result<Vec<PathBuf>> {
-  let entries = match std::fs::read_dir(fragment_dir) {
-    Ok(entries) => entries,
-    Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-    Err(source) => {
-      return Err(Error::Read {
-        path: fragment_dir.to_path_buf(),
-        source,
-      });
-    }
-  };
-  let mut fragments = Vec::new();
-  for entry in entries {
-    let entry = entry.map_err(|source| Error::Read {
-      path: fragment_dir.to_path_buf(),
-      source,
-    })?;
-    let path = entry.path();
-    if path.is_file() && path.extension().is_some_and(|extension| extension == "toml") {
-      fragments.push(path);
-    }
-  }
-  fragments.sort();
-  Ok(fragments)
 }
 
 fn load_agent_fragment(path: &Path) -> Result<AgentConfigFragment> {
