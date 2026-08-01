@@ -1,4 +1,5 @@
-//! Request-attempt event projection and raw upstream body observation.
+//! Request-attempt event projection and pre-adaptation application-body
+//! observation.
 //!
 //! The non-cloneable request lifecycle remains owned by the server adapter.
 //! Live upstream bodies instead update this small shared observation record;
@@ -135,13 +136,13 @@ impl OutboundRequestObserver for AttemptRequestObserver<'_> {
   }
 }
 
-/// Shared facts for one raw upstream response body.
+/// Shared facts for one reqwest-exposed upstream response body.
 #[derive(Clone)]
 pub(crate) struct UpstreamBodyObservation {
   inner: Arc<Mutex<UpstreamBodyState>>,
 }
 
-/// Terminal ownership for a response whose raw upstream body may remain live.
+/// Terminal ownership for a response whose pre-adaptation body may remain live.
 #[derive(Clone)]
 pub(crate) struct AttemptBodyPlan {
   observation: UpstreamBodyObservation,
@@ -192,7 +193,8 @@ impl AttemptBodyPlan {
   }
 }
 
-/// Wrap a received response before any adapter can poll its raw body.
+/// Wrap a received response before any adapter can poll its reqwest-exposed
+/// application body.
 pub(crate) fn observe_upstream_response(
   response: reqwest::Response,
   capture_limit: usize,
@@ -276,7 +278,7 @@ impl UpstreamBodyObservation {
   /// Materialize this attempt's terminal facts exactly once.
   ///
   /// An unfinished body is cancellation, which is truthful when the owning
-  /// response or conversion pipeline is being dropped before raw EOF.
+  /// response or conversion pipeline is being dropped before reqwest body EOF.
   pub(crate) fn take_terminal(&self, upstream_status: u16) -> Option<Vec<RequestTerminalEvent>> {
     let mut state = self.lock();
     if state.terminalized {
@@ -422,7 +424,8 @@ impl UpstreamBodyState {
   }
 }
 
-/// HTTP body wrapper that observes raw upstream frames without changing them.
+/// HTTP body wrapper that observes frames yielded by reqwest without changing
+/// them.
 pub(crate) struct ObservedUpstreamBody<B> {
   inner: Pin<Box<B>>,
   observation: UpstreamBodyObservation,

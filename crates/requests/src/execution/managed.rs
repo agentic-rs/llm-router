@@ -220,7 +220,8 @@ impl ManagedHttpExecutor {
     self.execute_observed(attempt, None).await
   }
 
-  /// Execute with an optional observer for the provider-prepared wire request.
+  /// Execute with an optional observer for the provider-prepared reqwest request
+  /// immediately before dispatch.
   pub async fn execute_observed(
     &self,
     attempt: ManagedHttpAttempt<'_>,

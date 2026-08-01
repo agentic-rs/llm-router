@@ -15,12 +15,13 @@
 //! previous `AttemptFinished` carries an explicit retry decision. CONNECT uses
 //! `ConnectReady`/`ConnectClosed` instead of synthetic HTTP attempts.
 //!
-//! `TrafficEvent.sequence` orders one request. `EventSeq` orders delivery across
-//! all requests accepted by an event hub. Reliable boundaries use the awaited
-//! publisher path; high-volume body progress may be coalesced, while terminal
-//! delivery remains reliable. Body capture policy belongs to the producer and
-//! is reported explicitly in `BodyCapture`; a persistence consumer may apply a
-//! narrower storage policy without reducing what other consumers receive.
+//! `TrafficEvent.sequence` is contiguous and orders one request. `EventSeq`
+//! orders delivery across all requests accepted by an event hub. Reliable
+//! boundaries use the awaited publisher path; high-volume body progress may be
+//! coalesced, while terminal delivery remains reliable. Body capture policy
+//! belongs to the producer and is reported explicitly in `BodyCapture`; a
+//! persistence consumer may apply a narrower storage policy without reducing
+//! what other consumers receive.
 
 mod capture;
 mod id;

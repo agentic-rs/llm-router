@@ -1,4 +1,4 @@
-//! Shared disclosure-safe projections of native HTTP wire facts.
+//! Shared disclosure-safe projections of application-boundary HTTP facts.
 
 use http::HeaderMap;
 use tokn_events::{is_sensitive_header_name, CapturedHeader, CapturedHeaders};

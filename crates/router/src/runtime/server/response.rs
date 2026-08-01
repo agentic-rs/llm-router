@@ -56,7 +56,8 @@ pub fn managed_response_to_axum(response: ManagedClientResponse) -> ResponseBrid
   Ok(response_from_parts(status, headers, body))
 }
 
-/// Materialize one untouched opaque upstream response for axum.
+/// Materialize one unadapted, content-coding-preserving opaque upstream
+/// response for axum.
 ///
 /// Converting through `http::Response<reqwest::Body>` moves the native header
 /// map and live body instead of rebuilding headers or adapting the body into a
