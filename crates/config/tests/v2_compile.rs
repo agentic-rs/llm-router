@@ -1,6 +1,7 @@
 use std::path::Path;
 use tokn_config::v2::{
-  compile, decode, load, parse, CompileError, Error, DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES,
+  compile, decode, load, parse, CompileError, Error, DEFAULT_BODY_MAX_BYTES, DEFAULT_MAX_DECODED_BYTES,
+  DEFAULT_MAX_WIRE_BYTES, DEFAULT_WRITE_QUEUE_CAPACITY,
 };
 use tokn_policy::{ConnectAction, HttpAction, ListenerPlan, RouteKind};
 
@@ -62,6 +63,16 @@ fn minimal_managed_llm_listener_compiles() {
     compiled.service().request_limits().max_decoded_bytes(),
     DEFAULT_MAX_DECODED_BYTES as usize
   );
+  let persistence = compiled.service().persistence();
+  assert!(persistence.enabled());
+  assert!(persistence.record_sessions());
+  assert!(persistence.record_request_bodies());
+  assert_eq!(persistence.body_max_bytes(), DEFAULT_BODY_MAX_BYTES as usize);
+  assert_eq!(
+    persistence.write_queue_capacity(),
+    DEFAULT_WRITE_QUEUE_CAPACITY as usize
+  );
+  assert_eq!(persistence.archive_extension(), None);
 }
 
 #[test]
@@ -180,6 +191,39 @@ fn service_accepts_system_proxy_without_explicit_proxy_settings() {
 }
 
 #[test]
+fn service_persistence_preserves_existing_paths_and_runtime_controls() {
+  let config = MINIMAL_MANAGED.replacen(
+    "[listeners.api]",
+    r#"[service.persistence]
+enabled = true
+usage_db_path = "state/custom-usage.db"
+sessions_db_path = "state/custom-sessions.db"
+requests_dir = "state/custom-requests"
+record_sessions = false
+record_request_bodies = false
+body_max_bytes = 12345
+write_queue_capacity = 17
+archive_extension = "db.zstd"
+
+[listeners.api]"#,
+    1,
+  );
+
+  let compiled = parse(&config, Path::new("config.toml")).unwrap();
+  let persistence = compiled.service().persistence();
+  assert!(persistence.enabled());
+  assert!(!persistence.record_sessions());
+  assert!(!persistence.record_request_bodies());
+  assert_eq!(persistence.body_max_bytes(), 12_345);
+  assert_eq!(persistence.write_queue_capacity(), 256);
+  assert_eq!(persistence.archive_extension(), Some("db.zstd"));
+  let paths = persistence.resolve_paths().unwrap();
+  assert_eq!(paths.usage_db, Path::new("state/custom-usage.db"));
+  assert_eq!(paths.sessions_db, Path::new("state/custom-sessions.db"));
+  assert_eq!(paths.requests_dir, Path::new("state/custom-requests"));
+}
+
+#[test]
 fn service_outbound_rejects_unsupported_or_conflicting_proxy_settings() {
   for (settings, location) in [
     ("proxy_url = \"ftp://proxy.example\"", "service.outbound.proxy_url"),
@@ -267,7 +311,12 @@ fn parse_rejects_unknown_fields() {
     Err(Error::Parse { .. })
   ));
 
-  for section in ["service", "service.outbound", "service.request_limits"] {
+  for section in [
+    "service",
+    "service.outbound",
+    "service.request_limits",
+    "service.persistence",
+  ] {
     let config = MINIMAL_MANAGED.replacen(
       "[listeners.api]",
       &format!("[{section}]\nunknown = true\n\n[listeners.api]"),

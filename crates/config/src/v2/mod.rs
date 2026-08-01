@@ -13,15 +13,18 @@ use std::path::Path;
 
 use crate::schema::{ConfigSchema, SchemaMarkerError};
 
-pub use compiled::{CompiledConfig, OutboundPlan, RequestLimitsPlan, ServicePlan};
+pub use compiled::{CompiledConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan, ServicePlan};
 pub use error::{CompileError, Error, Result};
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
   RawFallbackSelector, RawHttpPathPattern, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy,
-  RawOutbound, RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget, RawRequestLimits, RawRoute,
-  RawService, RawUpstream, RawUpstreamSelector, RawWireIdentity,
+  RawOutbound, RawPersistence, RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget,
+  RawRequestLimits, RawRoute, RawService, RawUpstream, RawUpstreamSelector, RawWireIdentity,
 };
-pub use raw::{DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, SCHEMA_VERSION};
+pub use raw::{
+  DEFAULT_BODY_MAX_BYTES, DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, DEFAULT_WRITE_QUEUE_CAPACITY,
+  SCHEMA_VERSION,
+};
 
 /// Decode a version 2 document without compiling references.
 ///

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use tokn_policy::GatewayPlan;
 
 /// A fully decoded and semantically compiled version 2 configuration.
@@ -30,13 +31,15 @@ impl CompiledConfig {
 pub struct ServicePlan {
   outbound: OutboundPlan,
   request_limits: RequestLimitsPlan,
+  persistence: PersistencePlan,
 }
 
 impl ServicePlan {
-  pub(super) fn new(outbound: OutboundPlan, request_limits: RequestLimitsPlan) -> Self {
+  pub(super) fn new(outbound: OutboundPlan, request_limits: RequestLimitsPlan, persistence: PersistencePlan) -> Self {
     Self {
       outbound,
       request_limits,
+      persistence,
     }
   }
 
@@ -47,6 +50,103 @@ impl ServicePlan {
   pub const fn request_limits(&self) -> RequestLimitsPlan {
     self.request_limits
   }
+
+  pub const fn persistence(&self) -> &PersistencePlan {
+    &self.persistence
+  }
+}
+
+/// Persistence and capture settings for the existing usage, sessions, and
+/// per-day request databases.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistencePlan {
+  enabled: bool,
+  usage_db_path: Option<PathBuf>,
+  sessions_db_path: Option<PathBuf>,
+  requests_dir: Option<PathBuf>,
+  record_sessions: bool,
+  record_request_bodies: bool,
+  body_max_bytes: usize,
+  write_queue_capacity: usize,
+  archive_extension: Option<String>,
+}
+
+impl PersistencePlan {
+  #[allow(clippy::too_many_arguments)]
+  pub(super) fn new(
+    enabled: bool,
+    usage_db_path: Option<PathBuf>,
+    sessions_db_path: Option<PathBuf>,
+    requests_dir: Option<PathBuf>,
+    record_sessions: bool,
+    record_request_bodies: bool,
+    body_max_bytes: usize,
+    write_queue_capacity: usize,
+    archive_extension: Option<String>,
+  ) -> Self {
+    Self {
+      enabled,
+      usage_db_path,
+      sessions_db_path,
+      requests_dir,
+      record_sessions,
+      record_request_bodies,
+      body_max_bytes,
+      write_queue_capacity,
+      archive_extension,
+    }
+  }
+
+  pub const fn enabled(&self) -> bool {
+    self.enabled
+  }
+
+  pub const fn record_sessions(&self) -> bool {
+    self.record_sessions
+  }
+
+  pub const fn record_request_bodies(&self) -> bool {
+    self.record_request_bodies
+  }
+
+  pub const fn body_max_bytes(&self) -> usize {
+    self.body_max_bytes
+  }
+
+  pub const fn write_queue_capacity(&self) -> usize {
+    self.write_queue_capacity
+  }
+
+  pub fn archive_extension(&self) -> Option<&str> {
+    self.archive_extension.as_deref()
+  }
+
+  pub fn resolve_paths(&self) -> crate::Result<PersistencePaths> {
+    Ok(PersistencePaths {
+      usage_db: self
+        .usage_db_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(crate::paths::default_usage_db)?,
+      sessions_db: self
+        .sessions_db_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(crate::paths::default_sessions_db)?,
+      requests_dir: self
+        .requests_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(crate::paths::default_requests_dir)?,
+    })
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistencePaths {
+  pub usage_db: PathBuf,
+  pub sessions_db: PathBuf,
+  pub requests_dir: PathBuf,
 }
 
 /// Shared outbound proxy policy for control, managed, opaque, and tunnel clients.

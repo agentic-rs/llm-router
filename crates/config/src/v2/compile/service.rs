@@ -1,5 +1,6 @@
 use crate::v2::{
-  CompileError, OutboundPlan, RawOutbound, RawRequestLimits, RawService, RequestLimitsPlan, ServicePlan,
+  CompileError, OutboundPlan, PersistencePlan, RawOutbound, RawPersistence, RawRequestLimits, RawService,
+  RequestLimitsPlan, ServicePlan,
 };
 use std::collections::BTreeSet;
 
@@ -7,6 +8,24 @@ pub(super) fn compile_service(raw: &RawService) -> Result<ServicePlan, CompileEr
   Ok(ServicePlan::new(
     compile_outbound(&raw.outbound)?,
     compile_request_limits(&raw.request_limits)?,
+    compile_persistence(&raw.persistence)?,
+  ))
+}
+
+fn compile_persistence(raw: &RawPersistence) -> Result<PersistencePlan, CompileError> {
+  let body_max_bytes = compile_usize("service.persistence.body_max_bytes", raw.body_max_bytes)?;
+  let write_queue_capacity =
+    compile_usize("service.persistence.write_queue_capacity", raw.write_queue_capacity)?.max(256);
+  Ok(PersistencePlan::new(
+    raw.enabled,
+    raw.usage_db_path.clone(),
+    raw.sessions_db_path.clone(),
+    raw.requests_dir.clone(),
+    raw.record_sessions,
+    raw.record_request_bodies,
+    body_max_bytes,
+    write_queue_capacity,
+    raw.archive_extension.clone(),
   ))
 }
 
@@ -85,6 +104,10 @@ fn compile_limit(location: &'static str, value: u64) -> Result<usize, CompileErr
   if value == 0 {
     return Err(invalid_value(location, "must be greater than zero"));
   }
+  compile_usize(location, value)
+}
+
+fn compile_usize(location: &'static str, value: u64) -> Result<usize, CompileError> {
   usize::try_from(value).map_err(|_| invalid_value(location, "does not fit this platform's address space"))
 }
 

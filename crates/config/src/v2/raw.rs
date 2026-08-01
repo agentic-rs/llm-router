@@ -11,6 +11,8 @@ use std::path::PathBuf;
 pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
 pub const DEFAULT_MAX_WIRE_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_DECODED_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_BODY_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_WRITE_QUEUE_CAPACITY: u64 = 4_096;
 
 /// The complete on-disk version 2 configuration.
 ///
@@ -54,6 +56,49 @@ pub struct RawService {
   pub outbound: RawOutbound,
   #[serde(default)]
   pub request_limits: RawRequestLimits,
+  #[serde(default)]
+  pub persistence: RawPersistence,
+}
+
+/// Existing persistence behavior represented without changing any database
+/// schema, filename convention, or archival format.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPersistence {
+  #[serde(default = "default_true")]
+  pub enabled: bool,
+  #[serde(default, alias = "db_path")]
+  pub usage_db_path: Option<PathBuf>,
+  #[serde(default)]
+  pub sessions_db_path: Option<PathBuf>,
+  #[serde(default)]
+  pub requests_dir: Option<PathBuf>,
+  #[serde(default = "default_true")]
+  pub record_sessions: bool,
+  #[serde(default = "default_true")]
+  pub record_request_bodies: bool,
+  #[serde(default = "default_body_max_bytes")]
+  pub body_max_bytes: u64,
+  #[serde(default = "default_write_queue_capacity")]
+  pub write_queue_capacity: u64,
+  #[serde(default)]
+  pub archive_extension: Option<String>,
+}
+
+impl Default for RawPersistence {
+  fn default() -> Self {
+    Self {
+      enabled: true,
+      usage_db_path: None,
+      sessions_db_path: None,
+      requests_dir: None,
+      record_sessions: true,
+      record_request_bodies: true,
+      body_max_bytes: default_body_max_bytes(),
+      write_queue_capacity: default_write_queue_capacity(),
+      archive_extension: None,
+    }
+  }
 }
 
 /// Shared outbound proxy settings for every client family.
@@ -94,6 +139,18 @@ const fn default_max_wire_bytes() -> u64 {
 
 const fn default_max_decoded_bytes() -> u64 {
   DEFAULT_MAX_DECODED_BYTES
+}
+
+const fn default_true() -> bool {
+  true
+}
+
+const fn default_body_max_bytes() -> u64 {
+  DEFAULT_BODY_MAX_BYTES
+}
+
+const fn default_write_queue_capacity() -> u64 {
+  DEFAULT_WRITE_QUEUE_CAPACITY
 }
 
 /// A network ingress and its listener-level fallback behavior.
