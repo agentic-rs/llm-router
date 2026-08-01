@@ -431,10 +431,7 @@ fn plan_reconcile_with_gateway_auth_path_and_manifest(
   let adapter = adapter_for(&request.agent).ok_or_else(|| anyhow!("unsupported agent {}", request.agent))?;
   let gateway_auth_path = std::path::absolute(&gateway_auth_path)
     .with_context(|| format!("resolving gateway auth path {}", gateway_auth_path.display()))?;
-  let configured_gateway_path = match request.gateway_config_path.as_deref() {
-    Some(path) => path.to_path_buf(),
-    None => tokn_config::paths::config_path()?,
-  };
+  let configured_gateway_path = tokn_config::paths::resolve_config_path(request.gateway_config_path.as_deref())?;
   let gateway_config_path = std::path::absolute(&configured_gateway_path)
     .with_context(|| format!("resolving gateway config path {}", configured_gateway_path.display()))?;
   let (cfg, gateway_config_snapshot) = load_stable_config(&gateway_config_path)?;

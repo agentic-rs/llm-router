@@ -172,10 +172,8 @@ fn print_provider_json(
 }
 
 async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str) -> Result<Vec<String>> {
-  let config_path = match cfg_path {
-    Some(path) => path.to_path_buf(),
-    None => tokn_config::paths::config_path().context("resolve the default gateway config path")?,
-  };
+  let config_path =
+    tokn_config::paths::resolve_config_path(cfg_path).context("resolve the default gateway config path")?;
   let compiled = tokn_config::v2::load(&config_path)
     .with_context(|| format!("load compiled gateway config `{}`", config_path.display()))?;
   let accounts = AuthStore::load(None, Some(&config_path))?.accounts;

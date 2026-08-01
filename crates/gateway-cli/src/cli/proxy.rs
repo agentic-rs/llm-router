@@ -300,10 +300,8 @@ struct ProxyListenerConfig {
 }
 
 fn resolve_proxy_listener(config_path: Option<&Path>, requested_listener: Option<&str>) -> Result<ProxyListenerConfig> {
-  let config_path = match config_path {
-    Some(path) => path.to_path_buf(),
-    None => tokn_config::paths::config_path().context("resolve the default gateway config path")?,
-  };
+  let config_path =
+    tokn_config::paths::resolve_config_path(config_path).context("resolve the default gateway config path")?;
   let compiled = tokn_config::v2::load(&config_path)
     .with_context(|| format!("load compiled gateway config `{}`", config_path.display()))?;
   select_proxy_listener(

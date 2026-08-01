@@ -236,7 +236,7 @@ impl Config {
   /// Load the effective legacy configuration only when the exact root and
   /// fragment sources remain stable across the complete load.
   pub fn load_stable(explicit: Option<&Path>) -> Result<StableLoadedConfig> {
-    let root = super::resolve_config_path(explicit)?;
+    let root = super::paths::resolve_config_path(explicit)?;
     let before = ConfigSourcesSnapshot::capture(&root)?;
     let loaded = Self::load_with_sources(Some(&root))?;
     let after = ConfigSourcesSnapshot::capture(&root)?;

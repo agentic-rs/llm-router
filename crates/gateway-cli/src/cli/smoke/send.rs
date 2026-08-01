@@ -89,10 +89,8 @@ struct PreparedRequest {
 }
 
 pub async fn run(config_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
-  let config_path = match config_path {
-    Some(path) => path,
-    None => tokn_config::paths::config_path().context("resolve the default gateway config path")?,
-  };
+  let config_path = tokn_config::paths::resolve_config_path(config_path.as_deref())
+    .context("resolve the default gateway config path")?;
   let runtime = load_runtime(&config_path, &args.profile)?;
   let prepared = prepare_request(&args)?;
 

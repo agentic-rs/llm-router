@@ -126,10 +126,8 @@ impl Client {
   fn build(builder: ClientBuilder) -> Result<Self> {
     let profile = builder.profile.unwrap_or_else(|| DEFAULT_PROFILE.to_owned());
     let profile = ProfileId::new(&profile).map_err(|source| Error::InvalidProfileId { profile, source })?;
-    let config_path = match builder.config_path {
-      Some(path) => path,
-      None => tokn_config::paths::config_path().map_err(|source| Error::ResolveConfigPath { source })?,
-    };
+    let config_path = tokn_config::paths::resolve_config_path(builder.config_path.as_deref())
+      .map_err(|source| Error::ResolveConfigPath { source })?;
     let auth_path = match builder.auth_path {
       Some(path) => path,
       None => default_auth_path().map_err(|source| Error::LoadCredentials {

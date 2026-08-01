@@ -843,7 +843,7 @@ impl Config {
   /// overlays. Use this only for commands which deliberately rewrite the
   /// primary config, such as `config init`.
   pub fn load_primary(explicit: Option<&Path>) -> Result<(Self, PathBuf)> {
-    let path = resolve_config_path(explicit)?;
+    let path = paths::resolve_config_path(explicit)?;
     let cfg = load_primary_config(&path)?;
     Ok((cfg, path))
   }
@@ -851,7 +851,7 @@ impl Config {
   /// Load the effective configuration, including the sorted agent-owned
   /// overlays from the matching `config.d` directory.
   pub fn load_with_sources(explicit: Option<&Path>) -> Result<LoadedConfig> {
-    let path = resolve_config_path(explicit)?;
+    let path = paths::resolve_config_path(explicit)?;
     let mut cfg = load_primary_config(&path)?;
     let fragment_dir = paths::config_fragment_dir(&path);
     let fragments = snapshot::load_fragment_paths(&fragment_dir)?;
@@ -1077,13 +1077,6 @@ fn read_optional_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
       path: path.to_path_buf(),
       source,
     }),
-  }
-}
-
-fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
-  match explicit {
-    Some(path) => Ok(path.to_path_buf()),
-    None => paths::config_path(),
   }
 }
 

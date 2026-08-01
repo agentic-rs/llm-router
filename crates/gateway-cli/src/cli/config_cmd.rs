@@ -145,10 +145,7 @@ pub struct UnsetArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
-  let path = match cfg_path {
-    Some(p) => p,
-    None => paths::config_path()?,
-  };
+  let path = paths::resolve_config_path(cfg_path.as_deref())?;
 
   match args.cmd {
     ConfigCmd::Get(a) => cmd_get(&path, a),
