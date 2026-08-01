@@ -1,6 +1,7 @@
 mod attempts;
 mod connect;
 mod dispatch;
+mod downstream;
 mod execution;
 mod gateway;
 mod intercept_ca;

@@ -1,17 +1,23 @@
+use futures_util::StreamExt;
 use http::header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH};
 use http::HeaderMap;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokn_access::ProviderAccess;
 use tokn_accounts::link::NoEligibleReason;
 use tokn_core::account::{AccountConfig, Secret};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::{Endpoint, ID_LLAMA_CPP};
 use tokn_core::util::http::HttpClientOptions;
+use tokn_events::{
+  AttemptOutcome, BodyCapture, BodyLeg, BodyOutcome, BodyResult, ConsumerResult, EventConsumer, EventSeq, GatewayEvent,
+  HubBuilder, RequestOutcome, RequestSource, TrafficEvent, TrafficEventKind,
+};
 use tokn_mock_server::{MockAuthConfig, MockLlmConfig, MockLlmServer, MockRoute};
 use tokn_policy::ProfileId;
 use tokn_requests::execution::ManagedClientBody;
+use tokn_requests::RequestLifecycleEmitter;
 use tokn_router::runtime::{
   link_builtin_gateway_runtime_with_profile_roots, EmbeddedProfileRoots, ManagedGatewayError, ManagedGatewayExecutor,
   ManagedGatewayOutcome, ManagedGatewayRequest, ManagedRequestBodyError,
@@ -20,6 +26,55 @@ use tokn_router::runtime::{
 const PROFILE: &str = "embedded";
 const REQUESTED_MODEL: &str = "client-alias";
 const UPSTREAM_MODEL: &str = "selected-backend-model";
+
+struct CaptureConsumer {
+  events: Arc<Mutex<Vec<GatewayEvent>>>,
+}
+
+impl EventConsumer<GatewayEvent> for CaptureConsumer {
+  fn name(&self) -> &str {
+    "embedded-managed-test"
+  }
+
+  fn handle(&mut self, _sequence: EventSeq, event: &GatewayEvent) -> ConsumerResult {
+    self.events.lock().unwrap().push(event.clone());
+    Ok(())
+  }
+}
+
+fn event_executor(
+  runtime: Arc<tokn_router::runtime::LinkedGatewayRuntime>,
+) -> (
+  ManagedGatewayExecutor,
+  Arc<Mutex<Vec<GatewayEvent>>>,
+  tokn_events::EventHub<GatewayEvent>,
+) {
+  let events = Arc::new(Mutex::new(Vec::new()));
+  let (publisher, hub) = HubBuilder::new()
+    .consumer(CaptureConsumer {
+      events: Arc::clone(&events),
+    })
+    .start()
+    .unwrap();
+  let gateway = ManagedGatewayExecutor::build_with_events(
+    runtime,
+    &HttpClientOptions::default(),
+    RequestLifecycleEmitter::new(publisher),
+    128,
+  )
+  .unwrap();
+  (gateway, events, hub)
+}
+
+fn traffic(events: &[GatewayEvent]) -> Vec<&TrafficEvent> {
+  events
+    .iter()
+    .filter_map(|event| match event {
+      GatewayEvent::Traffic(event) => Some(event),
+      _ => None,
+    })
+    .collect()
+}
 
 #[tokio::test]
 async fn embedded_gateway_executes_one_v2_profile_without_a_listener() {
@@ -143,6 +198,215 @@ async fn embedded_gateway_keeps_lookup_validation_and_eligibility_distinct() {
       reason: NoEligibleReason::ProviderAccessDenied,
     } if site.profile_id() == &profile
   ));
+}
+
+#[tokio::test]
+async fn embedded_invalid_body_has_a_complete_zero_attempt_lifecycle_and_separate_correlation_id() {
+  let (profile, runtime) = runtime("http://127.0.0.1:9");
+  let (gateway, events, hub) = event_executor(runtime);
+  let mut headers = HeaderMap::new();
+  headers.insert("x-client-request-id", HeaderValue::from_static("client-request-42"));
+  headers.insert("authorization", HeaderValue::from_static("Bearer do-not-disclose"));
+  let error = gateway
+    .execute(
+      &profile,
+      ManagedGatewayRequest::new(
+        Endpoint::Responses,
+        json!({
+          "model": " ",
+          "stream": true,
+          "input": "hello"
+        }),
+      )
+      .with_headers(headers)
+      .with_session_id("explicit-session"),
+    )
+    .await
+    .unwrap_err();
+  assert!(matches!(error, ManagedGatewayError::InvalidBody { .. }));
+  drop(gateway);
+  hub.shutdown().await.unwrap();
+
+  let events = events.lock().unwrap();
+  let traffic = traffic(&events);
+  assert_eq!(
+    traffic.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+    [1, 2, 3, 4, 5]
+  );
+  assert!(matches!(
+    &traffic[0].kind,
+    TrafficEventKind::Started(started)
+      if matches!(&started.source, RequestSource::Embedded { profile_id } if profile_id == PROFILE)
+        && started.method == "POST"
+        && started.target.as_str() == "/v1/responses"
+        && started.http_version.is_none()
+        && started.body_present
+        && started.correlation.client_request_id.as_deref() == Some("client-request-42")
+        && started.correlation.session_id.as_deref() == Some("explicit-session")
+  ));
+  let TrafficEventKind::Started(started) = &traffic[0].kind else {
+    unreachable!()
+  };
+  let authorization = started
+    .headers
+    .iter()
+    .find(|header| header.name() == "authorization")
+    .unwrap();
+  assert!(authorization.captured_value().is_redacted());
+  assert_ne!(traffic[0].request_id.as_str(), "client-request-42");
+  assert!(matches!(traffic[1].kind, TrafficEventKind::Authenticated(_)));
+  assert!(matches!(traffic[2].kind, TrafficEventKind::PolicySelected(_)));
+  assert!(matches!(
+    &traffic[3].kind,
+    TrafficEventKind::RequestBody(body)
+      if body.wire == BodyCapture::Absent
+        && matches!(&body.outcome, BodyOutcome::Rejected(_))
+        && body.requested_model.as_deref() == Some(" ")
+        && body.stream == Some(true)
+  ));
+  assert!(matches!(
+    traffic[4].kind,
+    TrafficEventKind::Finished(ref finished)
+      if finished.outcome == RequestOutcome::Rejected && finished.attempt_count == 0
+  ));
+  assert!(!traffic.iter().any(|event| matches!(
+    event.kind,
+    TrafficEventKind::Admitted(_) | TrafficEventKind::AttemptStarted(_)
+  )));
+}
+
+#[tokio::test]
+async fn embedded_buffered_success_finishes_upstream_and_downstream_before_return() {
+  let server = MockLlmServer::start(MockLlmConfig {
+    routes: vec![MockRoute::chat_completions()],
+    ..Default::default()
+  })
+  .await;
+  let (profile, runtime) = runtime(server.base_url());
+  let (gateway, events, hub) = event_executor(runtime);
+  let outcome = gateway
+    .execute(
+      &profile,
+      ManagedGatewayRequest::new(
+        Endpoint::Responses,
+        json!({
+          "model": REQUESTED_MODEL,
+          "input": "hello",
+          "stream": false
+        }),
+      ),
+    )
+    .await
+    .unwrap();
+  let ManagedGatewayOutcome::Response { response, .. } = outcome else {
+    panic!("expected buffered response")
+  };
+  assert!(matches!(response.body(), ManagedClientBody::Buffered(_)));
+  drop(gateway);
+  hub.shutdown().await.unwrap();
+
+  let events = events.lock().unwrap();
+  let traffic = traffic(&events);
+  let position = |predicate: fn(&TrafficEventKind) -> bool| {
+    traffic
+      .iter()
+      .position(|event| predicate(&event.kind))
+      .expect("expected lifecycle event")
+  };
+  let attempt_head = position(|kind| matches!(kind, TrafficEventKind::AttemptResponseHead(_)));
+  let upstream_finished = position(
+    |kind| matches!(kind, TrafficEventKind::BodyFinished(body) if matches!(body.leg, BodyLeg::Upstream { .. })),
+  );
+  let attempt_finished = position(|kind| matches!(kind, TrafficEventKind::AttemptFinished(_)));
+  let downstream_head = position(|kind| matches!(kind, TrafficEventKind::DownstreamResponseHead(_)));
+  let downstream_finished =
+    position(|kind| matches!(kind, TrafficEventKind::BodyFinished(body) if body.leg == BodyLeg::Downstream));
+  let finished = position(|kind| matches!(kind, TrafficEventKind::Finished(_)));
+  assert!(attempt_head < upstream_finished);
+  assert!(upstream_finished < attempt_finished);
+  assert!(attempt_finished < downstream_head);
+  assert!(downstream_head < downstream_finished);
+  assert!(downstream_finished < finished);
+  assert!(matches!(
+    &traffic[finished].kind,
+    TrafficEventKind::Finished(event)
+      if event.outcome == RequestOutcome::Delivered && event.attempt_count == 1
+  ));
+  assert!(traffic.iter().any(|event| matches!(
+    &event.kind,
+    TrafficEventKind::AttemptFinished(event) if event.outcome == AttemptOutcome::Response
+  )));
+}
+
+#[tokio::test]
+async fn embedded_live_stream_owns_completion_through_eof_and_drop() {
+  for consume in [true, false] {
+    let server = MockLlmServer::start(MockLlmConfig {
+      routes: vec![MockRoute::chat_completions_stream()],
+      ..Default::default()
+    })
+    .await;
+    let (profile, runtime) = runtime(server.base_url());
+    let (gateway, events, hub) = event_executor(runtime);
+    let outcome = gateway
+      .execute(
+        &profile,
+        ManagedGatewayRequest::new(
+          Endpoint::Responses,
+          json!({
+            "model": REQUESTED_MODEL,
+            "input": "hello",
+            "stream": true
+          }),
+        ),
+      )
+      .await
+      .unwrap();
+    let ManagedGatewayOutcome::Response { response, .. } = outcome else {
+      panic!("expected streaming response")
+    };
+    let (_, _, body) = response.into_parts();
+    let ManagedClientBody::Stream(mut stream) = body else {
+      panic!("expected managed stream")
+    };
+    if consume {
+      let mut received = Vec::new();
+      while let Some(chunk) = stream.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+      }
+      assert!(!received.is_empty());
+    }
+    drop(stream);
+    drop(gateway);
+    hub.shutdown().await.unwrap();
+
+    let events = events.lock().unwrap();
+    let traffic = traffic(&events);
+    let attempt = traffic.iter().find_map(|event| match &event.kind {
+      TrafficEventKind::AttemptFinished(event) => Some(event),
+      _ => None,
+    });
+    let downstream = traffic.iter().find_map(|event| match &event.kind {
+      TrafficEventKind::BodyFinished(event) if event.leg == BodyLeg::Downstream => Some(event),
+      _ => None,
+    });
+    let finished = traffic.iter().find_map(|event| match &event.kind {
+      TrafficEventKind::Finished(event) => Some(event),
+      _ => None,
+    });
+    if consume {
+      assert!(matches!(attempt, Some(event) if event.outcome == AttemptOutcome::Response));
+      assert!(matches!(downstream, Some(event) if event.result == BodyResult::Complete));
+      assert!(matches!(finished, Some(event) if event.outcome == RequestOutcome::Delivered));
+      assert!(traffic
+        .iter()
+        .any(|event| matches!(event.kind, TrafficEventKind::AttemptUsage(_))));
+    } else {
+      assert!(matches!(attempt, Some(event) if event.outcome == AttemptOutcome::Cancelled));
+      assert!(matches!(downstream, Some(event) if event.result == BodyResult::Cancelled));
+      assert!(matches!(finished, Some(event) if event.outcome == RequestOutcome::Cancelled));
+    }
+  }
 }
 
 fn runtime(base_url: &str) -> (ProfileId, Arc<tokn_router::runtime::LinkedGatewayRuntime>) {
