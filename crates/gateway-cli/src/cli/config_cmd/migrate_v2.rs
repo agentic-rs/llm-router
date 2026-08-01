@@ -1,24 +1,57 @@
 use super::{MigrateV2Args, V2ActivationArg};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use inquire::Confirm;
 use std::io::Write;
-use std::path::Path;
-use tokn_auth::AuthStore;
+use std::path::{Path, PathBuf};
+use tokn_auth::{AuthSource, AuthStore};
+use tokn_config::StableLoadedConfig;
 use tokn_core::account::AccountConfig;
 use tokn_router_legacy_config::v2::{
   plan_v2_migration, V2BehaviorChange, V2ListenerSelection, V2MigrationOptions, V2MigrationWarning,
 };
 
+mod apply;
+mod backup;
+
 struct PreparedMigration {
+  output: PlannedOutput,
+  legacy: StableLoadedConfig,
+  auth_path: PathBuf,
+  auth_preimage: AuthPreimage,
+  embedded_accounts: Vec<AccountConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedOutput {
   rendered: String,
   warnings: Vec<String>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct AuthPreimage {
+  sources: Vec<(AuthSource, Option<String>)>,
 }
 
 pub(super) fn run(config_path: &Path, args: &MigrateV2Args) -> Result<()> {
   let stdout = std::io::stdout();
   let stderr = std::io::stderr();
-  execute(config_path, args, None, &mut stdout.lock(), &mut stderr.lock())
+  let mut confirm = |prompt: &str| {
+    Confirm::new(prompt)
+      .with_default(false)
+      .prompt()
+      .context("version 2 migration confirmation cancelled")
+  };
+  execute_with_confirmation(
+    config_path,
+    args,
+    None,
+    &mut stdout.lock(),
+    &mut stderr.lock(),
+    &mut confirm,
+  )
 }
 
+#[cfg(test)]
 fn execute(
   config_path: &Path,
   args: &MigrateV2Args,
@@ -26,17 +59,117 @@ fn execute(
   stdout: &mut dyn Write,
   stderr: &mut dyn Write,
 ) -> Result<()> {
+  let mut unexpected_confirmation = |_: &str| bail!("unexpected migration confirmation");
+  execute_with_confirmation(
+    config_path,
+    args,
+    auth_path,
+    stdout,
+    stderr,
+    &mut unexpected_confirmation,
+  )
+}
+
+fn execute_with_confirmation(
+  config_path: &Path,
+  args: &MigrateV2Args,
+  auth_path: Option<&Path>,
+  stdout: &mut dyn Write,
+  stderr: &mut dyn Write,
+  confirm: &mut dyn FnMut(&str) -> Result<bool>,
+) -> Result<()> {
   let prepared = prepare(config_path, args, auth_path)?;
-  emit(&prepared, stdout, stderr)
+  if !args.apply {
+    return emit_dry_run(&prepared.output, stdout, stderr);
+  }
+
+  let legacy_contents = prepared
+    .legacy
+    .snapshot
+    .root_preimage()
+    .ok_or_else(|| anyhow::anyhow!("cannot apply a migration without an existing legacy config root"))?;
+  if !prepared.legacy.snapshot.fragments().is_empty() && !args.flatten_config_d {
+    bail!(
+      "the effective legacy config includes {} config.d fragment(s); inspect the preview and rerun with \
+       --flatten-config-d to acknowledge that they will be retained but inactive under version 2",
+      prepared.legacy.snapshot.fragments().len()
+    );
+  }
+  let backup_path = backup::legacy_backup_path(prepared.legacy.snapshot.root())?;
+  emit_apply_preview(&prepared, &backup_path, stderr)?;
+  if !args.yes && !confirm("Back up the legacy config and activate version 2?")? {
+    writeln!(stderr, "migration cancelled; no files changed").context("write migration cancellation")?;
+    stderr.flush().context("flush migration cancellation")?;
+    return Ok(());
+  }
+
+  let mut checkpoint = |_| Ok(());
+  match apply::apply(&prepared, args, legacy_contents, &mut checkpoint) {
+    Ok(report) => {
+      writeln!(
+        stderr,
+        "activated version 2 config `{}`; {} legacy backup `{}`{}",
+        report.config_path.display(),
+        if report.backup_created { "created" } else { "reused" },
+        report.backup_path.display(),
+        if report.auth_created {
+          "; embedded credentials were installed in modern auth"
+        } else {
+          ""
+        }
+      )
+      .context("write migration success")?;
+      stderr.flush().context("flush migration success")?;
+      Ok(())
+    }
+    Err(failure) => {
+      emit_apply_failure(&failure, stderr)?;
+      Err(failure.into_error())
+    }
+  }
 }
 
 fn prepare(config_path: &Path, args: &MigrateV2Args, auth_path: Option<&Path>) -> Result<PreparedMigration> {
-  let loaded = tokn_config::Config::load_with_sources(Some(config_path))
-    .with_context(|| format!("load effective legacy config `{}`", config_path.display()))?;
-  let accounts = load_authoritative_accounts(config_path, auth_path)?;
+  let legacy = tokn_config::Config::load_stable(Some(config_path))
+    .with_context(|| format!("load stable effective legacy config `{}`", config_path.display()))?;
+  let (store, auth_preimage) = load_stable_auth(auth_path)?;
+  let embedded_accounts = if auth_preimage.has_persisted_sources() {
+    Vec::new()
+  } else {
+    legacy
+      .snapshot
+      .root_preimage()
+      .map(|contents| tokn_router_legacy_config::schema::parse_legacy_accounts(contents, legacy.snapshot.root()))
+      .transpose()
+      .with_context(|| format!("load embedded accounts from `{}`", legacy.snapshot.root().display()))?
+      .flatten()
+      .unwrap_or_default()
+  };
+  let accounts = if auth_preimage.has_persisted_sources() {
+    &store.accounts
+  } else {
+    &embedded_accounts
+  };
+  let output = plan_output(&legacy.config, accounts, config_path, args)?;
+
+  Ok(PreparedMigration {
+    output,
+    legacy,
+    auth_path: store.path().to_path_buf(),
+    auth_preimage,
+    embedded_accounts,
+  })
+}
+
+fn plan_output(
+  legacy: &tokn_config::Config,
+  accounts: &[AccountConfig],
+  config_path: &Path,
+  args: &MigrateV2Args,
+) -> Result<PlannedOutput> {
   let plan = plan_v2_migration(
-    &loaded.config,
-    &accounts,
+    legacy,
+    accounts,
     V2MigrationOptions {
       listener_selection: args.activate.listener_selection(),
       allow_insecure_upstreams: args.allow_insecure_upstreams,
@@ -47,42 +180,112 @@ fn prepare(config_path: &Path, args: &MigrateV2Args, auth_path: Option<&Path>) -
   let rendered = toml::to_string_pretty(plan.raw_config()).context("render generated version 2 config")?;
   let compiled = tokn_config::v2::parse(&rendered, config_path)
     .with_context(|| format!("parse generated version 2 config for `{}`", config_path.display()))?;
-  tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), &accounts)
+  tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), accounts)
     .context("link generated version 2 gateway runtime")?;
 
-  Ok(PreparedMigration {
+  Ok(PlannedOutput {
     rendered,
     warnings: plan.warnings().iter().map(render_warning).collect(),
   })
 }
 
-fn load_authoritative_accounts(config_path: &Path, auth_path: Option<&Path>) -> Result<Vec<AccountConfig>> {
-  let store = AuthStore::load(auth_path, None).context("load modern credential sources")?;
-  let has_modern_source = store
-    .sources()
-    .iter()
-    .any(|source| store.source_sha256(source).is_some());
-  if has_modern_source {
-    return Ok(store.accounts);
+fn load_stable_auth(auth_path: Option<&Path>) -> Result<(AuthStore, AuthPreimage)> {
+  let first = AuthStore::load(auth_path, None).context("load modern credential sources")?;
+  let first_preimage = AuthPreimage::capture(&first);
+  let second = AuthStore::load(auth_path, None).context("reload modern credential sources")?;
+  let second_preimage = AuthPreimage::capture(&second);
+  if first_preimage != second_preimage {
+    bail!("modern credential sources changed while they were being loaded; retry the command");
   }
-
-  Ok(
-    tokn_router_legacy_config::schema::load_legacy_accounts(config_path)
-      .with_context(|| format!("load embedded accounts from `{}`", config_path.display()))?
-      .unwrap_or_default(),
-  )
+  Ok((second, second_preimage))
 }
 
-fn emit(prepared: &PreparedMigration, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<()> {
+fn emit_dry_run(output: &PlannedOutput, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<()> {
   stdout
-    .write_all(prepared.rendered.as_bytes())
+    .write_all(output.rendered.as_bytes())
     .context("write generated version 2 config to stdout")?;
   stdout.flush().context("flush generated version 2 config")?;
-  for warning in &prepared.warnings {
-    writeln!(stderr, "warning: {warning}").context("write migration warning to stderr")?;
-  }
+  emit_warnings(output, stderr)?;
   stderr.flush().context("flush migration warnings")?;
   Ok(())
+}
+
+fn emit_warnings(output: &PlannedOutput, stderr: &mut dyn Write) -> Result<()> {
+  for warning in &output.warnings {
+    writeln!(stderr, "warning: {warning}").context("write migration warning to stderr")?;
+  }
+  Ok(())
+}
+
+fn emit_apply_preview(prepared: &PreparedMigration, backup_path: &Path, stderr: &mut dyn Write) -> Result<()> {
+  emit_warnings(&prepared.output, stderr)?;
+  writeln!(stderr, "config: {}", prepared.legacy.snapshot.root().display()).context("write migration target")?;
+  writeln!(stderr, "legacy backup: {}", backup_path.display()).context("write migration backup target")?;
+  if prepared.auth_preimage.has_persisted_sources() {
+    writeln!(
+      stderr,
+      "auth: preserve authoritative modern sources rooted at {}",
+      prepared.auth_path.display()
+    )
+    .context("write migration auth summary")?;
+  } else {
+    writeln!(
+      stderr,
+      "auth: install {} embedded account(s) at {} before activation",
+      prepared.embedded_accounts.len(),
+      prepared.auth_path.display()
+    )
+    .context("write migration auth summary")?;
+  }
+  if !prepared.legacy.snapshot.fragments().is_empty() {
+    writeln!(
+      stderr,
+      "config.d: flatten {} effective fragment(s); retain their files unchanged but inactive",
+      prepared.legacy.snapshot.fragments().len()
+    )
+    .context("write migration fragment summary")?;
+  }
+  stderr.flush().context("flush migration preview")?;
+  Ok(())
+}
+
+fn emit_apply_failure(failure: &apply::ApplyFailure, stderr: &mut dyn Write) -> Result<()> {
+  if failure.activation_may_have_completed() {
+    writeln!(
+      stderr,
+      "warning: version 2 activation may already be complete at {}; do not restore automatically; inspect the active config before taking further action",
+      failure.config_path().display()
+    )
+    .context("write post-activation failure guidance")?;
+  } else if failure.auth_created() {
+    writeln!(
+      stderr,
+      "warning: modern credentials are durable at {}, but the legacy config remains active; fix the error and rerun",
+      failure.auth_path().display()
+    )
+    .context("write partial migration guidance")?;
+  }
+  stderr.flush().context("flush migration failure guidance")?;
+  Ok(())
+}
+
+impl AuthPreimage {
+  fn capture(store: &AuthStore) -> Self {
+    Self {
+      sources: store
+        .sources()
+        .into_iter()
+        .map(|source| {
+          let sha256 = store.source_sha256(&source);
+          (source, sha256)
+        })
+        .collect(),
+    }
+  }
+
+  fn has_persisted_sources(&self) -> bool {
+    self.sources.iter().any(|(_, sha256)| sha256.is_some())
+  }
 }
 
 impl V2ActivationArg {
@@ -158,6 +361,9 @@ mod tests {
     MigrateV2Args {
       activate,
       allow_insecure_upstreams: false,
+      apply: false,
+      yes: false,
+      flatten_config_d: false,
     }
   }
 
@@ -202,6 +408,13 @@ api_key = "migration-secret"
       };
       assert_eq!(parsed.activate.listener_selection(), expected);
       assert!(parsed.allow_insecure_upstreams);
+      assert!(!parsed.apply);
+      assert!(!parsed.yes);
+      assert!(!parsed.flatten_config_d);
+    }
+
+    for flag in ["--yes", "--flatten-config-d"] {
+      assert!(Cli::try_parse_from(["tokn-router", "config", "migrate-v2", "--activate", "api", flag,]).is_err());
     }
   }
 
@@ -212,16 +425,23 @@ api_key = "migration-secret"
     let auth_path = directory.path().join("auth.yaml");
     legacy_config(&config_path);
 
-    let embedded = load_authoritative_accounts(&config_path, Some(&auth_path)).unwrap();
+    let (missing_store, missing_preimage) = load_stable_auth(Some(&auth_path)).unwrap();
+    assert!(!missing_preimage.has_persisted_sources());
+    assert!(missing_store.accounts.is_empty());
+    let prepared = prepare(&config_path, &args(V2ActivationArg::Api), Some(&auth_path)).unwrap();
     assert_eq!(
-      embedded.iter().map(|account| account.id.as_str()).collect::<Vec<_>>(),
+      prepared
+        .embedded_accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<Vec<_>>(),
       ["embedded"]
     );
 
     fs::write(&auth_path, "version: 1\naccounts: []\n").unwrap();
-    assert!(load_authoritative_accounts(&config_path, Some(&auth_path))
-      .unwrap()
-      .is_empty());
+    let (empty_store, empty_preimage) = load_stable_auth(Some(&auth_path)).unwrap();
+    assert!(empty_preimage.has_persisted_sources());
+    assert!(empty_store.accounts.is_empty());
   }
 
   #[test]
