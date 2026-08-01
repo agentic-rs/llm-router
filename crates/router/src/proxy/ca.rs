@@ -10,6 +10,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokn_policy::CanonicalHost;
 
 const CA_CERT_FILE: &str = "ca.crt";
 const CA_KEY_FILE: &str = "ca.key";
@@ -136,6 +137,26 @@ impl ProxyCa {
     Ok(bundle_path)
   }
 
+  /// Build one server configuration whose identity is fixed by CONNECT.
+  ///
+  /// Certificate selection must never follow an untrusted ClientHello SNI.
+  /// Missing SNI is accepted for IP clients, while a supplied SNI must name
+  /// the exact canonical CONNECT host.
+  pub(crate) fn pinned_server_config(&self, host: &CanonicalHost) -> Result<Arc<rustls::ServerConfig>> {
+    let certified_key = self.certified_key_for(host.as_str())?;
+    let resolver = Arc::new(PinnedResolver {
+      host: host.clone(),
+      certified_key,
+    });
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+      .with_safe_default_protocol_versions()
+      .context("select safe TLS protocol versions for intercepted connections")?
+      .with_no_client_auth()
+      .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+  }
+
   pub(super) fn certified_key_for(&self, host: &str) -> Result<Arc<CertifiedKey>> {
     self.certified_key_for_at(host, OffsetDateTime::now_utc())
   }
@@ -225,16 +246,22 @@ pub(super) fn hexify(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug)]
-pub(super) struct DynamicResolver {
-  pub(super) ca: Arc<ProxyCa>,
-  pub(super) fallback_host: String,
+struct PinnedResolver {
+  host: CanonicalHost,
+  certified_key: Arc<CertifiedKey>,
 }
 
-impl ResolvesServerCert for DynamicResolver {
+impl ResolvesServerCert for PinnedResolver {
   fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-    let host = client_hello.server_name().unwrap_or(&self.fallback_host);
-    self.ca.certified_key_for(host).ok()
+    server_name_matches(&self.host, client_hello.server_name()).then(|| self.certified_key.clone())
   }
+}
+
+fn server_name_matches(expected: &CanonicalHost, server_name: Option<&str>) -> bool {
+  let Some(server_name) = server_name else {
+    return true;
+  };
+  CanonicalHost::parse(server_name).is_ok_and(|server_name| &server_name == expected)
 }
 
 #[cfg(test)]
@@ -267,5 +294,15 @@ mod tests {
     assert!(Arc::ptr_eq(&initial, &cached));
     assert!(!Arc::ptr_eq(&initial, &refreshed));
     assert!(Arc::ptr_eq(&refreshed, &refreshed_cached));
+  }
+
+  #[test]
+  fn pinned_identity_accepts_only_the_connect_server_name() {
+    let expected = CanonicalHost::parse("api.example.com").unwrap();
+
+    assert!(server_name_matches(&expected, None));
+    assert!(server_name_matches(&expected, Some("API.EXAMPLE.COM")));
+    assert!(!server_name_matches(&expected, Some("other.example.com")));
+    assert!(!server_name_matches(&expected, Some("api.example.com.")));
   }
 }

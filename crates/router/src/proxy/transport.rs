@@ -1,4 +1,3 @@
-use super::ca::DynamicResolver;
 use super::connect_proxy::{connect_upstream, ConnectProxy};
 
 use super::{
@@ -28,6 +27,7 @@ use tokn_auth::descriptor::RewriteTarget;
 use tokn_config::RouteMode;
 use tokn_core::event::Event as CoreEvent;
 use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEvent, RequestEventPayload, Stage, StageEvent};
+use tokn_policy::CanonicalHost;
 
 const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const BAD_CONNECT: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n";
@@ -119,9 +119,22 @@ pub(super) async fn handle_client(
   tracing::debug!(%peer, host = %host, port, intercept, proxy_route_mode = ?proxy_route_mode, "proxy_connect");
 
   if intercept {
+    let host = CanonicalHost::parse(&host).context("canonicalize intercepted CONNECT host")?;
+    let tls_config = ca.pinned_server_config(&host)?;
     stream.write_all(CONNECT_OK).await?;
     stream.flush().await?;
-    intercept_tls(stream, peer, local, &host, port, state, router, ca, proxy_route_mode).await
+    intercept_tls(
+      stream,
+      peer,
+      local,
+      host.as_str(),
+      port,
+      state,
+      router,
+      tls_config,
+      proxy_route_mode,
+    )
+    .await
   } else {
     tunnel(stream, &host, port, outbound_proxy.as_ref()).await
   }
@@ -175,18 +188,10 @@ async fn intercept_tls(
   port: u16,
   state: Arc<LiveAppState>,
   router: Router,
-  ca: Arc<ProxyCa>,
+  tls_config: Arc<rustls::ServerConfig>,
   proxy_route_mode: Option<String>,
 ) -> Result<()> {
-  let resolver = Arc::new(DynamicResolver {
-    ca,
-    fallback_host: host.to_string(),
-  });
-  let tls = TlsAcceptor::from(Arc::new(
-    rustls::ServerConfig::builder()
-      .with_no_client_auth()
-      .with_cert_resolver(resolver),
-  ));
+  let tls = TlsAcceptor::from(tls_config);
   let tls_stream = tls.accept(stream).await.context("TLS handshake failed")?;
   let mut http1_builder = http1::Builder::new();
   http1_builder.keep_alive(true).title_case_headers(true);
