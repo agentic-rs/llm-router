@@ -1,18 +1,98 @@
+use futures_util::StreamExt;
 use serde_json::json;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{oneshot, Notify};
+use tokio::task::JoinHandle;
 use tokn_mock_server::{MockLlmConfig, MockLlmServer, MockRoute};
 use tokn_sdk::chat_completions::ChatRequest;
 use tokn_sdk::events::{
-  BodyCapture, BodyLeg, BodyOutcome, BodyResult, RequestOutcome, RequestSource, TrafficEvent, TrafficEventKind,
+  AttemptOutcome, BodyCapture, BodyLeg, BodyOutcome, BodyResult, RequestOutcome, RequestSource, TrafficEvent,
+  TrafficEventKind,
 };
 use tokn_sdk::{
-  Client, ConsumerResult, Endpoint, Error, EventConsumer, EventSeq, GatewayEvent, HubBuilder, HubStatus, Publisher,
-  RequestOptions,
+  Client, ConsumerResult, Endpoint, Error, EventConsumer, EventSeq, GatewayEvent, GenerateEvent, HubBuilder, HubStatus,
+  Publisher, RequestOptions,
 };
+
+struct HangingSseServer {
+  base_url: String,
+  release: Option<oneshot::Sender<()>>,
+  task: Option<JoinHandle<()>>,
+}
+
+impl HangingSseServer {
+  async fn start() -> Self {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+      .await
+      .expect("bind hanging SSE fixture");
+    let addr = listener.local_addr().expect("read hanging SSE fixture address");
+    let body = MockRoute::chat_completions_stream().response.body;
+    let (release_tx, release_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+      let (mut socket, _) = listener.accept().await.expect("accept hanging SSE request");
+      let mut request = Vec::new();
+      let mut buffer = [0_u8; 4096];
+      while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = socket.read(&mut buffer).await.expect("read hanging SSE request");
+        if read == 0 {
+          return;
+        }
+        request.extend_from_slice(&buffer[..read]);
+      }
+
+      socket
+        .write_all(
+          b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n",
+        )
+        .await
+        .expect("write hanging SSE response head");
+      socket
+        .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+        .await
+        .expect("write hanging SSE chunk size");
+      socket
+        .write_all(&body)
+        .await
+        .expect("write hanging SSE terminal events");
+      socket.write_all(b"\r\n").await.expect("finish hanging SSE chunk");
+      socket.flush().await.expect("flush hanging SSE terminal events");
+      let _ = release_rx.await;
+    });
+    Self {
+      base_url: format!("http://{addr}"),
+      release: Some(release_tx),
+      task: Some(task),
+    }
+  }
+
+  fn base_url(&self) -> &str {
+    &self.base_url
+  }
+
+  async fn shutdown(mut self) {
+    if let Some(release) = self.release.take() {
+      let _ = release.send(());
+    }
+    if let Some(task) = self.task.take() {
+      task.await.expect("join hanging SSE fixture");
+    }
+  }
+}
+
+impl Drop for HangingSseServer {
+  fn drop(&mut self) {
+    if let Some(release) = self.release.take() {
+      let _ = release.send(());
+    }
+    if let Some(task) = self.task.take() {
+      task.abort();
+    }
+  }
+}
 
 struct Fixture {
   _root: TempDir,
@@ -389,6 +469,113 @@ async fn raw_stream_eof_and_drop_publish_truthful_terminal_facts() {
   drop(client);
   hub.shutdown().await.expect("shut down caller-owned event hub");
   mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn semantic_terminal_completes_promptly_and_publishes_delivered_lifecycle() {
+  let server = HangingSseServer::start().await;
+  let fixture = Fixture::new(server.base_url());
+  let (capture, publisher, hub) = event_hub();
+  let client = fixture.client(publisher);
+  let mut stream = client
+    .generate("llama-cpp/mock-model")
+    .prompt("hello")
+    .request_id("sdk-semantic-terminal")
+    .stream()
+    .await
+    .expect("start semantic stream");
+
+  let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+    while let Some(event) = stream.next().await {
+      let event = event.expect("semantic stream remains successful");
+      if matches!(event, GenerateEvent::Completed { .. }) {
+        return event;
+      }
+    }
+    panic!("semantic stream ended without completion")
+  })
+  .await
+  .expect("semantic stream waited for HTTP EOF");
+  assert!(matches!(terminal, GenerateEvent::Completed { .. }));
+  assert!(tokio::time::timeout(Duration::from_secs(2), stream.next())
+    .await
+    .expect("completed semantic stream remained pending")
+    .is_none());
+
+  capture.wait_for_finished(&["sdk-semantic-terminal"]).await;
+  let events = capture.traffic("sdk-semantic-terminal");
+  assert_contiguous_request_sequence(&events);
+  assert!(events.iter().any(|event| {
+    matches!(
+      &event.kind,
+      TrafficEventKind::AttemptFinished(attempt) if attempt.outcome == AttemptOutcome::Response
+    )
+  }));
+  for leg in [
+    BodyLeg::Upstream {
+      attempt: tokn_sdk::events::AttemptNo::FIRST,
+    },
+    BodyLeg::Downstream,
+  ] {
+    assert!(events.iter().any(|event| {
+      matches!(
+        &event.kind,
+        TrafficEventKind::BodyFinished(body) if body.leg == leg && body.result == BodyResult::Complete
+      )
+    }));
+  }
+  assert!(events.iter().any(|event| {
+    matches!(
+      &event.kind,
+      TrafficEventKind::Finished(finished) if finished.outcome == RequestOutcome::Delivered
+    )
+  }));
+
+  drop(stream);
+  drop(client);
+  hub.shutdown().await.expect("shut down caller-owned event hub");
+  server.shutdown().await;
+}
+
+#[tokio::test]
+async fn semantic_terminal_surfaces_lifecycle_submission_failure() {
+  let server = HangingSseServer::start().await;
+  let fixture = Fixture::new(server.base_url());
+  let (_capture, publisher, hub) = event_hub();
+  let client = fixture.client(publisher);
+  let mut stream = client
+    .generate("llama-cpp/mock-model")
+    .prompt("hello")
+    .request_id("sdk-semantic-terminal-closed-hub")
+    .stream()
+    .await
+    .expect("start semantic stream");
+
+  hub
+    .force_shutdown()
+    .await
+    .expect("force caller-owned hub shutdown with live stream");
+  let error = tokio::time::timeout(Duration::from_secs(2), async {
+    while let Some(event) = stream.next().await {
+      match event {
+        Ok(GenerateEvent::Completed { .. }) => panic!("semantic success escaped a failed lifecycle submission"),
+        Ok(_) => {}
+        Err(error) => return error,
+      }
+    }
+    panic!("semantic stream ended without reporting lifecycle submission failure")
+  })
+  .await
+  .expect("semantic stream waited for HTTP EOF");
+  assert!(matches!(
+    error,
+    Error::GenerateStream { message }
+      if message.contains("lifecycle completion") && message.contains("closed")
+  ));
+
+  drop(stream);
+  drop(client);
+  server.shutdown().await;
 }
 
 #[tokio::test]

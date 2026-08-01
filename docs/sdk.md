@@ -76,10 +76,13 @@ reload. A failed reload leaves both the previous runtime snapshot and the same
 publisher usable. The SDK never closes the hub, including when `Client` is
 dropped. Before calling `hub.shutdown()`, stop starting requests, await all
 buffered calls, and fully drain or drop every raw or semantic stream so each
-stream-owned lifecycle can publish its terminal facts. Friendly semantic
-streams drain their underlying transport through EOF before reporting normal
-completion; a transport error encountered during that drain is surfaced to the
-stream consumer.
+stream-owned lifecycle can publish its terminal facts. Raw streams retain
+transport EOF/drop semantics. Friendly semantic streams finish promptly when
+they recognize a protocol terminal, even if the peer keeps the HTTP connection
+open; the corresponding lifecycle terminal batch is submitted before semantic
+completion is exposed. A terminal publication failure is surfaced to the
+semantic stream consumer, while dropping a semantic stream before its terminal
+cancels the request lifecycle.
 
 Profile selection happens once, when the client is built:
 
