@@ -5,3 +5,9 @@
 //! selection live in their owning crates.
 
 pub mod execution;
+pub mod lifecycle;
+
+pub use lifecycle::{
+  generate_request_id, BoundaryPublishError, LifecycleDelivery, ProgressPublication, ProgressPublishError,
+  RequestCompletion, RequestLifecycle, RequestLifecycleEmitter, RequestTerminalEvent, RequestTermination,
+};
