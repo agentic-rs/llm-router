@@ -6,15 +6,16 @@
 //! without constructing a synthetic listener or opaque transport client.
 
 use super::{
-  managed_profile_route, resolve_managed_profile, ManagedAttemptCoordinator, ManagedAttemptCoordinatorError,
-  ManagedProfileResolveError, ManagedProfileSite, ManagedRequestBody, ManagedRequestBodyError, ManagedSelectionSummary,
+  managed_profile_route, resolve_managed_profile, strip_managed_wire_metadata, ManagedAttemptCoordinator,
+  ManagedAttemptCoordinatorError, ManagedProfileResolveError, ManagedProfileSite, ManagedRequestBody,
+  ManagedRequestBodyError, ManagedSelectionSummary,
 };
 use crate::runtime::LinkedGatewayRuntime;
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderMap;
 use serde_json::Value;
 use smol_str::SmolStr;
 use snafu::Snafu;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 use tokn_access::ProviderAccess;
@@ -26,7 +27,7 @@ use tokn_policy::ProfileId;
 use tokn_requests::execution::{ManagedAttemptError, ManagedClientResponse, ManagedHttpExecutor, ManagedResponseError};
 
 /// One listener-free managed request against an explicit linked profile.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedGatewayRequest {
   endpoint: Endpoint,
   body: Value,
@@ -34,6 +35,20 @@ pub struct ManagedGatewayRequest {
   session_id: Option<SmolStr>,
   provider_access: ProviderAccess,
   generation_options: Option<GenerationOptions>,
+}
+
+impl fmt::Debug for ManagedGatewayRequest {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("ManagedGatewayRequest")
+      .field("endpoint", &self.endpoint)
+      .field("body_kind", &json_kind(&self.body))
+      .field("header_count", &self.headers.len())
+      .field("has_session_id", &self.session_id.is_some())
+      .field("provider_access", &self.provider_access)
+      .field("has_generation_options", &self.generation_options.is_some())
+      .finish()
+  }
 }
 
 impl ManagedGatewayRequest {
@@ -96,10 +111,19 @@ impl ManagedGatewayRequest {
 }
 
 /// Listener-free managed execution over one immutable linked runtime.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedGatewayExecutor {
   runtime: Arc<LinkedGatewayRuntime>,
   attempts: ManagedAttemptCoordinator,
+}
+
+impl fmt::Debug for ManagedGatewayExecutor {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("ManagedGatewayExecutor")
+      .field("linked_profiles", &self.runtime.profiles().len())
+      .finish_non_exhaustive()
+  }
 }
 
 impl ManagedGatewayExecutor {
@@ -183,18 +207,18 @@ impl ManagedGatewayExecutor {
         let (site, selection, response) = success.into_parts();
         Ok(ManagedGatewayOutcome::Response {
           site,
-          selection: Box::new(selection),
+          selection,
           response,
         })
       }
       Err(ManagedAttemptCoordinatorError::Attempt { site, summary, source }) => Err(ManagedGatewayError::Attempt {
         site,
-        selection: Box::new(summary),
+        selection: summary,
         source,
       }),
       Err(ManagedAttemptCoordinatorError::Response { site, summary, source }) => Err(ManagedGatewayError::Response {
         site,
-        selection: Box::new(summary),
+        selection: summary,
         source,
       }),
     }
@@ -205,11 +229,15 @@ fn prepare_semantic_headers(
   mut headers: HeaderMap,
   explicit_session_id: Option<SmolStr>,
 ) -> (tokn_headers::HeaderMap, Option<SmolStr>) {
-  headers.remove(CONTENT_ENCODING);
-  headers.remove(CONTENT_LENGTH);
-  headers.remove(TRANSFER_ENCODING);
+  strip_managed_wire_metadata(&mut headers);
 
+  // Managed headers are string semantics. Native values that cannot be
+  // represented as strings are intentionally ignored by this projection.
   let mut headers = tokn_headers::HeaderMap::from(&headers);
+  let explicit_session_id = explicit_session_id.and_then(|session_id| {
+    let session_id = session_id.trim();
+    (!session_id.is_empty()).then(|| SmolStr::new(session_id))
+  });
   let session_id = match explicit_session_id {
     Some(session_id) => {
       headers.insert(&tokn_headers::keys::X_SESSION_ID, session_id.clone());
@@ -220,12 +248,23 @@ fn prepare_semantic_headers(
   (headers, session_id)
 }
 
+fn json_kind(value: &Value) -> &'static str {
+  match value {
+    Value::Null => "null",
+    Value::Bool(_) => "boolean",
+    Value::Number(_) => "number",
+    Value::String(_) => "string",
+    Value::Array(_) => "array",
+    Value::Object(_) => "object",
+  }
+}
+
 /// Policy-free result of one embedded managed request.
 #[derive(Debug)]
 pub enum ManagedGatewayOutcome {
   Response {
     site: ManagedProfileSite,
-    selection: Box<ManagedSelectionSummary>,
+    selection: ManagedSelectionSummary,
     response: ManagedClientResponse,
   },
   CoolingDown {
@@ -273,24 +312,41 @@ pub enum ManagedGatewayError {
   #[snafu(display("{site} selected managed attempt failed before a final response head: {source}"))]
   Attempt {
     site: ManagedProfileSite,
-    selection: Box<ManagedSelectionSummary>,
+    selection: ManagedSelectionSummary,
     source: ManagedAttemptError,
   },
 
   #[snafu(display("{site} selected managed response failed after its final head was settled: {source}"))]
   Response {
     site: ManagedProfileSite,
-    selection: Box<ManagedSelectionSummary>,
+    selection: ManagedSelectionSummary,
     source: ManagedResponseError,
   },
 }
 
 pub type ManagedGatewayResult<T> = std::result::Result<T, ManagedGatewayError>;
 
+impl ManagedGatewayError {
+  pub fn site(&self) -> Option<&ManagedProfileSite> {
+    match self {
+      Self::ProfileNotLinked { .. } => None,
+      Self::InvalidBody { site, .. } | Self::Attempt { site, .. } | Self::Response { site, .. } => Some(site),
+      Self::Resolve { source } => Some(source.site()),
+    }
+  }
+
+  pub fn selection(&self) -> Option<&ManagedSelectionSummary> {
+    match self {
+      Self::Attempt { selection, .. } | Self::Response { selection, .. } => Some(selection),
+      Self::ProfileNotLinked { .. } | Self::InvalidBody { .. } | Self::Resolve { .. } => None,
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
-  use http::header::HeaderValue;
+  use http::header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 
   #[test]
   fn explicit_session_replaces_header_correlation_and_strips_wire_metadata() {
@@ -300,7 +356,7 @@ mod tests {
     headers.insert(CONTENT_LENGTH, HeaderValue::from_static("120"));
     headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
 
-    let (headers, session_id) = prepare_semantic_headers(headers, Some(SmolStr::new("explicit-session")));
+    let (headers, session_id) = prepare_semantic_headers(headers, Some(SmolStr::new(" explicit-session ")));
 
     assert_eq!(session_id.as_deref(), Some("explicit-session"));
     assert_eq!(

@@ -15,6 +15,8 @@ pub use gateway::{
 };
 
 use super::{LinkedProfile, LinkedWireIdentity};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::HeaderMap;
 use serde_json::Value;
 use smol_str::SmolStr;
 use snafu::Snafu;
@@ -60,11 +62,7 @@ impl ManagedProfileSite {
 
 impl fmt::Display for ManagedProfileSite {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(
-      formatter,
-      "managed profile '{}' route '{}'",
-      self.profile_id, self.route_id
-    )
+    write!(formatter, "profile '{}' route '{}'", self.profile_id, self.route_id)
   }
 }
 
@@ -73,6 +71,11 @@ impl fmt::Display for ManagedProfileSite {
 /// [`ManagedProfileSite`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedSelectionSummary {
+  facts: Box<ManagedSelectionFacts>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedSelectionFacts {
   account_id: SmolStr,
   provider_id: ProviderId,
   upstream_id: UpstreamId,
@@ -87,48 +90,60 @@ impl ManagedSelectionSummary {
   fn from_target(target: &RoutedManagedTarget) -> Self {
     let selected = target.target();
     Self {
-      account_id: SmolStr::new(selected.binding().account_id()),
-      provider_id: selected.upstream().provider_id().clone(),
-      upstream_id: selected.upstream().id().clone(),
-      requested_model: SmolStr::new(target.requested_model()),
-      upstream_model: SmolStr::new(selected.model()),
-      requested_operation: target.requested_operation(),
-      upstream_operation: selected.operation(),
-      wire_identity: target.wire_identity().cloned(),
+      facts: Box::new(ManagedSelectionFacts {
+        account_id: SmolStr::new(selected.binding().account_id()),
+        provider_id: selected.upstream().provider_id().clone(),
+        upstream_id: selected.upstream().id().clone(),
+        requested_model: SmolStr::new(target.requested_model()),
+        upstream_model: SmolStr::new(selected.model()),
+        requested_operation: target.requested_operation(),
+        upstream_operation: selected.operation(),
+        wire_identity: target.wire_identity().cloned(),
+      }),
     }
   }
 
   pub fn account_id(&self) -> &str {
-    self.account_id.as_str()
+    self.facts.account_id.as_str()
   }
 
   pub fn provider_id(&self) -> &ProviderId {
-    &self.provider_id
+    &self.facts.provider_id
   }
 
   pub fn upstream_id(&self) -> &UpstreamId {
-    &self.upstream_id
+    &self.facts.upstream_id
   }
 
   pub fn requested_model(&self) -> &str {
-    self.requested_model.as_str()
+    self.facts.requested_model.as_str()
   }
 
   pub fn upstream_model(&self) -> &str {
-    self.upstream_model.as_str()
+    self.facts.upstream_model.as_str()
   }
 
   pub fn requested_operation(&self) -> Endpoint {
-    self.requested_operation
+    self.facts.requested_operation
   }
 
   pub fn upstream_operation(&self) -> Endpoint {
-    self.upstream_operation
+    self.facts.upstream_operation
   }
 
   pub fn wire_identity(&self) -> Option<&AgentId> {
-    self.wire_identity.as_ref()
+    self.facts.wire_identity.as_ref()
   }
+}
+
+/// Remove stale transport metadata before semantic managed execution.
+///
+/// The caller already owns decoded JSON, so a managed request is serialized
+/// as identity bytes and its outbound transport derives fresh framing.
+pub(crate) fn strip_managed_wire_metadata(headers: &mut HeaderMap) {
+  headers.remove(CONTENT_ENCODING);
+  headers.remove(CONTENT_LENGTH);
+  headers.remove(TRANSFER_ENCODING);
 }
 
 /// A managed target carrying both inbound semantics and the selected outbound
@@ -382,6 +397,16 @@ pub enum ManagedProfileResolveError {
   },
 }
 
+impl ManagedProfileResolveError {
+  pub fn site(&self) -> &ManagedProfileSite {
+    match self {
+      Self::NonManagedRoute { site, .. }
+      | Self::MalformedQualification { site, .. }
+      | Self::MissingProviderWireIdentity { site, .. } => site,
+    }
+  }
+}
+
 pub type ManagedProfileResolveResult<T> = std::result::Result<T, ManagedProfileResolveError>;
 
 #[cfg(test)]
@@ -556,7 +581,7 @@ mod tests {
     assert_eq!(target.site().route_id().as_str(), "managed-route");
     assert_eq!(
       target.site().to_string(),
-      "managed profile 'managed-profile' route 'managed-route'"
+      "profile 'managed-profile' route 'managed-route'"
     );
     assert_eq!(target.requested_model(), "requested-model");
     assert_eq!(target.requested_operation(), Endpoint::ChatCompletions);

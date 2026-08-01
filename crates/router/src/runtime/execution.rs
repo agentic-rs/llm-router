@@ -8,10 +8,11 @@
 //! HTTP policy.
 
 use super::dispatch::SelectedHttpTarget;
-use super::managed::{ManagedAttemptCoordinator, ManagedAttemptCoordinatorError, RoutedManagedTarget};
+use super::managed::{
+  strip_managed_wire_metadata, ManagedAttemptCoordinator, ManagedAttemptCoordinatorError, RoutedManagedTarget,
+};
 use super::{HttpDispatchSite, RoutedHttpDispatch};
 use bytes::Bytes;
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderMap;
 use serde_json::Value;
 use snafu::Snafu;
@@ -182,9 +183,7 @@ impl HttpExecutionRequest {
   /// encoding and framing fields before constructing its semantic header
   /// projection; the outbound transport derives its own content length.
   pub fn managed(mut headers: HeaderMap, body: Value) -> Self {
-    headers.remove(CONTENT_ENCODING);
-    headers.remove(CONTENT_LENGTH);
-    headers.remove(TRANSFER_ENCODING);
+    strip_managed_wire_metadata(&mut headers);
     Self {
       headers,
       body: HttpExecutionBody::Managed(body),
@@ -327,6 +326,7 @@ mod tests {
     link_gateway_runtime, match_http, HttpRequestHead, HttpRequestSemantics, HttpRouteMatch, LinkedGatewayRuntime,
     RuntimeNameRegistry,
   };
+  use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
   use http::{Method, StatusCode};
   use smol_str::SmolStr;
   use std::collections::BTreeMap;
