@@ -3228,8 +3228,6 @@ name = "tokn-router"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "arc-swap",
- "async-trait",
  "axum",
  "bytes",
  "flate2",
@@ -3254,24 +3252,14 @@ dependencies = [
  "tokio-rustls",
  "tokn-access",
  "tokn-accounts",
- "tokn-auth",
- "tokn-catalogue",
- "tokn-convert",
  "tokn-core",
  "tokn-headers",
  "tokn-mock-server",
  "tokn-policy",
- "tokn-provider-copilot",
- "tokn-provider-deepseek",
- "tokn-provider-openai",
- "tokn-provider-zai",
  "tokn-requests",
  "tokn-router-config",
  "toml",
- "tower",
- "tower-http",
  "tracing",
- "uuid",
  "zstd",
 ]
 
