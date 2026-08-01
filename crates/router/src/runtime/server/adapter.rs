@@ -429,6 +429,7 @@ pub(super) fn materialize_local_error(
 mod tests {
   use super::super::connect::connect_upgrade_channel;
   use super::*;
+  use crate::runtime::attempts::{close_pre_head_failure, publish_attempt_started, AttemptRequestObserver};
   use crate::runtime::{link_gateway_runtime, materialize_listeners, GatewayServerState, GatewayServingDefaults};
   use axum::body::to_bytes;
   use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, TRANSFER_ENCODING, WWW_AUTHENTICATE};
@@ -437,7 +438,7 @@ mod tests {
   use std::collections::{BTreeMap, BTreeSet};
   use std::net::{Ipv4Addr, SocketAddr};
   use std::path::PathBuf;
-  use std::sync::Arc;
+  use std::sync::{Arc, Mutex};
   use tokio::io::AsyncReadExt;
   use tokio::net::TcpListener;
   use tokio::sync::mpsc::error::TryRecvError;
@@ -445,9 +446,13 @@ mod tests {
   use tokn_access::AccessContext;
   use tokn_accounts::registry::Registry;
   use tokn_core::account::{AccountConfig, AccountTier};
-  use tokn_core::provider::ID_LLAMA_CPP;
+  use tokn_core::provider::{OutboundRequestObserver, ID_LLAMA_CPP};
   use tokn_core::util::http::HttpClientOptions;
-  use tokn_events::{EventHub, GatewayEvent, HubBuilder};
+  use tokn_events::{
+    AttemptNo, AttemptOutcome, BodyLeg, BodyResult, ConsumerResult, EventConsumer, EventHub, EventSeq, GatewayEvent,
+    HttpFamily, HubBuilder, RequestOutcome, RequestPhase, TargetSelection, TrafficEventKind,
+  };
+  use tokn_mock_server::{MockLlmConfig, MockLlmServer, MockRoute};
   use tokn_persistence::RequestPersistenceConsumer;
   use tokn_policy::{
     AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction,
@@ -455,7 +460,30 @@ mod tests {
     ManagedTarget, ModelGroupId, ModelSelector, ProfileId, ProfilePlan, ProviderId, RouteId, RoutePlan, UpstreamId,
     UpstreamPlan, UpstreamSelector, WireIdentity,
   };
-  use tokn_requests::RequestLifecycleEmitter;
+  use tokn_requests::{RequestCompletion, RequestLifecycleEmitter, RequestTermination};
+
+  struct CaptureConsumer {
+    events: Arc<Mutex<Vec<GatewayEvent>>>,
+  }
+
+  impl EventConsumer<GatewayEvent> for CaptureConsumer {
+    fn name(&self) -> &str {
+      "listener-managed-test"
+    }
+
+    fn handle(&mut self, _sequence: EventSeq, event: &GatewayEvent) -> ConsumerResult {
+      self.events.lock().unwrap().push(event.clone());
+      Ok(())
+    }
+  }
+
+  type ManagedEventFixture = (
+    tempfile::TempDir,
+    ListenerServerState,
+    EventHub<GatewayEvent>,
+    PathBuf,
+    Arc<Mutex<Vec<GatewayEvent>>>,
+  );
 
   fn listener_id() -> ListenerId {
     ListenerId::new("listener").unwrap()
@@ -535,13 +563,18 @@ mod tests {
     )))
   }
 
-  fn managed_event_state(
-    body_limits: super::super::RequestBodyLimits,
-  ) -> (tempfile::TempDir, ListenerServerState, EventHub<GatewayEvent>, PathBuf) {
+  fn managed_event_state(body_limits: super::super::RequestBodyLimits, upstream_url: &str) -> ManagedEventFixture {
     let temp = tempfile::tempdir().unwrap();
     let requests_dir = temp.path().join("requests");
     let persistence = RequestPersistenceConsumer::open(&requests_dir, "test-version").unwrap();
-    let (publisher, hub) = HubBuilder::new().consumer(persistence).start().unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(persistence)
+      .consumer(CaptureConsumer {
+        events: Arc::clone(&events),
+      })
+      .start()
+      .unwrap();
 
     let listener = listener_id();
     let profile = ProfileId::new("profile").unwrap();
@@ -585,7 +618,7 @@ mod tests {
         upstream,
         UpstreamPlan::new(
           ProviderId::new(ID_LLAMA_CPP).unwrap(),
-          Some("https://upstream.example/v1/".into()),
+          Some(upstream_url.into()),
           Box::default(),
           false,
         )
@@ -624,7 +657,13 @@ mod tests {
       )
       .unwrap(),
     );
-    (temp, ListenerServerState::new(gateway, resource), hub, requests_dir)
+    (
+      temp,
+      ListenerServerState::new(gateway, resource),
+      hub,
+      requests_dir,
+      events,
+    )
   }
 
   fn connect_request(target: SocketAddr) -> http::request::Builder {
@@ -805,7 +844,8 @@ mod tests {
     ];
 
     for case in cases {
-      let (_temp, state, hub, requests_dir) = managed_event_state(case.body_limits);
+      let (_temp, state, hub, requests_dir, _events) =
+        managed_event_state(case.body_limits, "https://upstream.example/v1/");
       let mut request = Request::builder()
         .method(Method::POST)
         .uri("/v1/responses")
@@ -911,6 +951,230 @@ mod tests {
         }
       }
     }
+  }
+
+  #[tokio::test]
+  async fn uri_credentials_are_omitted_from_events_and_request_persistence() {
+    let temp = tempfile::tempdir().unwrap();
+    let requests_dir = temp.path().join("requests");
+    let persistence = RequestPersistenceConsumer::open(&requests_dir, "test-version").unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(persistence)
+      .consumer(CaptureConsumer {
+        events: Arc::clone(&events),
+      })
+      .start()
+      .unwrap();
+
+    let inbound = Request::builder()
+      .method(Method::POST)
+      .uri("/v1/responses?access_token=inbound-secret")
+      .version(Version::HTTP_11)
+      .header(HOST, "client.example")
+      .body(Body::empty())
+      .unwrap();
+    let started = request_started(
+      RequestSource::Listener {
+        listener_id: "listener".into(),
+        ingress: IngressKind::LlmApi,
+        local_addr: None,
+        peer_addr: None,
+      },
+      &inbound,
+      false,
+    );
+    let emitter = RequestLifecycleEmitter::new(publisher);
+    let mut lifecycle = emitter.begin(started).await.unwrap();
+    publish_attempt_started(
+      &mut lifecycle,
+      TargetSelection {
+        family: HttpFamily::Transparent,
+        account_id: None,
+        provider_id: None,
+        upstream_id: None,
+        requested_model: None,
+        upstream_model: None,
+        requested_operation: None,
+        upstream_operation: None,
+      },
+    )
+    .await
+    .unwrap();
+
+    let upstream_url = reqwest::Url::parse(
+      "https://upstream-user:upstream-password@api.example/v1/responses?api_key=upstream-secret#private-fragment",
+    )
+    .unwrap();
+    let upstream = reqwest::Request::new(Method::POST, upstream_url);
+    let mut observer = AttemptRequestObserver::new(&mut lifecycle, AttemptNo::FIRST, 1024);
+    observer.observe(&upstream).await.unwrap();
+    assert!(observer.take_publication_error().is_none());
+    close_pre_head_failure(&mut lifecycle, RequestPhase::UpstreamRequest)
+      .await
+      .unwrap();
+    lifecycle
+      .finish(RequestTermination::new(RequestCompletion::new(
+        RequestOutcome::Failed,
+        RequestPhase::UpstreamRequest,
+        None,
+        None,
+      )))
+      .unwrap();
+    hub.shutdown().await.unwrap();
+
+    let events = events.lock().unwrap();
+    let inbound_target = events
+      .iter()
+      .find_map(|event| match event {
+        GatewayEvent::Traffic(event) => match &event.kind {
+          TrafficEventKind::Started(started) => Some(&started.target),
+          _ => None,
+        },
+        _ => None,
+      })
+      .unwrap();
+    assert_eq!(inbound_target.as_str(), "/v1/responses");
+    assert!(inbound_target.is_redacted());
+    let outbound_target = events
+      .iter()
+      .find_map(|event| match event {
+        GatewayEvent::Traffic(event) => match &event.kind {
+          TrafficEventKind::AttemptRequest(request) => Some(&request.request.uri),
+          _ => None,
+        },
+        _ => None,
+      })
+      .unwrap();
+    assert_eq!(outbound_target.as_str(), "https://api.example/v1/responses");
+    assert!(outbound_target.is_redacted());
+    for secret in [
+      "inbound-secret",
+      "upstream-user",
+      "upstream-password",
+      "upstream-secret",
+      "private-fragment",
+    ] {
+      assert!(!inbound_target.as_str().contains(secret));
+      assert!(!outbound_target.as_str().contains(secret));
+    }
+    drop(events);
+
+    let day_files = tokn_persistence::requests::day_files(&requests_dir).unwrap();
+    assert_eq!(day_files.len(), 1);
+    let database = tokn_persistence::requests::open_day_db(&day_files[0]).unwrap();
+    let (inbound_url, outbound_url, context) = database
+      .query_row(
+        "SELECT inbound_req_url, outbound_req_url, ctx_json FROM requests",
+        [],
+        |row| {
+          Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+          ))
+        },
+      )
+      .unwrap();
+    assert_eq!(inbound_url, "/v1/responses");
+    assert_eq!(outbound_url, "https://api.example/v1/responses");
+    let context: serde_json::Value = serde_json::from_str(&context).unwrap();
+    assert_eq!(context["inbound_target_redacted"], true);
+    assert_eq!(context["outbound_target_redacted"], true);
+    for secret in [
+      "inbound-secret",
+      "upstream-user",
+      "upstream-password",
+      "upstream-secret",
+      "private-fragment",
+    ] {
+      assert!(!inbound_url.contains(secret));
+      assert!(!outbound_url.contains(secret));
+    }
+  }
+
+  #[tokio::test]
+  async fn listener_streaming_protocol_mismatch_is_an_upstream_response_failure() {
+    let server = MockLlmServer::start(MockLlmConfig {
+      // Deliberately return JSON for a request whose transformed stream flag
+      // is true, causing adaptation to fail before polling the body.
+      routes: vec![MockRoute::chat_completions()],
+      ..Default::default()
+    })
+    .await;
+    let (_temp, state, hub, _requests_dir, events) =
+      managed_event_state(super::super::RequestBodyLimits::new(1024, 1024), server.base_url());
+    let body = br#"{"model":"fixture","input":"hello","stream":true}"#;
+    let request = Request::builder()
+      .method(Method::POST)
+      .uri("/v1/responses")
+      .version(Version::HTTP_11)
+      .header(HOST, "client.example")
+      .header(CONTENT_LENGTH, body.len().to_string())
+      .body(Body::from(body.as_slice()))
+      .unwrap();
+
+    let response = handle_llm_api_request(&state, connection_metadata(), request).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(std::str::from_utf8(&response_body)
+      .unwrap()
+      .contains("invalid_upstream_response"));
+    hub.shutdown().await.unwrap();
+
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+      event,
+      GatewayEvent::Traffic(event)
+        if matches!(
+          &event.kind,
+          TrafficEventKind::BodyFinished(body)
+            if matches!(body.leg, BodyLeg::Upstream { .. })
+              && matches!(
+                &body.result,
+                BodyResult::Failed(failure) if failure.code == "invalid_upstream_response"
+              )
+        )
+    )));
+    assert!(events.iter().any(|event| matches!(
+      event,
+      GatewayEvent::Traffic(event)
+        if matches!(
+          &event.kind,
+          TrafficEventKind::AttemptFinished(attempt)
+            if attempt.outcome == AttemptOutcome::Failed
+              && attempt.phase == RequestPhase::UpstreamResponse
+              && attempt.upstream_status == Some(200)
+              && matches!(
+                &attempt.failure,
+                Some(failure) if failure.code == "invalid_upstream_response"
+              )
+        )
+    )));
+    assert!(events.iter().any(|event| matches!(
+      event,
+      GatewayEvent::Traffic(event)
+        if matches!(
+          &event.kind,
+          TrafficEventKind::Finished(finished)
+            if finished.outcome == RequestOutcome::Failed
+              && finished.phase == RequestPhase::UpstreamResponse
+              && finished.attempt_count == 1
+              && matches!(
+                &finished.failure,
+                Some(failure) if failure.code == "invalid_upstream_response"
+              )
+        )
+    )));
+    assert!(!events.iter().any(|event| matches!(
+      event,
+      GatewayEvent::Traffic(event)
+        if matches!(
+          &event.kind,
+          TrafficEventKind::AttemptFinished(attempt) if attempt.outcome == AttemptOutcome::Cancelled
+        )
+    )));
   }
 
   #[tokio::test]

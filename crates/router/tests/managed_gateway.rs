@@ -12,9 +12,9 @@ use tokn_core::provider::{Endpoint, ID_LLAMA_CPP};
 use tokn_core::util::http::HttpClientOptions;
 use tokn_events::{
   AttemptOutcome, BodyCapture, BodyLeg, BodyOutcome, BodyResult, ConsumerResult, EventConsumer, EventSeq, GatewayEvent,
-  HubBuilder, RequestOutcome, RequestSource, TrafficEvent, TrafficEventKind,
+  HubBuilder, RequestOutcome, RequestPhase, RequestSource, TrafficEvent, TrafficEventKind,
 };
-use tokn_mock_server::{MockAuthConfig, MockLlmConfig, MockLlmServer, MockRoute};
+use tokn_mock_server::{MockAuthConfig, MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 use tokn_policy::ProfileId;
 use tokn_requests::execution::ManagedClientBody;
 use tokn_requests::RequestLifecycleEmitter;
@@ -335,6 +335,127 @@ async fn embedded_buffered_success_finishes_upstream_and_downstream_before_retur
   assert!(traffic.iter().any(|event| matches!(
     &event.kind,
     TrafficEventKind::AttemptFinished(event) if event.outcome == AttemptOutcome::Response
+  )));
+}
+
+#[tokio::test]
+async fn embedded_streaming_protocol_mismatch_is_an_upstream_response_failure() {
+  let server = MockLlmServer::start(MockLlmConfig {
+    // The route deliberately returns JSON even though the translated request
+    // asks for a stream.
+    routes: vec![MockRoute::chat_completions()],
+    ..Default::default()
+  })
+  .await;
+  let (profile, runtime) = runtime(server.base_url());
+  let (gateway, events, hub) = event_executor(runtime);
+
+  let error = gateway
+    .execute(
+      &profile,
+      ManagedGatewayRequest::new(
+        Endpoint::Responses,
+        json!({
+          "model": REQUESTED_MODEL,
+          "input": "hello",
+          "stream": true
+        }),
+      ),
+    )
+    .await
+    .unwrap_err();
+  assert!(matches!(error, ManagedGatewayError::Response { .. }));
+  drop(gateway);
+  hub.shutdown().await.unwrap();
+
+  let events = events.lock().unwrap();
+  let traffic = traffic(&events);
+  assert!(traffic.iter().any(|event| matches!(
+    &event.kind,
+    TrafficEventKind::BodyFinished(body)
+      if matches!(
+        &body.result,
+        BodyResult::Failed(failure) if failure.code == "invalid_upstream_response"
+      ) && matches!(body.leg, BodyLeg::Upstream { .. })
+  )));
+  assert!(traffic.iter().any(|event| matches!(
+    &event.kind,
+    TrafficEventKind::AttemptFinished(attempt)
+      if attempt.outcome == AttemptOutcome::Failed
+        && attempt.phase == RequestPhase::UpstreamResponse
+        && attempt.upstream_status == Some(200)
+        && matches!(
+          &attempt.failure,
+          Some(failure) if failure.code == "invalid_upstream_response"
+        )
+  )));
+  assert!(traffic.iter().any(|event| matches!(
+    &event.kind,
+    TrafficEventKind::Finished(finished)
+      if finished.outcome == RequestOutcome::Failed
+        && finished.phase == RequestPhase::UpstreamResponse
+        && finished.attempt_count == 1
+        && matches!(
+          &finished.failure,
+          Some(failure) if failure.code == "invalid_upstream_response"
+        )
+  )));
+  assert!(!traffic.iter().any(|event| matches!(
+    event.kind,
+    TrafficEventKind::AttemptFinished(ref attempt) if attempt.outcome == AttemptOutcome::Cancelled
+  )));
+}
+
+#[tokio::test]
+async fn embedded_json_adaptation_failure_after_eof_keeps_the_transfer_complete() {
+  let server = MockLlmServer::start(MockLlmConfig {
+    routes: vec![MockRoute::new(
+      MockEndpoint::ChatCompletions,
+      MockResponse {
+        status: http::StatusCode::OK,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: "{".into(),
+      },
+    )],
+    ..Default::default()
+  })
+  .await;
+  let (profile, runtime) = runtime(server.base_url());
+  let (gateway, events, hub) = event_executor(runtime);
+
+  let error = gateway
+    .execute(
+      &profile,
+      ManagedGatewayRequest::new(
+        Endpoint::Responses,
+        json!({
+          "model": REQUESTED_MODEL,
+          "input": "hello",
+          "stream": false
+        }),
+      ),
+    )
+    .await
+    .unwrap_err();
+  assert!(matches!(error, ManagedGatewayError::Response { .. }));
+  drop(gateway);
+  hub.shutdown().await.unwrap();
+
+  let events = events.lock().unwrap();
+  let traffic = traffic(&events);
+  assert!(traffic.iter().any(|event| matches!(
+    &event.kind,
+    TrafficEventKind::BodyFinished(body)
+      if body.result == BodyResult::Complete && matches!(body.leg, BodyLeg::Upstream { .. })
+  )));
+  assert!(traffic.iter().any(|event| matches!(
+    &event.kind,
+    TrafficEventKind::AttemptFinished(attempt)
+      if attempt.outcome == AttemptOutcome::Failed
+        && matches!(
+          &attempt.failure,
+          Some(failure) if failure.code == "invalid_upstream_response"
+        )
   )));
 }
 

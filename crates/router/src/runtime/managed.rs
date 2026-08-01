@@ -35,7 +35,7 @@ use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::provider::OutboundRequestObserver;
 use tokn_core::AgentId;
-use tokn_events::{AttemptNo, HttpFamily, RequestPhase, TargetSelection};
+use tokn_events::{AttemptNo, EventFailure, HttpFamily, RequestPhase, TargetSelection};
 use tokn_headers::HeaderMap as SemanticHeaderMap;
 use tokn_policy::{ProfileId, ProviderId, RouteId, RouteKind, UpstreamId};
 use tokn_requests::execution::{
@@ -353,7 +353,7 @@ impl ManagedAttemptCoordinator {
       }
       Err(error @ ManagedAttemptCoordinatorError::Response { .. }) => {
         body_plan
-          .publish_terminal(lifecycle)
+          .publish_failed_terminal(lifecycle, managed_response_failure())
           .await
           .map_err(|source| ManagedAttemptCoordinatorError::Lifecycle {
             phase: RequestPhase::UpstreamResponse,
@@ -423,6 +423,13 @@ impl ManagedAttemptCoordinator {
       }),
       Err(source) => Err(ManagedAttemptCoordinatorError::Response { site, summary, source }),
     }
+  }
+}
+
+fn managed_response_failure() -> EventFailure {
+  EventFailure {
+    code: "invalid_upstream_response".into(),
+    message: "the upstream response could not be processed".into(),
   }
 }
 
