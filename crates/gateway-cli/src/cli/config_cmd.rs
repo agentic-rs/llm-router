@@ -398,7 +398,7 @@ async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
   cfg.save(path)?;
   store.save()?;
   println!("Initialized config and upserted {upserted} account(s).");
-  println!("Next: tokn-router serve  # or tokn-router proxy start");
+  println!("Next: tokn-router serve");
   Ok(())
 }
 

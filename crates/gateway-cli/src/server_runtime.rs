@@ -3,12 +3,11 @@ use crate::db::archive::{ArchiveEventHandler, ArchiveRuntime};
 use crate::progress::{ArchiveProgressEventHandler, ProgressEventHandler, ProgressLogEventHandler};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokn_auth::AuthStore;
-use tokn_config::{v2::CompiledConfig, RouteMode};
+use tokn_config::v2::CompiledConfig;
 use tokn_core::account::AccountConfig;
 use tokn_core::event::{EventBus, EventHandler};
 use tokn_router::runtime::{
@@ -77,14 +76,6 @@ pub fn load_default_accounts() -> Result<Vec<AccountConfig>> {
   Ok(store.accounts)
 }
 
-pub fn load_access_store(enabled: bool) -> Result<Arc<tokn_access::AccessStore>> {
-  if enabled {
-    Ok(Arc::new(tokn_access::AccessStore::open_default()?))
-  } else {
-    Ok(Arc::new(tokn_access::AccessStore::disabled()))
-  }
-}
-
 /// Prepare and atomically bind every listener in one compiled v2 generation.
 ///
 /// Runtime linking, file-backed listener resources, and outbound transports
@@ -125,44 +116,10 @@ pub fn build_state(
   tokn_router::api::build_state(cfg, accounts, events)
 }
 
-pub fn build_proxy_state_for_route_mode(
-  cfg: &Config,
-  accounts: &[AccountConfig],
-  events: Arc<EventBus>,
-  route_mode: RouteMode,
-) -> Result<tokn_router::api::AppState> {
-  let mut cfg = cfg.clone();
-  cfg.server.route_mode = route_mode;
-  cfg.defaults.mode = route_mode;
-  tokn_router::api::build_proxy_state(&cfg, accounts, events)
-}
-
-pub fn resolve_bind_addr(host: &str, port: u16, insecure_allow_remote: bool) -> Result<SocketAddr> {
-  ensure_bind_host(host, insecure_allow_remote)?;
-  Ok(format!("{host}:{port}").parse()?)
-}
-
-pub fn is_loopback(host: &str) -> bool {
-  matches!(host, "127.0.0.1" | "::1" | "localhost")
-    || host
-      .parse::<std::net::IpAddr>()
-      .map(|ip| ip.is_loopback())
-      .unwrap_or(false)
-}
-
-pub fn ensure_bind_host(host: &str, insecure_allow_remote: bool) -> Result<()> {
-  if !insecure_allow_remote && !is_loopback(host) {
-    anyhow::bail!(
-      "refusing to bind to non-loopback host '{host}' without --insecure-allow-remote; API-key auth does not cover tunnels, passthrough traffic, or helper routes"
-    );
-  }
-  Ok(())
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+  use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
   use std::time::Duration;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::TcpStream;
@@ -309,24 +266,5 @@ default_http_action = {{ kind = "reject" }}
 
     shutdown_tx.send(()).unwrap();
     timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().unwrap();
-  }
-
-  #[test]
-  fn rejects_non_loopback_without_insecure_allow_remote() {
-    let err = ensure_bind_host("0.0.0.0", false).expect_err("remote bind should be rejected");
-    assert!(
-      err.to_string().contains("--insecure-allow-remote"),
-      "unexpected error: {err}"
-    );
-  }
-
-  #[test]
-  fn accepts_non_loopback_with_insecure_allow_remote() {
-    ensure_bind_host("0.0.0.0", true).expect("remote bind should be allowed");
-  }
-
-  #[test]
-  fn accepts_loopback_without_insecure_allow_remote() {
-    ensure_bind_host("127.0.0.1", false).expect("loopback bind should be allowed");
   }
 }

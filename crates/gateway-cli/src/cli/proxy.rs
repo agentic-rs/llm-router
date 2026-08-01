@@ -1,16 +1,12 @@
-use crate::cli::config_cmd::RouteModeArg;
-use crate::cli::lan_bootstrap;
-use crate::config::{Config, ProxyConfig};
+use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use std::collections::HashSet;
-use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use tokn_config::RouteMode;
 
 const DEFAULT_CLIENT_NO_PROXY: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
@@ -22,8 +18,6 @@ pub struct ProxyArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ProxyCmd {
-  /// Run the local MITM forward proxy
-  Start(StartArgs),
   /// Print shell environment exports for proxy + CA trust
   Env(EnvArgs),
   /// Enter a shell with proxy + CA env vars set
@@ -40,28 +34,6 @@ pub enum ProxyCmd {
   Pi(AgentProxyArgs),
   /// Inspect or regenerate the local proxy CA
   Ca(CaArgs),
-}
-
-#[derive(Args, Debug, Default)]
-pub struct StartArgs {
-  #[arg(long)]
-  pub host: Option<String>,
-  #[arg(long)]
-  pub port: Option<u16>,
-  #[arg(long, value_enum)]
-  pub route_mode: Option<RouteModeArg>,
-  /// Route intercepted requests directly to the original upstream with the
-  /// client's own credentials.
-  #[arg(long)]
-  pub passthrough: bool,
-  #[arg(long)]
-  pub ca_dir: Option<PathBuf>,
-  /// Allow non-loopback binding (insecure: tunnels and passthrough traffic are unauthenticated).
-  #[arg(long)]
-  pub insecure_allow_remote: bool,
-  /// Skip outbound proxy for this run.
-  #[arg(long)]
-  pub no_proxy: bool,
 }
 
 #[derive(Args, Debug)]
@@ -133,7 +105,6 @@ pub enum Shell {
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ProxyArgs) -> Result<()> {
   match args.cmd {
-    ProxyCmd::Start(args) => start(cfg_path, args).await,
     ProxyCmd::Env(args) => env(cfg_path, args).await,
     ProxyCmd::Shell(args) => shell(cfg_path, args).await,
     ProxyCmd::Run(args) => {
@@ -153,86 +124,6 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ProxyArgs) -> Result<()> {
     ProxyCmd::Pi(args) => agent(cfg_path, AgentKind::Pi, args).await,
     ProxyCmd::Ca(args) => ca(cfg_path, args).await,
   }
-}
-
-#[allow(clippy::result_large_err)]
-async fn start(cfg_path: Option<PathBuf>, args: StartArgs) -> Result<()> {
-  if args.passthrough && args.route_mode.is_some() {
-    anyhow::bail!("--passthrough and --route-mode cannot be used together");
-  }
-  let (mut cfg, _) = Config::load(cfg_path.as_deref())?;
-  if args.no_proxy {
-    cfg.proxy = ProxyConfig::default();
-  }
-  let accounts = crate::server_runtime::load_default_accounts()?;
-
-  let host = args.host.unwrap_or_else(|| cfg.proxy_mode.host.clone());
-  let port = args.port.unwrap_or(cfg.proxy_mode.port);
-  let route_mode = args
-    .route_mode
-    .map(Into::into)
-    .or_else(|| args.passthrough.then_some(RouteMode::Passthrough))
-    .unwrap_or(cfg.proxy_mode.route_mode);
-  let ca_dir = args
-    .ca_dir
-    .clone()
-    .map(Ok)
-    .unwrap_or_else(|| cfg.proxy_mode.resolved_ca_dir())?;
-
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&cfg)?;
-  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let mut state = crate::server_runtime::build_proxy_state_for_route_mode(&cfg, &accounts, events.clone(), route_mode)?;
-  state.access = crate::server_runtime::load_access_store(cfg.api_key.enabled)?;
-  let n = state.pool.len();
-  let addr: SocketAddr = crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
-    .with_context(|| format!("parse bind addr {host}:{port}"))?;
-
-  let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, false)?;
-  let ca_fingerprint = ca.fingerprint_sha256();
-  let plain_http_handler = if args.insecure_allow_remote {
-    let bootstrap = lan_bootstrap::BootstrapState::proxy_only(&ca, port)?;
-    Some(lan_bootstrap::proxy_plain_http_handler(bootstrap))
-  } else {
-    None
-  };
-  println!("tokn-router proxy listening on http://{addr}");
-  println!("CA: {} (sha256:{ca_fingerprint})", ca.cert_path().display());
-  println!("Trust this CA, then run: eval \"$(tokn-gateway proxy env)\"");
-  if args.insecure_allow_remote {
-    println!(
-      "LAN proxy bootstrap: {}",
-      lan_bootstrap::display_bootstrap_url(&host, port)
-    );
-  }
-  println!("Route mode: {}", route_mode_name(route_mode));
-  if let Some(url) = &cfg.proxy.url {
-    println!("Outbound proxy: {url}");
-    if !cfg.proxy.no_proxy.is_empty() {
-      println!("Outbound no_proxy: {}", cfg.proxy.no_proxy.join(","));
-    }
-  } else if cfg.proxy.system {
-    println!("Outbound proxy: system");
-  }
-  println!("Accounts: {n}");
-
-  let options = tokn_router::proxy::ProxyOptions {
-    addr,
-    ca_dir,
-    intercept_hosts: cfg.proxy_mode.intercept_hosts.clone(),
-    passthrough_hosts: cfg.proxy_mode.passthrough_hosts.clone(),
-    outbound_proxy: cfg.proxy.to_http_options(),
-    plain_http_handler,
-  };
-
-  let result = tokn_router::proxy::serve(state, options, async {
-    let _ = tokio::signal::ctrl_c().await;
-  })
-  .await;
-  if let Some(archive_runtime) = archive_runtime {
-    archive_runtime.shutdown().await;
-  }
-  events.shutdown().await;
-  result
 }
 
 async fn env(cfg_path: Option<PathBuf>, args: EnvArgs) -> Result<()> {
@@ -296,18 +187,18 @@ async fn ca(cfg_path: Option<PathBuf>, args: CaArgs) -> Result<()> {
   let ca_dir = cfg.proxy_mode.resolved_ca_dir()?;
   match args.cmd {
     CaCmd::Path => {
-      let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, false)?;
+      let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, false)?;
       println!("{}", ca.cert_path().display());
     }
     CaCmd::Show => {
-      let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, false)?;
+      let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, false)?;
       println!("cert: {}", ca.cert_path().display());
       println!("bundle: {}", ca.ensure_bundle()?.display());
       println!("key: {}", ca.key_path().display());
       println!("sha256: {}", ca.fingerprint_sha256());
     }
     CaCmd::Regenerate => {
-      let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, true)?;
+      let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, true)?;
       println!("regenerated CA at {}", ca.cert_path().display());
       println!("sha256: {}", ca.fingerprint_sha256());
     }
@@ -336,7 +227,7 @@ fn print_pwsh(env: &ProxyEnv) {
 fn resolved_proxy_env(cfg_path: Option<&Path>) -> Result<ProxyEnv> {
   let (cfg, _) = Config::load(cfg_path)?;
   let ca_dir = cfg.proxy_mode.resolved_ca_dir()?;
-  let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, false)?;
+  let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, false)?;
   let proxy_url = format!("http://{}:{}", cfg.proxy_mode.host, cfg.proxy_mode.port);
   let cert = ca.cert_path().display().to_string();
   let bundle = ca.ensure_bundle()?.display().to_string();
@@ -500,16 +391,6 @@ fn apply_shell_arg0(cmd: &mut Command, arg0: Option<&str>) {
 #[cfg(not(unix))]
 fn apply_shell_arg0(_cmd: &mut Command, _arg0: Option<&str>) {}
 
-fn route_mode_name(mode: RouteMode) -> &'static str {
-  match mode {
-    RouteMode::Passthrough => "passthrough",
-    RouteMode::Switch => "switch",
-    RouteMode::Exact => "exact",
-    RouteMode::Route => "route",
-    RouteMode::Fuzzy => "fuzzy",
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -632,17 +513,8 @@ mod tests {
   }
 
   #[test]
-  fn proxy_passthrough_is_start_only() {
-    assert!(Cli::try_parse_from(["tokn-router", "proxy", "--passthrough", "env"]).is_err());
-
-    let cli = Cli::try_parse_from(["tokn-router", "proxy", "start", "--passthrough"]).unwrap();
-    let Cmd::Proxy(proxy) = cli.cmd else {
-      panic!("expected proxy command");
-    };
-    let ProxyCmd::Start(args) = proxy.cmd else {
-      panic!("expected proxy start command");
-    };
-    assert!(args.passthrough);
+  fn proxy_start_is_retired_in_favor_of_compiled_listeners() {
+    assert!(Cli::try_parse_from(["tokn-router", "proxy", "start"]).is_err());
   }
 
   #[test]

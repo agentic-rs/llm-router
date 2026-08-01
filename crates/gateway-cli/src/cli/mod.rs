@@ -13,7 +13,6 @@ mod error;
 mod headers;
 mod import;
 mod inspect;
-mod lan_bootstrap;
 mod login;
 mod migration;
 mod onboarding;
