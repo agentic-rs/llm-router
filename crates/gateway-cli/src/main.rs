@@ -6,7 +6,6 @@ use tokn_config as config;
 mod auth_registry;
 mod cli;
 use tokn_persistence as db;
-mod error;
 mod logging;
 mod progress;
 mod provider;
