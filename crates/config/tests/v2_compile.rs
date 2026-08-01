@@ -184,6 +184,19 @@ fn service_outbound_rejects_unsupported_or_conflicting_proxy_settings() {
   for (settings, location) in [
     ("proxy_url = \"ftp://proxy.example\"", "service.outbound.proxy_url"),
     (
+      "proxy_url = \"http://proxy.example/path\"",
+      "service.outbound.proxy_url",
+    ),
+    (
+      "proxy_url = \"http://proxy.example?mode=connect\"",
+      "service.outbound.proxy_url",
+    ),
+    (
+      "proxy_url = \"http://proxy.example#fragment\"",
+      "service.outbound.proxy_url",
+    ),
+    ("proxy_url = \"http://proxy.example:0\"", "service.outbound.proxy_url"),
+    (
       "proxy_url = \"http://proxy.example\"\nuse_system_proxy = true",
       "service.outbound",
     ),

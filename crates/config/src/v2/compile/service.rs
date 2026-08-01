@@ -49,6 +49,18 @@ fn compile_proxy_url(value: &str) -> Result<String, CompileError> {
       format!("unsupported proxy URL scheme `{}`", parsed.scheme()),
     ));
   }
+  if parsed.host_str().is_none()
+    || parsed.cannot_be_a_base()
+    || !matches!(parsed.path(), "" | "/")
+    || parsed.query().is_some()
+    || parsed.fragment().is_some()
+    || parsed.port() == Some(0)
+  {
+    return Err(invalid_value(
+      "service.outbound.proxy_url",
+      "proxy URL must contain only a scheme, authority, and optional credentials",
+    ));
+  }
   Ok(parsed.to_string())
 }
 
