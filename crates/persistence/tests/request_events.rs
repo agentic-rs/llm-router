@@ -147,6 +147,158 @@ fn parsing_failure_keeps_the_started_row_without_inventing_routing_facts() {
 }
 
 #[test]
+fn embedded_accepted_body_uses_decoded_capture_when_wire_is_absent() {
+  let dir = tempdir();
+  let mut consumer = RequestPersistenceConsumer::open(&dir, "test-version").unwrap();
+  emit(
+    &mut consumer,
+    event("embedded-accepted", 1, 0, TrafficEventKind::Started(embedded_started())),
+  )
+  .unwrap();
+  emit(
+    &mut consumer,
+    event(
+      "embedded-accepted",
+      2,
+      1,
+      TrafficEventKind::RequestBody(RequestBodyObservation {
+        wire: BodyCapture::Absent,
+        decoded: Some(BodyCapture::Complete(Bytes::from_static(
+          br#"{"model":"requested","stream":false}"#,
+        ))),
+        requested_model: Some("requested".into()),
+        stream: Some(false),
+        initiator: None,
+        outcome: BodyOutcome::Accepted,
+      }),
+    ),
+  )
+  .unwrap();
+
+  let (body, request_error, context) = open_day(&dir, DAY)
+    .query_row(
+      "SELECT inbound_req_body, request_error, ctx_json
+       FROM requests WHERE request_id = 'embedded-accepted'",
+      [],
+      |row| {
+        Ok((
+          row.get::<_, Option<Vec<u8>>>(0)?,
+          row.get::<_, Option<String>>(1)?,
+          row.get::<_, String>(2)?,
+        ))
+      },
+    )
+    .map(|(body, request_error, context)| (body, request_error, serde_json::from_str::<Value>(&context).unwrap()))
+    .unwrap();
+
+  assert_eq!(body, Some(br#"{"model":"requested","stream":false}"#.to_vec()));
+  assert_eq!(request_error, None);
+  assert_eq!(context["request_source"], "embedded");
+  assert_eq!(context["source_profile_id"], "default");
+}
+
+#[test]
+fn embedded_rejected_body_preserves_decoded_capture_metadata_when_wire_is_absent() {
+  let dir = tempdir();
+  let mut consumer = RequestPersistenceConsumer::open(&dir, "test-version").unwrap();
+  emit(
+    &mut consumer,
+    event("embedded-rejected", 1, 0, TrafficEventKind::Started(embedded_started())),
+  )
+  .unwrap();
+  let decoded_prefix = Bytes::from_static(br#"{"model":"requested"#);
+  emit(
+    &mut consumer,
+    event(
+      "embedded-rejected",
+      2,
+      1,
+      TrafficEventKind::RequestBody(RequestBodyObservation {
+        wire: BodyCapture::Absent,
+        decoded: Some(BodyCapture::Truncated {
+          prefix: decoded_prefix.clone(),
+          bytes_seen: 64,
+        }),
+        requested_model: Some("requested".into()),
+        stream: None,
+        initiator: None,
+        outcome: BodyOutcome::Rejected(failure("invalid_request_body", "invalid embedded body")),
+      }),
+    ),
+  )
+  .unwrap();
+
+  let (body, request_error, context) = open_day(&dir, DAY)
+    .query_row(
+      "SELECT inbound_req_body, request_error, ctx_json
+       FROM requests WHERE request_id = 'embedded-rejected'",
+      [],
+      |row| {
+        Ok((
+          row.get::<_, Option<Vec<u8>>>(0)?,
+          row.get::<_, String>(1)?,
+          row.get::<_, String>(2)?,
+        ))
+      },
+    )
+    .map(|(body, request_error, context)| (body, request_error, serde_json::from_str::<Value>(&context).unwrap()))
+    .unwrap();
+
+  assert_eq!(body, Some(decoded_prefix.to_vec()));
+  assert_eq!(request_error, "request_body: invalid embedded body");
+  for key in ["inbound_request_body_capture", "decoded_request_body_capture"] {
+    assert_eq!(context[key]["state"], "truncated", "{key}");
+    assert_eq!(context[key]["bytes_seen"], 64, "{key}");
+    assert_eq!(context[key]["bytes_captured"], decoded_prefix.len(), "{key}");
+  }
+}
+
+#[test]
+fn listener_request_body_keeps_wire_precedence_over_decoded_capture() {
+  let dir = tempdir();
+  let mut consumer = RequestPersistenceConsumer::open(&dir, "test-version").unwrap();
+  emit(
+    &mut consumer,
+    event("listener-wire", 1, 0, TrafficEventKind::Started(started())),
+  )
+  .unwrap();
+  emit(
+    &mut consumer,
+    event(
+      "listener-wire",
+      2,
+      1,
+      TrafficEventKind::RequestBody(RequestBodyObservation {
+        wire: BodyCapture::Complete(Bytes::from_static(b"wire-body")),
+        decoded: Some(BodyCapture::Truncated {
+          prefix: Bytes::from_static(b"decoded-prefix"),
+          bytes_seen: 128,
+        }),
+        requested_model: Some("requested".into()),
+        stream: Some(false),
+        initiator: None,
+        outcome: BodyOutcome::Accepted,
+      }),
+    ),
+  )
+  .unwrap();
+
+  let (body, context) = open_day(&dir, DAY)
+    .query_row(
+      "SELECT inbound_req_body, ctx_json FROM requests WHERE request_id = 'listener-wire'",
+      [],
+      |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+    )
+    .map(|(body, context)| (body, serde_json::from_str::<Value>(&context).unwrap()))
+    .unwrap();
+
+  assert_eq!(body, b"wire-body");
+  assert!(context.get("inbound_request_body_capture").is_none());
+  assert_eq!(context["decoded_request_body_capture"]["state"], "truncated");
+  assert_eq!(context["decoded_request_body_capture"]["bytes_seen"], 128);
+}
+
+#[test]
 fn retries_keep_legacy_ids_and_clone_only_request_wide_facts() {
   let dir = tempdir();
   let mut consumer = RequestPersistenceConsumer::open(&dir, "test-version").unwrap();
@@ -2017,6 +2169,15 @@ fn started() -> RequestStarted {
       ..Correlation::default()
     },
   }
+}
+
+fn embedded_started() -> RequestStarted {
+  let mut started = started();
+  started.source = RequestSource::Embedded {
+    profile_id: "default".into(),
+  };
+  started.http_version = None;
+  started
 }
 
 fn started_for_ingress(ingress: IngressKind) -> RequestStarted {

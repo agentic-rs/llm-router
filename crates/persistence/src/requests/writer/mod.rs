@@ -23,10 +23,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_events::{
   AttemptFinished, AttemptHttpRequest, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted,
-  AttemptUsage, BodyFinished, BodyLeg, BodyOutcome, BodyProgress, BodyResult, ClientIdentity, ConnectAction,
-  ConnectClosed, ConnectReady, ConsumerResult, EventConsumer, EventSeq, GatewayEvent, HttpResponseHead,
-  PolicySelection, RequestAdmitted, RequestBodyObservation, RequestFinished, RequestPhase, RequestStarted,
-  SelectedAction, TokenUsage, TrafficEvent, TrafficEventKind,
+  AttemptUsage, BodyCapture, BodyFinished, BodyLeg, BodyOutcome, BodyProgress, BodyResult, ClientIdentity,
+  ConnectAction, ConnectClosed, ConnectReady, ConsumerResult, EventConsumer, EventSeq, GatewayEvent, HttpResponseHead,
+  PolicySelection, RequestAdmitted, RequestBodyObservation, RequestFinished, RequestPhase, RequestSource,
+  RequestStarted, SelectedAction, TokenUsage, TrafficEvent, TrafficEventKind,
 };
 
 const TERMINAL_TOMBSTONE_CAPACITY: usize = 4_096;
@@ -225,6 +225,7 @@ impl RequestPersistenceConsumer {
       base_day: day,
       last_sequence: 1,
       seed,
+      embedded_source: matches!(&started.source, RequestSource::Embedded { .. }),
       attempts: BTreeMap::new(),
       latest_attempt: None,
       http_admitted: false,
@@ -367,6 +368,7 @@ struct LogicalState {
   base_day: String,
   last_sequence: u64,
   seed: RequestSeed,
+  embedded_source: bool,
   attempts: BTreeMap<AttemptNo, AttemptState>,
   latest_attempt: Option<AttemptNo>,
   http_admitted: bool,
@@ -617,10 +619,15 @@ impl RequestPersistenceConsumer {
       ));
     }
     let mut context = state.seed.context.clone();
+    let inbound_capture = if state.embedded_source && matches!(&observation.wire, BodyCapture::Absent) {
+      observation.decoded.as_ref().unwrap_or(&observation.wire)
+    } else {
+      &observation.wire
+    };
     let inbound_body = project_body(
       &mut context,
       "inbound_request_body_capture",
-      &observation.wire,
+      inbound_capture,
       self.options,
     );
     if let Some(decoded) = observation.decoded.as_ref() {
