@@ -23,7 +23,7 @@ use smol_str::SmolStr;
 use snafu::Snafu;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokn_access::ProviderAccess;
@@ -211,10 +211,30 @@ impl ManagedGatewayExecutor {
     profile_id: &ProfileId,
     request: ManagedGatewayRequest,
   ) -> ManagedGatewayResult<ManagedGatewayOutcome> {
+    self
+      .execute_controlled(profile_id, request)
+      .await
+      .map(ManagedGatewayExecution::into_outcome)
+  }
+
+  /// Execute one request while retaining an optional semantic-stream terminal.
+  ///
+  /// Protocol-aware library adapters may consume the returned linear handle
+  /// when they recognize a complete terminal message. Raw body consumers
+  /// should use [`Self::execute`], whose EOF and early-drop behavior is
+  /// unchanged.
+  pub async fn execute_controlled(
+    &self,
+    profile_id: &ProfileId,
+    request: ManagedGatewayRequest,
+  ) -> ManagedGatewayResult<ManagedGatewayExecution> {
     if self.events.is_enabled() {
       self.execute_with_events(profile_id, request).await
     } else {
-      self.execute_unobserved(profile_id, request).await
+      self
+        .execute_unobserved(profile_id, request)
+        .await
+        .map(ManagedGatewayExecution::without_semantic_completion)
     }
   }
 
@@ -300,7 +320,7 @@ impl ManagedGatewayExecutor {
     &self,
     profile_id: &ProfileId,
     request: ManagedGatewayRequest,
-  ) -> ManagedGatewayResult<ManagedGatewayOutcome> {
+  ) -> ManagedGatewayResult<ManagedGatewayExecution> {
     let ManagedGatewayRequest {
       endpoint,
       body,
@@ -452,14 +472,18 @@ impl ManagedGatewayExecutor {
         ) {
           return Err(error);
         }
-        return Ok(ManagedGatewayOutcome::CoolingDown { site, retry_at });
+        return Ok(ManagedGatewayExecution::without_semantic_completion(
+          ManagedGatewayOutcome::CoolingDown { site, retry_at },
+        ));
       }
       TargetResolution::NoEligible { reason } => {
         let completion = no_eligible_completion(&reason);
         if let Some(error) = finish_embedded_outcome(lifecycle, completion) {
           return Err(error);
         }
-        return Ok(ManagedGatewayOutcome::NoEligible { site, reason });
+        return Ok(ManagedGatewayExecution::without_semantic_completion(
+          ManagedGatewayOutcome::NoEligible { site, reason },
+        ));
       }
     };
 
@@ -533,29 +557,32 @@ impl ManagedGatewayExecutor {
         downstream
           .finish_complete()
           .map_err(|source| lifecycle_error(RequestPhase::DownstreamResponse, source))?;
-        Ok(ManagedGatewayOutcome::Response {
-          site,
-          selection,
-          response,
-        })
+        Ok(ManagedGatewayExecution::without_semantic_completion(
+          ManagedGatewayOutcome::Response {
+            site,
+            selection,
+            response,
+          },
+        ))
       }
       ManagedClientBody::Stream(_) => {
+        let mut semantic_completion = None;
         let response = response.map_body(|body| {
           let ManagedClientBody::Stream(stream) = body else {
             unreachable!("managed response body variant changed while installing lifecycle ownership")
           };
-          ManagedClientBody::Stream(Box::pin(EmbeddedLifecycleStream::new(
-            stream,
-            lifecycle,
-            termination,
-            self.body_capture_limit,
-            attempt,
-          )))
+          let (stream, completion) =
+            EmbeddedLifecycleStream::new(stream, lifecycle, termination, self.body_capture_limit, attempt);
+          semantic_completion = Some(completion);
+          ManagedClientBody::Stream(Box::pin(stream))
         });
-        Ok(ManagedGatewayOutcome::Response {
-          site,
-          selection,
-          response,
+        Ok(ManagedGatewayExecution {
+          outcome: ManagedGatewayOutcome::Response {
+            site,
+            selection,
+            response,
+          },
+          semantic_completion,
         })
       }
     }
@@ -564,7 +591,44 @@ impl ManagedGatewayExecutor {
 
 struct EmbeddedLifecycleStream {
   inner: BoxStream<'static, std::io::Result<Bytes>>,
-  state: DownstreamLifecycle,
+  state: SharedDownstreamLifecycle,
+}
+
+type SharedDownstreamLifecycle = Arc<Mutex<DownstreamLifecycle>>;
+
+/// Linear authority to finish one embedded semantic stream at its application
+/// protocol boundary without waiting for HTTP response-body EOF.
+#[must_use = "dropping the handle preserves raw EOF/drop lifecycle semantics"]
+pub struct ManagedSemanticCompletion {
+  state: SharedDownstreamLifecycle,
+}
+
+impl fmt::Debug for ManagedSemanticCompletion {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("ManagedSemanticCompletion")
+      .finish_non_exhaustive()
+  }
+}
+
+impl ManagedSemanticCompletion {
+  /// Atomically close the upstream attempt, downstream body, and request as a
+  /// successful semantic delivery. Terminal publication failure is returned
+  /// to the protocol adapter and must be surfaced instead of semantic success.
+  pub fn complete(self) -> Result<(), tokn_events::TerminalSubmitError> {
+    let mut state = lock_downstream(&self.state);
+    if !state.is_active() {
+      return Ok(());
+    }
+    if let Err(error) = state.publish_attempt_progress() {
+      tracing::warn!(error = %error, "embedded upstream body progress publication failed at semantic completion");
+    }
+    state.finish_semantically_complete()
+  }
+}
+
+fn lock_downstream(state: &SharedDownstreamLifecycle) -> MutexGuard<'_, DownstreamLifecycle> {
+  state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl EmbeddedLifecycleStream {
@@ -574,16 +638,56 @@ impl EmbeddedLifecycleStream {
     termination: RequestTermination,
     capture_limit: usize,
     attempt: Option<AttemptBodyPlan>,
-  ) -> Self {
-    Self {
-      inner,
-      state: DownstreamLifecycle::new(lifecycle, termination, capture_limit, attempt),
+  ) -> (Self, ManagedSemanticCompletion) {
+    let state = Arc::new(Mutex::new(DownstreamLifecycle::new(
+      lifecycle,
+      termination,
+      capture_limit,
+      attempt,
+    )));
+    (
+      Self {
+        inner,
+        state: Arc::clone(&state),
+      },
+      ManagedSemanticCompletion { state },
+    )
+  }
+
+  fn is_active(&self) -> bool {
+    lock_downstream(&self.state).is_active()
+  }
+
+  fn publish_attempt_progress(&self) {
+    if let Err(error) = lock_downstream(&self.state).publish_attempt_progress() {
+      tracing::warn!(error = %error, "embedded upstream body progress publication failed");
     }
   }
 
-  fn publish_attempt_progress(&mut self) {
-    if let Err(error) = self.state.publish_attempt_progress() {
-      tracing::warn!(error = %error, "embedded upstream body progress publication failed");
+  fn observe_data(&self, data: &Bytes) {
+    if let Err(error) = lock_downstream(&self.state).observe_data(data) {
+      tracing::warn!(error = %error, "embedded downstream body progress publication failed");
+    }
+  }
+
+  fn finish_failed(&self) {
+    if let Err(error) = lock_downstream(&self.state).finish_failed(downstream_body_failure()) {
+      tracing::warn!(error = %error, "embedded downstream body terminal publication failed");
+    }
+  }
+
+  fn finish_complete(&self) {
+    if let Err(error) = lock_downstream(&self.state).finish_complete() {
+      tracing::warn!(error = %error, "embedded downstream body terminal publication failed");
+    }
+  }
+
+  fn finish_cancelled(&self) {
+    let mut state = lock_downstream(&self.state);
+    if state.is_active() {
+      if let Err(error) = state.finish_cancelled() {
+        tracing::warn!(error = %error, "embedded downstream body cancellation publication failed");
+      }
     }
   }
 }
@@ -592,29 +696,23 @@ impl Stream for EmbeddedLifecycleStream {
   type Item = std::io::Result<Bytes>;
 
   fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-    if !self.state.is_active() {
+    if !self.is_active() {
       return Poll::Ready(None);
     }
     match self.inner.as_mut().poll_next(context) {
       Poll::Ready(Some(Ok(data))) => {
         self.publish_attempt_progress();
-        if let Err(error) = self.state.observe_data(&data) {
-          tracing::warn!(error = %error, "embedded downstream body progress publication failed");
-        }
+        self.observe_data(&data);
         Poll::Ready(Some(Ok(data)))
       }
       Poll::Ready(Some(Err(error))) => {
         self.publish_attempt_progress();
-        if let Err(terminal_error) = self.state.finish_failed(downstream_body_failure()) {
-          tracing::warn!(error = %terminal_error, "embedded downstream body terminal publication failed");
-        }
+        self.finish_failed();
         Poll::Ready(Some(Err(error)))
       }
       Poll::Ready(None) => {
         self.publish_attempt_progress();
-        if let Err(error) = self.state.finish_complete() {
-          tracing::warn!(error = %error, "embedded downstream body terminal publication failed");
-        }
+        self.finish_complete();
         Poll::Ready(None)
       }
       Poll::Pending => {
@@ -622,6 +720,12 @@ impl Stream for EmbeddedLifecycleStream {
         Poll::Pending
       }
     }
+  }
+}
+
+impl Drop for EmbeddedLifecycleStream {
+  fn drop(&mut self) {
+    self.finish_cancelled();
   }
 }
 
@@ -763,6 +867,34 @@ pub enum ManagedGatewayOutcome {
   },
 }
 
+/// One embedded result plus optional linear semantic-stream completion.
+#[derive(Debug)]
+pub struct ManagedGatewayExecution {
+  outcome: ManagedGatewayOutcome,
+  semantic_completion: Option<ManagedSemanticCompletion>,
+}
+
+impl ManagedGatewayExecution {
+  fn without_semantic_completion(outcome: ManagedGatewayOutcome) -> Self {
+    Self {
+      outcome,
+      semantic_completion: None,
+    }
+  }
+
+  pub fn outcome(&self) -> &ManagedGatewayOutcome {
+    &self.outcome
+  }
+
+  pub fn into_outcome(self) -> ManagedGatewayOutcome {
+    self.outcome
+  }
+
+  pub fn into_parts(self) -> (ManagedGatewayOutcome, Option<ManagedSemanticCompletion>) {
+    (self.outcome, self.semantic_completion)
+  }
+}
+
 impl ManagedGatewayOutcome {
   pub fn site(&self) -> &ManagedProfileSite {
     match self {
@@ -782,6 +914,7 @@ pub type ManagedGatewayBuildResult<T> = std::result::Result<T, ManagedGatewayBui
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
+#[non_exhaustive]
 pub enum ManagedGatewayError {
   #[snafu(display("embedded request lifecycle publication failed during {phase:?}: {source}"))]
   Lifecycle { phase: RequestPhase, source: anyhow::Error },
@@ -1118,7 +1251,9 @@ mod tests {
       Some(200),
       None,
     ));
-    let mut stream = EmbeddedLifecycleStream::new(inner, lifecycle, termination, 2, Some(attempt));
+    let (mut stream, semantic_completion) =
+      EmbeddedLifecycleStream::new(inner, lifecycle, termination, 2, Some(attempt));
+    drop(semantic_completion);
     let propagated = stream
       .next()
       .await
