@@ -669,4 +669,124 @@ mode = "route"
     tokn_config::v2::load(&config_path).unwrap();
     assert_eq!(fs::read(fragment_path).unwrap(), fragment);
   }
+
+  #[test]
+  fn interrupted_after_credentials_is_forward_retryable() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    legacy_config(&config_path);
+    let original = fs::read(&config_path).unwrap();
+    let prepared = prepare(&config_path, &apply_args(), Some(&auth_path)).unwrap();
+    let legacy_contents = prepared.legacy.snapshot.root_preimage().unwrap().to_vec();
+    let mut interrupt = |checkpoint| {
+      if checkpoint == apply::ApplyCheckpoint::CredentialsDurable {
+        bail!("injected interruption after credentials")
+      }
+      Ok(())
+    };
+
+    let failure = apply::apply(&prepared, &apply_args(), &legacy_contents, &mut interrupt).unwrap_err();
+
+    assert!(!failure.activation_may_have_completed());
+    assert!(failure.auth_created());
+    assert!(format!("{:#}", failure.into_error()).contains("injected interruption"));
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert_eq!(
+      fs::read(backup::legacy_backup_path(&config_path).unwrap()).unwrap(),
+      original
+    );
+    assert_eq!(AuthStore::load(Some(&auth_path), None).unwrap().accounts.len(), 1);
+
+    let retried = prepare(&config_path, &apply_args(), Some(&auth_path)).unwrap();
+    let retry_contents = retried.legacy.snapshot.root_preimage().unwrap().to_vec();
+    let mut uninterrupted = |_| Ok(());
+    let report = apply::apply(&retried, &apply_args(), &retry_contents, &mut uninterrupted)
+      .unwrap_or_else(|failure| panic!("retry failed: {:#}", failure.into_error()));
+
+    assert!(!report.backup_created);
+    assert!(!report.auth_created);
+    let active = fs::read_to_string(&config_path).unwrap();
+    let compiled = tokn_config::v2::parse(&active, &config_path).unwrap();
+    let store = AuthStore::load(Some(&auth_path), None).unwrap();
+    tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), &store.accounts).unwrap();
+  }
+
+  #[test]
+  fn credential_change_after_durable_checkpoint_prevents_activation() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    legacy_config(&config_path);
+    let original = fs::read(&config_path).unwrap();
+    let prepared = prepare(&config_path, &apply_args(), Some(&auth_path)).unwrap();
+    let legacy_contents = prepared.legacy.snapshot.root_preimage().unwrap().to_vec();
+    let mut mutate_auth = |checkpoint| {
+      if checkpoint == apply::ApplyCheckpoint::CredentialsDurable {
+        let current = fs::read_to_string(&auth_path).context("read durable auth in checkpoint")?;
+        let changed = current.replace("migration-secret", "externally-changed-secret");
+        assert_ne!(changed, current);
+        fs::write(&auth_path, changed).context("mutate durable auth in checkpoint")?;
+      }
+      Ok(())
+    };
+
+    let failure = apply::apply(&prepared, &apply_args(), &legacy_contents, &mut mutate_auth).unwrap_err();
+
+    assert!(!failure.activation_may_have_completed());
+    assert!(failure.auth_created());
+    assert!(format!("{:#}", failure.into_error()).contains("changed after loading the auth store"));
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+  }
+
+  #[test]
+  fn config_change_at_activation_boundary_is_never_overwritten() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    legacy_config(&config_path);
+    let prepared = prepare(&config_path, &apply_args(), Some(&auth_path)).unwrap();
+    let legacy_contents = prepared.legacy.snapshot.root_preimage().unwrap().to_vec();
+    let external = b"externally replaced config\n";
+    let mut mutate_config = |checkpoint| {
+      if checkpoint == apply::ApplyCheckpoint::BeforeActivation {
+        fs::write(&config_path, external).context("mutate config at activation boundary")?;
+      }
+      Ok(())
+    };
+
+    let failure = apply::apply(&prepared, &apply_args(), &legacy_contents, &mut mutate_config).unwrap_err();
+
+    assert!(!failure.activation_may_have_completed());
+    assert!(failure.auth_created());
+    assert!(format!("{:#}", failure.into_error()).contains("revalidate legacy config at activation"));
+    assert_eq!(fs::read(&config_path).unwrap(), external);
+  }
+
+  #[test]
+  fn failure_after_activation_reports_ambiguous_active_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    legacy_config(&config_path);
+    let prepared = prepare(&config_path, &apply_args(), Some(&auth_path)).unwrap();
+    let legacy_contents = prepared.legacy.snapshot.root_preimage().unwrap().to_vec();
+    let mut interrupt = |checkpoint| {
+      if checkpoint == apply::ApplyCheckpoint::Activated {
+        bail!("injected interruption after activation")
+      }
+      Ok(())
+    };
+
+    let failure = apply::apply(&prepared, &apply_args(), &legacy_contents, &mut interrupt).unwrap_err();
+
+    assert!(failure.activation_may_have_completed());
+    let mut diagnostics = Vec::new();
+    emit_apply_failure(&failure, &mut diagnostics).unwrap();
+    let diagnostics = std::str::from_utf8(&diagnostics).unwrap();
+    assert!(diagnostics.contains("activation may already be complete"));
+    assert!(diagnostics.contains("inspect the active config"));
+    assert!(!diagnostics.contains("rerun"));
+    tokn_config::v2::load(&config_path).unwrap();
+  }
 }

@@ -145,7 +145,17 @@ fn apply_inner(
   *progress = ApplyProgress::CredentialsDurable;
   checkpoint(ApplyCheckpoint::CredentialsDurable).context("migration interrupted after making credentials durable")?;
 
+  store
+    .validate_locked(&auth_lock)
+    .context("revalidate modern credential sources after making credentials durable")?;
+  let durable_preimage = AuthPreimage::capture(&store);
   let durable_store = AuthStore::load_locked(&auth_lock).context("reload durable modern credential sources")?;
+  if AuthPreimage::capture(&durable_store) != durable_preimage {
+    bail!("modern credential sources changed while durable credentials were being reloaded; retry the command");
+  }
+  store
+    .validate_locked(&auth_lock)
+    .context("revalidate the durable credential preimage after reload")?;
   let durable_output = plan_output(&prepared.legacy.config, &durable_store.accounts, snapshot.root(), args)
     .context("preflight generated config against durable credentials")?;
   if durable_output != prepared.output {
