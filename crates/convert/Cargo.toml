@@ -12,7 +12,6 @@ license.workspace = true
 tokn-core = { workspace = true }
 bytes = { workspace = true }
 eventsource-stream = { workspace = true }
-futures = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -22,9 +21,9 @@ tokn-endpoint-chat-completions = { workspace = true }
 tokn-endpoint-core = { workspace = true }
 tokn-endpoint-messages = { workspace = true }
 tokn-endpoint-responses = { workspace = true }
-tokio = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+futures = { workspace = true }
 tokn-config = { workspace = true }
 rusqlite = { workspace = true }

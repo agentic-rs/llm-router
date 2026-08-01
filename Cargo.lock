@@ -2803,7 +2803,6 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
- "tokio",
  "tokn-core",
  "tokn-endpoint-chat-completions",
  "tokn-endpoint-core",
