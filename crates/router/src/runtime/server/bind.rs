@@ -29,7 +29,7 @@ impl BoundGatewayListeners {
   }
 
   /// Consume all sockets in deterministic listener-id order.
-  pub fn into_listeners(self) -> impl ExactSizeIterator<Item = (ListenerId, BoundListener)> {
+  pub(super) fn into_listeners(self) -> impl ExactSizeIterator<Item = (ListenerId, BoundListener)> {
     self.listeners.into_iter()
   }
 
@@ -50,16 +50,12 @@ pub struct BoundListener {
 }
 
 impl BoundListener {
-  pub fn state(&self) -> &Arc<ListenerServerState> {
-    &self.state
-  }
-
   pub fn local_addr(&self) -> io::Result<SocketAddr> {
     self.socket.local_addr()
   }
 
   /// Transfer the socket and shared state into a family-specific accept loop.
-  pub fn into_parts(self) -> (TcpListener, Arc<ListenerServerState>) {
+  pub(super) fn into_parts(self) -> (TcpListener, Arc<ListenerServerState>) {
     (self.socket, self.state)
   }
 }
@@ -326,7 +322,7 @@ mod tests {
     drop(reservations);
 
     let bound = bind_gateway_listeners(serving.clone(), resources).await.unwrap();
-    let state = bound.listener(&listener_id("api")).unwrap().state();
+    let state = &bound.listener(&listener_id("api")).unwrap().state;
     assert!(Arc::ptr_eq(state.gateway(), &serving));
     assert!(Arc::ptr_eq(state.gateway().runtime(), &gateway));
     assert!(Arc::ptr_eq(state.listener(), &linked_listener));
@@ -420,7 +416,7 @@ mod tests {
     assert_eq!(bound.len(), 2);
     assert!(bound
       .listeners()
-      .all(|(_, listener)| listener.state().resource().kind().proxy_ca().is_none()));
+      .all(|(_, listener)| listener.state.resource().kind().proxy_ca().is_none()));
   }
 
   #[tokio::test]

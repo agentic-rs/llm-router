@@ -12,10 +12,10 @@ mod connect;
 mod error;
 mod http;
 mod response;
+mod serve;
 mod state;
 mod tunnel;
 
-pub use adapter::{handle_forward_proxy_request, handle_llm_api_request};
 pub use admission::{
   admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request, classify_request_kind,
   AdmissionError, AdmittedHttpRequest, AuthorityLocation, ExpectedRequestTarget, ForwardProxyAdmission,
@@ -26,13 +26,10 @@ pub use bind::{bind_gateway_listeners, BoundGatewayListeners, BoundListener, Lis
 pub use body::{
   buffer_matched_body, BufferedRequestBody, ManagedRequestBody, RequestBodyError, RequestBodyLimits, RequestBodyResult,
 };
-pub use connect::{
-  connect_upgrade_channel, ConnectRunError, ConnectRunReport, ConnectRunResult, ConnectSession, ConnectUpgrade,
-  ConnectUpgradeReceiver, ConnectUpgradeSender,
-};
 pub use error::{AuthBoundary, ConnectUpgradeUnavailableReason, ServerError};
 pub use http::{handle_admitted_http, request_body_present};
 pub use response::{managed_response_to_axum, opaque_response_to_axum, ResponseBridgeError, ResponseBridgeResult};
+pub use serve::{serve_gateway_listeners, GatewayServeError, GatewayServeResult};
 pub use state::{
   GatewayServerState, GatewayServerStateError, GatewayServerStateResult, GatewayServingDefaults, ListenerServerState,
 };

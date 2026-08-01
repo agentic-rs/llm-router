@@ -20,17 +20,17 @@ use tokn_policy::ConnectAction;
 
 /// Authenticated policy decision retained for the complete CONNECT lifetime.
 #[derive(Debug)]
-pub struct ConnectSession {
+pub(super) struct ConnectSession {
   dispatch: ConnectDispatch,
   access: AccessContext,
 }
 
 impl ConnectSession {
-  pub fn dispatch(&self) -> &ConnectDispatch {
+  pub(super) fn dispatch(&self) -> &ConnectDispatch {
     &self.dispatch
   }
 
-  pub fn access(&self) -> &AccessContext {
+  pub(super) fn access(&self) -> &AccessContext {
     &self.access
   }
 }
@@ -39,23 +39,19 @@ impl ConnectSession {
 ///
 /// The listener adapter transfers this value to the owning connection task
 /// before returning 200. Dropping it closes the prepared upstream.
-pub struct ConnectUpgrade {
+pub(super) struct ConnectUpgrade {
   session: ConnectSession,
   on_upgrade: OnUpgrade,
   upstream: BoxTunnelIo,
 }
 
 impl ConnectUpgrade {
-  pub fn session(&self) -> &ConnectSession {
+  pub(super) fn session(&self) -> &ConnectSession {
     &self.session
   }
 
-  pub fn site(&self) -> &ConnectDispatchSite {
-    self.session.dispatch().site()
-  }
-
   /// Await Hyper's downstream upgrade and pump bytes in both directions.
-  pub async fn run(self) -> ConnectRunResult<ConnectRunReport> {
+  pub(super) async fn run(self) -> ConnectRunResult<ConnectRunReport> {
     let Self {
       session,
       on_upgrade,
@@ -81,30 +77,29 @@ impl ConnectUpgrade {
 
 /// Successful byte counts and session identity for one completed tunnel.
 #[derive(Debug)]
-pub struct ConnectRunReport {
+pub(super) struct ConnectRunReport {
   session: ConnectSession,
   client_to_upstream: u64,
   upstream_to_client: u64,
 }
 
 impl ConnectRunReport {
-  pub fn session(&self) -> &ConnectSession {
+  pub(super) fn session(&self) -> &ConnectSession {
     &self.session
   }
 
-  pub const fn client_to_upstream(&self) -> u64 {
+  pub(super) const fn client_to_upstream(&self) -> u64 {
     self.client_to_upstream
   }
 
-  pub const fn upstream_to_client(&self) -> u64 {
+  pub(super) const fn upstream_to_client(&self) -> u64 {
     self.upstream_to_client
   }
 }
 
 /// A failure after a successful CONNECT response was committed.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum ConnectRunError {
+pub(super) enum ConnectRunError {
   #[snafu(display("downstream upgrade failed for {site}: {source}"))]
   DownstreamUpgrade {
     site: ConnectDispatchSite,
@@ -119,19 +114,19 @@ pub enum ConnectRunError {
 }
 
 impl ConnectRunError {
-  pub fn site(&self) -> &ConnectDispatchSite {
+  pub(super) fn site(&self) -> &ConnectDispatchSite {
     match self {
       Self::DownstreamUpgrade { site, .. } | Self::TunnelPump { site, .. } => site,
     }
   }
 }
 
-pub type ConnectRunResult<T> = std::result::Result<T, ConnectRunError>;
-pub type ConnectUpgradeSender = mpsc::Sender<ConnectUpgrade>;
-pub type ConnectUpgradeReceiver = mpsc::Receiver<ConnectUpgrade>;
+pub(super) type ConnectRunResult<T> = std::result::Result<T, ConnectRunError>;
+pub(super) type ConnectUpgradeSender = mpsc::Sender<ConnectUpgrade>;
+pub(super) type ConnectUpgradeReceiver = mpsc::Receiver<ConnectUpgrade>;
 
 /// Create the single-slot handoff used by one forward-proxy connection.
-pub fn connect_upgrade_channel() -> (ConnectUpgradeSender, ConnectUpgradeReceiver) {
+pub(super) fn connect_upgrade_channel() -> (ConnectUpgradeSender, ConnectUpgradeReceiver) {
   mpsc::channel(1)
 }
 

@@ -4,11 +4,11 @@
 //! into admission and execution. In particular, a local error must close a
 //! framed HTTP/1 request because the body may not have been fully consumed.
 
-use super::connect::prepare_connect_upgrade;
+use super::connect::{prepare_connect_upgrade, ConnectUpgradeSender};
 use super::{
   admit_forward_proxy_request, admit_llm_api_request, authenticate_forward_proxy_client, authenticate_llm_api_client,
-  handle_admitted_http, request_body_present, ConnectUpgradeSender, ConnectUpgradeUnavailableReason,
-  ForwardProxyAdmission, ListenerServerState, ServerError,
+  handle_admitted_http, request_body_present, ConnectUpgradeUnavailableReason, ForwardProxyAdmission,
+  ListenerServerState, ServerError,
 };
 use crate::runtime::dispatch_connect;
 use axum::body::Body;
@@ -23,7 +23,7 @@ use tokn_policy::ListenerId;
 /// authentication can reject the request. Authentication consumes only the
 /// listener credential on success; the admitted request then enters the
 /// shared route/body/resolve/execute pipeline.
-pub async fn handle_llm_api_request(state: &ListenerServerState, mut request: Request<Body>) -> Response {
+pub(super) async fn handle_llm_api_request(state: &ListenerServerState, mut request: Request<Body>) -> Response {
   let version = request.version();
   let body_present = request_body_present(&request);
 
@@ -48,7 +48,7 @@ pub async fn handle_llm_api_request(state: &ListenerServerState, mut request: Re
 /// proxy authentication. CONNECT requests reject every body representation,
 /// authenticate, select policy, establish any tunnel transport, and transfer
 /// the prepared upgrade to the owning connection before returning 200.
-pub async fn handle_forward_proxy_request(
+pub(super) async fn handle_forward_proxy_request(
   state: &ListenerServerState,
   mut request: Request<Body>,
   upgrades: &ConnectUpgradeSender,
@@ -76,7 +76,7 @@ pub async fn handle_forward_proxy_request(
           .map_err(ServerError::proxy_auth)?;
         let dispatch = dispatch_connect(state.listener(), authority)?;
         let upgrade = prepare_connect_upgrade(state, dispatch, access, &mut request).await?;
-        let site = upgrade.site().clone();
+        let site = upgrade.session().dispatch().site().clone();
         upgrades.try_send(upgrade).map_err(|error| match error {
           tokio::sync::mpsc::error::TrySendError::Full(_) => {
             ServerError::connect_upgrade_unavailable(site, ConnectUpgradeUnavailableReason::QueueFull)
@@ -127,10 +127,9 @@ pub(super) fn materialize_local_error(
 
 #[cfg(test)]
 mod tests {
+  use super::super::connect::connect_upgrade_channel;
   use super::*;
-  use crate::runtime::{
-    connect_upgrade_channel, link_gateway_runtime, materialize_listeners, GatewayServerState, GatewayServingDefaults,
-  };
+  use crate::runtime::{link_gateway_runtime, materialize_listeners, GatewayServerState, GatewayServingDefaults};
   use http::header::{CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, TRANSFER_ENCODING, WWW_AUTHENTICATE};
   use http::{Method, StatusCode};
   use std::collections::BTreeMap;
@@ -394,8 +393,8 @@ mod tests {
       upgrade.session().dispatch().authority().authority().to_string(),
       target.to_string()
     );
-    assert_eq!(upgrade.site().listener_id(), &listener_id());
-    assert!(upgrade.site().rule_id().is_none());
+    assert_eq!(upgrade.session().dispatch().site().listener_id(), &listener_id());
+    assert!(upgrade.session().dispatch().site().rule_id().is_none());
 
     let run_error = upgrade.run().await.unwrap_err();
     assert_eq!(run_error.site().listener_id(), &listener_id());
