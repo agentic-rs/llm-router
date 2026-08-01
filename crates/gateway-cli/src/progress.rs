@@ -1,20 +1,18 @@
 //! Shared terminal progress surface and request lifecycle display.
 
-// Constructed by the subsequent server-runtime wiring checkpoint. Keeping
-// this local allowance avoids coupling the event consumer to startup early.
-#![allow(dead_code)]
-
 use console::{style, StyledObject};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokn_events::{
   AttemptFinished, AttemptNo, AttemptStarted, BodyLeg, BodyOutcome, BodyResult, ConsumerResult, EventConsumer,
   EventSeq, GatewayEvent, RequestAdmitted, RequestFinished, RequestOutcome, RequestStarted, TokenUsage, TrafficEvent,
   TrafficEventKind,
 };
+use tokn_persistence::archive::{ArchiveEvent, ArchiveEventHandler};
 
 static MULTI: OnceLock<MultiProgress> = OnceLock::new();
 
@@ -491,6 +489,172 @@ impl Drop for ProgressEventHandler {
   }
 }
 
+struct ArchiveBarState {
+  bar: ProgressBar,
+  started: Instant,
+  path: PathBuf,
+  archive: PathBuf,
+  total_bytes: u64,
+}
+
+/// Interactive progress display for the compatibility request-DB archiver.
+///
+/// This shares the process-wide [`MultiProgress`] with request rendering so
+/// archive scans never garble active request bars.
+pub struct ArchiveProgressEventHandler {
+  multi: MultiProgress,
+  bars: HashMap<String, ArchiveBarState>,
+  style: ProgressStyle,
+}
+
+impl ArchiveProgressEventHandler {
+  pub fn new() -> Self {
+    Self::with_multi(multi().clone())
+  }
+
+  fn with_multi(multi: MultiProgress) -> Self {
+    let style = ProgressStyle::with_template("{spinner:.yellow} {msg}")
+      .unwrap_or_else(|_| ProgressStyle::default_spinner())
+      .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+    Self {
+      multi,
+      bars: HashMap::new(),
+      style,
+    }
+  }
+
+  fn refresh(&self, id: &str, bytes_read: u64, total_bytes: u64) {
+    if let Some(state) = self.bars.get(id) {
+      let percent = if total_bytes > 0 {
+        (bytes_read as f64 * 100.0) / total_bytes as f64
+      } else {
+        100.0
+      };
+      let elapsed = state.started.elapsed().as_secs_f64();
+      let speed_kbs = if elapsed > 0.05 {
+        bytes_read as f64 / 1024.0 / elapsed
+      } else {
+        0.0
+      };
+      state.bar.set_message(format!(
+        "archive {} {:.1}% {:.1}/{:.1}MB {:.1}kB/s -> {}",
+        style(file_label(&state.path)).yellow(),
+        percent.min(100.0),
+        bytes_read as f64 / 1024.0 / 1024.0,
+        state.total_bytes as f64 / 1024.0 / 1024.0,
+        speed_kbs,
+        style(file_label(&state.archive)).dim(),
+      ));
+      state.bar.tick();
+    }
+  }
+}
+
+impl Default for ArchiveProgressEventHandler {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl ArchiveEventHandler for ArchiveProgressEventHandler {
+  fn handle(&mut self, event: &ArchiveEvent) {
+    match event {
+      ArchiveEvent::ScanStarted { dir } => {
+        tracing::debug!(path = %dir.display(), "request db archival progress scan started");
+      }
+      ArchiveEvent::FileStarted {
+        id,
+        path,
+        archive,
+        total_bytes,
+      } => {
+        let bar = self.multi.add(ProgressBar::new_spinner());
+        bar.set_style(self.style.clone());
+        bar.enable_steady_tick(Duration::from_millis(120));
+        self.bars.insert(
+          id.clone(),
+          ArchiveBarState {
+            bar,
+            started: Instant::now(),
+            path: path.clone(),
+            archive: archive.clone(),
+            total_bytes: *total_bytes,
+          },
+        );
+        self.refresh(id, 0, *total_bytes);
+      }
+      ArchiveEvent::FileProgress {
+        id,
+        bytes_read,
+        total_bytes,
+      } => self.refresh(id, *bytes_read, *total_bytes),
+      ArchiveEvent::FileCompleted {
+        id,
+        path,
+        archive,
+        bytes_in,
+        bytes_out,
+      } => {
+        if let Some(state) = self.bars.remove(id) {
+          state.bar.disable_steady_tick();
+          state.bar.finish_and_clear();
+        }
+        let ratio = if *bytes_in > 0 {
+          (*bytes_out as f64 * 100.0) / *bytes_in as f64
+        } else {
+          0.0
+        };
+        let _ = self.multi.println(format!(
+          "{} archived {} -> {} {:.1}MB to {:.1}MB ({:.1}%)",
+          style("✓").green().bold(),
+          style(file_label(path)).yellow(),
+          style(file_label(archive)).dim(),
+          *bytes_in as f64 / 1024.0 / 1024.0,
+          *bytes_out as f64 / 1024.0 / 1024.0,
+          ratio,
+        ));
+      }
+      ArchiveEvent::FileSkipped { path, archive } => {
+        tracing::debug!(path = %path.display(), archive = %archive.display(), "request db archive already exists");
+      }
+      ArchiveEvent::FileFailed {
+        id,
+        path,
+        archive,
+        error,
+      } => {
+        if let Some(state) = self.bars.remove(id) {
+          state.bar.disable_steady_tick();
+          state.bar.finish_and_clear();
+        }
+        let _ = self.multi.println(format!(
+          "{} archive {} -> {} failed: {}",
+          style("✗").red().bold(),
+          style(file_label(path)).yellow(),
+          style(file_label(archive)).dim(),
+          style(truncate(error, 120)).red(),
+        ));
+      }
+      ArchiveEvent::ScanCompleted { dir, stats } => {
+        tracing::debug!(path = %dir.display(), archived = stats.archived, skipped_existing = stats.skipped_existing, failed = stats.failed, "request db archival progress scan completed");
+      }
+    }
+  }
+
+  fn flush(&mut self) {
+    let bars = self.bars.drain().map(|(_, state)| state).collect::<Vec<_>>();
+    for state in bars {
+      let _ = self.multi.println(format!(
+        "{} archive {} interrupted",
+        style("⚠").yellow().bold(),
+        style(file_label(&state.path)).yellow(),
+      ));
+      state.bar.disable_steady_tick();
+      state.bar.finish_and_clear();
+    }
+  }
+}
+
 fn initial_endpoint(started: &RequestStarted) -> String {
   let target = started.target.as_str().trim();
   if started.method.eq_ignore_ascii_case("CONNECT") {
@@ -504,6 +668,14 @@ fn initial_endpoint(started: &RequestStarted) -> String {
   } else {
     target.to_string()
   }
+}
+
+fn file_label(path: &Path) -> String {
+  path
+    .file_name()
+    .and_then(|value| value.to_str())
+    .unwrap_or_else(|| path.to_str().unwrap_or("unknown"))
+    .to_string()
 }
 
 fn truncate(value: &str, max_chars: usize) -> Cow<'_, str> {
@@ -562,6 +734,10 @@ mod tests {
     ProgressEventHandler::with_multi(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
   }
 
+  fn hidden_archive_handler() -> ArchiveProgressEventHandler {
+    ArchiveProgressEventHandler::with_multi(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
+  }
+
   fn plain(value: &str) -> String {
     strip_ansi_codes(value).into_owned()
   }
@@ -583,6 +759,56 @@ mod tests {
         }),
       )
       .unwrap();
+  }
+
+  #[test]
+  fn archive_progress_preserves_the_historical_transfer_layout() {
+    let mut handler = hidden_archive_handler();
+    let path = PathBuf::from("/tmp/requests/2026-07-01.db");
+    let archive = PathBuf::from("/tmp/requests/2026-07-01.db.zstd");
+    handler.handle(&ArchiveEvent::FileStarted {
+      id: "archive-1".to_string(),
+      path: path.clone(),
+      archive: archive.clone(),
+      total_bytes: 2 * 1024 * 1024,
+    });
+    handler.handle(&ArchiveEvent::FileProgress {
+      id: "archive-1".to_string(),
+      bytes_read: 1024 * 1024,
+      total_bytes: 2 * 1024 * 1024,
+    });
+
+    let message = handler.bars["archive-1"].bar.message();
+    let message = plain(message.as_ref());
+    assert!(
+      message.starts_with("archive 2026-07-01.db 50.0% 1.0/2.0MB"),
+      "{message}"
+    );
+    assert!(message.ends_with("-> 2026-07-01.db.zstd"), "{message}");
+
+    handler.handle(&ArchiveEvent::FileCompleted {
+      id: "archive-1".to_string(),
+      path,
+      archive,
+      bytes_in: 2 * 1024 * 1024,
+      bytes_out: 1024 * 1024,
+    });
+    assert!(handler.bars.is_empty());
+  }
+
+  #[test]
+  fn archive_progress_flush_clears_interrupted_transfers() {
+    let mut handler = hidden_archive_handler();
+    handler.handle(&ArchiveEvent::FileStarted {
+      id: "archive-1".to_string(),
+      path: PathBuf::from("2026-07-01.db"),
+      archive: PathBuf::from("2026-07-01.db.xz"),
+      total_bytes: 128,
+    });
+
+    handler.flush();
+
+    assert!(handler.bars.is_empty());
   }
 
   fn started(method: &str, target: &str) -> RequestStarted {
