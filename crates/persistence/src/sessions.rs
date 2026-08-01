@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokn_core::db::SessionSource;
 use tokn_headers::inbound::{PARENT_THREAD_ID_HEADERS, THREAD_ID_HEADERS};
 use tracing::debug;
 
@@ -21,6 +20,7 @@ use semantic::{request_messages_from_json, response_messages_from_body};
 
 const BOOTSTRAP: &str = include_str!("../schemas/snapshot/sessions/v0.2.1.sql");
 const REQUESTS_TS_MILLIS_SCHEMA_VERSION: u32 = 8;
+const SESSION_SOURCE_HEADER: &str = "header";
 const MIGRATIONS: &[migrate::Migration] = &[
   migrate::Migration {
     version: 1,
@@ -222,7 +222,7 @@ impl SessionsDb {
       params![
         r.session_id,
         r.ts,
-        SessionSource::Header.as_str(),
+        SESSION_SOURCE_HEADER,
         r.account_id.as_deref(),
         r.provider_id.as_deref(),
         r.model.as_deref(),

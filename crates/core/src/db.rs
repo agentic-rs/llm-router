@@ -8,21 +8,6 @@ pub struct DbPaths {
   pub requests_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionSource {
-  Header,
-  Auto,
-}
-
-impl SessionSource {
-  pub fn as_str(self) -> &'static str {
-    match self {
-      SessionSource::Header => "header",
-      SessionSource::Auto => "auto",
-    }
-  }
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UsageDetails {
   pub cache_read: Option<u64>,
