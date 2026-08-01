@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 use tokn_headers::inbound::{PARENT_THREAD_ID_HEADERS, THREAD_ID_HEADERS};
 use tracing::debug;
 
+mod live;
 mod records;
 mod semantic;
 
+pub use live::SessionPersistenceConsumer;
 pub use records::{MessageRecord, PartRecord};
 use semantic::{request_messages_from_json, response_messages_from_body};
 
