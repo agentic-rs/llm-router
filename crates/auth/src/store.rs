@@ -6,7 +6,11 @@
 //! source so refreshes and removals never flatten agent credentials into the
 //! root file.
 
+mod lock;
+
 use anyhow::{anyhow, bail, Context, Result};
+pub use lock::AuthStoreLock;
+use lock::{resolve_auth_path, validate_direct_auth_layout};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -139,10 +143,20 @@ impl AuthStore {
   /// accepted for source compatibility but is no longer consulted; callers
   /// should run `tokn-router-legacy-config` before latest auth loading.
   pub fn load(auth_path: Option<&Path>, _config_path: Option<&Path>) -> Result<Self> {
-    let resolved = match auth_path {
-      Some(path) => path.to_path_buf(),
-      None => default_auth_path()?,
-    };
+    Self::load_from_path(resolve_auth_path(auth_path)?)
+  }
+
+  /// Load an auth store while retaining an already-acquired write lock.
+  ///
+  /// Use this when loading, inspecting, and saving credentials must form one
+  /// cooperative transaction. Finish the transaction with
+  /// [`Self::save_locked`] before dropping `lock`.
+  pub fn load_locked(lock: &AuthStoreLock) -> Result<Self> {
+    validate_direct_auth_layout(lock.auth_path())?;
+    Self::load_from_path(lock.auth_path().to_path_buf())
+  }
+
+  fn load_from_path(resolved: PathBuf) -> Result<Self> {
     let mut store = Self {
       path: resolved.clone(),
       accounts: Vec::new(),
@@ -164,10 +178,28 @@ impl AuthStore {
   ///
   /// A source missing at load is installed atomically only if it remains
   /// absent. Existing sources are revalidated after staging, but their final
-  /// portable rename is not a content-based compare-and-swap; cooperating
-  /// writers must still serialize replacements.
+  /// portable rename is not a content-based compare-and-swap. This method
+  /// acquires the store's cooperative write lock before revalidating and
+  /// committing changes.
   pub fn save(&mut self) -> Result<()> {
+    let lock = AuthStoreLock::acquire(Some(&self.path))?;
+    self.save_locked(&lock)
+  }
+
+  /// Persist changes under an already-acquired store write lock.
+  ///
+  /// The guard must belong to this store's root. Every loaded source is
+  /// revalidated after lock acquisition, including when no write is needed.
+  pub fn save_locked(&mut self, lock: &AuthStoreLock) -> Result<()> {
+    self.validate_locked(lock)?;
     self.save_with_before_commit(|_| {})
+  }
+
+  /// Verify that this guard belongs to the store and every loaded credential
+  /// source still has the exact source set and bytes observed at load or save.
+  pub fn validate_locked(&self, lock: &AuthStoreLock) -> Result<()> {
+    lock.ensure_matches(&self.path)?;
+    self.validate_sources_unchanged()
   }
 
   fn save_with_before_commit(&mut self, mut before_commit: impl FnMut(&Path)) -> Result<()> {
@@ -330,6 +362,19 @@ impl AuthStore {
     self.source_paths.values().cloned().collect()
   }
 
+  /// Whether a modern root or shard credential source existed when loaded or
+  /// has since been written by this store.
+  ///
+  /// A present, valid source is authoritative even when it contains no
+  /// accounts. Callers can use this to decide whether legacy embedded
+  /// credentials are eligible for one-time import.
+  pub fn has_persisted_sources(&self) -> bool {
+    self
+      .source_snapshots
+      .values()
+      .any(|snapshot| matches!(snapshot, SourceSnapshot::Contents(_)))
+  }
+
   /// Return the SHA-256 digest of the exact bytes loaded or most recently
   /// written for a credential source.
   ///
@@ -404,6 +449,7 @@ impl AuthStore {
   /// prevents a save to one shard from making a concurrent change elsewhere
   /// produce a duplicate account id in the merged pool.
   fn validate_sources_unchanged(&self) -> Result<()> {
+    validate_direct_auth_layout(&self.path)?;
     let expected_shards = self
       .source_snapshots
       .iter()
@@ -686,6 +732,66 @@ mod tests {
   }
 
   #[test]
+  fn locked_load_and_save_cover_one_write_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.yaml");
+    let lock = AuthStoreLock::acquire(Some(&path)).unwrap();
+    let mut store = AuthStore::load_locked(&lock).unwrap();
+    store.upsert(sample_account("locked"));
+
+    store.save_locked(&lock).unwrap();
+
+    let loaded = AuthStore::load(Some(&path), None).unwrap();
+    assert_eq!(loaded.accounts.len(), 1);
+    assert_eq!(loaded.accounts[0].id, "locked");
+  }
+
+  #[test]
+  fn locked_validation_detects_an_external_change_without_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.yaml");
+    write_auth(&path, &[sample_account("original")]);
+    let lock = AuthStoreLock::acquire(Some(&path)).unwrap();
+    let store = AuthStore::load_locked(&lock).unwrap();
+    write_auth(&path, &[sample_account("external")]);
+
+    let error = store.validate_locked(&lock).unwrap_err();
+
+    assert!(error.to_string().contains("changed after loading the auth store"));
+  }
+
+  #[test]
+  fn locked_save_rejects_a_guard_for_another_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let guarded = dir.path().join("guarded.yaml");
+    let other = dir.path().join("other.yaml");
+    let lock = AuthStoreLock::acquire(Some(&guarded)).unwrap();
+    let mut store = AuthStore::load(Some(&other), None).unwrap();
+    store.upsert(sample_account("other"));
+
+    let error = store.save_locked(&lock).unwrap_err();
+
+    assert!(error.to_string().contains("cannot guard"));
+    assert!(!other.exists());
+  }
+
+  #[test]
+  fn ordinary_save_uses_the_cooperative_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&path), None).unwrap();
+    store.upsert(sample_account("blocked"));
+    let _lock = AuthStoreLock::acquire(Some(&path)).unwrap();
+
+    let error = store.save().unwrap_err();
+
+    assert!(error
+      .to_string()
+      .contains("another auth store writer is already in progress"));
+    assert!(!path.exists());
+  }
+
+  #[test]
   fn roundtrip_yaml_preserves_accounts() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("auth.yaml");
@@ -758,6 +864,25 @@ mod tests {
     assert!(!root.exists());
     assert_eq!(store.accounts.len(), 1);
     assert_eq!(store.account_source_path("opencode"), Some(shard));
+  }
+
+  #[test]
+  fn persisted_source_authority_includes_empty_root_and_sidecar_only_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing/auth.yaml");
+    let empty = dir.path().join("empty/auth.yaml");
+    let sidecar_root = dir.path().join("sidecar/auth.yaml");
+    write_auth(&empty, &[]);
+    write_auth(
+      &AuthStore::shard_path_for(&sidecar_root, "opencode").unwrap(),
+      &[sample_account("opencode")],
+    );
+
+    assert!(!AuthStore::load(Some(&missing), None).unwrap().has_persisted_sources());
+    assert!(AuthStore::load(Some(&empty), None).unwrap().has_persisted_sources());
+    assert!(AuthStore::load(Some(&sidecar_root), None)
+      .unwrap()
+      .has_persisted_sources());
   }
 
   #[test]
@@ -942,6 +1067,14 @@ mod tests {
 
     assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(fs::metadata(&shard).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+      fs::metadata(dir.path().join(".auth.yaml.lock"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      0o600
+    );
     assert_eq!(
       fs::metadata(shard.parent().unwrap()).unwrap().permissions().mode() & 0o777,
       0o700
