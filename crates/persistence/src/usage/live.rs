@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokn_events::{
   AttemptFinished, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted, AttemptUsage, BodyFinished,
-  BodyLeg, BodyResult, ClientIdentity, ConnectAction, ConnectClosed, ConnectReady, ConsumerResult, EventConsumer,
-  EventFailure, EventSeq, GatewayEvent, HttpFamily, IngressKind, PolicySelection, RequestAdmitted,
+  BodyLeg, BodyProgress, BodyResult, ClientIdentity, ConnectAction, ConnectClosed, ConnectReady, ConsumerResult,
+  EventConsumer, EventFailure, EventSeq, GatewayEvent, HttpFamily, IngressKind, PolicySelection, RequestAdmitted,
   RequestBodyObservation, RequestFinished, RequestOutcome, RequestPhase, RequestSource, RequestStarted, SelectedAction,
   TargetSelection, TokenUsage, TrafficEvent, TrafficEventKind, UsageKind,
 };
@@ -87,8 +87,13 @@ impl UsagePersistenceConsumer {
           seed: UsageSeed::from_started(started),
           attempts: BTreeMap::new(),
           latest_attempt: None,
+          http_admitted: false,
+          policy_observed: false,
+          selected_transport: None,
           downstream_status: None,
+          downstream_body_observed: false,
           connect: ConnectState::None,
+          connect_authority: None,
         },
       );
       return Ok(());
@@ -141,12 +146,13 @@ impl UsagePersistenceConsumer {
     state: &mut LogicalUsageState,
   ) -> UsageWriteResult<bool> {
     match &event.kind {
-      TrafficEventKind::Admitted(admitted) => on_admitted(state, admitted),
+      TrafficEventKind::Admitted(admitted) => on_admitted(request_id, state, admitted)?,
       TrafficEventKind::Authenticated(identity) => on_authenticated(state, identity),
-      TrafficEventKind::PolicySelected(selection) => on_policy_selected(state, selection),
-      TrafficEventKind::RequestBody(observation) => on_request_body(state, observation),
+      TrafficEventKind::PolicySelected(selection) => on_policy_selected(request_id, state, selection)?,
+      TrafficEventKind::RequestBody(observation) => on_request_body(request_id, state, observation)?,
       TrafficEventKind::AttemptStarted(started) => on_attempt_started(request_id, event, state, started)?,
       TrafficEventKind::AttemptResponseHead(response) => on_attempt_response_head(request_id, event, state, response)?,
+      TrafficEventKind::BodyProgress(progress) => on_body_progress(request_id, state, progress)?,
       TrafficEventKind::BodyFinished(finished) => {
         self.on_body_finished(request_id, state, finished)?;
       }
@@ -163,7 +169,7 @@ impl UsagePersistenceConsumer {
         self.on_finished(request_id, event.elapsed_ms, state, finished)?;
         return Ok(true);
       }
-      TrafficEventKind::Started(_) | TrafficEventKind::AttemptRequest(_) | TrafficEventKind::BodyProgress(_) => {}
+      TrafficEventKind::Started(_) | TrafficEventKind::AttemptRequest(_) => {}
       _ => {}
     }
     Ok(false)
@@ -175,6 +181,15 @@ impl UsagePersistenceConsumer {
     state: &mut LogicalUsageState,
     finished: &BodyFinished,
   ) -> UsageWriteResult {
+    if finished.leg == BodyLeg::Downstream {
+      if matches!(state.connect, ConnectState::Ready(_) | ConnectState::Closed) {
+        return Err(UsageWriteError::lifecycle(
+          request_id,
+          "downstream body completion followed a ready CONNECT lifecycle",
+        ));
+      }
+      state.downstream_body_observed = true;
+    }
     let (attempt, phase) = match finished.leg {
       BodyLeg::Upstream { attempt } => (attempt, RequestPhase::UpstreamResponse),
       BodyLeg::Downstream => match state.latest_attempt {
@@ -210,6 +225,12 @@ impl UsagePersistenceConsumer {
     state: &mut LogicalUsageState,
     status: u16,
   ) -> UsageWriteResult {
+    if matches!(state.connect, ConnectState::Ready(_) | ConnectState::Closed) {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "downstream response head followed a ready CONNECT lifecycle",
+      ));
+    }
     observe_downstream_status(request_id, state, status)?;
     let Some(attempt) = state.latest_attempt else {
       return Ok(());
@@ -332,6 +353,12 @@ impl UsagePersistenceConsumer {
         "request finished before CONNECT closed",
       ));
     }
+    if state.connect == ConnectState::Admitted && finished.outcome == RequestOutcome::Delivered {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "CONNECT was delivered before it became ready and closed",
+      ));
+    }
     if let (Some(observed), Some(summary)) = (state.downstream_status, finished.downstream_status) {
       if observed != summary {
         return Err(UsageWriteError::lifecycle(
@@ -441,15 +468,29 @@ struct LogicalUsageState {
   seed: UsageSeed,
   attempts: BTreeMap<AttemptNo, PendingUsageRecord>,
   latest_attempt: Option<AttemptNo>,
+  http_admitted: bool,
+  policy_observed: bool,
+  selected_transport: Option<SelectedTransport>,
   downstream_status: Option<u16>,
+  downstream_body_observed: bool,
   connect: ConnectState,
+  connect_authority: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectState {
   None,
+  Admitted,
   Ready(ConnectAction),
   Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedTransport {
+  Reject,
+  Http,
+  Connect(ConnectAction),
+  Unknown,
 }
 
 #[derive(Clone)]
@@ -549,7 +590,13 @@ impl From<serde_json::Error> for UsageWriteError {
 
 type UsageWriteResult<T = ()> = std::result::Result<T, UsageWriteError>;
 
-fn on_admitted(state: &mut LogicalUsageState, admitted: &RequestAdmitted) {
+fn on_admitted(request_id: &str, state: &mut LogicalUsageState, admitted: &RequestAdmitted) -> UsageWriteResult {
+  if state.http_admitted || state.connect != ConnectState::None {
+    return Err(UsageWriteError::lifecycle(
+      request_id,
+      "request admission was observed more than once",
+    ));
+  }
   match admitted {
     RequestAdmitted::Http {
       scheme,
@@ -557,6 +604,12 @@ fn on_admitted(state: &mut LogicalUsageState, admitted: &RequestAdmitted) {
       path_and_query,
       operation,
     } => {
+      if matches!(state.selected_transport, Some(SelectedTransport::Connect(_))) {
+        return Err(UsageWriteError::lifecycle(
+          request_id,
+          "HTTP admission followed CONNECT policy",
+        ));
+      }
       insert_string(&mut state.seed.context, "scheme", scheme);
       insert_string(&mut state.seed.context, "authority", authority);
       if state.seed.endpoint.is_none() {
@@ -565,13 +618,23 @@ fn on_admitted(state: &mut LogicalUsageState, admitted: &RequestAdmitted) {
           .map(ToString::to_string)
           .or_else(|| (!path_and_query.is_redacted()).then(|| endpoint_from_path(path_and_query.as_str())));
       }
+      state.http_admitted = true;
     }
     RequestAdmitted::Connect { authority } => {
+      if matches!(state.selected_transport, Some(SelectedTransport::Http)) {
+        return Err(UsageWriteError::lifecycle(
+          request_id,
+          "CONNECT admission followed HTTP policy",
+        ));
+      }
       insert_string(&mut state.seed.context, "authority", authority);
       state.seed.endpoint.get_or_insert_with(|| "connect".to_string());
+      state.connect = ConnectState::Admitted;
+      state.connect_authority = Some(authority.to_string());
     }
     _ => {}
   }
+  Ok(())
 }
 
 fn on_authenticated(state: &mut LogicalUsageState, identity: &ClientIdentity) {
@@ -589,7 +652,32 @@ fn on_authenticated(state: &mut LogicalUsageState, identity: &ClientIdentity) {
   }
 }
 
-fn on_policy_selected(state: &mut LogicalUsageState, selection: &PolicySelection) {
+fn on_policy_selected(
+  request_id: &str,
+  state: &mut LogicalUsageState,
+  selection: &PolicySelection,
+) -> UsageWriteResult {
+  if state.policy_observed {
+    return Err(UsageWriteError::lifecycle(
+      request_id,
+      "request policy was selected more than once",
+    ));
+  }
+  match &selection.action {
+    SelectedAction::Http { .. } if state.connect != ConnectState::None => {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "HTTP policy followed CONNECT admission",
+      ));
+    }
+    SelectedAction::Connect { .. } if state.http_admitted => {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "CONNECT policy followed HTTP admission",
+      ));
+    }
+    _ => {}
+  }
   insert_optional_string(&mut state.seed.context, "binding_id", selection.binding_id.as_ref());
   match &selection.action {
     SelectedAction::Reject => insert_literal(&mut state.seed.context, "selected_action", "reject"),
@@ -609,9 +697,32 @@ fn on_policy_selected(state: &mut LogicalUsageState, selection: &PolicySelection
     }
     _ => insert_literal(&mut state.seed.context, "selected_action", "unknown"),
   }
+  state.policy_observed = true;
+  state.selected_transport = Some(match &selection.action {
+    SelectedAction::Reject => SelectedTransport::Reject,
+    SelectedAction::Http { .. } => SelectedTransport::Http,
+    SelectedAction::Connect { action } => SelectedTransport::Connect(*action),
+    _ => SelectedTransport::Unknown,
+  });
+  Ok(())
 }
 
-fn on_request_body(state: &mut LogicalUsageState, observation: &RequestBodyObservation) {
+fn on_request_body(
+  request_id: &str,
+  state: &mut LogicalUsageState,
+  observation: &RequestBodyObservation,
+) -> UsageWriteResult {
+  if state.connect != ConnectState::None
+    || matches!(
+      state.selected_transport,
+      Some(SelectedTransport::Reject | SelectedTransport::Connect(_))
+    )
+  {
+    return Err(UsageWriteError::lifecycle(
+      request_id,
+      "request body followed a non-HTTP policy or CONNECT lifecycle",
+    ));
+  }
   if state.seed.model.is_none() {
     state.seed.model = observation.requested_model.as_ref().map(ToString::to_string);
   }
@@ -621,6 +732,7 @@ fn on_request_body(state: &mut LogicalUsageState, observation: &RequestBodyObser
   if let Some(initiator) = observation.initiator.as_ref() {
     insert_string(&mut state.seed.params, "initiator", initiator);
   }
+  Ok(())
 }
 
 fn on_attempt_started(
@@ -629,10 +741,15 @@ fn on_attempt_started(
   state: &mut LogicalUsageState,
   started: &AttemptStarted,
 ) -> UsageWriteResult {
-  if state.connect != ConnectState::None {
+  if state.connect != ConnectState::None
+    || matches!(
+      state.selected_transport,
+      Some(SelectedTransport::Reject | SelectedTransport::Connect(_))
+    )
+  {
     return Err(UsageWriteError::lifecycle(
       request_id,
-      "HTTP attempt followed a CONNECT lifecycle",
+      "HTTP attempt followed a non-HTTP policy or CONNECT lifecycle",
     ));
   }
   let expected_attempt = u32::try_from(state.attempts.len())
@@ -764,17 +881,79 @@ fn observe_downstream_status(request_id: &str, state: &mut LogicalUsageState, st
   Ok(())
 }
 
-fn on_connect_ready(request_id: &str, state: &mut LogicalUsageState, ready: &ConnectReady) -> UsageWriteResult {
-  if !state.attempts.is_empty() {
+fn on_body_progress(request_id: &str, state: &mut LogicalUsageState, progress: &BodyProgress) -> UsageWriteResult {
+  if progress.leg != BodyLeg::Downstream {
+    return Ok(());
+  }
+  if matches!(state.connect, ConnectState::Ready(_) | ConnectState::Closed) {
     return Err(UsageWriteError::lifecycle(
       request_id,
-      "ConnectReady followed an HTTP attempt",
+      "downstream body progress followed a ready CONNECT lifecycle",
     ));
   }
-  if state.connect != ConnectState::None {
+  state.downstream_body_observed = true;
+  Ok(())
+}
+
+fn on_connect_ready(request_id: &str, state: &mut LogicalUsageState, ready: &ConnectReady) -> UsageWriteResult {
+  if state.http_admitted || !state.attempts.is_empty() {
     return Err(UsageWriteError::lifecycle(
       request_id,
-      "ConnectReady was emitted more than once",
+      "ConnectReady followed an HTTP lifecycle",
+    ));
+  }
+  match state.connect {
+    ConnectState::Admitted => {}
+    ConnectState::None => {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "ConnectReady was emitted before CONNECT admission",
+      ));
+    }
+    ConnectState::Ready(_) | ConnectState::Closed => {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "ConnectReady was emitted more than once",
+      ));
+    }
+  }
+  if ready.action == ConnectAction::Reject {
+    return Err(UsageWriteError::lifecycle(
+      request_id,
+      "rejected CONNECT cannot become ready",
+    ));
+  }
+  match state.selected_transport {
+    Some(SelectedTransport::Connect(action)) if action == ready.action => {}
+    Some(SelectedTransport::Connect(_)) => {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "ConnectReady action differs from the selected CONNECT policy",
+      ));
+    }
+    Some(_) => {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "ConnectReady followed a non-CONNECT policy",
+      ));
+    }
+    None => {
+      return Err(UsageWriteError::lifecycle(
+        request_id,
+        "ConnectReady was emitted before CONNECT policy selection",
+      ));
+    }
+  }
+  if state.downstream_status.is_some() || state.downstream_body_observed {
+    return Err(UsageWriteError::lifecycle(
+      request_id,
+      "ConnectReady followed an HTTP response boundary",
+    ));
+  }
+  if state.connect_authority.as_deref() != Some(ready.authority.as_str()) {
+    return Err(UsageWriteError::lifecycle(
+      request_id,
+      "ConnectReady authority differs from CONNECT admission",
     ));
   }
   observe_downstream_status(request_id, state, 200)?;
@@ -783,14 +962,14 @@ fn on_connect_ready(request_id: &str, state: &mut LogicalUsageState, ready: &Con
 }
 
 fn on_connect_closed(request_id: &str, state: &mut LogicalUsageState, closed: &ConnectClosed) -> UsageWriteResult {
-  if !state.attempts.is_empty() {
+  if state.http_admitted || !state.attempts.is_empty() {
     return Err(UsageWriteError::lifecycle(
       request_id,
-      "ConnectClosed followed an HTTP attempt",
+      "ConnectClosed followed an HTTP lifecycle",
     ));
   }
   match state.connect {
-    ConnectState::None => {
+    ConnectState::None | ConnectState::Admitted => {
       return Err(UsageWriteError::lifecycle(
         request_id,
         "ConnectClosed was emitted before ConnectReady",

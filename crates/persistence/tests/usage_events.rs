@@ -5,10 +5,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokn_events::{
   AttemptFinished, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted, AttemptUsage, BodyCapture,
-  BodyOutcome, BodyResult, CapturedHeaders, CapturedUri, ClientIdentity, ConnectAction, ConnectClosed, ConnectReady,
-  ConsumerResult, Correlation, EventConsumer, EventFailure, EventSeq, GatewayEvent, HttpFamily, HttpResponseHead,
-  IngressKind, RequestAdmitted, RequestBodyObservation, RequestFinished, RequestId, RequestOutcome, RequestPhase,
-  RequestSource, RequestStarted, RetryDecision, TargetSelection, TokenUsage, TrafficEvent, TrafficEventKind, UsageKind,
+  BodyFinished, BodyLeg, BodyOutcome, BodyProgress, BodyResult, CapturedHeaders, CapturedUri, ClientIdentity,
+  ConnectAction, ConnectClosed, ConnectReady, ConsumerResult, Correlation, EventConsumer, EventFailure, EventSeq,
+  GatewayEvent, HttpFamily, HttpResponseHead, IngressKind, PolicySelection, RequestAdmitted, RequestBodyObservation,
+  RequestFinished, RequestId, RequestOutcome, RequestPhase, RequestSource, RequestStarted, RetryDecision,
+  SelectedAction, TargetSelection, TokenUsage, TrafficEvent, TrafficEventKind, UsageKind,
 };
 use tokn_persistence::usage::{UsageDb, UsagePersistenceConsumer};
 
@@ -608,21 +609,10 @@ fn connect_lifecycle_rejects_http_attempts_and_requires_close_before_finish() {
       }),
     )
     .unwrap();
-  events
-    .emit(
-      &mut consumer,
-      2,
-      TrafficEventKind::ConnectReady(ConnectReady {
-        action: ConnectAction::Tunnel,
-        authority: "upstream.test:443".into(),
-      }),
-    )
-    .unwrap();
-
   let attempt_error = events
     .emit(
       &mut consumer,
-      3,
+      2,
       TrafficEventKind::AttemptStarted(AttemptStarted {
         attempt: AttemptNo::FIRST,
         target: target("account-1", "provider-1"),
@@ -631,12 +621,29 @@ fn connect_lifecycle_rejects_http_attempts_and_requires_close_before_finish() {
     .unwrap_err();
   assert!(attempt_error
     .to_string()
-    .contains("HTTP attempt followed a CONNECT lifecycle"));
+    .contains("HTTP attempt followed a non-HTTP policy or CONNECT lifecycle"));
+  events
+    .emit(
+      &mut consumer,
+      3,
+      TrafficEventKind::PolicySelected(connect_policy(ConnectAction::Tunnel)),
+    )
+    .unwrap();
+  events
+    .emit(
+      &mut consumer,
+      4,
+      TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "upstream.test:443".into(),
+      }),
+    )
+    .unwrap();
 
   let unfinished = events
     .emit(
       &mut consumer,
-      4,
+      5,
       TrafficEventKind::Finished(RequestFinished {
         outcome: RequestOutcome::Delivered,
         phase: RequestPhase::Connect,
@@ -653,7 +660,7 @@ fn connect_lifecycle_rejects_http_attempts_and_requires_close_before_finish() {
   events
     .emit(
       &mut consumer,
-      5,
+      6,
       TrafficEventKind::ConnectClosed(ConnectClosed {
         action: ConnectAction::Tunnel,
         client_to_upstream_bytes: Some(12),
@@ -665,7 +672,7 @@ fn connect_lifecycle_rejects_http_attempts_and_requires_close_before_finish() {
   events
     .emit(
       &mut consumer,
-      6,
+      7,
       TrafficEventKind::Finished(RequestFinished {
         outcome: RequestOutcome::Delivered,
         phase: RequestPhase::Connect,
@@ -676,6 +683,207 @@ fn connect_lifecycle_rejects_http_attempts_and_requires_close_before_finish() {
     )
     .unwrap();
   assert_eq!(row_count(&path), 0);
+}
+
+#[test]
+fn connect_admission_policy_and_ready_action_must_agree() {
+  let path = temp_usage_db();
+  let mut consumer = UsagePersistenceConsumer::open(&path, "test-version").unwrap();
+
+  let mut connect_with_http_policy = Events::new("connect-with-http-policy");
+  connect_with_http_policy
+    .emit(&mut consumer, 0, TrafficEventKind::Started(started()))
+    .unwrap();
+  connect_with_http_policy
+    .emit(
+      &mut consumer,
+      1,
+      TrafficEventKind::Admitted(RequestAdmitted::Connect {
+        authority: "upstream.test:443".into(),
+      }),
+    )
+    .unwrap();
+  let error = connect_with_http_policy
+    .emit(&mut consumer, 2, TrafficEventKind::PolicySelected(http_policy()))
+    .unwrap_err();
+  assert!(error.to_string().contains("HTTP policy followed CONNECT admission"));
+
+  let mut http_with_connect_policy = Events::new("http-with-connect-policy");
+  http_with_connect_policy
+    .emit(&mut consumer, 0, TrafficEventKind::Started(started()))
+    .unwrap();
+  http_with_connect_policy
+    .emit(
+      &mut consumer,
+      1,
+      TrafficEventKind::Admitted(RequestAdmitted::Http {
+        scheme: "http".into(),
+        authority: "gateway.test".into(),
+        path_and_query: CapturedUri::exact("/v1/responses"),
+        operation: Some("responses".into()),
+      }),
+    )
+    .unwrap();
+  let error = http_with_connect_policy
+    .emit(
+      &mut consumer,
+      2,
+      TrafficEventKind::PolicySelected(connect_policy(ConnectAction::Tunnel)),
+    )
+    .unwrap_err();
+  assert!(error.to_string().contains("CONNECT policy followed HTTP admission"));
+
+  let mut mismatched_action = Events::new("connect-action-mismatch");
+  start_connect(&mut mismatched_action, &mut consumer, ConnectAction::Tunnel);
+  let error = mismatched_action
+    .emit(
+      &mut consumer,
+      3,
+      TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Intercept,
+        authority: "upstream.test:443".into(),
+      }),
+    )
+    .unwrap_err();
+  assert!(error
+    .to_string()
+    .contains("ConnectReady action differs from the selected CONNECT policy"));
+
+  let mut rejected_action = Events::new("connect-ready-reject");
+  start_connect(&mut rejected_action, &mut consumer, ConnectAction::Reject);
+  let error = rejected_action
+    .emit(
+      &mut consumer,
+      3,
+      TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Reject,
+        authority: "upstream.test:443".into(),
+      }),
+    )
+    .unwrap_err();
+  assert!(error.to_string().contains("rejected CONNECT cannot become ready"));
+
+  let mut policy_without_admission = Events::new("connect-policy-with-http-attempt");
+  policy_without_admission
+    .emit(&mut consumer, 0, TrafficEventKind::Started(started()))
+    .unwrap();
+  policy_without_admission
+    .emit(
+      &mut consumer,
+      1,
+      TrafficEventKind::PolicySelected(connect_policy(ConnectAction::Tunnel)),
+    )
+    .unwrap();
+  let error = policy_without_admission
+    .emit(
+      &mut consumer,
+      2,
+      TrafficEventKind::AttemptStarted(AttemptStarted {
+        attempt: AttemptNo::FIRST,
+        target: target("account-1", "provider-1"),
+      }),
+    )
+    .unwrap_err();
+  assert!(error
+    .to_string()
+    .contains("HTTP attempt followed a non-HTTP policy or CONNECT lifecycle"));
+}
+
+#[test]
+fn failed_connect_can_return_http_but_cannot_become_ready_after_response_facts() {
+  let path = temp_usage_db();
+  let mut consumer = UsagePersistenceConsumer::open(&path, "test-version").unwrap();
+  let mut events = Events::new("failed-connect-response");
+  start_connect(&mut events, &mut consumer, ConnectAction::Tunnel);
+  events
+    .emit(
+      &mut consumer,
+      3,
+      TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: 502,
+        headers: CapturedHeaders::default(),
+      }),
+    )
+    .unwrap();
+  let error = events
+    .emit(
+      &mut consumer,
+      4,
+      TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "upstream.test:443".into(),
+      }),
+    )
+    .unwrap_err();
+  assert!(error
+    .to_string()
+    .contains("ConnectReady followed an HTTP response boundary"));
+
+  events
+    .emit(
+      &mut consumer,
+      5,
+      TrafficEventKind::Finished(RequestFinished {
+        outcome: RequestOutcome::Failed,
+        phase: RequestPhase::Connect,
+        downstream_status: Some(502),
+        failure: Some(failure("connect_failed", "CONNECT setup failed")),
+        attempt_count: 0,
+      }),
+    )
+    .unwrap();
+  assert_eq!(row_count(&path), 0);
+
+  let mut body_events = Events::new("rejected-connect-body");
+  start_connect(&mut body_events, &mut consumer, ConnectAction::Tunnel);
+  body_events
+    .emit(
+      &mut consumer,
+      3,
+      TrafficEventKind::BodyProgress(BodyProgress {
+        leg: BodyLeg::Downstream,
+        bytes_seen: 17,
+        chunks: 1,
+      }),
+    )
+    .unwrap();
+  body_events
+    .emit(
+      &mut consumer,
+      4,
+      TrafficEventKind::BodyFinished(BodyFinished {
+        leg: BodyLeg::Downstream,
+        capture: BodyCapture::Complete(Bytes::from_static(b"connect rejected")),
+        result: BodyResult::Complete,
+      }),
+    )
+    .unwrap();
+  let error = body_events
+    .emit(
+      &mut consumer,
+      5,
+      TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "upstream.test:443".into(),
+      }),
+    )
+    .unwrap_err();
+  assert!(error
+    .to_string()
+    .contains("ConnectReady followed an HTTP response boundary"));
+  body_events
+    .emit(
+      &mut consumer,
+      6,
+      TrafficEventKind::Finished(RequestFinished {
+        outcome: RequestOutcome::Rejected,
+        phase: RequestPhase::Connect,
+        downstream_status: None,
+        failure: Some(failure("connect_rejected", "CONNECT was rejected")),
+        attempt_count: 0,
+      }),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -853,6 +1061,40 @@ fn start_attempt(
       }),
     )
     .unwrap();
+}
+
+fn start_connect(events: &mut Events, consumer: &mut UsagePersistenceConsumer, action: ConnectAction) {
+  events.emit(consumer, 0, TrafficEventKind::Started(started())).unwrap();
+  events
+    .emit(
+      consumer,
+      1,
+      TrafficEventKind::Admitted(RequestAdmitted::Connect {
+        authority: "upstream.test:443".into(),
+      }),
+    )
+    .unwrap();
+  events
+    .emit(consumer, 2, TrafficEventKind::PolicySelected(connect_policy(action)))
+    .unwrap();
+}
+
+fn connect_policy(action: ConnectAction) -> PolicySelection {
+  PolicySelection {
+    binding_id: Some("proxy-binding".into()),
+    action: SelectedAction::Connect { action },
+  }
+}
+
+fn http_policy() -> PolicySelection {
+  PolicySelection {
+    binding_id: Some("route-binding".into()),
+    action: SelectedAction::Http {
+      profile_id: "default".into(),
+      route_id: "default".into(),
+      family: HttpFamily::Managed,
+    },
+  }
 }
 
 fn started() -> RequestStarted {
