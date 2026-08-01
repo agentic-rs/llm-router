@@ -415,7 +415,11 @@ mod tests {
       BTreeMap::from([(
         pool_id("broken"),
         AccountPoolPlan::new(
-          AccountSelector::new(Some(BTreeSet::from([provider_id("not-installed")])), None),
+          AccountSelector::new(
+            Some(BTreeSet::from([provider_id("not-installed")])),
+            None,
+            BTreeSet::new(),
+          ),
           AccountSelectionStrategy::RoundRobin,
           Duration::from_secs(5),
           None,

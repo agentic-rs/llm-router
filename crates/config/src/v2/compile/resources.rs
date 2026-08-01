@@ -66,8 +66,23 @@ fn compile_account_pools(
         raw_pool.session_expired_retention_secs,
         MAX_SESSION_DURATION_SECS,
       )?;
-      let accounts = compile_account_filter(raw_pool.accounts.as_deref(), format!("account_pools.{raw_id}.accounts"))?
-        .map(|accounts| accounts.into_iter().map(Into::into).collect());
+      let active_accounts = compile_active_account_filter(
+        raw_pool.active_accounts.as_deref(),
+        format!("account_pools.{raw_id}.active_accounts"),
+      )?;
+      let fallback_accounts = compile_fallback_account_filter(
+        &raw_pool.fallback_accounts,
+        format!("account_pools.{raw_id}.fallback_accounts"),
+      )?;
+      if active_accounts
+        .as_ref()
+        .is_some_and(|active_accounts| !active_accounts.is_disjoint(&fallback_accounts))
+      {
+        return Err(invalid_value(
+          format!("account_pools.{raw_id}.fallback_accounts"),
+          "must not overlap explicit active_accounts",
+        ));
+      }
       let providers = compile_provider_filter(raw_pool.providers.as_deref(), raw_id)?;
 
       let session_affinity = if raw_pool.session_ttl_secs == 0 {
@@ -89,7 +104,11 @@ fn compile_account_pools(
         RawPoolStrategy::RoundRobin => AccountSelectionStrategy::RoundRobin,
       };
       let plan = AccountPoolPlan::new(
-        AccountSelector::new(providers, accounts),
+        AccountSelector::new(
+          providers,
+          active_accounts.map(|accounts| accounts.into_iter().map(Into::into).collect()),
+          fallback_accounts.into_iter().map(Into::into).collect(),
+        ),
         strategy,
         Duration::from_secs(raw_pool.failure_cooldown_secs),
         session_affinity,
@@ -121,6 +140,35 @@ fn compile_account_filter(
     return Ok(None);
   }
 
+  compile_explicit_account_ids(raw_values, location).map(Some)
+}
+
+fn compile_active_account_filter(
+  raw_values: Option<&[String]>,
+  location: String,
+) -> Result<Option<BTreeSet<String>>, CompileError> {
+  let Some(raw_values) = raw_values else {
+    return Ok(None);
+  };
+  validate_wildcard_shape(raw_values, location.clone())?;
+  if raw_values == ["*"] {
+    return Ok(None);
+  }
+
+  compile_explicit_account_ids(raw_values, location).map(Some)
+}
+
+fn compile_fallback_account_filter(raw_values: &[String], location: String) -> Result<BTreeSet<String>, CompileError> {
+  if raw_values.iter().any(|value| value == "*") {
+    return Err(invalid_value(
+      location,
+      "wildcard `*` is not allowed for fallback accounts",
+    ));
+  }
+  compile_explicit_account_ids(raw_values, location)
+}
+
+fn compile_explicit_account_ids(raw_values: &[String], location: String) -> Result<BTreeSet<String>, CompileError> {
   let mut values = BTreeSet::new();
   for value in raw_values {
     if value.trim().is_empty() || value.trim() != value {
@@ -133,7 +181,7 @@ fn compile_account_filter(
       return Err(duplicate_value(location.clone(), value));
     }
   }
-  Ok(Some(values))
+  Ok(values)
 }
 
 fn compile_provider_filter(
@@ -165,6 +213,10 @@ fn validate_selector_shape(raw_values: &[String], location: String) -> Result<()
       "must not be empty; omit the field or use [\"*\"] for an unrestricted selector",
     ));
   }
+  validate_wildcard_shape(raw_values, location)
+}
+
+fn validate_wildcard_shape(raw_values: &[String], location: String) -> Result<(), CompileError> {
   if raw_values.iter().any(|value| value == "*") && raw_values != ["*"] {
     return Err(invalid_value(location, "wildcard `*` must be the only selector value"));
   }

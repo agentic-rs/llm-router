@@ -867,7 +867,11 @@ mod tests {
 
   fn account_pool(account_ids: Option<&[&str]>) -> AccountPoolPlan {
     AccountPoolPlan::new(
-      AccountSelector::new(None, account_ids.map(|ids| ids.iter().map(SmolStr::new).collect())),
+      AccountSelector::new(
+        None,
+        account_ids.map(|ids| ids.iter().map(SmolStr::new).collect()),
+        BTreeSet::new(),
+      ),
       AccountSelectionStrategy::RoundRobin,
       Duration::from_secs(5),
       None,

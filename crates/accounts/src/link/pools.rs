@@ -11,7 +11,6 @@ use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokn_core::account::AccountTier;
 use tokn_policy::{AccountPoolId, AccountSelectionStrategy, GatewayPlan, ProviderId, SessionAffinityPlan, UpstreamId};
 
 /// Every account pool linked from one compiled gateway plan.
@@ -43,7 +42,7 @@ impl std::fmt::Debug for LinkedAccountPools {
   }
 }
 
-/// One immutable pool definition split into global active and fallback tiers.
+/// One immutable pool definition split into pool-local active and fallback tiers.
 pub struct LinkedAccountPool {
   id: AccountPoolId,
   strategy: AccountSelectionStrategy,
@@ -70,12 +69,12 @@ impl LinkedAccountPool {
     self.session_affinity
   }
 
-  /// Enabled active accounts in their original account-input order.
+  /// Accounts assigned to this pool's active tier, in original input order.
   pub fn active(&self) -> &[LinkedPoolAccount] {
     &self.active
   }
 
-  /// Enabled fallback accounts in their original account-input order.
+  /// Accounts assigned to this pool's fallback tier, in original input order.
   pub fn fallback(&self) -> &[LinkedPoolAccount] {
     &self.fallback
   }
@@ -145,6 +144,9 @@ pub enum PoolLinkError {
 
   #[snafu(display("account pool '{pool}' references unknown account '{account_id}'"))]
   UnknownAccount { pool: AccountPoolId, account_id: SmolStr },
+
+  #[snafu(display("account pool '{pool}' assigns account '{account_id}' to both active and fallback tiers"))]
+  OverlappingAccountTiers { pool: AccountPoolId, account_id: SmolStr },
 }
 
 pub type PoolLinkResult<T> = std::result::Result<T, PoolLinkError>;
@@ -175,8 +177,14 @@ pub fn link_account_pools(
         || !selector
           .providers()
           .is_none_or(|provider_ids| provider_ids.contains(config.provider.as_str()))
-        || !selector
-          .accounts()
+      {
+        continue;
+      }
+
+      let is_fallback = selector.fallback_accounts().contains(config.id.as_str());
+      if !is_fallback
+        && !selector
+          .active_accounts()
           .is_none_or(|account_ids| account_ids.contains(config.id.as_str()))
       {
         continue;
@@ -196,9 +204,10 @@ pub fn link_account_pools(
         bindings,
       };
 
-      match config.tier {
-        AccountTier::Active => active.push(linked),
-        AccountTier::Fallback => fallback.push(linked),
+      if is_fallback {
+        fallback.push(linked);
+      } else {
+        active.push(linked);
       }
     }
 
@@ -222,6 +231,16 @@ fn validate_selector(
   providers: &ProviderGraph,
   registry: &Registry,
 ) -> PoolLinkResult<()> {
+  if let Some(account_id) = selector
+    .active_accounts()
+    .and_then(|active_accounts| active_accounts.intersection(selector.fallback_accounts()).next())
+  {
+    return Err(PoolLinkError::OverlappingAccountTiers {
+      pool: pool_id.clone(),
+      account_id: account_id.clone(),
+    });
+  }
+
   if let Some(provider_ids) = selector.providers() {
     for provider_id in provider_ids {
       if registry.resolve(provider_id.as_str()).is_none() {
@@ -233,14 +252,17 @@ fn validate_selector(
     }
   }
 
-  if let Some(account_ids) = selector.accounts() {
-    for account_id in account_ids {
-      if providers.account(account_id.as_str()).is_none() {
-        return Err(PoolLinkError::UnknownAccount {
-          pool: pool_id.clone(),
-          account_id: account_id.clone(),
-        });
-      }
+  for account_id in selector
+    .active_accounts()
+    .into_iter()
+    .flatten()
+    .chain(selector.fallback_accounts())
+  {
+    if providers.account(account_id.as_str()).is_none() {
+      return Err(PoolLinkError::UnknownAccount {
+        pool: pool_id.clone(),
+        account_id: account_id.clone(),
+      });
     }
   }
 
@@ -252,7 +274,7 @@ mod tests {
   use super::*;
   use crate::link::link_provider_graph;
   use std::collections::BTreeMap;
-  use tokn_core::account::AccountConfig;
+  use tokn_core::account::{AccountConfig, AccountTier};
   use tokn_core::provider::{ID_LLAMA_CPP, ID_OPENAI};
   use tokn_policy::{AccountPoolPlan, AccountSelector, UpstreamPlan};
 
@@ -295,11 +317,12 @@ mod tests {
     .with_eligible_accounts(eligible_accounts.map(|ids| ids.iter().map(SmolStr::new).collect()))
   }
 
-  fn pool(providers: Option<&[&str]>, accounts: Option<&[&str]>) -> AccountPoolPlan {
+  fn pool(providers: Option<&[&str]>, active_accounts: Option<&[&str]>, fallback_accounts: &[&str]) -> AccountPoolPlan {
     AccountPoolPlan::new(
       AccountSelector::new(
         providers.map(|ids| ids.iter().map(|id| provider_id(id)).collect()),
-        accounts.map(|ids| ids.iter().map(SmolStr::new).collect()),
+        active_accounts.map(|ids| ids.iter().map(SmolStr::new).collect()),
+        fallback_accounts.iter().map(SmolStr::new).collect(),
       ),
       AccountSelectionStrategy::RoundRobin,
       Duration::from_secs(17),
@@ -332,19 +355,19 @@ mod tests {
   }
 
   #[test]
-  fn groups_upstreams_by_logical_account_and_preserves_account_and_tier_order() {
+  fn groups_upstreams_by_logical_account_and_uses_pool_local_tier_order() {
     let primary = upstream_id("z-primary");
     let secondary = upstream_id("a-secondary");
     let plan = plan(
-      BTreeMap::from([(pool_id("all"), pool(None, None))]),
+      BTreeMap::from([(pool_id("all"), pool(None, None, &["fallback-first"]))]),
       BTreeMap::from([
         (primary.clone(), upstream(ID_LLAMA_CPP, None)),
         (secondary.clone(), upstream(ID_LLAMA_CPP, None)),
       ]),
     );
     let accounts = [
-      account("fallback-first", ID_LLAMA_CPP, AccountTier::Fallback),
-      account("active-second", ID_LLAMA_CPP, AccountTier::Active),
+      account("fallback-first", ID_LLAMA_CPP, AccountTier::Active),
+      account("active-second", ID_LLAMA_CPP, AccountTier::Fallback),
       account("active-third", ID_LLAMA_CPP, AccountTier::Active),
     ];
 
@@ -390,7 +413,7 @@ mod tests {
     let plan = plan(
       BTreeMap::from([(
         pool_id("selected"),
-        pool(Some(&[ID_LLAMA_CPP]), Some(&["selected", "omitted-provider"])),
+        pool(Some(&[ID_LLAMA_CPP]), Some(&["selected", "omitted-provider"]), &[]),
       )]),
       BTreeMap::from([
         (upstream_id("llama"), upstream(ID_LLAMA_CPP, None)),
@@ -411,8 +434,8 @@ mod tests {
     let upstream_id = upstream_id("local");
     let plan = plan(
       BTreeMap::from([
-        (pool_id("first"), pool(None, None)),
-        (pool_id("second"), pool(None, Some(&["shared"]))),
+        (pool_id("first"), pool(None, None, &[])),
+        (pool_id("second"), pool(None, Some(&["shared"]), &[])),
       ]),
       BTreeMap::from([(upstream_id.clone(), upstream(ID_LLAMA_CPP, None))]),
     );
@@ -431,9 +454,36 @@ mod tests {
   }
 
   #[test]
+  fn the_same_account_can_have_different_tiers_in_different_pools() {
+    let upstream_id = upstream_id("local");
+    let plan = plan(
+      BTreeMap::from([
+        (pool_id("primary"), pool(None, Some(&["shared"]), &[])),
+        (pool_id("backup"), pool(None, None, &["shared"])),
+      ]),
+      BTreeMap::from([(upstream_id.clone(), upstream(ID_LLAMA_CPP, None))]),
+    );
+
+    // Pool-local membership is authoritative even when the legacy account
+    // record carries the opposite global tier.
+    let (providers, linked) = link(&plan, &[account("shared", ID_LLAMA_CPP, AccountTier::Fallback)]).unwrap();
+    let primary = linked.pool(&pool_id("primary")).unwrap();
+    let backup = linked.pool(&pool_id("backup")).unwrap();
+
+    assert_eq!(primary.active()[0].account_id(), "shared");
+    assert!(primary.fallback().is_empty());
+    assert!(backup.active().is_empty());
+    assert_eq!(backup.fallback()[0].account_id(), "shared");
+    assert!(Arc::ptr_eq(
+      providers.binding(&upstream_id, "shared").unwrap(),
+      backup.fallback()[0].binding(&upstream_id).unwrap()
+    ));
+  }
+
+  #[test]
   fn validates_explicit_provider_and_account_names() {
     let unknown_provider_plan = plan(
-      BTreeMap::from([(pool_id("invalid-provider"), pool(Some(&["not-installed"]), None))]),
+      BTreeMap::from([(pool_id("invalid-provider"), pool(Some(&["not-installed"]), None, &[]))]),
       BTreeMap::new(),
     );
     let provider_error = link(&unknown_provider_plan, &[]).err().unwrap();
@@ -444,7 +494,7 @@ mod tests {
     ));
 
     let unknown_account_plan = plan(
-      BTreeMap::from([(pool_id("invalid-account"), pool(None, Some(&["missing"])))]),
+      BTreeMap::from([(pool_id("invalid-account"), pool(None, Some(&["missing"]), &[]))]),
       BTreeMap::new(),
     );
     let account_error = link(&unknown_account_plan, &[]).err().unwrap();
@@ -452,6 +502,28 @@ mod tests {
       account_error,
       PoolLinkError::UnknownAccount { pool, account_id }
         if pool.as_str() == "invalid-account" && account_id == "missing"
+    ));
+
+    let unknown_fallback_plan = plan(
+      BTreeMap::from([(pool_id("invalid-fallback"), pool(None, None, &["missing-fallback"]))]),
+      BTreeMap::new(),
+    );
+    let fallback_error = link(&unknown_fallback_plan, &[]).err().unwrap();
+    assert!(matches!(
+      fallback_error,
+      PoolLinkError::UnknownAccount { pool, account_id }
+        if pool.as_str() == "invalid-fallback" && account_id == "missing-fallback"
+    ));
+
+    let overlapping_tiers_plan = plan(
+      BTreeMap::from([(pool_id("overlapping-tiers"), pool(None, Some(&["shared"]), &["shared"]))]),
+      BTreeMap::new(),
+    );
+    let overlap_error = link(&overlapping_tiers_plan, &[]).err().unwrap();
+    assert!(matches!(
+      overlap_error,
+      PoolLinkError::OverlappingAccountTiers { pool, account_id }
+        if pool.as_str() == "overlapping-tiers" && account_id == "shared"
     ));
   }
 
@@ -461,7 +533,7 @@ mod tests {
     disabled.enabled = false;
     let unbound = account("unbound", ID_OPENAI, AccountTier::Active);
     let plan = plan(
-      BTreeMap::from([(pool_id("empty"), pool(None, Some(&["disabled", "unbound"])))]),
+      BTreeMap::from([(pool_id("empty"), pool(None, Some(&["disabled", "unbound"]), &[]))]),
       BTreeMap::from([(upstream_id("llama"), upstream(ID_LLAMA_CPP, None))]),
     );
 
@@ -476,7 +548,7 @@ mod tests {
     let unrestricted = upstream_id("unrestricted");
     let restricted = upstream_id("restricted");
     let plan = plan(
-      BTreeMap::from([(pool_id("all"), pool(None, None))]),
+      BTreeMap::from([(pool_id("all"), pool(None, None, &[]))]),
       BTreeMap::from([
         (unrestricted.clone(), upstream(ID_LLAMA_CPP, None)),
         (restricted.clone(), upstream(ID_LLAMA_CPP, Some(&["eligible"]))),

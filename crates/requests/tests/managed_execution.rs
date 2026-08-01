@@ -59,7 +59,7 @@ model = {{ kind = "fallback", selector = {{ kind = "fixed", group = "fixture" }}
 operation = "translate_compatible"
 
 [account_pools.default]
-accounts = ["*"]
+active_accounts = ["*"]
 providers = ["*"]
 strategy = "round_robin"
 
@@ -218,7 +218,7 @@ model = {{ kind = "capability" }}
 operation = "preserve"
 
 [account_pools.default]
-accounts = ["codex-account"]
+active_accounts = ["codex-account"]
 providers = ["codex"]
 strategy = "round_robin"
 

@@ -513,17 +513,28 @@ impl ConnectMatch {
   }
 }
 
-/// Typed constraints used to materialize an account pool from the account
-/// inventory. `None` leaves that dimension unconstrained.
+/// Typed constraints used to materialize one pool-local view of the account
+/// inventory. Provider selection applies to both tiers. `None` active accounts
+/// means every matching account is active unless it is explicitly assigned to
+/// the fallback tier; an empty active set selects no active accounts.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AccountSelector {
   providers: Option<BTreeSet<ProviderId>>,
-  accounts: Option<BTreeSet<SmolStr>>,
+  active_accounts: Option<BTreeSet<SmolStr>>,
+  fallback_accounts: BTreeSet<SmolStr>,
 }
 
 impl AccountSelector {
-  pub fn new(providers: Option<BTreeSet<ProviderId>>, accounts: Option<BTreeSet<SmolStr>>) -> Self {
-    Self { providers, accounts }
+  pub fn new(
+    providers: Option<BTreeSet<ProviderId>>,
+    active_accounts: Option<BTreeSet<SmolStr>>,
+    fallback_accounts: BTreeSet<SmolStr>,
+  ) -> Self {
+    Self {
+      providers,
+      active_accounts,
+      fallback_accounts,
+    }
   }
 
   pub fn all() -> Self {
@@ -534,8 +545,12 @@ impl AccountSelector {
     self.providers.as_ref()
   }
 
-  pub fn accounts(&self) -> Option<&BTreeSet<SmolStr>> {
-    self.accounts.as_ref()
+  pub fn active_accounts(&self) -> Option<&BTreeSet<SmolStr>> {
+    self.active_accounts.as_ref()
+  }
+
+  pub fn fallback_accounts(&self) -> &BTreeSet<SmolStr> {
+    &self.fallback_accounts
   }
 }
 
@@ -897,6 +912,7 @@ mod tests {
     let selector = AccountSelector::new(
       Some(BTreeSet::from([id("openai")])),
       Some(BTreeSet::from([SmolStr::new("personal")])),
+      BTreeSet::from([SmolStr::new("backup")]),
     );
     let pool = AccountPoolPlan::new(
       selector,
@@ -913,7 +929,8 @@ mod tests {
       .providers()
       .unwrap()
       .contains(&id::<ProviderId>("openai")));
-    assert!(pool.selector().accounts().unwrap().contains("personal"));
+    assert!(pool.selector().active_accounts().unwrap().contains("personal"));
+    assert!(pool.selector().fallback_accounts().contains("backup"));
     assert_eq!(pool.failure_cooldown(), Duration::from_secs(60));
     assert_eq!(
       pool.session_affinity().unwrap().expired_retention(),

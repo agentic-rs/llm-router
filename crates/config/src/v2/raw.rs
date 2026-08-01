@@ -274,14 +274,18 @@ pub enum RawRelayTarget {
   FixedUpstream { upstream: String, account_pool: String },
 }
 
-/// Account selection and affinity settings for one independently managed
-/// pool. Omitted selectors mean unrestricted; an explicit `"*"` is retained
-/// for the compiler to canonicalize and validate against mixed selectors.
+/// Account selection, pool-local tiering, and affinity settings for one
+/// independently managed pool. Omitted `active_accounts` or `["*"]` means all
+/// matching accounts are active except explicit fallback members. An explicit
+/// empty active list selects none. Fallback accounts must always be named
+/// explicitly and override the implicit-all active tier.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawAccountPool {
   #[serde(default)]
-  pub accounts: Option<Vec<String>>,
+  pub active_accounts: Option<Vec<String>>,
+  #[serde(default)]
+  pub fallback_accounts: Vec<String>,
   #[serde(default)]
   pub providers: Option<Vec<String>>,
   #[serde(default)]
@@ -369,7 +373,7 @@ model = { kind = "capability" }
 operation = "translate_compatible"
 
 [account_pools.default]
-accounts = ["*"]
+active_accounts = ["*"]
 providers = ["*"]
 strategy = "round_robin"
 

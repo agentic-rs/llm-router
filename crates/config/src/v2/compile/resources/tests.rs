@@ -20,7 +20,7 @@ model = {{ kind = "capability" }}
 operation = "translate_compatible"
 
 [account_pools.default]
-accounts = ["*"]
+active_accounts = ["*"]
 providers = ["*"]
 
 [upstreams.default]
@@ -50,6 +50,57 @@ fn compiles_wildcards_and_managed_auto_identity() {
 
   assert_eq!(pool.selector(), &AccountSelector::all());
   assert_eq!(profile.wire_identity(), &WireIdentity::ProviderDefault);
+}
+
+#[test]
+fn compiles_pool_local_active_and_fallback_membership() {
+  let mut config = base_config("");
+  let pool = config.account_pools.get_mut("default").unwrap();
+  pool.active_accounts = Some(Vec::new());
+  pool.fallback_accounts = vec!["backup".into()];
+
+  let compiled = compile_resources(&config).unwrap();
+  let selector = compiled.account_pools[&AccountPoolId::new("default").unwrap()].selector();
+
+  assert!(selector.active_accounts().unwrap().is_empty());
+  assert!(selector.fallback_accounts().contains("backup"));
+
+  let pool = config.account_pools.get_mut("default").unwrap();
+  pool.active_accounts = None;
+  let compiled = compile_resources(&config).unwrap();
+  let selector = compiled.account_pools[&AccountPoolId::new("default").unwrap()].selector();
+  assert!(selector.active_accounts().is_none());
+  assert!(selector.fallback_accounts().contains("backup"));
+
+  let pool = config.account_pools.get_mut("default").unwrap();
+  pool.active_accounts = Some(vec!["*".into()]);
+  let compiled = compile_resources(&config).unwrap();
+  let selector = compiled.account_pools[&AccountPoolId::new("default").unwrap()].selector();
+  assert!(selector.active_accounts().is_none());
+  assert!(selector.fallback_accounts().contains("backup"));
+}
+
+#[test]
+fn rejects_explicit_tier_overlap_and_fallback_wildcards() {
+  let mut config = base_config("");
+  let pool = config.account_pools.get_mut("default").unwrap();
+  pool.active_accounts = Some(vec!["shared".into()]);
+  pool.fallback_accounts = vec!["shared".into()];
+
+  assert!(matches!(
+    compile_resources(&config),
+    Err(CompileError::InvalidValue { location, .. })
+      if location == "account_pools.default.fallback_accounts"
+  ));
+
+  let pool = config.account_pools.get_mut("default").unwrap();
+  pool.active_accounts = Some(vec!["*".into()]);
+  pool.fallback_accounts = vec!["*".into()];
+  assert!(matches!(
+    compile_resources(&config),
+    Err(CompileError::InvalidValue { location, .. })
+      if location == "account_pools.default.fallback_accounts"
+  ));
 }
 
 #[test]

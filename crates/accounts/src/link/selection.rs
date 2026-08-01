@@ -363,10 +363,19 @@ mod tests {
   }
 
   fn pool(accounts: Option<&[&str]>, affinity: Option<SessionAffinityPlan>) -> AccountPoolPlan {
+    pool_with_tiers(accounts, &[], affinity)
+  }
+
+  fn pool_with_tiers(
+    active_accounts: Option<&[&str]>,
+    fallback_accounts: &[&str],
+    affinity: Option<SessionAffinityPlan>,
+  ) -> AccountPoolPlan {
     AccountPoolPlan::new(
       AccountSelector::new(
         None,
-        accounts.map(|account_ids| account_ids.iter().map(SmolStr::new).collect()),
+        active_accounts.map(|account_ids| account_ids.iter().map(SmolStr::new).collect()),
+        fallback_accounts.iter().map(SmolStr::new).collect(),
       ),
       AccountSelectionStrategy::RoundRobin,
       Duration::from_secs(60),
@@ -452,11 +461,11 @@ mod tests {
   #[test]
   fn active_tier_precedes_fallback_until_active_binding_is_cooled() {
     let runtimes = runtimes(
-      BTreeMap::from([(pool_id("default"), pool(None, None))]),
+      BTreeMap::from([(pool_id("default"), pool_with_tiers(None, &["fallback"], None))]),
       BTreeMap::from([(upstream_id("local"), upstream(&[]))]),
       &[
-        account("active", AccountTier::Active),
-        account("fallback", AccountTier::Fallback),
+        account("active", AccountTier::Fallback),
+        account("fallback", AccountTier::Active),
       ],
     );
     let runtime = runtimes.runtime(&pool_id("default")).unwrap();

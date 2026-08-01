@@ -24,7 +24,7 @@ model = { kind = "capability" }
 operation = "translate_compatible"
 
 [account_pools.default]
-accounts = ["*"]
+active_accounts = ["*"]
 providers = ["*"]
 
 [upstreams.default]
