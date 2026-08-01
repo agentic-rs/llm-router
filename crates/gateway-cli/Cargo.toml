@@ -18,6 +18,7 @@ name = "tokn-gateway"
 path = "src/main.rs"
 
 [dependencies]
+tokn-accounts = { workspace = true }
 tokn-core = { workspace = true }
 tokn-config = { workspace = true }
 tokn-router-legacy-config = { workspace = true }

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::db::archive::{ArchiveEventHandler, ArchiveRuntime};
 use crate::progress::{ArchiveProgressEventHandler, ProgressEventHandler, ProgressLogEventHandler};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use std::future::Future;
 use std::io::IsTerminal;
@@ -9,10 +9,15 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokn_accounts::registry::Registry;
 use tokn_auth::AuthStore;
-use tokn_config::RouteMode;
+use tokn_config::{v2::CompiledConfig, RouteMode};
 use tokn_core::account::AccountConfig;
 use tokn_core::event::{EventBus, EventHandler};
+use tokn_router::runtime::{
+  bind_gateway_listeners, link_gateway_runtime, materialize_listeners, BoundGatewayListeners, GatewayServerState,
+  GatewayServingDefaults, RequestBodyLimits, RuntimeNameRegistry,
+};
 
 type EventBusParts = (
   Arc<EventBus>,
@@ -87,6 +92,43 @@ pub fn load_access_store(enabled: bool) -> Result<Arc<tokn_access::AccessStore>>
   }
 }
 
+/// Prepare and atomically bind every listener in one compiled v2 generation.
+///
+/// Runtime linking, file-backed listener resources, and outbound transports
+/// are all prepared before socket acquisition begins. The router's binder
+/// then acquires the complete listener set without starting accept loops and
+/// releases earlier sockets if any later bind fails.
+#[allow(dead_code)] // Wired into command dispatch by the subsequent v2 CLI cutover.
+pub async fn bind_compiled_gateway(
+  compiled: &CompiledConfig,
+  accounts: &[AccountConfig],
+  local_access_db_path: Option<&Path>,
+) -> Result<BoundGatewayListeners> {
+  let provider_registry = Registry::builtin();
+  let runtime_names = RuntimeNameRegistry::builtin();
+  let runtime = Arc::new(
+    link_gateway_runtime(compiled.gateway(), accounts, &provider_registry, &runtime_names)
+      .context("failed to link compiled gateway runtime")?,
+  );
+  let listener_resources = materialize_listeners(runtime.listeners(), local_access_db_path)
+    .context("failed to prepare compiled gateway listener resources")?;
+
+  let outbound = compiled.service().outbound().to_http_client_options();
+  let request_limits = compiled.service().request_limits();
+  let serving_defaults = GatewayServingDefaults::new(RequestBodyLimits::new(
+    request_limits.max_wire_bytes(),
+    request_limits.max_decoded_bytes(),
+  ));
+  let serving = Arc::new(
+    GatewayServerState::build(runtime, &outbound, serving_defaults)
+      .context("failed to prepare compiled gateway serving state")?,
+  );
+
+  bind_gateway_listeners(serving, listener_resources)
+    .await
+    .context("failed to bind compiled gateway listeners")
+}
+
 pub fn build_state(
   cfg: &Config,
   accounts: &[AccountConfig],
@@ -154,6 +196,23 @@ pub fn ensure_bind_host(host: &str, insecure_allow_remote: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+
+  fn compile_reject_only_gateway(listeners: &[(&str, SocketAddr)]) -> CompiledConfig {
+    let mut config = String::from("schema_version = 2\n");
+    for (id, address) in listeners {
+      config.push_str(&format!(
+        r#"
+[listeners.{id}]
+kind = "llm_api"
+bind = "{address}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+"#,
+      ));
+    }
+    tokn_config::v2::parse(&config, Path::new("compiled-gateway.toml")).unwrap()
+  }
 
   fn persistence_config(record_sessions: bool) -> (Config, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("tokn-server-runtime-test-{}", uuid::Uuid::new_v4()));
@@ -183,6 +242,50 @@ mod tests {
     let _parts = build_event_bus(&cfg).expect("event bus should initialize other persistence");
 
     assert!(!sessions_db.exists());
+  }
+
+  #[tokio::test]
+  async fn binds_reject_only_compiled_gateway() {
+    let reservation = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = reservation.local_addr().unwrap();
+    let compiled = compile_reject_only_gateway(&[("api", address)]);
+    drop(reservation);
+
+    let bound = bind_compiled_gateway(&compiled, &[], None).await.unwrap();
+
+    assert_eq!(bound.len(), 1);
+    let (listener_id, listener) = bound.listeners().next().unwrap();
+    assert_eq!(listener_id.as_str(), "api");
+    assert_eq!(listener.local_addr().unwrap(), address);
+  }
+
+  #[tokio::test]
+  async fn compiled_gateway_bind_failure_releases_earlier_sockets() {
+    let mut reservations = (0..2)
+      .map(|_| StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+      .collect::<Vec<_>>();
+    let first_address = reservations[0].local_addr().unwrap();
+    let second_address = reservations[1].local_addr().unwrap();
+    let second_reservation = reservations.pop().unwrap();
+    drop(reservations);
+    let compiled = compile_reject_only_gateway(&[("a-first", first_address), ("b-second", second_address)]);
+
+    let error = bind_compiled_gateway(&compiled, &[], None).await.unwrap_err();
+    let bind_error = error
+      .downcast_ref::<tokn_router::runtime::ListenerBindError>()
+      .expect("the startup error must retain the listener bind failure");
+    assert!(matches!(
+      bind_error,
+      tokn_router::runtime::ListenerBindError::Bind {
+        listener,
+        address,
+        ..
+      } if listener.as_str() == "b-second" && *address == second_address
+    ));
+
+    let rebound = StdTcpListener::bind(first_address).expect("the earlier socket must be released after rollback");
+    assert_eq!(rebound.local_addr().unwrap(), first_address);
+    drop(second_reservation);
   }
 
   #[test]

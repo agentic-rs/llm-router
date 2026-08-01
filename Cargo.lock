@@ -2993,6 +2993,7 @@ dependencies = [
  "time",
  "tokio",
  "tokn-access",
+ "tokn-accounts",
  "tokn-agent-migration",
  "tokn-auth",
  "tokn-catalogue",
