@@ -114,7 +114,7 @@ pub async fn run(config_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
   let outcome = match runtime.executor.execute(&runtime.profile, request).await {
     Ok(outcome) => outcome,
     Err(error) => {
-      print_execution_error(&error, &runtime.profile, args.format)?;
+      print_execution_error(&error, &runtime.profile, &request_id, args.format)?;
       return Err(anyhow!(error).context("managed smoke request failed"));
     }
   };
@@ -244,10 +244,14 @@ fn prepare_body(
 }
 
 fn parse_header_kv(raw: &str) -> std::result::Result<(String, String), String> {
-  let (name, value) = raw
-    .split_once('=')
-    .or_else(|| raw.split_once(':').map(|(name, value)| (name, value.trim_start())))
-    .ok_or_else(|| format!("expected `name=value` or `name: value`, got `{raw}`"))?;
+  let separator = match (raw.find('='), raw.find(':')) {
+    (Some(equals), Some(colon)) => equals.min(colon),
+    (Some(equals), None) => equals,
+    (None, Some(colon)) => colon,
+    (None, None) => return Err(format!("expected `name=value` or `name: value`, got `{raw}`")),
+  };
+  let (name, value) = raw.split_at(separator);
+  let value = &value[1..];
   let name = name.trim();
   let value = value.trim();
   let parsed_name = name
@@ -380,20 +384,20 @@ fn print_selection_text(
   }
 }
 
-fn print_execution_error(error: &ManagedGatewayError, profile: &ProfileId, format: OutputFormat) -> Result<()> {
+fn print_execution_error(
+  error: &ManagedGatewayError,
+  profile: &ProfileId,
+  request_id: &str,
+  format: OutputFormat,
+) -> Result<()> {
   match format {
     OutputFormat::Json => {
-      let report = serde_json::json!({
-        "success": false,
-        "profile": profile.as_str(),
-        "site": error.site().map(site_json).unwrap_or(Value::Null),
-        "selection": error.selection().map(selection_json).unwrap_or(Value::Null),
-        "error": error.to_string(),
-      });
+      let report = execution_error_json(error, profile, request_id);
       println!("{}", serde_json::to_string_pretty(&report)?);
     }
     OutputFormat::Text => {
       eprintln!("profile: {profile}");
+      eprintln!("request: {request_id}");
       if let Some(site) = error.site() {
         eprintln!("route:   {}", site.route_id());
       }
@@ -404,6 +408,17 @@ fn print_execution_error(error: &ManagedGatewayError, profile: &ProfileId, forma
     }
   }
   Ok(())
+}
+
+fn execution_error_json(error: &ManagedGatewayError, profile: &ProfileId, request_id: &str) -> Value {
+  serde_json::json!({
+    "success": false,
+    "request_id": request_id,
+    "profile": profile.as_str(),
+    "site": error.site().map(site_json).unwrap_or(Value::Null),
+    "selection": error.selection().map(selection_json).unwrap_or(Value::Null),
+    "error": error.to_string(),
+  })
 }
 
 fn print_unavailable(
@@ -491,7 +506,7 @@ fn print_headers_text(headers: &HeaderMap, redact: bool, stderr: bool) {
 }
 
 fn render_header_value(name: &HeaderName, value: &HeaderValue, redact: bool) -> String {
-  if redact && is_sensitive_header(name.as_str()) {
+  if redact && (value.is_sensitive() || is_sensitive_header(name.as_str())) {
     return "<redacted>".to_owned();
   }
   value
@@ -503,7 +518,16 @@ fn render_header_value(name: &HeaderName, value: &HeaderValue, redact: bool) -> 
 fn is_sensitive_header(name: &str) -> bool {
   matches!(
     name,
-    "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    "authorization"
+      | "proxy-authorization"
+      | "cookie"
+      | "set-cookie"
+      | "api-key"
+      | "x-api-key"
+      | "x-goog-api-key"
+      | "x-auth-token"
+      | "x-access-token"
+      | "ocp-apim-subscription-key"
   )
 }
 
@@ -563,16 +587,16 @@ fn load_body_file(path: &Path) -> Result<Value> {
 }
 
 fn extract_body_section(raw: &str) -> Option<&str> {
-  let body_index = raw
-    .lines()
-    .scan(0usize, |offset, line| {
-      let start = *offset;
-      *offset += line.len() + 1;
-      Some((start, line))
-    })
-    .find_map(|(start, line)| line.trim().eq_ignore_ascii_case("body:").then_some(start + line.len()))?;
-
-  Some(raw[body_index..].trim_start_matches(['\r', '\n']).trim_start())
+  let mut offset = 0;
+  for line_with_ending in raw.split_inclusive('\n') {
+    let line = line_with_ending.strip_suffix('\n').unwrap_or(line_with_ending);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    offset += line_with_ending.len();
+    if line.trim().eq_ignore_ascii_case("body:") {
+      return Some(raw[offset..].trim_start());
+    }
+  }
+  None
 }
 
 fn route_kind_name(kind: RouteKind) -> &'static str {
@@ -664,6 +688,14 @@ mod tests {
       parse_header_kv("X-Session-Id: session").unwrap(),
       ("x-session-id".to_owned(), "session".to_owned())
     );
+    assert_eq!(
+      parse_header_kv("Cookie: session=abc==").unwrap(),
+      ("cookie".to_owned(), "session=abc==".to_owned())
+    );
+    assert_eq!(
+      parse_header_kv("x-callback=https://example.test/result?a=b").unwrap(),
+      ("x-callback".to_owned(), "https://example.test/result?a=b".to_owned())
+    );
   }
 
   #[test]
@@ -687,13 +719,27 @@ mod tests {
     headers.append("set-cookie", HeaderValue::from_static("a=1"));
     headers.append("x-test", HeaderValue::from_static("first"));
     headers.append("set-cookie", HeaderValue::from_static("b=2"));
+    headers.append("api-key", HeaderValue::from_static("azure-secret"));
+    headers.append("x-goog-api-key", HeaderValue::from_static("google-secret"));
+    headers.append("x-auth-token", HeaderValue::from_static("provider-secret"));
+    let mut marked_sensitive = HeaderValue::from_static("marked-secret");
+    marked_sensitive.set_sensitive(true);
+    headers.append("x-provider-secret", marked_sensitive);
 
     assert_eq!(
       headers_json_value(&headers, true),
       json!({
+        "api-key": ["<redacted>"],
         "set-cookie": ["<redacted>", "<redacted>"],
+        "x-auth-token": ["<redacted>"],
+        "x-goog-api-key": ["<redacted>"],
+        "x-provider-secret": ["<redacted>"],
         "x-test": ["first"],
       })
+    );
+    assert_eq!(
+      headers_json_value(&headers, false)["x-provider-secret"],
+      json!(["marked-secret"])
     );
   }
 
@@ -707,10 +753,30 @@ mod tests {
   }
 
   #[test]
+  fn extract_body_section_accepts_crlf_capture_format() {
+    let raw = "HEADERS:\r\n{\"accept\":\"*/*\"}\r\n\r\nBODY:\r\n{\"model\":\"provider/model\"}\r\n";
+    assert_eq!(extract_body_section(raw), Some("{\"model\":\"provider/model\"}\r\n"));
+  }
+
+  #[test]
   fn extract_body_section_returns_none_for_plain_json() {
     let raw = "{\"model\":\"provider/model\"}";
     assert_eq!(extract_body_section(raw), None);
     let parsed: Value = serde_json::from_str(extract_body_section(raw).unwrap_or(raw)).unwrap();
     assert_eq!(parsed, json!({"model": "provider/model"}));
+  }
+
+  #[test]
+  fn execution_error_json_includes_request_id() {
+    let profile = ProfileId::new("work").unwrap();
+    let error = ManagedGatewayError::ProfileNotLinked {
+      profile: profile.clone(),
+    };
+
+    let report = execution_error_json(&error, &profile, "request-123");
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["request_id"], "request-123");
+    assert_eq!(report["profile"], "work");
   }
 }

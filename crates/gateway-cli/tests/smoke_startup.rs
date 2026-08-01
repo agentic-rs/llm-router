@@ -235,7 +235,10 @@ async fn managed_send_stream_keeps_stdout_as_raw_sse() {
 
   assert!(output.status.success(), "{}", stderr(&output));
   let stdout = String::from_utf8_lossy(&output.stdout);
-  assert!(stdout.starts_with("event: ") || stdout.starts_with("data: "), "{stdout}");
+  assert!(
+    stdout.starts_with("event: ") || stdout.starts_with("data: "),
+    "{stdout}"
+  );
   assert!(stdout.contains("data: "), "{stdout}");
   assert!(!stdout.contains("profile:"), "{stdout}");
   assert!(stderr(&output).contains("profile:   work"));
