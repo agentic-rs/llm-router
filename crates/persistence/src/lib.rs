@@ -19,7 +19,7 @@ pub use viewer::{
 
 pub use sessions::{MessageRecord, PartRecord};
 use snafu::Snafu;
-pub use tokn_core::db::{DbPaths, HttpSnapshot};
+pub use tokn_core::db::HttpSnapshot;
 pub use usage::UsageDb;
 
 #[derive(Debug, Snafu)]

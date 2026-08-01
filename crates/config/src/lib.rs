@@ -628,6 +628,13 @@ pub struct DbConfig {
   pub archive_extension: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedDbPaths {
+  pub usage_db: PathBuf,
+  pub sessions_db: PathBuf,
+  pub requests_dir: PathBuf,
+}
+
 impl Default for DbConfig {
   fn default() -> Self {
     Self {
@@ -645,8 +652,8 @@ impl Default for DbConfig {
 }
 
 impl DbConfig {
-  pub fn resolve_paths(&self) -> Result<tokn_core::db::DbPaths> {
-    Ok(tokn_core::db::DbPaths {
+  pub fn resolve_paths(&self) -> Result<ResolvedDbPaths> {
+    Ok(ResolvedDbPaths {
       usage_db: self
         .usage_db_path
         .clone()
@@ -1507,6 +1514,7 @@ mod tests {
   #[test]
   fn default_paths_use_tokn_router_home() {
     let home = tokn_core::util::paths::router_home().expect("home directory should resolve");
+    let resolved = DbConfig::default().resolve_paths().unwrap();
 
     assert_eq!(paths::config_dir().unwrap(), home);
     assert_eq!(paths::config_path().unwrap(), home.join("config.toml"));
@@ -1517,6 +1525,29 @@ mod tests {
     assert_eq!(paths::default_requests_dir().unwrap(), home.join("requests"));
     assert_eq!(paths::default_logs_dir().unwrap(), home.join("logs"));
     assert_eq!(paths::default_ca_dir().unwrap(), home.join("ca"));
+    assert_eq!(resolved.usage_db, home.join("usage.db"));
+    assert_eq!(resolved.sessions_db, home.join("sessions.db"));
+    assert_eq!(resolved.requests_dir, home.join("requests"));
+  }
+
+  #[test]
+  fn db_paths_preserve_all_explicit_overrides() {
+    let directory = tempfile::tempdir().unwrap();
+    let usage_db = directory.path().join("custom-usage.db");
+    let sessions_db = directory.path().join("custom-sessions.db");
+    let requests_dir = directory.path().join("custom-requests");
+    let config = DbConfig {
+      usage_db_path: Some(usage_db.clone()),
+      sessions_db_path: Some(sessions_db.clone()),
+      requests_dir: Some(requests_dir.clone()),
+      ..Default::default()
+    };
+
+    let resolved = config.resolve_paths().unwrap();
+
+    assert_eq!(resolved.usage_db, usage_db);
+    assert_eq!(resolved.sessions_db, sessions_db);
+    assert_eq!(resolved.requests_dir, requests_dir);
   }
 
   #[test]

@@ -1,12 +1,4 @@
 use bytes::Bytes;
-use std::path::PathBuf;
-
-#[derive(Clone, Debug)]
-pub struct DbPaths {
-  pub usage_db: PathBuf,
-  pub sessions_db: PathBuf,
-  pub requests_dir: PathBuf,
-}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UsageDetails {
