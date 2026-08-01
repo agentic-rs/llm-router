@@ -8,7 +8,6 @@ pub mod viewer;
 
 pub use access::{AccessDb, ApiKeyRecord, ApiKeySummaryRecord, NewApiKeyRecord};
 pub use requests::{read_request_row, RequestEventHandler};
-pub use sessions::SessionEventHandler;
 pub use viewer::{
   get_request, get_request_llm_message, get_request_llm_summary, get_request_llm_tool_definition, get_session,
   get_session_from_db, get_session_node_from_db, get_session_usage, is_valid_request_day, list_latest_requests,

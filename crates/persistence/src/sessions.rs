@@ -13,10 +13,8 @@ use tokn_core::db::SessionSource;
 use tokn_headers::inbound::{PARENT_THREAD_ID_HEADERS, THREAD_ID_HEADERS};
 use tracing::debug;
 
-mod live;
 mod semantic;
 
-pub use live::SessionEventHandler;
 use semantic::{request_messages_from_json, response_messages_from_body};
 
 const BOOTSTRAP: &str = include_str!("../schemas/snapshot/sessions/v0.2.1.sql");
