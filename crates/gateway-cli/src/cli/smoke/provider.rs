@@ -1,12 +1,14 @@
 use super::send::filter_accounts;
 use super::OutputFormat;
 use crate::config::Config;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokn_accounts::registry::Registry;
+use tokn_auth::AuthStore;
 use tokn_core::provider::{match_endpoint_rule, Endpoint, ModelInfo};
-use tokn_router::accounts::registry::Registry;
 
 #[derive(Args, Debug)]
 pub struct ProviderArgs {
@@ -173,40 +175,37 @@ fn print_provider_json(
 
 async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str) -> Result<Vec<String>> {
   let (cfg, _) = Config::load(cfg_path)?;
-  let mut accounts = crate::server_runtime::load_default_accounts()?;
+  let mut accounts = AuthStore::load(None, None)?.accounts;
   filter_accounts(&mut accounts, Some(provider_id), None)?;
 
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&cfg)?;
-  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let state = crate::server_runtime::build_state(&cfg, &accounts, events.clone())?;
+  let registry = Registry::builtin();
+  let providers = accounts
+    .into_iter()
+    .filter(|account| account.enabled)
+    .map(|account| {
+      let account_id = account.id.clone();
+      registry
+        .build(Arc::new(account))
+        .with_context(|| format!("failed to build provider for account `{account_id}`"))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  if providers.is_empty() {
+    return Err(anyhow!("no accounts configured. Run `tokn-router account add` first."));
+  }
+  let http = crate::util::http::build_client(&cfg.proxy)?;
 
   let mut ids: Vec<String> = Vec::new();
   let mut seen: HashSet<String> = HashSet::new();
   let mut last_err: Option<String> = None;
-  for acct in state.pool.all() {
-    if acct.provider.info().id != provider_id {
+  for provider in providers {
+    if provider.info().id != provider_id {
       continue;
     }
-    match acct.provider.list_models(&state.http).await {
-      Ok(v) => {
-        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-          for m in arr {
-            if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
-              if seen.insert(id.to_string()) {
-                ids.push(id.to_string());
-              }
-            }
-          }
-        }
-      }
+    match provider.list_models(&http).await {
+      Ok(value) => extend_model_ids(&value, &mut ids, &mut seen),
       Err(e) => last_err = Some(e.to_string()),
     }
   }
-
-  if let Some(rt) = archive_runtime {
-    rt.shutdown().await;
-  }
-  events.shutdown().await;
 
   if ids.is_empty() {
     let msg = last_err.unwrap_or_else(|| format!("no live models returned for provider '{provider_id}'"));
@@ -214,4 +213,55 @@ async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str
   }
   ids.sort();
   Ok(ids)
+}
+
+fn extend_model_ids(value: &serde_json::Value, ids: &mut Vec<String>, seen: &mut HashSet<String>) {
+  let Some(models) = value.get("data").and_then(serde_json::Value::as_array) else {
+    return;
+  };
+  for model in models {
+    let Some(id) = model.get("id").and_then(serde_json::Value::as_str) else {
+      continue;
+    };
+    if seen.insert(id.to_string()) {
+      ids.push(id.to_string());
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+
+  #[test]
+  fn extend_model_ids_deduplicates_and_ignores_malformed_entries() {
+    let mut ids = vec!["existing".to_string()];
+    let mut seen = HashSet::from(["existing".to_string()]);
+    let value = json!({
+      "data": [
+        {"id": "z-model"},
+        {"id": "existing"},
+        {"object": "model"},
+        {"id": 42},
+        {"id": "a-model"},
+        {"id": "z-model"},
+      ]
+    });
+
+    extend_model_ids(&value, &mut ids, &mut seen);
+
+    assert_eq!(ids, ["existing", "z-model", "a-model"]);
+  }
+
+  #[test]
+  fn extend_model_ids_ignores_non_array_data() {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+
+    extend_model_ids(&json!({"data": {"id": "ignored"}}), &mut ids, &mut seen);
+
+    assert!(ids.is_empty());
+    assert!(seen.is_empty());
+  }
 }
