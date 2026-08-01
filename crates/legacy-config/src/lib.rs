@@ -1,9 +1,6 @@
 pub mod locations;
 pub mod schema;
-// The migration contract remains internal until resource synthesis and final
-// composition are wired into the public API.
-#[allow(dead_code)]
-mod v2;
+pub mod v2;
 
 use anyhow::Result;
 use std::path::Path;

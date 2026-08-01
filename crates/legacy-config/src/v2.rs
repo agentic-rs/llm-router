@@ -4,7 +4,10 @@ use thiserror::Error;
 use tokn_config::RouteMode;
 
 mod analysis;
+mod compose;
 mod resources;
+
+pub use compose::{plan_v2_migration, V2MigrationPlan};
 
 /// Which legacy listener surface should be represented in a v2 plan.
 ///
