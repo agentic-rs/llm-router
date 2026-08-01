@@ -121,16 +121,12 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
-lzma-rust2 = "0.16.2"
 zstd = "0.13"
 
 [profile.release]
 lto = "thin"
 strip = true
 codegen-units = 1
-
-[profile.dev.package.lzma-rust2]
-opt-level = 3
 
 [profile.dev.package.zstd]
 opt-level = 3
@@ -139,9 +135,6 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.zstd-sys]
-opt-level = 3
-
-[profile.test.package.lzma-rust2]
 opt-level = 3
 
 [profile.test.package.zstd]

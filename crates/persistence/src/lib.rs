@@ -1,5 +1,4 @@
 pub mod access;
-pub mod archive;
 pub mod migrate;
 pub mod requests;
 pub mod sessions;
