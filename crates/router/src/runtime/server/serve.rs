@@ -12,7 +12,7 @@ use http::Request;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use snafu::Snafu;
 use std::convert::Infallible;
 use std::future::Future;
@@ -26,6 +26,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokn_policy::{ListenerId, ListenerKind};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serve every pre-bound listener until the supplied shutdown future resolves.
 ///
@@ -173,8 +174,7 @@ async fn serve_llm_api_connection(
       Ok::<_, Infallible>(response)
     }
   });
-  let mut builder = http1::Builder::new();
-  builder.half_close(true).keep_alive(true);
+  let builder = http1_builder();
   let connection = builder.serve_connection(TokioIo::new(stream), service);
   tokio::pin!(connection);
 
@@ -200,8 +200,7 @@ async fn serve_forward_proxy_connection(
   });
 
   let connection_result = {
-    let mut builder = http1::Builder::new();
-    builder.half_close(true).keep_alive(true);
+    let builder = http1_builder();
     let connection = builder.serve_connection(TokioIo::new(stream), service).with_upgrades();
     tokio::pin!(connection);
     tokio::select! {
@@ -219,6 +218,16 @@ async fn serve_forward_proxy_connection(
     result = upgrade.run() => result.map(Some).map_err(|source| ConnectionServeError::Connect { source }),
     _ = shutdown_requested(&mut shutdown) => Ok(None),
   }
+}
+
+fn http1_builder() -> http1::Builder {
+  let mut builder = http1::Builder::new();
+  builder
+    .half_close(true)
+    .keep_alive(true)
+    .timer(TokioTimer::new())
+    .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
+  builder
 }
 
 async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
