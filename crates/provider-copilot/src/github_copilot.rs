@@ -263,26 +263,6 @@ impl Provider for CopilotProvider {
   fn on_unauthorized(&self) {
     self.invalidate_api_token();
   }
-
-  fn needs_refresh(&self, cfg: &AccountConfig) -> bool {
-    const SKEW_SECS: i64 = 300;
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    cfg
-      .access_token_expires_at
-      .map(|exp| exp - SKEW_SECS <= now)
-      .unwrap_or(true)
-      || cfg.access_token.is_none()
-  }
-
-  async fn refresh(&self, cfg: &AccountConfig, http: &reqwest::Client) -> Result<AccountConfig> {
-    let token = self.ensure_api_token(http).await?;
-    let (_, expires_at) = self.snapshot();
-    let mut next = cfg.clone();
-    next.access_token = Some(token);
-    next.access_token_expires_at = expires_at;
-    next.last_refresh = Some(time::OffsetDateTime::now_utc().unix_timestamp());
-    Ok(next)
-  }
 }
 
 fn headers_from_settings(a: &AccountConfig) -> Result<CopilotHeaders> {
