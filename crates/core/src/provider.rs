@@ -413,12 +413,21 @@ impl HeaderPatchCtx<'_> {
   }
 }
 
+/// Provider-owned final transformation of a managed request body.
+///
+/// Managed execution invokes this after endpoint conversion and shared
+/// generation-option lowering, immediately before serializing the upstream
+/// wire body.
+pub trait InputTransformer: Send + Sync {
+  fn transform_input(&self, endpoint: Endpoint, body: Value) -> Result<Value>;
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
   fn id(&self) -> &str;
   fn info(&self) -> &ProviderInfo;
 
-  fn input_transformer(&self) -> Option<&dyn crate::pipeline::InputTransformer> {
+  fn input_transformer(&self) -> Option<&dyn InputTransformer> {
     None
   }
 
