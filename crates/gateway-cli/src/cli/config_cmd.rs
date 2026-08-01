@@ -12,6 +12,7 @@ use tokn_config::RouteMode;
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value as EditValue};
 
 mod migrate_v2;
+mod v2_io;
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
