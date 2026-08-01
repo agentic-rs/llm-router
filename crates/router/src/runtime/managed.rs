@@ -10,8 +10,9 @@ mod gateway;
 
 pub use body::{ManagedRequestBody, ManagedRequestBodyError, ManagedRequestBodyResult};
 pub use gateway::{
-  ManagedGatewayBuildError, ManagedGatewayBuildResult, ManagedGatewayError, ManagedGatewayExecutor,
-  ManagedGatewayOutcome, ManagedGatewayRequest, ManagedGatewayResult,
+  ManagedGatewayBuildError, ManagedGatewayBuildResult, ManagedGatewayError, ManagedGatewayExecution,
+  ManagedGatewayExecutor, ManagedGatewayOutcome, ManagedGatewayRequest, ManagedGatewayResult,
+  ManagedSemanticCompletion,
 };
 
 use super::{LinkedManagedRoute, LinkedProfile, LinkedRouteKind, LinkedWireIdentity};

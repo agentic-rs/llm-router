@@ -124,6 +124,13 @@ impl DownstreamLifecycle {
     self.finish(capture, BodyResult::Cancelled)
   }
 
+  pub(crate) fn finish_semantically_complete(&mut self) -> Result<(), tokn_events::TerminalSubmitError> {
+    if let Some(attempt) = &self.attempt {
+      attempt.mark_semantically_complete();
+    }
+    self.finish_complete()
+  }
+
   fn incomplete_capture(&mut self) -> BodyCapture {
     BodyCapture::Truncated {
       prefix: self.capture.split().freeze(),
