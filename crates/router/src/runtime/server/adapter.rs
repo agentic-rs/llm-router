@@ -4,16 +4,16 @@
 //! into admission and execution. In particular, a local error must close a
 //! framed HTTP/1 request because the body may not have been fully consumed.
 
-use super::connect::{prepare_connect_upgrade, ConnectUpgradeSender};
+use super::connect::{prepare_connect_upgrade, ConnectSession, ConnectUpgradeSender};
 use super::{
-  admit_forward_proxy_request, admit_llm_api_request, authenticate_forward_proxy_client, authenticate_llm_api_client,
-  handle_admitted_http, request_body_present, ConnectUpgradeUnavailableReason, ForwardProxyAdmission,
-  ListenerServerState, ServerError,
+  admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request,
+  authenticate_forward_proxy_client, authenticate_llm_api_client, handle_admitted_http, request_body_present,
+  ConnectUpgradeUnavailableReason, ForwardProxyAdmission, ListenerServerState, ServerError,
 };
 use crate::runtime::dispatch_connect;
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
-use http::header::{HeaderValue, CONNECTION};
+use http::header::{HeaderValue, CONNECTION, PROXY_AUTHORIZATION};
 use http::{Method, Request, StatusCode, Version};
 use tokn_policy::ListenerId;
 
@@ -88,6 +88,34 @@ pub(super) async fn handle_forward_proxy_request(
         Ok(StatusCode::OK.into_response())
       }
     }
+  }
+  .await;
+
+  match result {
+    Ok(response) => response,
+    Err(error) => materialize_local_error(state.listener().id(), error, version, body_present || is_connect),
+  }
+}
+
+/// Serve one HTTPS request decoded inside an authenticated CONNECT session.
+///
+/// The original CONNECT authority remains the immutable ingress destination,
+/// and the outer access context is reused for every inner keep-alive request.
+/// Proxy credentials are first-hop metadata and can never reach a selected
+/// origin or provider.
+pub(super) async fn handle_intercepted_https_request(
+  state: &ListenerServerState,
+  session: &ConnectSession,
+  mut request: Request<Body>,
+) -> Response {
+  let version = request.version();
+  let body_present = request_body_present(&request);
+  let is_connect = request.method() == Method::CONNECT;
+  request.headers_mut().remove(PROXY_AUTHORIZATION);
+
+  let result: Result<Response, ServerError> = async {
+    let admitted = admit_intercepted_https_request(&request, session.dispatch().authority())?;
+    handle_admitted_http(state, admitted, session.access(), request, body_present).await
   }
   .await;
 
@@ -386,7 +414,7 @@ mod tests {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.headers().contains_key(CONNECTION));
-    let upstream = timeout(Duration::from_secs(1), accept).await.unwrap().unwrap();
+    let mut upstream = timeout(Duration::from_secs(1), accept).await.unwrap().unwrap();
     let upgrade = receiver.try_recv().unwrap();
     assert_eq!(upgrade.session().access(), &AccessContext::unrestricted());
     assert_eq!(
@@ -396,9 +424,15 @@ mod tests {
     assert_eq!(upgrade.session().dispatch().site().listener_id(), &listener_id());
     assert!(upgrade.session().dispatch().site().rule_id().is_none());
 
-    let run_error = upgrade.run().await.unwrap_err();
-    assert_eq!(run_error.site().listener_id(), &listener_id());
-    drop(upstream);
+    drop(upgrade);
+    let mut byte = [0u8; 1];
+    assert_eq!(
+      timeout(Duration::from_secs(1), upstream.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap(),
+      0
+    );
   }
 
   #[tokio::test]

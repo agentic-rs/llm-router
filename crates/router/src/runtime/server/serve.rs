@@ -4,8 +4,11 @@
 //! Shutdown stops new accepts, cancels HTTP connections and raw tunnels at a
 //! well-defined boundary, and waits for every task to release its generation.
 
-use super::adapter::{handle_forward_proxy_request, handle_llm_api_request};
-use super::connect::{connect_upgrade_channel, ConnectRunError, ConnectRunReport};
+use super::adapter::{handle_forward_proxy_request, handle_intercepted_https_request, handle_llm_api_request};
+use super::connect::{
+  connect_upgrade_channel, ConnectRunError, ConnectRunOutcome, ConnectRunReport, ConnectRunResult, ConnectTransport,
+  ConnectUpgrade,
+};
 use super::{BoundGatewayListeners, BoundListener, ListenerServerState};
 use axum::body::Body;
 use http::Request;
@@ -23,10 +26,12 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
+use tokio_rustls::TlsAcceptor;
 use tokn_policy::{ListenerId, ListenerKind};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Serve every pre-bound listener until the supplied shutdown future resolves.
 ///
@@ -156,7 +161,7 @@ async fn serve_connection(
       Ok(ConnectionOutcome::Http)
     }
     ListenerKind::ForwardProxy => match serve_forward_proxy_connection(stream, state, shutdown).await? {
-      Some(report) => Ok(ConnectionOutcome::Tunnel(report)),
+      Some(report) => Ok(ConnectionOutcome::Connect(report)),
       None => Ok(ConnectionOutcome::Http),
     },
   }
@@ -190,6 +195,7 @@ async fn serve_forward_proxy_connection(
   mut shutdown: watch::Receiver<bool>,
 ) -> ConnectionServeResult<Option<ConnectRunReport>> {
   let (upgrades, mut upgrade_receiver) = connect_upgrade_channel();
+  let upgrade_state = state.clone();
   let service = service_fn(move |request: Request<Incoming>| {
     let state = state.clone();
     let upgrades = upgrades.clone();
@@ -215,8 +221,65 @@ async fn serve_forward_proxy_connection(
     return Ok(None);
   };
   tokio::select! {
-    result = upgrade.run() => result.map(Some).map_err(|source| ConnectionServeError::Connect { source }),
+    result = run_connect_upgrade(upgrade, upgrade_state) => {
+      result.map(Some).map_err(|source| ConnectionServeError::Connect { source })
+    },
     _ = shutdown_requested(&mut shutdown) => Ok(None),
+  }
+}
+
+async fn run_connect_upgrade(
+  upgrade: ConnectUpgrade,
+  state: Arc<ListenerServerState>,
+) -> ConnectRunResult<ConnectRunReport> {
+  let (session, on_upgrade, transport) = upgrade.into_parts();
+  let site = session.dispatch().site().clone();
+  let upgraded = on_upgrade.await.map_err(|source| ConnectRunError::DownstreamUpgrade {
+    site: site.clone(),
+    source,
+  })?;
+  let downstream = TokioIo::new(upgraded);
+
+  match transport {
+    ConnectTransport::Tunnel { mut upstream } => {
+      let mut downstream = downstream;
+      let (client_to_upstream, upstream_to_client) = tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
+        .await
+        .map_err(|source| ConnectRunError::TunnelPump { site, source })?;
+      Ok(ConnectRunReport::tunnel(
+        session,
+        client_to_upstream,
+        upstream_to_client,
+      ))
+    }
+    ConnectTransport::Intercept { prepared } => {
+      let tls = tokio::time::timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        TlsAcceptor::from(prepared.into_config()).accept(downstream),
+      )
+      .await
+      .map_err(|_| ConnectRunError::TlsHandshakeTimeout { site: site.clone() })?
+      .map_err(|source| ConnectRunError::TlsHandshake {
+        site: site.clone(),
+        source,
+      })?;
+
+      let request_session = session.clone();
+      let service = service_fn(move |request: Request<Incoming>| {
+        let state = state.clone();
+        let session = request_session.clone();
+        async move {
+          let response = handle_intercepted_https_request(&state, &session, request.map(Body::new)).await;
+          Ok::<_, Infallible>(response)
+        }
+      });
+      let builder = http1_builder();
+      builder
+        .serve_connection(TokioIo::new(tls), service)
+        .await
+        .map_err(|source| ConnectRunError::InterceptHttp { site, source })?;
+      Ok(ConnectRunReport::intercepted(session))
+    }
   }
 }
 
@@ -245,22 +308,36 @@ fn log_connection_result(
     Ok((peer, Ok(ConnectionOutcome::Http))) => {
       tracing::trace!(%listener, %peer, "HTTP connection completed");
     }
-    Ok((peer, Ok(ConnectionOutcome::Tunnel(report)))) => {
-      tracing::debug!(
-        %listener,
-        %peer,
-        site = %report.session().dispatch().site(),
-        client_key_id = report.session().access().key_id.as_deref(),
-        client_to_upstream = report.client_to_upstream(),
-        upstream_to_client = report.upstream_to_client(),
-        "CONNECT tunnel completed"
-      );
-    }
+    Ok((peer, Ok(ConnectionOutcome::Connect(report)))) => match report.outcome() {
+      ConnectRunOutcome::Tunnel {
+        client_to_upstream,
+        upstream_to_client,
+      } => {
+        tracing::debug!(
+          %listener,
+          %peer,
+          site = %report.session().dispatch().site(),
+          client_key_id = report.session().access().key_id.as_deref(),
+          client_to_upstream,
+          upstream_to_client,
+          "CONNECT tunnel completed"
+        );
+      }
+      ConnectRunOutcome::Intercept => {
+        tracing::debug!(
+          %listener,
+          %peer,
+          site = %report.session().dispatch().site(),
+          client_key_id = report.session().access().key_id.as_deref(),
+          "intercepted HTTPS connection completed"
+        );
+      }
+    },
     Ok((peer, Err(ConnectionServeError::Http { source }))) => {
       tracing::debug!(%listener, %peer, error = %source, "HTTP connection failed");
     }
     Ok((peer, Err(ConnectionServeError::Connect { source }))) => {
-      tracing::warn!(%listener, %peer, site = %source.site(), error = %source, "CONNECT tunnel failed");
+      tracing::warn!(%listener, %peer, site = %source.site(), error = %source, "CONNECT session failed");
     }
     Err(error) => {
       tracing::error!(%listener, error = %error, "connection task failed");
@@ -270,7 +347,7 @@ fn log_connection_result(
 
 enum ConnectionOutcome {
   Http,
-  Tunnel(ConnectRunReport),
+  Connect(ConnectRunReport),
 }
 
 #[derive(Debug, Snafu)]
@@ -278,7 +355,7 @@ enum ConnectionServeError {
   #[snafu(display("HTTP/1 connection failed: {source}"))]
   Http { source: hyper::Error },
 
-  #[snafu(display("CONNECT tunnel failed: {source}"))]
+  #[snafu(display("CONNECT session failed: {source}"))]
   Connect { source: ConnectRunError },
 }
 
@@ -303,17 +380,23 @@ mod tests {
     bind_gateway_listeners, link_gateway_runtime, materialize_listeners, GatewayServerState, GatewayServingDefaults,
     LinkedGatewayRuntime, RequestBodyLimits, RuntimeNameRegistry,
   };
+  use rustls::pki_types::ServerName;
+  use rustls::{ClientConfig, RootCertStore};
   use std::collections::BTreeMap;
+  use std::io::BufReader;
   use std::net::Ipv4Addr;
+  use std::path::{Path, PathBuf};
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::TcpListener;
   use tokio::sync::oneshot;
   use tokio::time::timeout;
+  use tokio_rustls::TlsConnector;
   use tokn_access::AccessContext;
   use tokn_accounts::registry::Registry;
   use tokn_core::util::http::HttpClientOptions;
   use tokn_policy::{
     ClientAuthPlan, ConnectAction, ForwardProxyListenerPlan, GatewayPlan, HttpAction, ListenerPlan, LlmApiListenerPlan,
+    TlsPlan,
   };
 
   const TEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -349,6 +432,28 @@ mod tests {
     )
   }
 
+  fn intercept_plan(bind: SocketAddr, ca_dir: PathBuf) -> GatewayPlan {
+    GatewayPlan::new(
+      BTreeMap::from([(
+        listener_id(),
+        ListenerPlan::ForwardProxy(ForwardProxyListenerPlan::new(
+          bind,
+          ClientAuthPlan::None,
+          Box::default(),
+          HttpAction::Reject,
+          Box::default(),
+          ConnectAction::Intercept,
+          Some(TlsPlan::new(ca_dir)),
+        )),
+      )]),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+    )
+  }
+
   fn linked_runtime(plan: &GatewayPlan) -> Arc<LinkedGatewayRuntime> {
     Arc::new(link_gateway_runtime(plan, &[], &Registry::builtin(), &RuntimeNameRegistry::builtin()).unwrap())
   }
@@ -374,6 +479,32 @@ mod tests {
     Arc::new(ListenerServerState::new(serving_generation(runtime), resource))
   }
 
+  fn intercept_state(bind: SocketAddr) -> (tempfile::TempDir, Arc<ListenerServerState>, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let plan = intercept_plan(bind, temp.path().join("ca"));
+    let runtime = linked_runtime(&plan);
+    let resources = materialize_listeners(runtime.listeners(), None).unwrap();
+    let resource = resources.listener(&listener_id()).unwrap().clone();
+    let ca_cert = resource.kind().proxy_ca().unwrap().cert_path();
+    let state = Arc::new(ListenerServerState::new(serving_generation(runtime), resource));
+    (temp, state, ca_cert)
+  }
+
+  fn tls_client_config(ca_cert: &Path) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    let mut reader = BufReader::new(std::fs::File::open(ca_cert).unwrap());
+    for certificate in rustls_pemfile::certs(&mut reader) {
+      roots.add(certificate.unwrap()).unwrap();
+    }
+    let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+      .with_safe_default_protocol_versions()
+      .unwrap()
+      .with_root_certificates(roots)
+      .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+  }
+
   async fn bound_generation() -> (BoundGatewayListeners, SocketAddr, std::sync::Weak<GatewayServerState>) {
     let reservation = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let reserved_address = reservation.local_addr().unwrap();
@@ -388,7 +519,10 @@ mod tests {
     (bound, address, weak)
   }
 
-  async fn read_response_head(stream: &mut TcpStream) -> (Vec<u8>, Vec<u8>) {
+  async fn read_response_head<S>(stream: &mut S) -> (Vec<u8>, Vec<u8>)
+  where
+    S: tokio::io::AsyncRead + Unpin,
+  {
     let mut received = Vec::new();
     loop {
       if let Some(index) = received.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -403,13 +537,29 @@ mod tests {
     }
   }
 
-  async fn fill_to(stream: &mut TcpStream, bytes: &mut Vec<u8>, length: usize) {
+  async fn fill_to<S>(stream: &mut S, bytes: &mut Vec<u8>, length: usize)
+  where
+    S: tokio::io::AsyncRead + Unpin,
+  {
     while bytes.len() < length {
       let mut chunk = [0u8; 64];
       let count = stream.read(&mut chunk).await.unwrap();
       assert_ne!(count, 0, "tunnel closed before the expected bytes arrived");
       bytes.extend_from_slice(&chunk[..count]);
     }
+  }
+
+  fn response_content_length(head: &[u8]) -> usize {
+    std::str::from_utf8(head)
+      .unwrap()
+      .lines()
+      .find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name
+          .eq_ignore_ascii_case("content-length")
+          .then(|| value.trim().parse().unwrap())
+      })
+      .expect("test response has a content length")
   }
 
   #[tokio::test]
@@ -531,10 +681,12 @@ mod tests {
       .unwrap()
       .unwrap()
       .expect("a successful CONNECT returns one report");
-    assert_eq!(report.client_to_upstream(), (EARLY.len() + LATER.len()) as u64);
     assert_eq!(
-      report.upstream_to_client(),
-      (READY.len() + REPLY.len() + FINAL.len()) as u64
+      report.outcome(),
+      ConnectRunOutcome::Tunnel {
+        client_to_upstream: (EARLY.len() + LATER.len()) as u64,
+        upstream_to_client: (READY.len() + REPLY.len() + FINAL.len()) as u64,
+      }
     );
     assert_eq!(report.session().access(), &AccessContext::unrestricted());
     assert_eq!(
@@ -543,6 +695,67 @@ mod tests {
     );
     assert_eq!(report.session().dispatch().site().listener_id(), &listener_id());
     assert!(report.session().dispatch().site().rule_id().is_none());
+    drop(shutdown_tx);
+  }
+
+  #[tokio::test]
+  async fn intercepted_connect_serves_https_with_the_connect_identity() {
+    let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let (_temp, state, ca_cert) = intercept_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_503)));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let connection = tokio::spawn(async move {
+      let (stream, _) = proxy_listener.accept().await.unwrap();
+      serve_forward_proxy_connection(stream, state, shutdown_rx).await
+    });
+
+    let mut client = TcpStream::connect(proxy_address).await.unwrap();
+    client
+      .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
+      .await
+      .unwrap();
+    let (head, read_ahead) = timeout(TEST_TIMEOUT, read_response_head(&mut client)).await.unwrap();
+    let head = std::str::from_utf8(&head).unwrap();
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "unexpected response: {head:?}");
+    assert!(read_ahead.is_empty());
+
+    let server_name = ServerName::try_from("api.example.test").unwrap().to_owned();
+    let mut tls = timeout(
+      TEST_TIMEOUT,
+      TlsConnector::from(tls_client_config(&ca_cert)).connect(server_name, client),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
+    tls
+      .write_all(b"GET /v1/models HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n")
+      .await
+      .unwrap();
+    let (head, mut body) = timeout(TEST_TIMEOUT, read_response_head(&mut tls)).await.unwrap();
+    assert!(std::str::from_utf8(&head)
+      .unwrap()
+      .starts_with("HTTP/1.1 403 Forbidden\r\n"));
+    let content_length = response_content_length(&head);
+    timeout(TEST_TIMEOUT, fill_to(&mut tls, &mut body, content_length))
+      .await
+      .unwrap();
+    assert_eq!(body.len(), content_length);
+    assert!(std::str::from_utf8(&body)
+      .unwrap()
+      .contains("\"code\":\"route_rejected\""));
+
+    let report = timeout(TEST_TIMEOUT, connection)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap()
+      .expect("a successful intercepted CONNECT returns one report");
+    assert_eq!(report.outcome(), ConnectRunOutcome::Intercept);
+    assert_eq!(
+      report.session().dispatch().authority().authority().to_string(),
+      "api.example.test:443"
+    );
     drop(shutdown_tx);
   }
 

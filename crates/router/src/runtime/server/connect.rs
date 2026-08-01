@@ -1,19 +1,20 @@
-//! Prepared CONNECT upgrades and post-response tunnel execution.
+//! Prepared CONNECT upgrades and post-response execution state.
 //!
 //! CONNECT setup is split at the response boundary. Policy rejection,
-//! interception availability, and upstream dialing all complete before a 200
+//! pinned TLS identity creation, and upstream dialing all complete before a 200
 //! response can be returned. Once the response is committed, the owning
 //! connection task runs the prepared upgrade and reports only post-response
 //! transport failures.
 
+use super::intercept::{prepare_tls_intercept, PreparedTlsIntercept};
 use super::{BoxTunnelIo, ConnectUpgradeUnavailableReason, ListenerServerState, ServerError};
 use crate::runtime::{ConnectDispatch, ConnectDispatchSite};
 use axum::body::Body;
 use http::Request;
 use hyper::upgrade::OnUpgrade;
-use hyper_util::rt::TokioIo;
 use snafu::Snafu;
 use std::io;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokn_access::AccessContext;
 use tokn_policy::ConnectAction;
@@ -40,9 +41,9 @@ impl ConnectSession {
 /// The listener adapter transfers this value to the owning connection task
 /// before returning 200. Dropping it closes the prepared upstream.
 pub(super) struct ConnectUpgrade {
-  session: ConnectSession,
+  session: Arc<ConnectSession>,
   on_upgrade: OnUpgrade,
-  upstream: BoxTunnelIo,
+  transport: ConnectTransport,
 }
 
 impl ConnectUpgrade {
@@ -50,51 +51,57 @@ impl ConnectUpgrade {
     &self.session
   }
 
-  /// Await Hyper's downstream upgrade and pump bytes in both directions.
-  pub(super) async fn run(self) -> ConnectRunResult<ConnectRunReport> {
-    let Self {
-      session,
-      on_upgrade,
-      mut upstream,
-    } = self;
-    let site = session.dispatch().site().clone();
-    let upgraded = on_upgrade.await.map_err(|source| ConnectRunError::DownstreamUpgrade {
-      site: site.clone(),
-      source,
-    })?;
-    let mut downstream = TokioIo::new(upgraded);
-    let (client_to_upstream, upstream_to_client) = tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
-      .await
-      .map_err(|source| ConnectRunError::TunnelPump { site, source })?;
-
-    Ok(ConnectRunReport {
-      session,
-      client_to_upstream,
-      upstream_to_client,
-    })
+  pub(super) fn into_parts(self) -> (Arc<ConnectSession>, OnUpgrade, ConnectTransport) {
+    (self.session, self.on_upgrade, self.transport)
   }
 }
 
-/// Successful byte counts and session identity for one completed tunnel.
+pub(super) enum ConnectTransport {
+  Tunnel { upstream: BoxTunnelIo },
+  Intercept { prepared: PreparedTlsIntercept },
+}
+
+/// Session identity and transport-specific outcome for one completed CONNECT.
 #[derive(Debug)]
 pub(super) struct ConnectRunReport {
-  session: ConnectSession,
-  client_to_upstream: u64,
-  upstream_to_client: u64,
+  session: Arc<ConnectSession>,
+  outcome: ConnectRunOutcome,
 }
 
 impl ConnectRunReport {
+  pub(super) fn tunnel(session: Arc<ConnectSession>, client_to_upstream: u64, upstream_to_client: u64) -> Self {
+    Self {
+      session,
+      outcome: ConnectRunOutcome::Tunnel {
+        client_to_upstream,
+        upstream_to_client,
+      },
+    }
+  }
+
+  pub(super) fn intercepted(session: Arc<ConnectSession>) -> Self {
+    Self {
+      session,
+      outcome: ConnectRunOutcome::Intercept,
+    }
+  }
+
   pub(super) fn session(&self) -> &ConnectSession {
     &self.session
   }
 
-  pub(super) const fn client_to_upstream(&self) -> u64 {
-    self.client_to_upstream
+  pub(super) const fn outcome(&self) -> ConnectRunOutcome {
+    self.outcome
   }
+}
 
-  pub(super) const fn upstream_to_client(&self) -> u64 {
-    self.upstream_to_client
-  }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConnectRunOutcome {
+  Tunnel {
+    client_to_upstream: u64,
+    upstream_to_client: u64,
+  },
+  Intercept,
 }
 
 /// A failure after a successful CONNECT response was committed.
@@ -111,12 +118,31 @@ pub(super) enum ConnectRunError {
     site: ConnectDispatchSite,
     source: io::Error,
   },
+
+  #[snafu(display("TLS handshake timed out for {site}"))]
+  TlsHandshakeTimeout { site: ConnectDispatchSite },
+
+  #[snafu(display("TLS handshake failed for {site}: {source}"))]
+  TlsHandshake {
+    site: ConnectDispatchSite,
+    source: io::Error,
+  },
+
+  #[snafu(display("intercepted HTTPS connection failed for {site}: {source}"))]
+  InterceptHttp {
+    site: ConnectDispatchSite,
+    source: hyper::Error,
+  },
 }
 
 impl ConnectRunError {
   pub(super) fn site(&self) -> &ConnectDispatchSite {
     match self {
-      Self::DownstreamUpgrade { site, .. } | Self::TunnelPump { site, .. } => site,
+      Self::DownstreamUpgrade { site, .. }
+      | Self::TunnelPump { site, .. }
+      | Self::TlsHandshakeTimeout { site }
+      | Self::TlsHandshake { site, .. }
+      | Self::InterceptHttp { site, .. } => site,
     }
   }
 }
@@ -137,32 +163,40 @@ pub(super) async fn prepare_connect_upgrade(
   access: AccessContext,
   request: &mut Request<Body>,
 ) -> Result<ConnectUpgrade, ServerError> {
-  match dispatch.action() {
-    ConnectAction::Reject => Err(ServerError::connect_rejected(dispatch.site().clone())),
-    ConnectAction::Intercept => Err(ServerError::connect_interception_unavailable(dispatch.site().clone())),
-    ConnectAction::Tunnel => {
-      if request.extensions().get::<OnUpgrade>().is_none() {
-        return Err(ServerError::connect_upgrade_unavailable(
-          dispatch.site().clone(),
-          ConnectUpgradeUnavailableReason::MissingToken,
-        ));
-      }
+  if dispatch.action() == ConnectAction::Reject {
+    return Err(ServerError::connect_rejected(dispatch.site().clone()));
+  }
+  if request.extensions().get::<OnUpgrade>().is_none() {
+    return Err(ServerError::connect_upgrade_unavailable(
+      dispatch.site().clone(),
+      ConnectUpgradeUnavailableReason::MissingToken,
+    ));
+  }
 
+  let transport = match dispatch.action() {
+    ConnectAction::Reject => unreachable!("rejected CONNECT returned before transport preparation"),
+    ConnectAction::Intercept => {
+      let prepared = prepare_tls_intercept(state, &dispatch)
+        .map_err(|source| ServerError::connect_interception_setup(dispatch.site().clone(), source))?;
+      ConnectTransport::Intercept { prepared }
+    }
+    ConnectAction::Tunnel => {
       let upstream = state
         .gateway()
         .tunnel_connector()
         .connect(dispatch.authority().authority())
         .await
         .map_err(|source| ServerError::tunnel_connect(dispatch.site().clone(), source))?;
-
-      // Taking `OnUpgrade` is intentionally last: all recoverable setup
-      // failures must remain materializable as an HTTP response.
-      let on_upgrade = hyper::upgrade::on(request);
-      Ok(ConnectUpgrade {
-        session: ConnectSession { dispatch, access },
-        on_upgrade,
-        upstream,
-      })
+      ConnectTransport::Tunnel { upstream }
     }
-  }
+  };
+
+  // Taking `OnUpgrade` is intentionally last: all recoverable setup
+  // failures must remain materializable as an HTTP response.
+  let on_upgrade = hyper::upgrade::on(request);
+  Ok(ConnectUpgrade {
+    session: Arc::new(ConnectSession { dispatch, access }),
+    on_upgrade,
+    transport,
+  })
 }

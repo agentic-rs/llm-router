@@ -118,6 +118,7 @@ pub enum AdmissionError {
   ConnectMethodRequired {
     method: Method,
   },
+  NestedConnectUnsupported,
   UnsupportedScheme {
     expected: HttpScheme,
     found: String,
@@ -155,6 +156,9 @@ impl fmt::Display for AdmissionError {
           "authority-form request target requires CONNECT, found {method}"
         )
       }
+      Self::NestedConnectUnsupported => {
+        formatter.write_str("CONNECT is not supported inside an intercepted HTTPS connection")
+      }
       Self::UnsupportedScheme { expected, found } => {
         write!(formatter, "expected {expected} URI scheme, found `{found}`")
       }
@@ -183,6 +187,7 @@ impl std::error::Error for AdmissionError {
       Self::InvalidPath { source } => Some(source),
       Self::WrongTargetForm { .. }
       | Self::ConnectMethodRequired { .. }
+      | Self::NestedConnectUnsupported
       | Self::UnsupportedScheme { .. }
       | Self::MissingHost
       | Self::MultipleHostValues { .. }
@@ -266,6 +271,9 @@ pub fn admit_intercepted_https_request<B>(
   request: &Request<B>,
   connect: &IngressAuthority,
 ) -> Result<AdmittedHttpRequest, AdmissionError> {
+  if request.method() == Method::CONNECT {
+    return Err(AdmissionError::NestedConnectUnsupported);
+  }
   let ingress = match request_target_form(request.uri()) {
     RequestTargetForm::Origin => {
       let host = required_host(request.headers())?;
@@ -611,6 +619,19 @@ mod tests {
         ..
       })
     ));
+  }
+
+  #[test]
+  fn intercepted_https_rejects_nested_connect_independent_of_target_form() {
+    let connect = connect_authority("api.example.test:443");
+
+    for target in ["nested.example.test:443", "/tunnel", "https://api.example.test/tunnel"] {
+      let request = make_request(Method::CONNECT, target, &[]);
+      assert_eq!(
+        admit_intercepted_https_request(&request, &connect),
+        Err(AdmissionError::NestedConnectUnsupported)
+      );
+    }
   }
 
   #[test]

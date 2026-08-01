@@ -11,6 +11,7 @@ mod body;
 mod connect;
 mod error;
 mod http;
+mod intercept;
 mod response;
 mod serve;
 mod state;

@@ -68,8 +68,9 @@ pub enum ServerError {
   ConnectRejected {
     site: ConnectDispatchSite,
   },
-  ConnectInterceptionUnavailable {
+  ConnectInterceptionSetup {
     site: ConnectDispatchSite,
+    source: anyhow::Error,
   },
   TunnelConnect {
     site: ConnectDispatchSite,
@@ -123,9 +124,9 @@ impl ServerError {
     Self::ConnectRejected { site }
   }
 
-  /// Report an interception decision until pinned TLS serving is available.
-  pub fn connect_interception_unavailable(site: ConnectDispatchSite) -> Self {
-    Self::ConnectInterceptionUnavailable { site }
+  /// Preserve a pre-response TLS identity/configuration failure for logs.
+  pub fn connect_interception_setup(site: ConnectDispatchSite, source: anyhow::Error) -> Self {
+    Self::ConnectInterceptionSetup { site, source }
   }
 
   /// Preserve the policy location and rich outbound tunnel failure for logs.
@@ -186,11 +187,13 @@ impl ServerError {
     match self {
       Self::Admission(source) => admission_descriptor(source),
       Self::ClientAuth { boundary, source } => auth_descriptor(*boundary, *source),
-      Self::ConnectDispatch(_) | Self::ConnectUpgradeUnavailable { .. } => ErrorDescriptor::new(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
-        "the CONNECT request could not be processed",
-      ),
+      Self::ConnectDispatch(_) | Self::ConnectInterceptionSetup { .. } | Self::ConnectUpgradeUnavailable { .. } => {
+        ErrorDescriptor::new(
+          StatusCode::INTERNAL_SERVER_ERROR,
+          "internal_error",
+          "the CONNECT request could not be processed",
+        )
+      }
       Self::ConnectBodyUnsupported { .. } => ErrorDescriptor::new(
         StatusCode::BAD_REQUEST,
         "invalid_connect_body",
@@ -200,11 +203,6 @@ impl ServerError {
         StatusCode::FORBIDDEN,
         "connect_rejected",
         "listener policy rejected this CONNECT request",
-      ),
-      Self::ConnectInterceptionUnavailable { .. } => ErrorDescriptor::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "connect_interception_unavailable",
-        "CONNECT interception is not available",
       ),
       Self::TunnelConnect {
         source: TunnelConnectError::Timeout { .. },
@@ -272,11 +270,8 @@ impl fmt::Display for ServerError {
         write!(formatter, "listener '{listener}' rejected CONNECT request body framing")
       }
       Self::ConnectRejected { site } => write!(formatter, "{site} explicitly rejected CONNECT"),
-      Self::ConnectInterceptionUnavailable { site } => {
-        write!(
-          formatter,
-          "{site} selected CONNECT interception before its transport was available"
-        )
+      Self::ConnectInterceptionSetup { site, source } => {
+        write!(formatter, "failed to prepare intercepted TLS for {site}: {source}")
       }
       Self::TunnelConnect { site, source } => write!(formatter, "failed to establish tunnel for {site}: {source}"),
       Self::ConnectUpgradeUnavailable { site, reason } => {
@@ -307,6 +302,7 @@ impl std::error::Error for ServerError {
       Self::Admission(source) => Some(source),
       Self::ClientAuth { source, .. } => Some(source),
       Self::ConnectDispatch(source) => Some(source),
+      Self::ConnectInterceptionSetup { source, .. } => Some(source.as_ref()),
       Self::TunnelConnect { source, .. } => Some(source),
       Self::RequestBody(source) => Some(source),
       Self::Dispatch(source) => Some(source),
@@ -314,7 +310,6 @@ impl std::error::Error for ServerError {
       Self::ResponseBridge(source) => Some(source),
       Self::ConnectBodyUnsupported { .. }
       | Self::ConnectRejected { .. }
-      | Self::ConnectInterceptionUnavailable { .. }
       | Self::ConnectUpgradeUnavailable { .. }
       | Self::RouteRejected { .. }
       | Self::NoEligible { .. }
@@ -404,6 +399,11 @@ fn admission_descriptor(source: &AdmissionError) -> ErrorDescriptor {
       StatusCode::METHOD_NOT_ALLOWED,
       "method_not_allowed",
       "CONNECT is required for an authority-form request target",
+    ),
+    AdmissionError::NestedConnectUnsupported => ErrorDescriptor::new(
+      StatusCode::NOT_IMPLEMENTED,
+      "nested_connect_unsupported",
+      "CONNECT is not supported inside an intercepted HTTPS connection",
     ),
     AdmissionError::WrongTargetForm { .. } => ErrorDescriptor::new(
       StatusCode::BAD_REQUEST,
@@ -689,6 +689,10 @@ mod tests {
     assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(method.code(), "method_not_allowed");
 
+    let nested = ServerError::from(AdmissionError::NestedConnectUnsupported);
+    assert_eq!(nested.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(nested.code(), "nested_connect_unsupported");
+
     let malformed = ServerError::from(AdmissionError::MissingHost);
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     assert_eq!(malformed.code(), "invalid_host");
@@ -751,9 +755,14 @@ mod tests {
     assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
     assert_eq!(rejected.code(), "connect_rejected");
 
-    let unavailable = ServerError::connect_interception_unavailable(connect_site());
-    assert_eq!(unavailable.status(), StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(unavailable.code(), "connect_interception_unavailable");
+    let setup = ServerError::connect_interception_setup(connect_site(), anyhow::anyhow!("sensitive TLS setup detail"));
+    assert_eq!(setup.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(setup.code(), "internal_error");
+    assert!(setup.to_string().contains("sensitive TLS setup detail"));
+    assert_eq!(
+      std::error::Error::source(&setup).unwrap().to_string(),
+      "sensitive TLS setup detail"
+    );
 
     let scheduling =
       ServerError::connect_upgrade_unavailable(connect_site(), ConnectUpgradeUnavailableReason::OwnerClosed);
@@ -812,6 +821,18 @@ mod tests {
     assert!(!text.contains("private.example"));
     assert!(!text.contains("8443"));
     assert!(!text.contains("407"));
+  }
+
+  #[tokio::test]
+  async fn interception_setup_response_hides_source_details() {
+    let response =
+      ServerError::connect_interception_setup(connect_site(), anyhow::anyhow!("sensitive TLS setup detail"))
+        .into_response();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+
+    assert!(!text.contains("sensitive TLS setup detail"));
+    assert!(!text.contains("TLS"));
   }
 
   #[test]
