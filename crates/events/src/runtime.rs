@@ -4,16 +4,23 @@
 //! Consumers are fixed before the hub starts, so the first accepted event is
 //! observed by the same consumer set as the last one. The dispatcher assigns a
 //! hub-wide sequence and calls consumers synchronously in registration order.
+//!
+//! Streaming finalizers use a separate nonblocking control lane. A body guard
+//! already owns its fallback factory; dropping it only transfers that ownership
+//! to a dedicated relay thread. The relay materializes terminal facts and alone
+//! waits for the normal bounded ingress. The control lane is intentionally not
+//! advertised as bounded request admission.
 
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+use std::time::{Instant, SystemTime};
 
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 const DEFAULT_CAPACITY: usize = 1_024;
 
@@ -150,6 +157,134 @@ pub enum HubStatus {
   Failed(Arc<HubFailure>),
 }
 
+/// Submission time captured synchronously when a stream explicitly finishes
+/// or its body is dropped.
+///
+/// A deferred terminal factory receives this value on the relay thread. It can
+/// combine the exact teardown time with shared flow state containing current
+/// byte counts, attempts, usage, and the next request-local sequence.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalContext {
+  submitted_at: Instant,
+  submitted_at_system_time: SystemTime,
+}
+
+impl TerminalContext {
+  fn now() -> Self {
+    Self {
+      submitted_at: Instant::now(),
+      submitted_at_system_time: SystemTime::now(),
+    }
+  }
+
+  #[must_use]
+  pub const fn submitted_at(self) -> Instant {
+    self.submitted_at
+  }
+
+  #[must_use]
+  pub const fn submitted_at_system_time(self) -> SystemTime {
+    self.submitted_at_system_time
+  }
+}
+
+/// A non-empty, ordered group of terminal lifecycle events.
+///
+/// A stream commonly closes with body completion, optional usage, and request
+/// completion. Keeping those observations in one batch prevents shutdown from
+/// placing its barrier between them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalBatch<E> {
+  first: E,
+  rest: Vec<E>,
+}
+
+impl<E> TerminalBatch<E> {
+  #[must_use]
+  pub fn one(event: E) -> Self {
+    Self {
+      first: event,
+      rest: Vec::new(),
+    }
+  }
+
+  #[must_use]
+  pub fn new(first: E, rest: Vec<E>) -> Self {
+    Self { first, rest }
+  }
+
+  #[must_use]
+  pub fn len(&self) -> usize {
+    1 + self.rest.len()
+  }
+
+  #[must_use]
+  pub const fn is_empty(&self) -> bool {
+    false
+  }
+
+  fn into_events(self) -> impl Iterator<Item = E> {
+    std::iter::once(self.first).chain(self.rest)
+  }
+}
+
+/// Why a guarded flow could not be registered with its first event.
+#[derive(Clone, Eq, PartialEq)]
+pub enum TerminalRegistrationError<E> {
+  Closed(E),
+  Failed { event: E, failure: Arc<HubFailure> },
+}
+
+impl<E> TerminalRegistrationError<E> {
+  #[must_use]
+  pub fn into_event(self) -> E {
+    match self {
+      Self::Closed(event) | Self::Failed { event, .. } => event,
+    }
+  }
+}
+
+impl<E> fmt::Debug for TerminalRegistrationError<E> {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Closed(_) => formatter.write_str("TerminalRegistrationError::Closed(..)"),
+      Self::Failed { failure, .. } => formatter
+        .debug_tuple("TerminalRegistrationError::Failed")
+        .field(failure)
+        .finish(),
+    }
+  }
+}
+
+impl<E> fmt::Display for TerminalRegistrationError<E> {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Closed(_) => formatter.write_str("event hub is closed"),
+      Self::Failed { failure, .. } => write!(formatter, "event hub failed: {failure}"),
+    }
+  }
+}
+
+impl<E> Error for TerminalRegistrationError<E> {}
+
+/// A terminal batch could not be transferred to its dedicated relay.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum TerminalSubmitError {
+  #[error("event hub is closed")]
+  Closed,
+  #[error("event hub failed: {0}")]
+  Failed(Arc<HubFailure>),
+  #[error("event terminal relay stopped unexpectedly")]
+  RelayStopped,
+}
+
+/// Result of explicitly abandoning unresolved terminal obligations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForcedShutdown {
+  pub delivery: DeliveryStats,
+  pub abandoned_terminal_obligations: usize,
+}
+
 /// Builds a statically registered event hub.
 pub struct HubBuilder<E> {
   capacity: usize,
@@ -216,13 +351,31 @@ where
       .spawn(move || dispatch(receiver, consumers, dispatcher_state))
       .map_err(HubBuildError::SpawnDispatcher)?;
 
+    let (terminal_sender, terminal_receiver) = std_mpsc::channel();
+    let terminal_state = Arc::clone(&state);
+    let terminal_ingress = sender.clone();
+    let terminal_relay = match thread::Builder::new()
+      .name("tokn-event-terminal".to_owned())
+      .spawn(move || relay_terminals(terminal_receiver, terminal_ingress, terminal_state))
+    {
+      Ok(relay) => relay,
+      Err(error) => {
+        drop(sender);
+        let _ = dispatcher.join();
+        return Err(HubBuildError::SpawnTerminalRelay(error));
+      }
+    };
+
     let publisher = Publisher {
       sender: sender.clone(),
       state: Arc::clone(&state),
+      terminal_sender: terminal_sender.clone(),
     };
     let hub = EventHub {
       sender,
       state,
+      terminal_sender,
+      terminal_relay: Some(terminal_relay),
       dispatcher: Some(dispatcher),
     };
     Ok((publisher, hub))
@@ -237,12 +390,15 @@ pub enum HubBuildError {
   NoConsumers,
   #[error("failed to spawn event dispatcher thread")]
   SpawnDispatcher(#[source] std::io::Error),
+  #[error("failed to spawn event terminal relay thread")]
+  SpawnTerminalRelay(#[source] std::io::Error),
 }
 
 /// Cloneable event publisher with bounded, backpressured ingress.
 pub struct Publisher<E> {
   sender: mpsc::Sender<Message<E>>,
   state: Arc<SharedState>,
+  terminal_sender: std_mpsc::Sender<TerminalRelayMessage<E>>,
 }
 
 impl<E> Clone for Publisher<E> {
@@ -250,6 +406,7 @@ impl<E> Clone for Publisher<E> {
     Self {
       sender: self.sender.clone(),
       state: Arc::clone(&self.state),
+      terminal_sender: self.terminal_sender.clone(),
     }
   }
 }
@@ -302,7 +459,7 @@ impl<E> Publisher<E> {
         event,
         failure: Arc::clone(failure),
       }),
-      InternalStatus::Closing | InternalStatus::Closed(_) => Err(PublishError::Closed(event)),
+      InternalStatus::Closing { .. } | InternalStatus::Closed(_) => Err(PublishError::Closed(event)),
     }
   }
 
@@ -316,7 +473,7 @@ impl<E> Publisher<E> {
           failure: Arc::clone(failure),
         });
       }
-      InternalStatus::Closing | InternalStatus::Closed(_) => return Err(TryPublishError::Closed(event)),
+      InternalStatus::Closing { .. } | InternalStatus::Closed(_) => return Err(TryPublishError::Closed(event)),
       InternalStatus::Running => {}
     }
 
@@ -334,6 +491,63 @@ impl<E> Publisher<E> {
         Err(self.classify_try_publish_error(event))
       }
       Err(_) => unreachable!("publisher only sends event messages through try_publish"),
+    }
+  }
+
+  /// Atomically admits a request's first event and registers its terminal
+  /// fallback before returning the lifecycle guard.
+  ///
+  /// Shutdown can therefore observe neither a guarded `Started` event without
+  /// its terminal obligation nor an obligation whose `Started` event was
+  /// rejected. Cancelling this future before admission does neither operation.
+  /// The fallback runs on the terminal relay and must not perform blocking I/O;
+  /// forced shutdown detaches the relay if a factory nevertheless gets stuck.
+  pub async fn begin_guarded<F>(
+    &self,
+    started: E,
+    fallback: F,
+  ) -> Result<TerminalGuard<E>, TerminalRegistrationError<E>>
+  where
+    F: FnOnce(TerminalContext) -> TerminalBatch<E> + Send + 'static,
+  {
+    match self.state.status() {
+      HubStatus::Running => {}
+      HubStatus::Failed(failure) => {
+        return Err(TerminalRegistrationError::Failed {
+          event: started,
+          failure,
+        });
+      }
+      HubStatus::Closing | HubStatus::Closed(_) => return Err(TerminalRegistrationError::Closed(started)),
+    }
+
+    let permit = match self.sender.clone().reserve_owned().await {
+      Ok(permit) => permit,
+      Err(_) => return Err(self.classify_terminal_registration_error(started)),
+    };
+    let fallback: TerminalFactory<E> = Box::new(fallback);
+    let mut admission = self.state.lock();
+    match &admission.status {
+      InternalStatus::Running => {
+        admission.terminal_obligations = admission
+          .terminal_obligations
+          .checked_add(1)
+          .expect("terminal obligation counter overflowed");
+        permit.send(Message::Event(started));
+        admission.accepted = admission
+          .accepted
+          .checked_add(1)
+          .expect("event acceptance counter overflowed");
+        Ok(TerminalGuard {
+          publisher: self.clone(),
+          fallback: Some(fallback),
+        })
+      }
+      InternalStatus::Failed(failure) => Err(TerminalRegistrationError::Failed {
+        event: started,
+        failure: Arc::clone(failure),
+      }),
+      InternalStatus::Closing { .. } | InternalStatus::Closed(_) => Err(TerminalRegistrationError::Closed(started)),
     }
   }
 
@@ -359,7 +573,7 @@ impl<E> Publisher<E> {
           permit.send(Message::Flush(completion_tx));
         }
         InternalStatus::Failed(failure) => return Err(FlushError::Failed(Arc::clone(failure))),
-        InternalStatus::Closing | InternalStatus::Closed(_) => return Err(FlushError::Closed),
+        InternalStatus::Closing { .. } | InternalStatus::Closed(_) => return Err(FlushError::Closed),
       }
     }
     completion_rx.await.unwrap_or_else(|_| Err(self.classify_flush_error()))
@@ -385,12 +599,144 @@ impl<E> Publisher<E> {
       HubStatus::Running | HubStatus::Closing | HubStatus::Closed(_) => FlushError::Closed,
     }
   }
+
+  fn classify_terminal_registration_error(&self, event: E) -> TerminalRegistrationError<E> {
+    match self.state.status() {
+      HubStatus::Failed(failure) => TerminalRegistrationError::Failed { event, failure },
+      HubStatus::Running | HubStatus::Closing | HubStatus::Closed(_) => TerminalRegistrationError::Closed(event),
+    }
+  }
+
+  fn try_publish_from_guard(&self, event: E) -> Result<(), TryPublishError<E>> {
+    let mut admission = self.state.lock();
+    match &admission.status {
+      InternalStatus::Failed(failure) => {
+        return Err(TryPublishError::Failed {
+          event,
+          failure: Arc::clone(failure),
+        });
+      }
+      InternalStatus::Closing {
+        accept_terminals: false,
+      }
+      | InternalStatus::Closed(_) => return Err(TryPublishError::Closed(event)),
+      InternalStatus::Running | InternalStatus::Closing { accept_terminals: true } => {}
+    }
+
+    match self.sender.try_send(Message::Event(event)) {
+      Ok(()) => {
+        admission.accepted = admission
+          .accepted
+          .checked_add(1)
+          .expect("event acceptance counter overflowed");
+        Ok(())
+      }
+      Err(mpsc::error::TrySendError::Full(Message::Event(event))) => Err(TryPublishError::Full(event)),
+      Err(mpsc::error::TrySendError::Closed(Message::Event(event))) => {
+        drop(admission);
+        Err(self.classify_try_publish_error(event))
+      }
+      Err(_) => unreachable!("guard only sends event messages through try_publish"),
+    }
+  }
+
+  fn submit_terminal(&self, payload: TerminalPayload<E>) -> Result<(), TerminalSubmitError> {
+    if let Err(error) = self.state.terminal_submission_status() {
+      self.state.abandon_one_terminal();
+      return Err(error);
+    }
+    let message = TerminalRelayMessage::Complete {
+      context: TerminalContext::now(),
+      payload,
+    };
+    if self.terminal_sender.send(message).is_ok() {
+      return Ok(());
+    }
+
+    self.state.abandon_one_terminal();
+    match self.state.status() {
+      HubStatus::Failed(failure) => Err(TerminalSubmitError::Failed(failure)),
+      HubStatus::Closing | HubStatus::Closed(_) => Err(TerminalSubmitError::Closed),
+      HubStatus::Running => Err(TerminalSubmitError::RelayStopped),
+    }
+  }
+}
+
+/// Exactly-once terminal publication guard for a request lifecycle.
+///
+/// This type is intended to be owned by a streaming response body. When the
+/// hub is healthy, explicit completion submits one non-empty ordered batch;
+/// cancellation, body errors, and early body drops submit the deferred
+/// fallback batch. Consumer/hub failure and forced shutdown are reported
+/// conditions under which delivery can be abandoned.
+///
+/// `Drop` never invokes the fallback factory and never waits for bounded queue
+/// capacity or consumer work. It only captures the teardown time and transfers
+/// the already-owned factory to the terminal control lane.
+#[must_use = "dropping the guard submits its terminal fallback batch"]
+pub struct TerminalGuard<E> {
+  publisher: Publisher<E>,
+  fallback: Option<TerminalFactory<E>>,
+}
+
+impl<E> TerminalGuard<E> {
+  /// Attempts a bounded, nonblocking in-stream publication while retaining the
+  /// terminal obligation.
+  ///
+  /// Unlike ordinary publishers, a guard may keep publishing after graceful
+  /// shutdown has entered `Closing`. A full queue returns the original event
+  /// so a body wrapper can coalesce progress into its shared terminal state.
+  pub fn try_publish(&self, event: E) -> Result<(), TryPublishError<E>> {
+    self.publisher.try_publish_from_guard(event)
+  }
+
+  /// Nonblockingly transfers an already materialized terminal batch to the
+  /// relay instead of using the fallback factory.
+  pub fn finish(mut self, batch: TerminalBatch<E>) -> Result<(), TerminalSubmitError> {
+    self.fallback.take();
+    self.publisher.submit_terminal(TerminalPayload::Ready(batch))
+  }
+
+  /// Nonblockingly transfers a fresh terminal batch factory to the relay.
+  ///
+  /// The factory runs only on the relay thread and receives the exact finish
+  /// submission time. It should read shared flow state quickly and must not
+  /// perform blocking I/O.
+  pub fn finish_with<F>(mut self, factory: F) -> Result<(), TerminalSubmitError>
+  where
+    F: FnOnce(TerminalContext) -> TerminalBatch<E> + Send + 'static,
+  {
+    self.fallback.take();
+    self
+      .publisher
+      .submit_terminal(TerminalPayload::Deferred(Box::new(factory)))
+  }
+}
+
+impl<E> fmt::Debug for TerminalGuard<E> {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("TerminalGuard")
+      .field("status", &self.publisher.status())
+      .field("armed", &self.fallback.is_some())
+      .finish_non_exhaustive()
+  }
+}
+
+impl<E> Drop for TerminalGuard<E> {
+  fn drop(&mut self) {
+    if let Some(fallback) = self.fallback.take() {
+      let _ = self.publisher.submit_terminal(TerminalPayload::Deferred(fallback));
+    }
+  }
 }
 
 /// Owns the dispatcher thread and coordinates graceful shutdown.
 pub struct EventHub<E> {
   sender: mpsc::Sender<Message<E>>,
   state: Arc<SharedState>,
+  terminal_sender: std_mpsc::Sender<TerminalRelayMessage<E>>,
+  terminal_relay: Option<JoinHandle<()>>,
   dispatcher: Option<JoinHandle<()>>,
 }
 
@@ -414,47 +760,60 @@ impl<E> EventHub<E> {
   where
     E: Send + 'static,
   {
-    tokio::spawn(async move { self.shutdown_inner().await })
+    tokio::spawn(async move { self.shutdown_inner(ShutdownMode::Graceful).await })
+      .await
+      .map_err(|error| ShutdownError::ShutdownTask(Arc::from(error.to_string())))?
+      .map(|shutdown| shutdown.delivery)
+  }
+
+  /// Stops admission and abandons live guards instead of waiting for them.
+  ///
+  /// Already submitted ordinary events are still drained and consumers are
+  /// flushed. Deferred terminal work not yet materialized is discarded, the
+  /// returned count makes that loss explicit, and the relay is detached after
+  /// terminal admission closes. This lets forced shutdown return even when a
+  /// user terminal factory is already stuck; Rust threads cannot be safely
+  /// preempted, so that relay thread remains detached until the factory exits.
+  /// Like graceful shutdown, the owned task is cancellation-safe.
+  pub async fn force_shutdown(self) -> Result<ForcedShutdown, ShutdownError>
+  where
+    E: Send + 'static,
+  {
+    tokio::spawn(async move { self.shutdown_inner(ShutdownMode::Force).await })
       .await
       .map_err(|error| ShutdownError::ShutdownTask(Arc::from(error.to_string())))?
   }
 
-  async fn shutdown_inner(mut self) -> Result<DeliveryStats, ShutdownError> {
-    let initial = match self.state.status() {
-      HubStatus::Running => None,
-      HubStatus::Closing => Some(Err(ShutdownError::Closed)),
-      HubStatus::Closed(stats) => Some(Ok(stats)),
-      HubStatus::Failed(failure) => Some(Err(ShutdownError::Failed(failure))),
+  async fn shutdown_inner(mut self, mode: ShutdownMode) -> Result<ForcedShutdown, ShutdownError> {
+    let (mut outcome, abandoned_terminal_obligations) = match self.state.begin_shutdown(mode) {
+      Ok(abandoned) => (None, abandoned),
+      Err(BeginShutdownFailure::Closing) => (Some(Err(ShutdownError::Closed)), 0),
+      Err(BeginShutdownFailure::Closed(stats)) => (Some(Ok(stats)), 0),
+      Err(BeginShutdownFailure::Failed(failure)) => (Some(Err(ShutdownError::Failed(failure))), 0),
     };
 
-    let outcome = if let Some(outcome) = initial {
-      outcome
-    } else if let Ok(permit) = self.sender.clone().reserve_owned().await {
-      let (completion_tx, completion_rx) = oneshot::channel();
-      let started = {
-        let mut admission = self.state.lock();
-        match &admission.status {
-          InternalStatus::Running => {
-            admission.status = InternalStatus::Closing;
-            // Publish while the admission lock is still held. Otherwise a
-            // dispatcher failure could publish `Failed` between this state
-            // transition and the notification, only to be overwritten by a
-            // stale `Closing` update.
-            self.state.publish_status(HubStatus::Closing);
-            permit.send(Message::Shutdown(completion_tx));
-            true
-          }
-          InternalStatus::Closing | InternalStatus::Closed(_) | InternalStatus::Failed(_) => false,
-        }
-      };
-      if started {
-        completion_rx.await.unwrap_or_else(|_| self.shutdown_state())
-      } else {
-        self.shutdown_state()
+    if outcome.is_none() && mode == ShutdownMode::Graceful {
+      if let Err(failure) = self.state.wait_for_terminals().await {
+        outcome = Some(Err(ShutdownError::Failed(failure)));
       }
-    } else {
-      self.shutdown_state()
-    };
+    }
+
+    if let Err(error) = self.stop_terminal_relay(mode).await {
+      if outcome.is_none() {
+        outcome = Some(Err(error));
+      }
+    }
+
+    if matches!(self.state.status(), HubStatus::Closing) {
+      let dispatcher_outcome = self.stop_dispatcher().await;
+      if outcome.is_none() {
+        outcome = Some(dispatcher_outcome);
+      }
+    } else if matches!(self.state.status(), HubStatus::Failed(_)) {
+      self.abort_dispatcher().await;
+    } else if outcome.is_none() {
+      outcome = Some(self.shutdown_state());
+    }
 
     let dispatcher = self
       .dispatcher
@@ -464,8 +823,66 @@ impl<E> EventHub<E> {
       .await
       .map_err(|error| ShutdownError::JoinDispatcher(Arc::from(error.to_string())))?;
     match join_result {
-      Ok(()) => outcome,
+      Ok(()) => outcome
+        .expect("shutdown always determines an outcome before joining")
+        .map(|delivery| ForcedShutdown {
+          delivery,
+          abandoned_terminal_obligations,
+        }),
       Err(payload) => Err(ShutdownError::DispatcherPanicked(panic_message(payload))),
+    }
+  }
+
+  async fn stop_terminal_relay(&mut self, mode: ShutdownMode) -> Result<(), ShutdownError> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let stop_sent = self
+      .terminal_sender
+      .send(TerminalRelayMessage::Stop(completion_tx))
+      .is_ok();
+    let terminal_relay = self
+      .terminal_relay
+      .take()
+      .expect("event hub always owns its terminal relay until shutdown");
+    if mode == ShutdownMode::Force {
+      drop(terminal_relay);
+      return Ok(());
+    }
+
+    let acknowledged = stop_sent && completion_rx.await.is_ok();
+    let join_result = tokio::task::spawn_blocking(move || terminal_relay.join())
+      .await
+      .map_err(|error| ShutdownError::JoinTerminalRelay(Arc::from(error.to_string())))?;
+    match join_result {
+      Ok(()) if acknowledged || matches!(self.state.status(), HubStatus::Failed(_)) => Ok(()),
+      Ok(()) => Err(ShutdownError::TerminalRelayStopped),
+      Err(payload) => Err(ShutdownError::TerminalRelayPanicked(panic_message(payload))),
+    }
+  }
+
+  async fn stop_dispatcher(&self) -> Result<DeliveryStats, ShutdownError> {
+    if let Ok(permit) = self.sender.clone().reserve_owned().await {
+      let (completion_tx, completion_rx) = oneshot::channel();
+      let started = {
+        let admission = self.state.lock();
+        match &admission.status {
+          InternalStatus::Closing { .. } if admission.terminal_obligations == 0 => {
+            permit.send(Message::Shutdown(completion_tx));
+            true
+          }
+          InternalStatus::Running => unreachable!("shutdown changes admission state before stopping the relay"),
+          InternalStatus::Closing { .. } | InternalStatus::Closed(_) | InternalStatus::Failed(_) => false,
+        }
+      };
+      if started {
+        return completion_rx.await.unwrap_or_else(|_| self.shutdown_state());
+      }
+    };
+    self.shutdown_state()
+  }
+
+  async fn abort_dispatcher(&self) {
+    if let Ok(permit) = self.sender.clone().reserve_owned().await {
+      permit.send(Message::Abort);
     }
   }
 
@@ -500,6 +917,12 @@ pub enum ShutdownError {
   JoinDispatcher(Arc<str>),
   #[error("event dispatcher panicked: {0}")]
   DispatcherPanicked(Arc<str>),
+  #[error("event terminal relay stopped without acknowledging shutdown")]
+  TerminalRelayStopped,
+  #[error("failed to join the event terminal relay task: {0}")]
+  JoinTerminalRelay(Arc<str>),
+  #[error("event terminal relay panicked: {0}")]
+  TerminalRelayPanicked(Arc<str>),
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -586,15 +1009,33 @@ struct RegisteredConsumer<E> {
   consumer: Box<dyn EventConsumer<E>>,
 }
 
+type TerminalFactory<E> = Box<dyn FnOnce(TerminalContext) -> TerminalBatch<E> + Send + 'static>;
+
+enum TerminalPayload<E> {
+  Ready(TerminalBatch<E>),
+  Deferred(TerminalFactory<E>),
+}
+
+enum TerminalRelayMessage<E> {
+  Complete {
+    context: TerminalContext,
+    payload: TerminalPayload<E>,
+  },
+  Stop(oneshot::Sender<()>),
+}
+
 enum Message<E> {
   Event(E),
   Flush(oneshot::Sender<Result<DeliveryStats, FlushError>>),
   Shutdown(oneshot::Sender<Result<DeliveryStats, ShutdownError>>),
+  Abort,
 }
 
 struct SharedState {
   admission: Mutex<Admission>,
+  dispatch_gate: Mutex<()>,
   status_updates: watch::Sender<HubStatus>,
+  terminal_updates: Notify,
 }
 
 impl SharedState {
@@ -606,8 +1047,11 @@ impl SharedState {
         accepted: 0,
         delivered: 0,
         latest_sequence: EventSeq::ZERO,
+        terminal_obligations: 0,
       }),
+      dispatch_gate: Mutex::new(()),
       status_updates,
+      terminal_updates: Notify::new(),
     }
   }
 
@@ -615,11 +1059,18 @@ impl SharedState {
     self.admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
   }
 
+  fn lock_dispatch(&self) -> MutexGuard<'_, ()> {
+    self
+      .dispatch_gate
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+  }
+
   fn status(&self) -> HubStatus {
     let admission = self.lock();
     match &admission.status {
       InternalStatus::Running => HubStatus::Running,
-      InternalStatus::Closing => HubStatus::Closing,
+      InternalStatus::Closing { .. } => HubStatus::Closing,
       InternalStatus::Closed(stats) => HubStatus::Closed(*stats),
       InternalStatus::Failed(failure) => HubStatus::Failed(Arc::clone(failure)),
     }
@@ -647,6 +1098,66 @@ impl SharedState {
 
   fn publish_status(&self, status: HubStatus) {
     self.status_updates.send_replace(status);
+  }
+
+  fn complete_terminal(&self) {
+    let became_empty = {
+      let mut admission = self.lock();
+      if admission.terminal_obligations == 0 {
+        return;
+      }
+      admission.terminal_obligations -= 1;
+      admission.terminal_obligations == 0
+    };
+    if became_empty {
+      self.terminal_updates.notify_one();
+    }
+  }
+
+  fn abandon_one_terminal(&self) {
+    self.complete_terminal();
+  }
+
+  fn begin_shutdown(&self, mode: ShutdownMode) -> Result<usize, BeginShutdownFailure> {
+    let mut admission = self.lock();
+    match &admission.status {
+      InternalStatus::Running => {
+        let abandoned = match mode {
+          ShutdownMode::Graceful => 0,
+          ShutdownMode::Force => std::mem::take(&mut admission.terminal_obligations),
+        };
+        admission.status = InternalStatus::Closing {
+          accept_terminals: mode == ShutdownMode::Graceful,
+        };
+        // Publish while admission is locked so a dispatcher failure cannot
+        // publish `Failed` and then be overwritten by a stale `Closing`.
+        self.publish_status(HubStatus::Closing);
+        if abandoned > 0 {
+          self.terminal_updates.notify_one();
+        }
+        Ok(abandoned)
+      }
+      InternalStatus::Closing { .. } => Err(BeginShutdownFailure::Closing),
+      InternalStatus::Closed(stats) => Err(BeginShutdownFailure::Closed(*stats)),
+      InternalStatus::Failed(failure) => Err(BeginShutdownFailure::Failed(Arc::clone(failure))),
+    }
+  }
+
+  async fn wait_for_terminals(&self) -> Result<(), Arc<HubFailure>> {
+    loop {
+      let notified = self.terminal_updates.notified();
+      {
+        let admission = self.lock();
+        match &admission.status {
+          InternalStatus::Failed(failure) => return Err(Arc::clone(failure)),
+          InternalStatus::Closing { .. } if admission.terminal_obligations == 0 => return Ok(()),
+          InternalStatus::Closing { .. } => {}
+          InternalStatus::Running => unreachable!("terminal wait begins only after shutdown starts"),
+          InternalStatus::Closed(_) => return Ok(()),
+        }
+      }
+      notified.await;
+    }
   }
 
   fn barrier_stats(&self) -> DeliveryStats {
@@ -689,7 +1200,19 @@ impl SharedState {
       failure
     };
     self.publish_status(HubStatus::Failed(Arc::clone(&failure)));
+    self.terminal_updates.notify_one();
     failure
+  }
+
+  fn fail_external(
+    &self,
+    consumer_name: Arc<str>,
+    operation: ConsumerOperation,
+    kind: ConsumerFailureKind,
+  ) -> Arc<HubFailure> {
+    let _dispatch = self.lock_dispatch();
+    let sequence = self.latest_sequence();
+    self.fail(consumer_name, sequence, operation, kind)
   }
 
   fn close(&self) -> DeliveryStats {
@@ -706,6 +1229,42 @@ impl SharedState {
   fn latest_sequence(&self) -> EventSeq {
     self.lock().latest_sequence
   }
+
+  fn admit_terminal_event(&self) -> bool {
+    let mut admission = self.lock();
+    match &admission.status {
+      InternalStatus::Running | InternalStatus::Closing { accept_terminals: true } => {
+        admission.accepted = admission
+          .accepted
+          .checked_add(1)
+          .expect("event acceptance counter overflowed");
+        true
+      }
+      InternalStatus::Closing {
+        accept_terminals: false,
+      }
+      | InternalStatus::Closed(_)
+      | InternalStatus::Failed(_) => false,
+    }
+  }
+
+  fn accepts_terminal_work(&self) -> bool {
+    matches!(
+      &self.lock().status,
+      InternalStatus::Running | InternalStatus::Closing { accept_terminals: true }
+    )
+  }
+
+  fn terminal_submission_status(&self) -> Result<(), TerminalSubmitError> {
+    match &self.lock().status {
+      InternalStatus::Running | InternalStatus::Closing { accept_terminals: true } => Ok(()),
+      InternalStatus::Closing {
+        accept_terminals: false,
+      }
+      | InternalStatus::Closed(_) => Err(TerminalSubmitError::Closed),
+      InternalStatus::Failed(failure) => Err(TerminalSubmitError::Failed(Arc::clone(failure))),
+    }
+  }
 }
 
 struct Admission {
@@ -713,13 +1272,91 @@ struct Admission {
   accepted: u64,
   delivered: u64,
   latest_sequence: EventSeq,
+  terminal_obligations: usize,
+}
+
+enum BeginShutdownFailure {
+  Closing,
+  Closed(DeliveryStats),
+  Failed(Arc<HubFailure>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownMode {
+  Graceful,
+  Force,
 }
 
 enum InternalStatus {
   Running,
-  Closing,
+  Closing { accept_terminals: bool },
   Closed(DeliveryStats),
   Failed(Arc<HubFailure>),
+}
+
+fn relay_terminals<E>(
+  receiver: std_mpsc::Receiver<TerminalRelayMessage<E>>,
+  ingress: mpsc::Sender<Message<E>>,
+  state: Arc<SharedState>,
+) where
+  E: Send + 'static,
+{
+  while let Ok(message) = receiver.recv() {
+    match message {
+      TerminalRelayMessage::Complete { context, payload } => {
+        if !state.accepts_terminal_work() {
+          state.complete_terminal();
+          continue;
+        }
+
+        let batch = match materialize_terminal(payload, context) {
+          Ok(batch) => batch,
+          Err(kind) => {
+            state.fail_external(Arc::from("terminal-factory"), ConsumerOperation::Handle, kind);
+            state.complete_terminal();
+            let _ = ingress.blocking_send(Message::Abort);
+            return;
+          }
+        };
+
+        for event in batch.into_events() {
+          if !state.admit_terminal_event() {
+            break;
+          }
+          if ingress.blocking_send(Message::Event(event)).is_err() {
+            if matches!(state.status(), HubStatus::Running | HubStatus::Closing) {
+              state.fail(
+                Arc::from("terminal-relay"),
+                state.latest_sequence(),
+                ConsumerOperation::Handle,
+                ConsumerFailureKind::Error(Arc::from("event ingress closed during terminal delivery")),
+              );
+            }
+            state.complete_terminal();
+            return;
+          }
+        }
+        state.complete_terminal();
+      }
+      TerminalRelayMessage::Stop(completion) => {
+        let _ = completion.send(());
+        return;
+      }
+    }
+  }
+}
+
+fn materialize_terminal<E>(
+  payload: TerminalPayload<E>,
+  context: TerminalContext,
+) -> Result<TerminalBatch<E>, ConsumerFailureKind> {
+  match payload {
+    TerminalPayload::Ready(batch) => Ok(batch),
+    TerminalPayload::Deferred(factory) => match catch_unwind(AssertUnwindSafe(|| factory(context))) {
+      Ok(batch) => Ok(batch),
+      Err(payload) => Err(ConsumerFailureKind::Panic(panic_message(payload))),
+    },
+  }
 }
 
 fn dispatch<E>(
@@ -733,39 +1370,74 @@ fn dispatch<E>(
   while let Some(message) = receiver.blocking_recv() {
     match message {
       Message::Event(event) => {
+        let dispatch_guard = state.lock_dispatch();
+        if let HubStatus::Failed(failure) = state.status() {
+          drop(dispatch_guard);
+          flush_consumers_best_effort(&mut consumers);
+          terminate_failed(&mut receiver, failure);
+          return;
+        }
         let sequence = EventSeq(next_sequence);
         next_sequence = next_sequence.checked_add(1).expect("event sequence counter overflowed");
         state.note_sequence(sequence);
         if let Err(failure) = handle_event(&mut consumers, sequence, &event, &state) {
+          drop(dispatch_guard);
           flush_consumers_best_effort(&mut consumers);
           terminate_failed(&mut receiver, failure);
           return;
         }
         state.note_delivery();
+        drop(dispatch_guard);
       }
-      Message::Flush(completion) => match flush_consumers(&mut consumers, &state) {
-        Ok(()) => {
-          let _ = completion.send(Ok(state.barrier_stats()));
-        }
-        Err(failure) => {
+      Message::Flush(completion) => {
+        let dispatch_guard = state.lock_dispatch();
+        if let HubStatus::Failed(failure) = state.status() {
+          drop(dispatch_guard);
           let _ = completion.send(Err(FlushError::Failed(Arc::clone(&failure))));
           terminate_failed(&mut receiver, failure);
           return;
         }
-      },
+        match flush_consumers(&mut consumers, &state) {
+          Ok(()) => {
+            let stats = state.barrier_stats();
+            drop(dispatch_guard);
+            let _ = completion.send(Ok(stats));
+          }
+          Err(failure) => {
+            drop(dispatch_guard);
+            let _ = completion.send(Err(FlushError::Failed(Arc::clone(&failure))));
+            terminate_failed(&mut receiver, failure);
+            return;
+          }
+        }
+      }
       Message::Shutdown(completion) => {
+        let dispatch_guard = state.lock_dispatch();
         match flush_consumers(&mut consumers, &state) {
           Ok(()) => {
             receiver.close();
             let stats = state.close();
+            drop(dispatch_guard);
             let _ = completion.send(Ok(stats));
             drain_closed(&mut receiver, None);
           }
           Err(failure) => {
+            drop(dispatch_guard);
             let _ = completion.send(Err(ShutdownError::Failed(Arc::clone(&failure))));
             terminate_failed(&mut receiver, failure);
           }
         }
+        return;
+      }
+      Message::Abort => {
+        flush_consumers_best_effort(&mut consumers);
+        let failure = match state.status() {
+          HubStatus::Failed(failure) => failure,
+          HubStatus::Running | HubStatus::Closing | HubStatus::Closed(_) => {
+            unreachable!("dispatcher abort requires a published hub failure")
+          }
+        };
+        terminate_failed(&mut receiver, failure);
         return;
       }
     }
@@ -853,6 +1525,7 @@ fn drain_closed<E>(receiver: &mut mpsc::Receiver<Message<E>>, failure: Option<Ar
         };
         let _ = completion.send(result);
       }
+      Message::Abort => {}
     }
   }
 }
@@ -967,6 +1640,31 @@ mod tests {
   struct BlockingConsumer {
     started: Option<std_mpsc::Sender<()>>,
     gate: Arc<(Mutex<bool>, Condvar)>,
+  }
+
+  struct CountingGateConsumer {
+    handled: Arc<AtomicUsize>,
+    started: Option<std_mpsc::Sender<()>>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+  }
+
+  impl EventConsumer<u64> for CountingGateConsumer {
+    fn name(&self) -> &str {
+      "counting-gate"
+    }
+
+    fn handle(&mut self, _sequence: EventSeq, _event: &u64) -> ConsumerResult {
+      self.handled.fetch_add(1, Ordering::SeqCst);
+      if let Some(started) = self.started.take() {
+        started.send(()).unwrap();
+      }
+      let (open, condition) = &*self.gate;
+      let mut open = open.lock().unwrap();
+      while !*open {
+        open = condition.wait(open).unwrap();
+      }
+      Ok(())
+    }
   }
 
   impl EventConsumer<u64> for BlockingConsumer {
@@ -1395,5 +2093,420 @@ mod tests {
       late_publisher.publish(21).await,
       Err(PublishError::Closed(21))
     ));
+  }
+
+  #[tokio::test]
+  async fn terminal_guard_explicit_finish_and_drop_are_exactly_once() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records: Arc::clone(&records),
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+
+    let finished = publisher.begin_guarded(1, |_| TerminalBatch::one(99)).await.unwrap();
+    finished.try_publish(2).unwrap();
+    finished.finish(TerminalBatch::new(3, vec![4])).unwrap();
+
+    let latest = Arc::new(AtomicUsize::new(5));
+    let fallback_latest = Arc::clone(&latest);
+    let cancelled = publisher
+      .begin_guarded(5, move |_| {
+        TerminalBatch::one(u64::try_from(fallback_latest.load(Ordering::SeqCst)).unwrap())
+      })
+      .await
+      .unwrap();
+    latest.store(6, Ordering::SeqCst);
+    drop(cancelled);
+
+    let stats = hub.shutdown().await.unwrap();
+    assert_eq!(stats.delivered, 6);
+    let values = records
+      .lock()
+      .unwrap()
+      .iter()
+      .map(|(_, _, event)| *event)
+      .collect::<Vec<_>>();
+    assert_eq!(values.len(), 6);
+    let position = |event| values.iter().position(|candidate| *candidate == event).unwrap();
+    assert!(position(1) < position(2));
+    assert!(position(2) < position(3));
+    assert!(position(3) < position(4));
+    assert!(position(5) < position(6));
+  }
+
+  #[tokio::test]
+  async fn terminal_drop_is_nonblocking_when_bounded_ingress_is_full() {
+    let (started_tx, started_rx) = std_mpsc::channel();
+    let (release_tx, release_rx) = std_mpsc::channel();
+    let (publisher, hub) = HubBuilder::new()
+      .capacity(1)
+      .consumer(SteppedConsumer {
+        started: started_tx,
+        releases: release_rx,
+      })
+      .start()
+      .unwrap();
+
+    let (factory_tx, factory_rx) = std_mpsc::channel();
+    let terminal = publisher
+      .begin_guarded(1, move |_| {
+        factory_tx.send(()).unwrap();
+        TerminalBatch::one(3)
+      })
+      .await
+      .unwrap();
+    assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+    publisher.publish(2).await.unwrap();
+    assert!(matches!(terminal.try_publish(9), Err(TryPublishError::Full(9))));
+
+    drop(terminal);
+    factory_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    release_tx.send(()).unwrap();
+    assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+    release_tx.send(()).unwrap();
+    assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+    release_tx.send(()).unwrap();
+
+    assert_eq!(hub.shutdown().await.unwrap().delivered, 3);
+  }
+
+  #[tokio::test]
+  async fn terminal_drop_does_not_invoke_factory_under_caller_lock() {
+    let snapshot = Arc::new(Mutex::new(2_u64));
+    let fallback_snapshot = Arc::clone(&snapshot);
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records: Arc::clone(&records),
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+    let terminal = publisher
+      .begin_guarded(1, move |_| TerminalBatch::one(*fallback_snapshot.lock().unwrap()))
+      .await
+      .unwrap();
+
+    {
+      let snapshot_lock = snapshot.lock().unwrap();
+      drop(terminal);
+      assert_eq!(*snapshot_lock, 2);
+    }
+
+    assert_eq!(hub.shutdown().await.unwrap().delivered, 2);
+    assert_eq!(
+      *records.lock().unwrap(),
+      vec![("writer", EventSeq(1), 1), ("writer", EventSeq(2), 2)]
+    );
+  }
+
+  #[tokio::test]
+  async fn active_terminal_guards_can_exceed_ingress_capacity() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .capacity(1)
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records,
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+
+    let mut terminals = Vec::new();
+    for event in 1..=16 {
+      terminals.push(
+        publisher
+          .begin_guarded(event, move |_| TerminalBatch::one(event + 100))
+          .await
+          .unwrap(),
+      );
+    }
+    drop(terminals);
+
+    assert_eq!(
+      hub.shutdown().await.unwrap(),
+      DeliveryStats {
+        accepted: 32,
+        delivered: 32,
+        undelivered: 0,
+      }
+    );
+  }
+
+  #[tokio::test]
+  async fn guarded_begin_is_atomic_with_concurrent_shutdown() {
+    let (started_tx, started_rx) = std_mpsc::channel();
+    let (release_tx, release_rx) = std_mpsc::channel();
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let (publisher, hub) = HubBuilder::new()
+      .capacity(1)
+      .consumer(SteppedConsumer {
+        started: started_tx,
+        releases: release_rx,
+      })
+      .start()
+      .unwrap();
+
+    publisher.publish(10).await.unwrap();
+    assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 10);
+    publisher.publish(11).await.unwrap();
+
+    let begin = {
+      let publisher = publisher.clone();
+      let fallback_calls = Arc::clone(&fallback_calls);
+      tokio::spawn(async move {
+        publisher
+          .begin_guarded(12, move |_| {
+            fallback_calls.fetch_add(1, Ordering::SeqCst);
+            TerminalBatch::one(13)
+          })
+          .await
+      })
+    };
+    tokio::task::yield_now().await;
+    assert!(!begin.is_finished());
+
+    let shutdown = tokio::spawn(hub.shutdown());
+    for _ in 0..100 {
+      if matches!(publisher.status(), HubStatus::Closing) {
+        break;
+      }
+      tokio::task::yield_now().await;
+    }
+    assert!(matches!(publisher.status(), HubStatus::Closing));
+
+    release_tx.send(()).unwrap();
+    assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 11);
+    let rejected = tokio::time::timeout(Duration::from_secs(1), begin)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap_err();
+    assert!(matches!(rejected, TerminalRegistrationError::Closed(12)));
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+
+    release_tx.send(()).unwrap();
+    assert_eq!(shutdown.await.unwrap().unwrap().delivered, 2);
+  }
+
+  #[tokio::test]
+  async fn closing_hub_accepts_guarded_stream_events_before_terminal() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .capacity(1)
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records: Arc::clone(&records),
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+    let terminal = publisher.begin_guarded(1, |_| TerminalBatch::one(99)).await.unwrap();
+    let shutdown = tokio::spawn(hub.shutdown());
+    for _ in 0..100 {
+      if matches!(publisher.status(), HubStatus::Closing) {
+        break;
+      }
+      tokio::task::yield_now().await;
+    }
+    assert!(matches!(publisher.status(), HubStatus::Closing));
+    assert!(matches!(publisher.publish(88).await, Err(PublishError::Closed(88))));
+
+    terminal.try_publish(2).unwrap();
+    terminal.finish(TerminalBatch::new(3, vec![4])).unwrap();
+
+    assert_eq!(shutdown.await.unwrap().unwrap().delivered, 4);
+    assert_eq!(
+      *records.lock().unwrap(),
+      vec![
+        ("writer", EventSeq(1), 1),
+        ("writer", EventSeq(2), 2),
+        ("writer", EventSeq(3), 3),
+        ("writer", EventSeq(4), 4),
+      ]
+    );
+  }
+
+  #[tokio::test]
+  async fn cancelled_shutdown_still_waits_for_terminal_obligation() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records: Arc::clone(&records),
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+    let terminal = publisher.begin_guarded(1, |_| TerminalBatch::one(9)).await.unwrap();
+
+    let shutdown = tokio::spawn(hub.shutdown());
+    for _ in 0..100 {
+      if matches!(publisher.status(), HubStatus::Closing) {
+        break;
+      }
+      tokio::task::yield_now().await;
+    }
+    assert!(matches!(publisher.status(), HubStatus::Closing));
+    shutdown.abort();
+    terminal.finish(TerminalBatch::one(7)).unwrap();
+
+    assert!(matches!(
+      tokio::time::timeout(Duration::from_secs(1), publisher.wait_failed())
+        .await
+        .unwrap(),
+      Err(WaitFailedError::Closed(DeliveryStats {
+        accepted: 2,
+        delivered: 2,
+        undelivered: 0,
+      }))
+    ));
+    assert_eq!(
+      *records.lock().unwrap(),
+      vec![("writer", EventSeq(1), 1), ("writer", EventSeq(2), 7)]
+    );
+  }
+
+  #[tokio::test]
+  async fn consumer_failure_wakes_terminal_drop_without_deadlock() {
+    let (publisher, hub) = HubBuilder::new()
+      .capacity(1)
+      .consumer(FailingConsumer {
+        fail_at: 1,
+        flushes: Arc::new(AtomicUsize::new(0)),
+      })
+      .start()
+      .unwrap();
+    let terminal = publisher.begin_guarded(1, |_| TerminalBatch::one(2)).await.unwrap();
+    let failure = publisher.wait_failed().await.unwrap();
+    let (dropped_tx, dropped_rx) = std_mpsc::channel();
+    let drop_thread = thread::spawn(move || {
+      drop(terminal);
+      dropped_tx.send(()).unwrap();
+    });
+    dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    drop_thread.join().unwrap();
+
+    assert_eq!(failure.stats.accepted, 1);
+    assert!(matches!(hub.shutdown().await, Err(ShutdownError::Failed(observed)) if observed == failure));
+  }
+
+  #[tokio::test]
+  async fn force_shutdown_abandons_an_endless_guard() {
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&fallback_calls);
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records: Arc::new(Mutex::new(Vec::new())),
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+    let terminal = publisher
+      .begin_guarded(1, move |_| {
+        observed_calls.fetch_add(1, Ordering::SeqCst);
+        TerminalBatch::one(2)
+      })
+      .await
+      .unwrap();
+
+    let shutdown = tokio::time::timeout(Duration::from_secs(1), hub.force_shutdown())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(shutdown.abandoned_terminal_obligations, 1);
+    assert_eq!(shutdown.delivery.delivered, 1);
+    drop(terminal);
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+  }
+
+  #[tokio::test]
+  async fn force_shutdown_does_not_wait_for_a_running_terminal_factory() {
+    let (factory_started_tx, factory_started_rx) = std_mpsc::channel();
+    let (factory_release_tx, factory_release_rx) = std_mpsc::channel();
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records: Arc::new(Mutex::new(Vec::new())),
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+    let terminal = publisher
+      .begin_guarded(1, move |_| {
+        factory_started_tx.send(()).unwrap();
+        factory_release_rx.recv().unwrap();
+        TerminalBatch::one(2)
+      })
+      .await
+      .unwrap();
+    drop(terminal);
+    factory_started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let shutdown = tokio::time::timeout(Duration::from_secs(1), hub.force_shutdown())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(shutdown.abandoned_terminal_obligations, 1);
+    assert_eq!(shutdown.delivery.delivered, 1);
+
+    factory_release_tx.send(()).unwrap();
+  }
+
+  #[tokio::test]
+  async fn panicking_terminal_factory_fails_without_deadlocking_shutdown() {
+    let handled = Arc::new(AtomicUsize::new(0));
+    let (consumer_started_tx, consumer_started_rx) = std_mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (factory_started_tx, factory_started_rx) = std_mpsc::channel();
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(CountingGateConsumer {
+        handled: Arc::clone(&handled),
+        started: Some(consumer_started_tx),
+        gate: Arc::clone(&gate),
+      })
+      .start()
+      .unwrap();
+    let terminal = publisher
+      .begin_guarded(1, move |_| -> TerminalBatch<u64> {
+        factory_started_tx.send(()).unwrap();
+        panic!("terminal snapshot exploded")
+      })
+      .await
+      .unwrap();
+    consumer_started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    publisher.publish(2).await.unwrap();
+    publisher.publish(3).await.unwrap();
+    drop(terminal);
+    factory_started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let (open, condition) = &*gate;
+    *open.lock().unwrap() = true;
+    condition.notify_all();
+
+    let failure = publisher.wait_failed().await.unwrap();
+    assert_eq!(failure.consumer_name.as_ref(), "terminal-factory");
+    assert!(
+      matches!(&failure.kind, ConsumerFailureKind::Panic(message) if message.as_ref() == "terminal snapshot exploded")
+    );
+    assert!(matches!(
+      tokio::time::timeout(Duration::from_secs(1), hub.shutdown())
+        .await
+        .unwrap(),
+      Err(ShutdownError::Failed(observed)) if observed == failure
+    ));
+    assert_eq!(failure.stats.accepted, 3);
+    assert_eq!(
+      failure.stats.delivered,
+      u64::try_from(handled.load(Ordering::SeqCst)).unwrap()
+    );
   }
 }
