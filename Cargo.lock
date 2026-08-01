@@ -2715,7 +2715,6 @@ dependencies = [
 name = "tokn-accounts"
 version = "0.2.1"
 dependencies = [
- "arc-swap",
  "async-trait",
  "parking_lot",
  "reqwest",
@@ -2730,9 +2729,7 @@ dependencies = [
  "tokn-provider-llama-cpp",
  "tokn-provider-openai",
  "tokn-provider-zai",
- "tokn-router-config",
  "toml",
- "tracing",
 ]
 
 [[package]]
