@@ -32,8 +32,10 @@ pub use listeners::{
   LinkedHttpPolicy, LinkedListener, LinkedListenerKind, LinkedListeners, ListenerLinkError, ListenerLinkResult,
 };
 pub use managed::{
-  ManagedProfileResolveError, ManagedProfileResolveResult, ManagedProfileSite, ManagedRequestBody,
-  ManagedRequestBodyError, ManagedRequestBodyResult, ManagedSelectionSummary,
+  ManagedGatewayBuildError, ManagedGatewayBuildResult, ManagedGatewayError, ManagedGatewayExecutor,
+  ManagedGatewayOutcome, ManagedGatewayRequest, ManagedGatewayResult, ManagedProfileResolveError,
+  ManagedProfileResolveResult, ManagedProfileSite, ManagedRequestBody, ManagedRequestBodyError,
+  ManagedRequestBodyResult, ManagedSelectionSummary,
 };
 pub use matchers::{
   link_connect_matcher, link_http_matcher, ConnectFactsError, ConnectFactsResult, ConnectRequestFacts,

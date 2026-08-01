@@ -6,8 +6,13 @@
 //! so every caller observes the same managed routing invariants.
 
 mod body;
+mod gateway;
 
 pub use body::{ManagedRequestBody, ManagedRequestBodyError, ManagedRequestBodyResult};
+pub use gateway::{
+  ManagedGatewayBuildError, ManagedGatewayBuildResult, ManagedGatewayError, ManagedGatewayExecutor,
+  ManagedGatewayOutcome, ManagedGatewayRequest, ManagedGatewayResult,
+};
 
 use super::{LinkedProfile, LinkedWireIdentity};
 use serde_json::Value;
@@ -292,13 +297,7 @@ pub(crate) fn resolve_managed_profile(
   session_id: Option<&str>,
   provider_access: &ProviderAccess,
 ) -> ManagedProfileResolveResult<TargetResolution<RoutedManagedTarget>> {
-  let site = ManagedProfileSite::from_profile(profile);
-  let LinkedRouteKind::Managed(route) = profile.route().kind() else {
-    return Err(ManagedProfileResolveError::NonManagedRoute {
-      site,
-      route_kind: profile.route().route_kind(),
-    });
-  };
+  let (site, route) = managed_profile_route(profile)?;
   let resolution = resolve_managed_target(
     route,
     requested_model.as_str(),
@@ -325,6 +324,19 @@ pub(crate) fn resolve_managed_profile(
     TargetResolution::CoolingDown { retry_at } => Ok(TargetResolution::CoolingDown { retry_at }),
     TargetResolution::NoEligible { reason } => Ok(TargetResolution::NoEligible { reason }),
   }
+}
+
+fn managed_profile_route(
+  profile: &LinkedProfile,
+) -> ManagedProfileResolveResult<(ManagedProfileSite, &tokn_accounts::link::LinkedManagedRoute)> {
+  let site = ManagedProfileSite::from_profile(profile);
+  let LinkedRouteKind::Managed(route) = profile.route().kind() else {
+    return Err(ManagedProfileResolveError::NonManagedRoute {
+      site,
+      route_kind: profile.route().route_kind(),
+    });
+  };
+  Ok((site, route))
 }
 
 fn resolve_wire_identity(
