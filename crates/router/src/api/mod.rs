@@ -27,7 +27,6 @@ use std::time::Duration;
 use tokn_accounts::registry::Registry as ProviderRegistry;
 use tokn_accounts::routing::RouteResolver;
 use tokn_accounts::{AccountInventory, AccountPool, AccountPoolRuleset};
-use tokn_config::ProxyProviderMode;
 use tokn_config::RouteMode;
 use tokn_config::{AgentId, Config, ModelFamily, ProfileConfig};
 use tokn_core::account::AccountConfig;
@@ -123,7 +122,6 @@ pub struct AppState {
   pub body_max_bytes: usize,
   pub cors_allowed_origins: Arc<BTreeSet<String>>,
   pub cors_allow_localhost: bool,
-  pub proxy_provider_modes: Arc<std::collections::BTreeMap<String, ProxyProviderMode>>,
   /// Shared `tokn-requests` pipeline used for router-owned JSON endpoints.
   pub request_pipeline: Arc<tokn_requests::Pipeline>,
   /// Shared `tokn-requests` pipeline used when the resolved route mode is
@@ -135,19 +133,6 @@ pub struct AppState {
   /// endpoints run in [`RouteMode::Switch`]. The body stays verbatim,
   /// but inbound auth is stripped before provider auth is injected.
   pub switch_pipeline: Arc<tokn_requests::Pipeline>,
-  /// Shared `tokn-requests` pipeline used by the MITM proxy passthrough
-  /// path. Unlike [`Self::passthrough_pipeline`], this variant does **no
-  /// account resolution** — the intercepted TLS host is the upstream
-  /// and the client's own `Authorization` reaches it unchanged. Wired
-  /// via `RunConfig` keys (`proxy.host`, `proxy.path`, `proxy.method`,
-  /// `proxy.provider_id`, `proxy.account_id`) that the proxy transport
-  /// layer fills before calling `run_with`.
-  pub proxy_passthrough_pipeline: Arc<tokn_requests::Pipeline>,
-  /// Shared `tokn-requests` pipeline used by the MITM proxy `switch`
-  /// path. This variant resolves the provider from the intercepted URL,
-  /// selects a configured account for that provider, and forwards the
-  /// request bytes verbatim with router-managed auth injection.
-  pub proxy_switch_pipeline: Arc<tokn_requests::Pipeline>,
 }
 
 #[derive(Clone)]
@@ -397,43 +382,17 @@ async fn admin_config_reload(axum::extract::State(state): axum::extract::State<L
 }
 
 pub fn build_state(cfg: &Config, accounts: &[AccountConfig], events: Arc<EventBus>) -> Result<AppState> {
-  build_state_inner(cfg, accounts, events, StateBuildKind::Api)
-}
-
-pub fn build_proxy_state(cfg: &Config, accounts: &[AccountConfig], events: Arc<EventBus>) -> Result<AppState> {
-  build_state_inner(cfg, accounts, events, StateBuildKind::Proxy)
-}
-
-#[derive(Clone, Copy)]
-enum StateBuildKind {
-  Api,
-  Proxy,
-}
-
-fn build_state_inner(
-  cfg: &Config,
-  accounts: &[AccountConfig],
-  events: Arc<EventBus>,
-  kind: StateBuildKind,
-) -> Result<AppState> {
   cfg.validate()?;
   let provider_registry = Arc::new(ProviderRegistry::builtin());
-  let _ = validate_proxy_provider_modes(cfg, provider_registry.as_ref());
   validate_policy_providers(cfg, provider_registry.as_ref())?;
   validate_policy_accounts(cfg, accounts)?;
   let identity = Arc::new(AccountIdentityResolver::from_accounts(accounts));
   let default_mode = effective_default_mode(cfg);
-  let inventory = if accounts.is_empty() && matches!(default_mode, RouteMode::Passthrough) {
-    AccountInventory::empty()
-  } else {
-    let registry = provider_registry.clone();
-    AccountInventory::from_accounts_with(accounts, move |account| registry.build(account))?
-  };
+  let registry = provider_registry.clone();
+  let inventory = AccountInventory::from_accounts_with(accounts, move |account| registry.build(account))?;
   let pool = AccountPool::from_inventory(&inventory, cfg, &AccountPoolRuleset::all())?;
   let default_families = effective_default_families(cfg);
-  if matches!(kind, StateBuildKind::Api) {
-    validate_api_default_provider_modes(cfg, default_mode)?;
-  }
+  validate_api_default_provider_modes(cfg, default_mode)?;
   let route = Arc::new(RouteResolver::with_default_provider(
     default_mode,
     cfg.defaults.default_provider_id.clone(),
@@ -473,8 +432,6 @@ fn build_state_inner(
     );
     profiles.insert(name.clone(), runtime);
   }
-  let proxy_passthrough_pipeline = build_proxy_passthrough_pipeline(http.clone(), events.clone());
-  let proxy_switch_pipeline = build_proxy_switch_pipeline(pool.clone(), http.clone(), events.clone());
   let cors_allowed_origins = if cfg.server.cors.enabled {
     cfg.server.cors.canonical_allowed_origins()?
   } else {
@@ -498,9 +455,6 @@ fn build_state_inner(
     body_max_bytes,
     cors_allowed_origins: Arc::new(cors_allowed_origins),
     cors_allow_localhost: cfg.server.cors.enabled && cfg.server.cors.allow_localhost,
-    proxy_provider_modes: Arc::new(cfg.proxy_mode.provider_modes.clone()),
-    proxy_passthrough_pipeline,
-    proxy_switch_pipeline,
   })
 }
 
@@ -629,26 +583,6 @@ fn validate_api_default_provider_modes(cfg: &Config, default_mode: RouteMode) ->
     "API passthrough/switch policies require default_provider_id: {}",
     missing.join(", ")
   )
-}
-
-fn validate_proxy_provider_modes(cfg: &Config, provider_registry: &ProviderRegistry) -> Result<()> {
-  let mut unresolved = Vec::new();
-  for provider_id in cfg.proxy_mode.provider_modes.keys() {
-    if provider_registry.resolve(provider_id).is_none() {
-      tracing::warn!(
-        provider_id = %provider_id,
-        "ignoring unresolved [proxy_mode].provider_modes entry"
-      );
-      unresolved.push(provider_id.clone());
-    }
-  }
-  if unresolved.is_empty() {
-    return Ok(());
-  }
-  anyhow::bail!(
-    "[proxy_mode].provider_modes contains unresolved provider ids: {}",
-    unresolved.join(", ")
-  );
 }
 
 fn validate_policy_providers(cfg: &Config, provider_registry: &ProviderRegistry) -> Result<()> {
@@ -805,60 +739,6 @@ fn build_passthrough_pipeline(
 enum PassthroughAuthMode {
   PreserveClient,
   Router,
-}
-
-/// Construct the proxy-passthrough `tokn-requests` pipeline used by the
-/// MITM proxy when the resolved route mode is
-/// [`RouteMode::Passthrough`]. Unlike [`build_passthrough_pipeline`],
-/// this variant performs **no account resolution** — the intercepted
-/// TLS host is the upstream, the client's `Authorization` reaches it
-/// untouched, and there is no provider-side auth injection.
-///
-/// The proxy transport layer supplies per-request hints
-/// (`proxy.host`, `proxy.path`, `proxy.method`, …) through a
-/// [`tokn_requests::RunConfig`] passed to `Pipeline::run_with`.
-/// [`ProxyResolve`] and [`ProxySend`] read those keys; the remaining
-/// stages are the same as the standard passthrough variant.
-fn build_proxy_passthrough_pipeline(http: reqwest::Client, events: Arc<EventBus>) -> Arc<tokn_requests::Pipeline> {
-  use tokn_requests::stages::{
-    PassthroughBuildHeaders, PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, ProxyResolve,
-    ProxySend,
-  };
-  let profile = tokn_requests::Profile::full(
-    "router-proxy-passthrough",
-    Arc::new(PassthroughExtract),
-    Arc::new(ProxyResolve),
-    Arc::new(PassthroughBuildHeaders::preserve_host()),
-    Arc::new(PassthroughConvertRequest),
-    Arc::new(ProxySend::new(http)),
-    Arc::new(PassthroughConvertResponse::new()),
-  );
-  Arc::new(tokn_requests::Pipeline::new_with_retry(
-    Arc::new(profile),
-    events,
-    PIPELINE_RETRY_POLICY,
-  ))
-}
-
-fn build_proxy_switch_pipeline(
-  pool: Arc<AccountPool>,
-  http: reqwest::Client,
-  events: Arc<EventBus>,
-) -> Arc<tokn_requests::Pipeline> {
-  use tokn_requests::stages::{
-    PassthroughBuildHeaders, PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract,
-    ProxyProviderResolve, ProxySend,
-  };
-  let profile = tokn_requests::Profile::full(
-    "router-proxy-switch",
-    Arc::new(PassthroughExtract),
-    Arc::new(ProxyProviderResolve::new(pool)),
-    Arc::new(PassthroughBuildHeaders::preserve_host_with_router_auth()),
-    Arc::new(PassthroughConvertRequest),
-    Arc::new(ProxySend::new(http)),
-    Arc::new(PassthroughConvertResponse::new()),
-  );
-  Arc::new(tokn_requests::Pipeline::new(Arc::new(profile), events))
 }
 
 #[cfg(test)]
@@ -1482,17 +1362,6 @@ mod tests {
   }
 
   #[test]
-  fn build_state_allows_empty_accounts_in_passthrough_mode() {
-    let mut cfg = Config::default();
-    cfg.server.route_mode = RouteMode::Passthrough;
-    let bus = EventBus::new(16);
-
-    let state =
-      build_proxy_state(&cfg, &[], Arc::new(bus)).expect("proxy passthrough mode should allow empty accounts");
-    assert_eq!(state.pool.len(), 0);
-  }
-
-  #[test]
   fn build_state_rejects_api_passthrough_without_default_provider_id() {
     let mut cfg = Config::default();
     cfg.defaults.mode = RouteMode::Passthrough;
@@ -1515,23 +1384,17 @@ mod tests {
   }
 
   #[test]
-  fn build_state_rejects_empty_accounts_in_non_passthrough_mode() {
-    let mut cfg = Config::default();
-    cfg.server.route_mode = RouteMode::Route;
+  fn build_state_rejects_empty_accounts() {
+    let cfg = Config::default();
     let bus = EventBus::new(16);
 
-    let res = build_proxy_state(&cfg, &[], Arc::new(bus));
-    assert!(res.is_err(), "non-passthrough mode should require accounts");
+    let res = build_state(&cfg, &[], Arc::new(bus));
+    assert!(res.is_err(), "API state should require accounts");
     let err = res.err().expect("checked above");
     assert!(err.to_string().contains("no accounts configured"));
   }
 
-  fn passthrough_state(
-    body_max_bytes: usize,
-    default_mode: RouteMode,
-    proxy_provider_mode: ProxyProviderMode,
-    profile_name: &str,
-  ) -> AppState {
+  fn passthrough_state(body_max_bytes: usize, default_mode: RouteMode, profile_name: &str) -> AppState {
     let mut cfg = Config::default();
     cfg.server.route_mode = RouteMode::Passthrough;
     cfg.defaults.mode = default_mode;
@@ -1540,18 +1403,14 @@ mod tests {
     }
     cfg.db.enabled = true;
     cfg.db.body_max_bytes = body_max_bytes;
-    cfg
-      .proxy_mode
-      .provider_modes
-      .insert("openai".into(), proxy_provider_mode);
     cfg.profiles.insert(profile_name.into(), ProfileConfig::default());
     build_state(&cfg, &[zai_account()], Arc::new(EventBus::noop())).expect("test state should build")
   }
 
   #[tokio::test]
   async fn admin_config_reload_swaps_live_state() {
-    let initial = passthrough_state(1, RouteMode::Passthrough, ProxyProviderMode::Passthrough, "old-profile");
-    let replacement = passthrough_state(2, RouteMode::Fuzzy, ProxyProviderMode::Switch, "new-profile");
+    let initial = passthrough_state(1, RouteMode::Passthrough, "old-profile");
+    let replacement = passthrough_state(2, RouteMode::Fuzzy, "new-profile");
     let live = LiveAppState::new(initial);
     let live_for_reload = live.clone();
     assert!(live
@@ -1587,10 +1446,6 @@ mod tests {
     assert_eq!(current.body_max_bytes, 2);
     assert_eq!(current.default_policy.mode, RouteMode::Fuzzy);
     assert_eq!(current.route.resolve_mode(None).unwrap(), RouteMode::Fuzzy);
-    assert_eq!(
-      current.proxy_provider_modes.get("openai"),
-      Some(&ProxyProviderMode::Switch)
-    );
     assert!(current.profiles.contains_key("new-profile"));
     assert!(!current.profiles.contains_key("old-profile"));
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -1603,12 +1458,7 @@ mod tests {
 
   #[tokio::test]
   async fn admin_config_reload_failure_keeps_live_state() {
-    let live = LiveAppState::new(passthrough_state(
-      1,
-      RouteMode::Passthrough,
-      ProxyProviderMode::Passthrough,
-      "old-profile",
-    ));
+    let live = LiveAppState::new(passthrough_state(1, RouteMode::Passthrough, "old-profile"));
     assert!(live
       .set_admin_reloader(AdminReloader::new(|| async { Err("invalid config".into()) }))
       .is_ok());
@@ -1630,10 +1480,6 @@ mod tests {
     assert_eq!(current.body_max_bytes, 1);
     assert_eq!(current.default_policy.mode, RouteMode::Passthrough);
     assert_eq!(current.route.resolve_mode(None).unwrap(), RouteMode::Passthrough);
-    assert_eq!(
-      current.proxy_provider_modes.get("openai"),
-      Some(&ProxyProviderMode::Passthrough)
-    );
     assert!(current.profiles.contains_key("old-profile"));
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1725,38 +1571,6 @@ mod tests {
       new_raw_request.contains(r#""model":"glm-4.7""#),
       "new upstream should receive the post-reload request"
     );
-  }
-
-  #[test]
-  fn build_state_allows_unknown_proxy_provider_mode_provider() {
-    let mut cfg = Config::default();
-    cfg.server.route_mode = RouteMode::Passthrough;
-    cfg
-      .proxy_mode
-      .provider_modes
-      .insert("made-up-provider".into(), ProxyProviderMode::Switch);
-    let bus = EventBus::new(16);
-
-    let res = build_proxy_state(&cfg, &[], Arc::new(bus));
-    assert!(
-      res.is_ok(),
-      "unknown provider ids should only warn and not fail state construction"
-    );
-  }
-
-  #[test]
-  fn validate_proxy_provider_modes_returns_error_for_unknown_provider() {
-    let mut cfg = Config::default();
-    cfg
-      .proxy_mode
-      .provider_modes
-      .insert("made-up-provider".into(), ProxyProviderMode::Switch);
-    let registry = ProviderRegistry::builtin();
-
-    let res = validate_proxy_provider_modes(&cfg, &registry);
-    let err = res.expect_err("helper should still return an error for outside callers");
-    assert!(err.to_string().contains("unresolved provider ids"));
-    assert!(err.to_string().contains("made-up-provider"));
   }
 
   #[tokio::test]
