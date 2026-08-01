@@ -13,7 +13,6 @@ import {
 export type ContainerNames = {
   gatewayImage: string;
   gatewayContainer: string;
-  networkName: string;
   projectName: string;
   routerStateVolume: string;
 };
@@ -21,12 +20,16 @@ export type ContainerNames = {
 type UpArgs = {
   copyLocal: "none" | "config" | "accounts";
   forceCopyLocal: boolean;
+  published_ports: PublishedPort[];
   tag: string;
-  port?: number;
-  proxyPort?: number;
 };
 
-export function resourceExists(kind: "container" | "image" | "network" | "volume", name: string): boolean {
+type PublishedPort = {
+  host_port: number;
+  listener_port: number;
+};
+
+export function resourceExists(kind: "container" | "image" | "volume", name: string): boolean {
   return containerOk([kind, "inspect", name]);
 }
 
@@ -35,16 +38,9 @@ export function namesForTag(tag: string): ContainerNames {
   return {
     gatewayImage: `${gatewayImageRepo}:${tag}`,
     gatewayContainer: `${projectName}-gateway`,
-    networkName: `${projectName}-net`,
     projectName,
     routerStateVolume: `${projectName}-router-state`,
   };
-}
-
-export function ensureNetwork(names: ContainerNames): void {
-  if (!resourceExists("network", names.networkName)) {
-    container(["network", "create", names.networkName]);
-  }
 }
 
 export function ensureImage(image: string, hint: string): void {
@@ -65,20 +61,14 @@ function parseUpArgs(args: string[]): UpArgs {
   const tagged = parseTaggedArgs(args, defaultTag);
   let copyLocal: UpArgs["copyLocal"] = "none";
   let forceCopyLocal = false;
-  let port: number | undefined;
-  let proxyPort: number | undefined;
+  const published_ports: PublishedPort[] = [];
   for (let i = 0; i < tagged.rest.length; i += 1) {
     const arg = tagged.rest[i];
-    if (arg === "--port") {
-      port = requirePort(requireValue(tagged.rest, i, "--port"), "--port");
+    if (arg === "--publish") {
+      published_ports.push(parsePublishedPort(requireValue(tagged.rest, i, "--publish")));
       i += 1;
-    } else if (arg.startsWith("--port=")) {
-      port = requirePort(arg.slice("--port=".length), "--port");
-    } else if (arg === "--proxy-port") {
-      proxyPort = requirePort(requireValue(tagged.rest, i, "--proxy-port"), "--proxy-port");
-      i += 1;
-    } else if (arg.startsWith("--proxy-port=")) {
-      proxyPort = requirePort(arg.slice("--proxy-port=".length), "--proxy-port");
+    } else if (arg.startsWith("--publish=")) {
+      published_ports.push(parsePublishedPort(arg.slice("--publish=".length)));
     } else if (arg === "--copy-local-config") {
       if (copyLocal !== "none") {
         throw new Error("--copy-local-config and --copy-local-accounts are mutually exclusive");
@@ -98,7 +88,24 @@ function parseUpArgs(args: string[]): UpArgs {
   if (forceCopyLocal && copyLocal === "none") {
     throw new Error("--force-copy-local requires --copy-local-config or --copy-local-accounts");
   }
-  return { copyLocal, forceCopyLocal, tag: tagged.tag, port, proxyPort };
+  const duplicateHostPort = published_ports.find(
+    (candidate, index) => published_ports.findIndex((entry) => entry.host_port === candidate.host_port) !== index,
+  );
+  if (duplicateHostPort !== undefined) {
+    throw new Error(`host port ${duplicateHostPort.host_port} is published more than once`);
+  }
+  return { copyLocal, forceCopyLocal, published_ports, tag: tagged.tag };
+}
+
+function parsePublishedPort(value: string): PublishedPort {
+  const parts = value.split(":");
+  if (parts.length !== 2) {
+    throw new Error(`invalid --publish value '${value}' (expected HOST_PORT:LISTENER_PORT)`);
+  }
+  return {
+    host_port: requirePort(parts[0], "--publish host port"),
+    listener_port: requirePort(parts[1], "--publish listener port"),
+  };
 }
 
 function copyLocalRouterFiles(names: ContainerNames, parsed: UpArgs): void {
@@ -155,44 +162,67 @@ function loadHintForTag(tag: string): string {
   return `run \`bun --cwd scripts docker load --tag ${tag} <image.tar>\` first`;
 }
 
+function requireV2GatewayConfig(names: ContainerNames): void {
+  const volumeArgs = ["-v", `${names.routerStateVolume}:/state:ro`];
+  const hasConfig = containerOk([
+    "run",
+    "--rm",
+    ...volumeArgs,
+    "--entrypoint",
+    "sh",
+    names.gatewayImage,
+    "-c",
+    "test -f /state/config.toml",
+  ]);
+  if (!hasConfig) {
+    throw new Error(
+      `gateway state has no config.toml; seed a schema-v2 config with --copy-local-config for tag ${names.projectName}`,
+    );
+  }
+
+  const isV2 = containerOk([
+    "run",
+    "--rm",
+    ...volumeArgs,
+    "--entrypoint",
+    "sh",
+    names.gatewayImage,
+    "-c",
+    "grep -Eq '^[[:space:]]*schema_version[[:space:]]*=[[:space:]]*2[[:space:]]*(#.*)?$' /state/config.toml",
+  ]);
+  if (!isV2) {
+    throw new Error(
+      `gateway config is not schema version 2; migrate it or replace it with --copy-local-config --force-copy-local`,
+    );
+  }
+}
+
 export function up(args: string[] = []): void {
   const parsed = parseUpArgs(args);
   const names = namesForTag(parsed.tag);
   ensureImage(names.gatewayImage, loadHintForTag(parsed.tag));
-  ensureNetwork(names);
   if (resourceExists("container", names.gatewayContainer)) {
     container(["rm", "-f", names.gatewayContainer]);
   }
   copyLocalRouterFiles(names, parsed);
+  requireV2GatewayConfig(names);
   const portArgs: string[] = [];
-  if (parsed.port !== undefined) {
-    portArgs.push("-p", `127.0.0.1:${parsed.port}:4141`);
-  }
-  if (parsed.proxyPort !== undefined) {
-    portArgs.push("-p", `127.0.0.1:${parsed.proxyPort}:4142`);
+  for (const published of parsed.published_ports) {
+    portArgs.push("-p", `127.0.0.1:${published.host_port}:${published.listener_port}`);
   }
   container([
     "run",
     "-d",
     "--name",
     names.gatewayContainer,
-    "--network",
-    names.networkName,
     ...portArgs,
     "-v",
     `${names.routerStateVolume}:/root/.tokn/router`,
     names.gatewayImage,
     "serve",
-    "--host",
-    "0.0.0.0",
-    "--with-proxy",
-    "--insecure-allow-remote",
   ]);
-  if (parsed.port !== undefined) {
-    console.log(`API: http://127.0.0.1:${parsed.port}/v1`);
-  }
-  if (parsed.proxyPort !== undefined) {
-    console.log(`Proxy: http://127.0.0.1:${parsed.proxyPort}`);
+  for (const published of parsed.published_ports) {
+    console.log(`Published: 127.0.0.1:${published.host_port} -> listener port ${published.listener_port}`);
   }
 }
 
@@ -206,9 +236,6 @@ export function down(args: string[] = []): void {
   const names = namesForTag(tagged.tag);
   if (resourceExists("container", names.gatewayContainer)) {
     container(["rm", "-f", names.gatewayContainer]);
-  }
-  if (resourceExists("network", names.networkName)) {
-    container(["network", "rm", names.networkName]);
   }
 }
 
@@ -232,7 +259,6 @@ export function status(args: string[] = []): void {
   container(["image", "ls", names.gatewayImage]);
   container(["image", "ls", agentImage]);
   container(["volume", "ls", "--filter", `name=${names.routerStateVolume}`]);
-  container(["network", "ls", "--filter", `name=${names.networkName}`]);
 }
 
 export function logs(args: string[] = []): void {
