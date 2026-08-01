@@ -8,10 +8,10 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 use tokn_events::{
-  AttemptFinished, AttemptNo, AttemptOutcome, AttemptStarted, BodyCapture, BodyFinished, BodyLeg, BodyOutcome,
-  BodyResult, ConnectAction, ConnectClosed, ConnectReady, ConsumerResult, EventConsumer, EventSeq, GatewayEvent,
-  HttpResponseHead, RequestAdmitted, RequestBodyObservation, RequestFinished, RequestId, RequestOutcome,
-  RequestStarted, TrafficEvent, TrafficEventKind,
+  AttemptFinished, AttemptHttpRequest, AttemptNo, AttemptOutcome, AttemptStarted, BodyCapture, BodyFinished, BodyLeg,
+  BodyOutcome, BodyProgress, BodyResult, ConnectAction, ConnectClosed, ConnectReady, ConsumerResult, EventConsumer,
+  EventSeq, GatewayEvent, HttpResponseHead, PolicySelection, RequestAdmitted, RequestBodyObservation, RequestFinished,
+  RequestId, RequestOutcome, RequestStarted, SelectedAction, TrafficEvent, TrafficEventKind,
 };
 
 const MAX_PENDING_SESSIONS: usize = 16_384;
@@ -190,11 +190,17 @@ struct PendingSession {
   endpoint: Option<String>,
   requested_model: Option<String>,
   request_body: SemanticRequestBody,
+  admission_observed: bool,
+  policy: Option<SelectedTransport>,
+  request_body_observed: bool,
   attempts: BTreeMap<AttemptNo, PendingAttempt>,
   accepted_attempt: Option<AttemptNo>,
   transport: TransportState,
+  connect_authority: Option<String>,
   downstream_status: Option<u16>,
   downstream_body: Option<Bytes>,
+  downstream_body_observed: bool,
+  downstream_body_progress_observed: bool,
 }
 
 impl PendingSession {
@@ -209,11 +215,17 @@ impl PendingSession {
       endpoint: None,
       requested_model: None,
       request_body: SemanticRequestBody::Unavailable,
+      admission_observed: false,
+      policy: None,
+      request_body_observed: false,
       attempts: BTreeMap::new(),
       accepted_attempt: None,
       transport: TransportState::Unknown,
+      connect_authority: None,
       downstream_status: None,
       downstream_body: None,
+      downstream_body_observed: false,
+      downstream_body_progress_observed: false,
     }
   }
 
@@ -234,19 +246,17 @@ impl PendingSession {
   fn apply(&mut self, event: &TrafficEvent) -> SessionWriteResult {
     match &event.kind {
       TrafficEventKind::Admitted(admitted) => self.observe_admitted(&event.request_id, admitted)?,
+      TrafficEventKind::PolicySelected(selection) => self.observe_policy(&event.request_id, selection)?,
       TrafficEventKind::RequestBody(observation) => {
         self.require_http(&event.request_id, "request body")?;
-        self.observe_request_body(observation);
+        self.observe_request_body(&event.request_id, observation)?;
       }
       TrafficEventKind::AttemptStarted(started) => self.start_attempt(&event.request_id, event.at_unix_ms, started)?,
+      TrafficEventKind::AttemptRequest(request) => self.observe_attempt_request(&event.request_id, request)?,
       TrafficEventKind::AttemptResponseHead(response) => {
         self.observe_attempt_head(&event.request_id, response.attempt, response.response.status)?
       }
-      TrafficEventKind::BodyProgress(progress) => {
-        if let BodyLeg::Upstream { attempt } = progress.leg {
-          self.open_attempt_mut(&event.request_id, attempt, "upstream body progress")?;
-        }
-      }
+      TrafficEventKind::BodyProgress(progress) => self.observe_body_progress(&event.request_id, progress)?,
       TrafficEventKind::BodyFinished(finished) => self.observe_body(&event.request_id, finished)?,
       TrafficEventKind::DownstreamResponseHead(response) => {
         self.observe_downstream_head(&event.request_id, response)?;
@@ -254,6 +264,9 @@ impl PendingSession {
       TrafficEventKind::AttemptFinished(finished) => self.finish_attempt(&event.request_id, finished)?,
       TrafficEventKind::ConnectReady(ready) => self.observe_connect_ready(&event.request_id, ready)?,
       TrafficEventKind::ConnectClosed(closed) => self.observe_connect_closed(&event.request_id, closed)?,
+      // Usage can arrive after AttemptFinished in a terminal batch. Sessions do
+      // not project token accounting, so preserve that valid late boundary.
+      TrafficEventKind::AttemptUsage(_) => {}
       TrafficEventKind::Started(_) | TrafficEventKind::Finished(_) => {
         return Err(SessionWriteError::lifecycle(
           &event.request_id,
@@ -266,14 +279,32 @@ impl PendingSession {
   }
 
   fn observe_admitted(&mut self, request_id: &RequestId, admitted: &RequestAdmitted) -> SessionWriteResult {
+    if self.admission_observed {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        "request admission was observed more than once",
+      ));
+    }
     match admitted {
       RequestAdmitted::Http { operation, .. } => {
+        if matches!(self.policy, Some(SelectedTransport::Connect(_))) {
+          return Err(SessionWriteError::lifecycle(
+            request_id,
+            "HTTP admission followed a CONNECT policy",
+          ));
+        }
         self.require_http(request_id, "HTTP admission")?;
         if let Some(operation) = operation.as_ref() {
           self.endpoint = non_empty(Some(operation.as_str()));
         }
       }
-      RequestAdmitted::Connect { .. } => {
+      RequestAdmitted::Connect { authority } => {
+        if matches!(self.policy, Some(SelectedTransport::Http)) {
+          return Err(SessionWriteError::lifecycle(
+            request_id,
+            "CONNECT admission followed an HTTP policy",
+          ));
+        }
         self.transport = match self.transport {
           TransportState::Unknown => TransportState::Connect(ConnectState::Admitted),
           TransportState::Http => {
@@ -289,9 +320,42 @@ impl PendingSession {
             ));
           }
         };
+        self.connect_authority = Some(authority.to_string());
       }
       _ => {}
     }
+    self.admission_observed = true;
+    Ok(())
+  }
+
+  fn observe_policy(&mut self, request_id: &RequestId, selection: &PolicySelection) -> SessionWriteResult {
+    if self.policy.is_some() {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        "request policy was selected more than once",
+      ));
+    }
+    match (&selection.action, self.transport) {
+      (SelectedAction::Http { .. }, TransportState::Connect(_)) => {
+        return Err(SessionWriteError::lifecycle(
+          request_id,
+          "HTTP policy followed CONNECT admission",
+        ));
+      }
+      (SelectedAction::Connect { .. }, TransportState::Http) => {
+        return Err(SessionWriteError::lifecycle(
+          request_id,
+          "CONNECT policy followed an HTTP lifecycle",
+        ));
+      }
+      _ => {}
+    }
+    self.policy = Some(match &selection.action {
+      SelectedAction::Reject => SelectedTransport::Reject,
+      SelectedAction::Http { .. } => SelectedTransport::Http,
+      SelectedAction::Connect { action } => SelectedTransport::Connect(*action),
+      _ => SelectedTransport::Unknown,
+    });
     Ok(())
   }
 
@@ -309,7 +373,17 @@ impl PendingSession {
     Ok(())
   }
 
-  fn observe_request_body(&mut self, observation: &RequestBodyObservation) {
+  fn observe_request_body(
+    &mut self,
+    request_id: &RequestId,
+    observation: &RequestBodyObservation,
+  ) -> SessionWriteResult {
+    if self.request_body_observed {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        "request body was observed more than once",
+      ));
+    }
     self.requested_model = observation.requested_model.as_ref().map(ToString::to_string);
     self.request_body = match &observation.outcome {
       BodyOutcome::Rejected(_) => SemanticRequestBody::Rejected,
@@ -318,13 +392,23 @@ impl PendingSession {
         .unwrap_or(SemanticRequestBody::Unavailable),
       _ => SemanticRequestBody::Unavailable,
     };
+    self.request_body_observed = true;
+    Ok(())
   }
 
   fn start_attempt(&mut self, request_id: &RequestId, at_unix_ms: i64, started: &AttemptStarted) -> SessionWriteResult {
-    if matches!(self.transport, TransportState::Connect(_)) {
+    if matches!(self.transport, TransportState::Connect(_))
+      || matches!(
+        self.policy,
+        Some(SelectedTransport::Reject | SelectedTransport::Connect(_))
+      )
+    {
       return Err(SessionWriteError::lifecycle(
         request_id,
-        format!("attempt {} followed a CONNECT lifecycle", started.attempt),
+        format!(
+          "attempt {} followed a non-HTTP policy or CONNECT lifecycle",
+          started.attempt
+        ),
       ));
     }
     let expected_attempt = u32::try_from(self.attempts.len()).unwrap_or(u32::MAX).saturating_add(1);
@@ -368,9 +452,11 @@ impl PendingSession {
         provider_id: started.target.provider_id.as_ref().map(ToString::to_string),
         requested_model: started.target.requested_model.as_ref().map(ToString::to_string),
         requested_operation: started.target.requested_operation.as_ref().map(ToString::to_string),
+        request_observed: false,
         wire_status: None,
         terminal_status: None,
         upstream_body: None,
+        upstream_body_observed: false,
         finished: false,
         retry_planned: false,
       },
@@ -378,17 +464,52 @@ impl PendingSession {
     Ok(())
   }
 
+  fn observe_attempt_request(&mut self, request_id: &RequestId, request: &AttemptHttpRequest) -> SessionWriteResult {
+    let attempt = self.open_attempt_mut(request_id, request.attempt, "request snapshot")?;
+    if attempt.request_observed {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        format!("attempt {} request was observed more than once", request.attempt),
+      ));
+    }
+    attempt.request_observed = true;
+    Ok(())
+  }
+
   fn observe_attempt_head(&mut self, request_id: &RequestId, attempt: AttemptNo, status: u16) -> SessionWriteResult {
-    let attempt = self.open_attempt_mut(request_id, attempt, "response head")?;
-    if let Some(observed) = attempt.wire_status {
-      if observed != status {
-        return Err(SessionWriteError::lifecycle(
-          request_id,
-          format!("attempt response status changed from {observed} to {status}"),
-        ));
+    let attempt_state = self.open_attempt_mut(request_id, attempt, "response head")?;
+    if attempt_state.wire_status.is_some() {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        format!("attempt {attempt} response head was observed more than once"),
+      ));
+    }
+    attempt_state.wire_status = Some(status);
+    Ok(())
+  }
+
+  fn observe_body_progress(&mut self, request_id: &RequestId, progress: &BodyProgress) -> SessionWriteResult {
+    match progress.leg {
+      BodyLeg::Upstream { attempt } => {
+        let attempt_state = self.open_attempt_mut(request_id, attempt, "upstream body progress")?;
+        if attempt_state.upstream_body_observed {
+          return Err(SessionWriteError::lifecycle(
+            request_id,
+            format!("attempt {attempt} body progress followed body completion"),
+          ));
+        }
       }
-    } else {
-      attempt.wire_status = Some(status);
+      BodyLeg::Downstream => {
+        self.require_http(request_id, "downstream body progress")?;
+        if self.downstream_body_observed {
+          return Err(SessionWriteError::lifecycle(
+            request_id,
+            "downstream body progress followed body completion",
+          ));
+        }
+        self.downstream_body_progress_observed = true;
+      }
+      _ => {}
     }
     Ok(())
   }
@@ -401,30 +522,41 @@ impl PendingSession {
     };
     match finished.leg {
       BodyLeg::Upstream { attempt } => {
-        self
-          .open_attempt_mut(request_id, attempt, "upstream body")?
-          .upstream_body = body;
+        let attempt_state = self.open_attempt_mut(request_id, attempt, "upstream body")?;
+        if attempt_state.upstream_body_observed {
+          return Err(SessionWriteError::lifecycle(
+            request_id,
+            format!("attempt {attempt} body finished more than once"),
+          ));
+        }
+        attempt_state.upstream_body = body;
+        attempt_state.upstream_body_observed = true;
       }
-      BodyLeg::Downstream => self.downstream_body = body,
+      BodyLeg::Downstream => {
+        self.require_http(request_id, "downstream body completion")?;
+        if self.downstream_body_observed {
+          return Err(SessionWriteError::lifecycle(
+            request_id,
+            "downstream body finished more than once",
+          ));
+        }
+        self.downstream_body = body;
+        self.downstream_body_observed = true;
+      }
       _ => {}
     }
     Ok(())
   }
 
   fn observe_downstream_head(&mut self, request_id: &RequestId, response: &HttpResponseHead) -> SessionWriteResult {
-    if let Some(observed) = self.downstream_status {
-      if observed != response.status {
-        return Err(SessionWriteError::lifecycle(
-          request_id,
-          format!(
-            "downstream response status changed from {observed} to {}",
-            response.status
-          ),
-        ));
-      }
-    } else {
-      self.downstream_status = Some(response.status);
+    self.require_http(request_id, "downstream response head")?;
+    if self.downstream_status.is_some() {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        "downstream response head was observed more than once",
+      ));
     }
+    self.downstream_status = Some(response.status);
     Ok(())
   }
 
@@ -457,8 +589,8 @@ impl PendingSession {
   }
 
   fn observe_connect_ready(&mut self, request_id: &RequestId, ready: &ConnectReady) -> SessionWriteResult {
-    self.transport = match self.transport {
-      TransportState::Connect(ConnectState::Admitted) => TransportState::Connect(ConnectState::Ready(ready.action)),
+    match self.transport {
+      TransportState::Connect(ConnectState::Admitted) => {}
       TransportState::Unknown => {
         return Err(SessionWriteError::lifecycle(
           request_id,
@@ -483,7 +615,48 @@ impl PendingSession {
           "CONNECT became ready after it closed",
         ));
       }
-    };
+    }
+    if ready.action == ConnectAction::Reject {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        "rejected CONNECT cannot become ready",
+      ));
+    }
+    match self.policy {
+      Some(SelectedTransport::Connect(action)) if action == ready.action => {}
+      Some(SelectedTransport::Connect(_)) => {
+        return Err(SessionWriteError::lifecycle(
+          request_id,
+          "CONNECT ready action differs from the selected CONNECT policy",
+        ));
+      }
+      Some(_) => {
+        return Err(SessionWriteError::lifecycle(
+          request_id,
+          "CONNECT became ready after a non-CONNECT policy",
+        ));
+      }
+      None => {
+        return Err(SessionWriteError::lifecycle(
+          request_id,
+          "CONNECT became ready before CONNECT policy selection",
+        ));
+      }
+    }
+    if self.connect_authority.as_deref() != Some(ready.authority.as_str()) {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        "CONNECT ready authority differs from CONNECT admission",
+      ));
+    }
+    if self.downstream_status.is_some() || self.downstream_body_observed || self.downstream_body_progress_observed {
+      return Err(SessionWriteError::lifecycle(
+        request_id,
+        "CONNECT became ready after an HTTP response boundary",
+      ));
+    }
+    self.downstream_status = Some(200);
+    self.transport = TransportState::Connect(ConnectState::Ready(ready.action));
     Ok(())
   }
 
@@ -670,11 +843,21 @@ struct PendingAttempt {
   provider_id: Option<String>,
   requested_model: Option<String>,
   requested_operation: Option<String>,
+  request_observed: bool,
   wire_status: Option<u16>,
   terminal_status: Option<u16>,
   upstream_body: Option<Bytes>,
+  upstream_body_observed: bool,
   finished: bool,
   retry_planned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedTransport {
+  Reject,
+  Http,
+  Connect(ConnectAction),
+  Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -787,8 +970,9 @@ mod tests {
   use super::*;
   use serde_json::json;
   use tokn_events::{
-    BodyOutcome, CapturedHeaders, CapturedUri, Correlation, EventFailure, HttpFamily, HttpResponseHead, IngressKind,
-    RequestPhase, RequestSource, RetryDecision, TargetSelection,
+    AttemptUsage, BodyOutcome, CapturedHeaders, CapturedUri, Correlation, EventFailure, HttpFamily,
+    HttpRequestSnapshot, HttpResponseHead, IngressKind, RequestPhase, RequestSource, RetryDecision, TargetSelection,
+    TokenUsage,
   };
 
   struct Harness {
@@ -855,16 +1039,40 @@ mod tests {
       }));
     }
 
+    fn admit_connect(&mut self, authority: &str) {
+      self.emit(TrafficEventKind::Admitted(RequestAdmitted::Connect {
+        authority: authority.into(),
+      }));
+    }
+
+    fn select_connect(&mut self, action: ConnectAction) {
+      self.emit(TrafficEventKind::PolicySelected(PolicySelection {
+        binding_id: Some("connect-binding".into()),
+        action: SelectedAction::Connect { action },
+      }));
+    }
+
+    fn ready_connect(&mut self, authority: &str, action: ConnectAction) {
+      self.emit(TrafficEventKind::ConnectReady(ConnectReady {
+        action,
+        authority: authority.into(),
+      }));
+    }
+
     fn request_body(&mut self, body: serde_json::Value, model: &str) {
+      self.request_body_result(body, model).unwrap();
+    }
+
+    fn request_body_result(&mut self, body: serde_json::Value, model: &str) -> ConsumerResult {
       let body = Bytes::from(serde_json::to_vec(&body).unwrap());
-      self.emit(TrafficEventKind::RequestBody(RequestBodyObservation {
+      self.emit_result(TrafficEventKind::RequestBody(RequestBodyObservation {
         wire: BodyCapture::Complete(body.clone()),
         decoded: Some(BodyCapture::Complete(body)),
         requested_model: Some(model.into()),
         stream: Some(false),
         initiator: None,
         outcome: BodyOutcome::Accepted,
-      }));
+      }))
     }
 
     fn start_attempt(&mut self, attempt: AttemptNo, status_model: &str) {
@@ -888,7 +1096,11 @@ mod tests {
     }
 
     fn response_head(&mut self, attempt: AttemptNo, status: u16) {
-      self.emit(TrafficEventKind::AttemptResponseHead(
+      self.response_head_result(attempt, status).unwrap();
+    }
+
+    fn response_head_result(&mut self, attempt: AttemptNo, status: u16) -> ConsumerResult {
+      self.emit_result(TrafficEventKind::AttemptResponseHead(
         tokn_events::AttemptHttpResponseHead {
           attempt,
           response: HttpResponseHead {
@@ -896,7 +1108,7 @@ mod tests {
             headers: CapturedHeaders::default(),
           },
         },
-      ));
+      ))
     }
 
     fn finish_attempt(&mut self, attempt: AttemptNo, status: u16, retry: Option<RetryDecision>) {
@@ -923,6 +1135,20 @@ mod tests {
         attempt_count,
       }))
     }
+  }
+
+  fn ready_connect_harness(request_id: &str) -> Harness {
+    let mut harness = Harness::new(
+      request_id,
+      Correlation {
+        session_id: Some(format!("session-{request_id}").into()),
+        ..Correlation::default()
+      },
+    );
+    harness.admit_connect("example.com:443");
+    harness.select_connect(ConnectAction::Tunnel);
+    harness.ready_connect("example.com:443", ConnectAction::Tunnel);
+    harness
   }
 
   #[test]
@@ -1325,6 +1551,177 @@ mod tests {
   }
 
   #[test]
+  fn request_and_response_boundaries_are_one_shot() {
+    let mut body = Harness::new(
+      "request-duplicate-request-body",
+      Correlation {
+        session_id: Some("session-duplicate-request-body".into()),
+        ..Correlation::default()
+      },
+    );
+    body.admit("responses");
+    body.request_body(json!({"input": "first"}), "model-first");
+    let error = body
+      .request_body_result(json!({"input": "second"}), "model-second")
+      .unwrap_err();
+    assert!(error.to_string().contains("request body was observed more than once"));
+    assert_eq!(
+      body.consumer.pending[&body.request_id].requested_model.as_deref(),
+      Some("model-first")
+    );
+
+    let mut upstream = Harness::new(
+      "request-duplicate-upstream-head",
+      Correlation {
+        session_id: Some("session-duplicate-upstream-head".into()),
+        ..Correlation::default()
+      },
+    );
+    upstream.start_attempt(AttemptNo::FIRST, "model-head");
+    upstream.response_head(AttemptNo::FIRST, 200);
+    let error = upstream.response_head_result(AttemptNo::FIRST, 200).unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("attempt 1 response head was observed more than once"));
+
+    let mut downstream = Harness::new(
+      "request-duplicate-downstream-head",
+      Correlation {
+        session_id: Some("session-duplicate-downstream-head".into()),
+        ..Correlation::default()
+      },
+    );
+    downstream.admit("responses");
+    downstream.emit(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+      status: 200,
+      headers: CapturedHeaders::default(),
+    }));
+    let error = downstream
+      .emit_result(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: 200,
+        headers: CapturedHeaders::default(),
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("downstream response head was observed more than once"));
+  }
+
+  #[test]
+  fn body_completion_is_one_shot_and_closes_progress() {
+    let mut upstream = Harness::new(
+      "request-duplicate-upstream-body",
+      Correlation {
+        session_id: Some("session-duplicate-upstream-body".into()),
+        ..Correlation::default()
+      },
+    );
+    upstream.start_attempt(AttemptNo::FIRST, "model-body");
+    let completion = TrafficEventKind::BodyFinished(BodyFinished {
+      leg: BodyLeg::Upstream {
+        attempt: AttemptNo::FIRST,
+      },
+      capture: BodyCapture::Absent,
+      result: BodyResult::Complete,
+    });
+    upstream.emit(completion.clone());
+    let failed_sequence = upstream.sequence + 1;
+    let error = upstream.emit_at_result(failed_sequence, completion).unwrap_err();
+    assert!(error.to_string().contains("attempt 1 body finished more than once"));
+    let error = upstream
+      .emit_at_result(
+        failed_sequence,
+        TrafficEventKind::BodyProgress(BodyProgress {
+          leg: BodyLeg::Upstream {
+            attempt: AttemptNo::FIRST,
+          },
+          bytes_seen: 1,
+          chunks: 1,
+        }),
+      )
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("attempt 1 body progress followed body completion"));
+
+    let mut downstream = Harness::new(
+      "request-duplicate-downstream-body",
+      Correlation {
+        session_id: Some("session-duplicate-downstream-body".into()),
+        ..Correlation::default()
+      },
+    );
+    downstream.admit("responses");
+    let completion = TrafficEventKind::BodyFinished(BodyFinished {
+      leg: BodyLeg::Downstream,
+      capture: BodyCapture::Absent,
+      result: BodyResult::Complete,
+    });
+    downstream.emit(completion.clone());
+    let failed_sequence = downstream.sequence + 1;
+    let error = downstream.emit_at_result(failed_sequence, completion).unwrap_err();
+    assert!(error.to_string().contains("downstream body finished more than once"));
+    let error = downstream
+      .emit_at_result(
+        failed_sequence,
+        TrafficEventKind::BodyProgress(BodyProgress {
+          leg: BodyLeg::Downstream,
+          bytes_seen: 1,
+          chunks: 1,
+        }),
+      )
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("downstream body progress followed body completion"));
+  }
+
+  #[test]
+  fn attempt_request_is_one_shot_but_late_usage_remains_valid() {
+    let mut request = Harness::new(
+      "request-duplicate-attempt-request",
+      Correlation {
+        session_id: Some("session-duplicate-attempt-request".into()),
+        ..Correlation::default()
+      },
+    );
+    request.start_attempt(AttemptNo::FIRST, "model-request");
+    let snapshot = TrafficEventKind::AttemptRequest(AttemptHttpRequest {
+      attempt: AttemptNo::FIRST,
+      request: HttpRequestSnapshot {
+        method: "POST".into(),
+        uri: CapturedUri::exact("https://example.com/v1/responses"),
+        headers: CapturedHeaders::default(),
+        body: BodyCapture::Absent,
+      },
+    });
+    request.emit(snapshot.clone());
+    let error = request.emit_result(snapshot).unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("attempt 1 request was observed more than once"));
+
+    let mut usage = Harness::new(
+      "request-late-session-usage",
+      Correlation {
+        session_id: Some("session-late-session-usage".into()),
+        ..Correlation::default()
+      },
+    );
+    usage.start_attempt(AttemptNo::FIRST, "model-usage");
+    usage.finish_attempt(AttemptNo::FIRST, 200, None);
+    usage.emit(TrafficEventKind::AttemptUsage(AttemptUsage {
+      attempt: AttemptNo::FIRST,
+      usage: TokenUsage {
+        total: Some(7),
+        ..TokenUsage::default()
+      },
+    }));
+    usage.finish(RequestOutcome::Delivered, Some(200), 1);
+    assert!(usage.consumer.pending.is_empty());
+  }
+
+  #[test]
   fn delivered_request_requires_a_response_from_the_final_attempt() {
     let mut harness = Harness::new(
       "request-stale-response",
@@ -1421,13 +1818,13 @@ mod tests {
         ..Correlation::default()
       },
     );
-    connect_then_http.emit(TrafficEventKind::Admitted(RequestAdmitted::Connect {
-      authority: "example.com:443".into(),
-    }));
+    connect_then_http.admit_connect("example.com:443");
     let error = connect_then_http
       .start_attempt_result(AttemptNo::FIRST, "model-connect")
       .unwrap_err();
-    assert!(error.to_string().contains("attempt 1 followed a CONNECT lifecycle"));
+    assert!(error
+      .to_string()
+      .contains("attempt 1 followed a non-HTTP policy or CONNECT lifecycle"));
 
     let mut http_then_connect = Harness::new(
       "request-http-then-connect",
@@ -1454,17 +1851,9 @@ mod tests {
         ..Correlation::default()
       },
     );
-    connect.emit(TrafficEventKind::Admitted(RequestAdmitted::Connect {
-      authority: "example.com:443".into(),
-    }));
-    connect.emit(TrafficEventKind::ConnectReady(ConnectReady {
-      action: ConnectAction::Tunnel,
-      authority: "example.com:443".into(),
-    }));
-    connect.emit(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
-      status: 200,
-      headers: CapturedHeaders::default(),
-    }));
+    connect.admit_connect("example.com:443");
+    connect.select_connect(ConnectAction::Tunnel);
+    connect.ready_connect("example.com:443", ConnectAction::Tunnel);
     connect.emit(TrafficEventKind::ConnectClosed(ConnectClosed {
       action: ConnectAction::Tunnel,
       client_to_upstream_bytes: Some(10),
@@ -1474,6 +1863,166 @@ mod tests {
     connect.finish(RequestOutcome::Delivered, Some(200), 0);
     assert!(connect.consumer.pending.is_empty());
     assert_eq!(session_node_count(&connect.consumer), 0);
+  }
+
+  #[test]
+  fn connect_ready_requires_the_selected_action_and_admitted_authority() {
+    let mut mismatch = Harness::new(
+      "request-connect-action-mismatch",
+      Correlation {
+        session_id: Some("session-connect-action-mismatch".into()),
+        ..Correlation::default()
+      },
+    );
+    mismatch.admit_connect("example.com:443");
+    mismatch.select_connect(ConnectAction::Intercept);
+    let error = mismatch
+      .emit_result(TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "example.com:443".into(),
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("CONNECT ready action differs from the selected CONNECT policy"));
+
+    let mut rejected = Harness::new(
+      "request-connect-reject-ready",
+      Correlation {
+        session_id: Some("session-connect-reject-ready".into()),
+        ..Correlation::default()
+      },
+    );
+    rejected.admit_connect("example.com:443");
+    rejected.select_connect(ConnectAction::Reject);
+    let error = rejected
+      .emit_result(TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Reject,
+        authority: "example.com:443".into(),
+      }))
+      .unwrap_err();
+    assert!(error.to_string().contains("rejected CONNECT cannot become ready"));
+
+    let mut authority = Harness::new(
+      "request-connect-authority-mismatch",
+      Correlation {
+        session_id: Some("session-connect-authority-mismatch".into()),
+        ..Correlation::default()
+      },
+    );
+    authority.admit_connect("example.com:443");
+    authority.select_connect(ConnectAction::Tunnel);
+    let error = authority
+      .emit_result(TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "other.example:443".into(),
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("CONNECT ready authority differs from CONNECT admission"));
+
+    let mut generic_reject = Harness::new(
+      "request-connect-generic-reject",
+      Correlation {
+        session_id: Some("session-connect-generic-reject".into()),
+        ..Correlation::default()
+      },
+    );
+    generic_reject.admit_connect("example.com:443");
+    generic_reject.emit(TrafficEventKind::PolicySelected(PolicySelection {
+      binding_id: None,
+      action: SelectedAction::Reject,
+    }));
+    let error = generic_reject
+      .emit_result(TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "example.com:443".into(),
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("CONNECT became ready after a non-CONNECT policy"));
+  }
+
+  #[test]
+  fn ready_connect_rejects_http_response_facts() {
+    let mut head = ready_connect_harness("request-connect-late-head");
+    let error = head
+      .emit_result(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: 200,
+        headers: CapturedHeaders::default(),
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("downstream response head followed a CONNECT lifecycle"));
+
+    let mut progress = ready_connect_harness("request-connect-late-progress");
+    let error = progress
+      .emit_result(TrafficEventKind::BodyProgress(BodyProgress {
+        leg: BodyLeg::Downstream,
+        bytes_seen: 10,
+        chunks: 1,
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("downstream body progress followed a CONNECT lifecycle"));
+
+    let mut body = ready_connect_harness("request-connect-late-body");
+    let error = body
+      .emit_result(TrafficEventKind::BodyFinished(BodyFinished {
+        leg: BodyLeg::Downstream,
+        capture: BodyCapture::Absent,
+        result: BodyResult::Complete,
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("downstream body completion followed a CONNECT lifecycle"));
+  }
+
+  #[test]
+  fn admission_and_policy_selection_are_one_shot() {
+    let mut admission = Harness::new(
+      "request-duplicate-admission",
+      Correlation {
+        session_id: Some("session-duplicate-admission".into()),
+        ..Correlation::default()
+      },
+    );
+    admission.admit("responses");
+    let error = admission
+      .emit_result(TrafficEventKind::Admitted(RequestAdmitted::Http {
+        scheme: "http".into(),
+        authority: "localhost".into(),
+        path_and_query: CapturedUri::exact("/v1/responses"),
+        operation: Some("responses".into()),
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("request admission was observed more than once"));
+
+    let mut policy = Harness::new(
+      "request-duplicate-policy",
+      Correlation {
+        session_id: Some("session-duplicate-policy".into()),
+        ..Correlation::default()
+      },
+    );
+    policy.admit_connect("example.com:443");
+    policy.select_connect(ConnectAction::Tunnel);
+    let error = policy
+      .emit_result(TrafficEventKind::PolicySelected(PolicySelection {
+        binding_id: None,
+        action: SelectedAction::Connect {
+          action: ConnectAction::Tunnel,
+        },
+      }))
+      .unwrap_err();
+    assert!(error.to_string().contains("request policy was selected more than once"));
   }
 
   #[test]
