@@ -21,7 +21,8 @@ pub use execution::{
   HttpExecutionCoordinator, HttpExecutionError, HttpExecutionOutcome, HttpExecutionRequest, HttpExecutionResult,
 };
 pub use gateway::{
-  link_builtin_gateway_runtime, link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime,
+  link_builtin_gateway_runtime, link_builtin_gateway_runtime_with_profile_roots, link_gateway_runtime,
+  link_gateway_runtime_with_profile_roots, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime,
 };
 pub use intercept_ca::{load_or_generate_ca, ProxyCa};
 pub use listeners::{
@@ -35,8 +36,8 @@ pub use matchers::{
 };
 pub use names::{RuntimeNameError, RuntimeNameRegistry, RuntimeNameResult};
 pub use profiles::{
-  link_profiles, scan_profile_reachability, LinkedProfile, LinkedProfiles, LinkedWireIdentity, ProfileLinkError,
-  ProfileLinkResult, ProfileReachability, ProfileReferenceSite,
+  include_embedded_profile_roots, link_profiles, scan_profile_reachability, EmbeddedProfileRoots, LinkedProfile,
+  LinkedProfiles, LinkedWireIdentity, ProfileLinkError, ProfileLinkResult, ProfileReachability, ProfileReferenceSite,
 };
 pub use resources::{
   materialize_listeners, ListenerResourceError, ListenerResourceResult, MaterializedClientAuth, MaterializedListener,

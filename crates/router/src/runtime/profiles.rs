@@ -54,6 +54,36 @@ impl ProfileReachability {
   }
 }
 
+/// Explicit profile roots requested by an in-process runtime consumer.
+///
+/// Listener serving keeps its existing reachability pruning. Embedded callers
+/// add only the profiles they are prepared to execute, so unrelated plugin
+/// identities and dormant routes remain outside their linked generation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmbeddedProfileRoots {
+  profile_ids: BTreeSet<ProfileId>,
+}
+
+impl EmbeddedProfileRoots {
+  pub fn new(profile_ids: impl IntoIterator<Item = ProfileId>) -> Self {
+    Self {
+      profile_ids: profile_ids.into_iter().collect(),
+    }
+  }
+
+  pub fn one(profile_id: ProfileId) -> Self {
+    Self::new([profile_id])
+  }
+
+  pub fn profile_ids(&self) -> &BTreeSet<ProfileId> {
+    &self.profile_ids
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.profile_ids.is_empty()
+  }
+}
+
 /// Scan listener HTTP actions in deterministic evaluation order.
 ///
 /// Bindings are visited in their configured order, followed by the listener's
@@ -82,6 +112,31 @@ pub fn scan_profile_reachability(plan: &GatewayPlan) -> ProfileLinkResult<Profil
   }
 
   Ok(reachable)
+}
+
+/// Add explicitly requested embedded profiles to listener-derived
+/// reachability without inventing a listener or binding site.
+pub fn include_embedded_profile_roots(
+  plan: &GatewayPlan,
+  roots: &EmbeddedProfileRoots,
+  reachable: &mut ProfileReachability,
+) -> ProfileLinkResult<()> {
+  for profile_id in roots.profile_ids() {
+    let profile = plan
+      .profile(profile_id)
+      .ok_or_else(|| ProfileLinkError::UnknownEmbeddedProfile {
+        profile: profile_id.clone(),
+      })?;
+    if plan.route(profile.route()).is_none() {
+      return Err(ProfileLinkError::UnknownEmbeddedRoute {
+        profile: profile_id.clone(),
+        route: profile.route().clone(),
+      });
+    }
+    reachable.profile_ids.insert(profile_id.clone());
+    reachable.route_ids.insert(profile.route().clone());
+  }
+  Ok(())
 }
 
 fn scan_action(
@@ -273,6 +328,12 @@ pub enum ProfileLinkError {
     profile: ProfileId,
     route: RouteId,
   },
+
+  #[snafu(display("embedded profile root '{profile}' does not exist in the gateway plan"))]
+  UnknownEmbeddedProfile { profile: ProfileId },
+
+  #[snafu(display("embedded profile root '{profile}' references unknown route '{route}'"))]
+  UnknownEmbeddedRoute { profile: ProfileId, route: RouteId },
 
   #[snafu(display("reachable profile '{profile}' disappeared from the gateway plan during linking"))]
   MissingReachableProfile { profile: ProfileId },

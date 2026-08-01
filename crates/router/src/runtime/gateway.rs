@@ -5,8 +5,8 @@
 //! every later phase reuses the exact `Arc` nodes produced by the earlier one.
 
 use super::{
-  link_listeners, link_profiles, scan_profile_reachability, LinkedListeners, LinkedProfiles, ListenerLinkError,
-  ProfileLinkError, RuntimeNameRegistry,
+  include_embedded_profile_roots, link_listeners, link_profiles, scan_profile_reachability, EmbeddedProfileRoots,
+  LinkedListeners, LinkedProfiles, ListenerLinkError, ProfileLinkError, RuntimeNameRegistry,
 };
 use snafu::Snafu;
 use tokn_accounts::link::{
@@ -64,9 +64,19 @@ pub fn link_builtin_gateway_runtime(
   plan: &GatewayPlan,
   accounts: &[AccountConfig],
 ) -> GatewayLinkResult<LinkedGatewayRuntime> {
+  link_builtin_gateway_runtime_with_profile_roots(plan, accounts, &EmbeddedProfileRoots::default())
+}
+
+/// Link the listener graph plus explicit profiles used by an in-process
+/// consumer with the registries shipped by the gateway binary.
+pub fn link_builtin_gateway_runtime_with_profile_roots(
+  plan: &GatewayPlan,
+  accounts: &[AccountConfig],
+  embedded_profiles: &EmbeddedProfileRoots,
+) -> GatewayLinkResult<LinkedGatewayRuntime> {
   let registry = Registry::builtin();
   let names = RuntimeNameRegistry::builtin();
-  link_gateway_runtime(plan, accounts, &registry, &names)
+  link_gateway_runtime_with_profile_roots(plan, accounts, &registry, &names, embedded_profiles)
 }
 
 /// Link a compiled gateway plan and account snapshot into one runtime graph.
@@ -80,13 +90,28 @@ pub fn link_gateway_runtime(
   registry: &Registry,
   names: &RuntimeNameRegistry,
 ) -> GatewayLinkResult<LinkedGatewayRuntime> {
+  link_gateway_runtime_with_profile_roots(plan, accounts, registry, names, &EmbeddedProfileRoots::default())
+}
+
+/// Link one runtime generation from listener roots plus explicit embedded
+/// profile roots.
+pub fn link_gateway_runtime_with_profile_roots(
+  plan: &GatewayPlan,
+  accounts: &[AccountConfig],
+  registry: &Registry,
+  names: &RuntimeNameRegistry,
+  embedded_profiles: &EmbeddedProfileRoots,
+) -> GatewayLinkResult<LinkedGatewayRuntime> {
   let provider_graph =
     link_provider_graph(plan, accounts, registry).map_err(|source| GatewayLinkError::ProviderGraph { source })?;
   let account_pools =
     link_account_pools(plan, &provider_graph, registry).map_err(|source| GatewayLinkError::AccountPools { source })?;
   let account_pool_runtimes = build_account_pool_runtimes(&account_pools);
 
-  let reachable = scan_profile_reachability(plan).map_err(|source| GatewayLinkError::ProfileReachability { source })?;
+  let mut reachable =
+    scan_profile_reachability(plan).map_err(|source| GatewayLinkError::ProfileReachability { source })?;
+  include_embedded_profile_roots(plan, embedded_profiles, &mut reachable)
+    .map_err(|source| GatewayLinkError::ProfileReachability { source })?;
   let routes = link_routes(plan, reachable.route_ids(), &provider_graph, &account_pool_runtimes)
     .map_err(|source| GatewayLinkError::Routes { source })?;
   let profiles =
@@ -453,6 +478,68 @@ mod tests {
 
     assert!(runtime.routes().is_empty());
     assert!(runtime.routes().route(&broken_route).is_none());
+  }
+
+  #[test]
+  fn embedded_profile_roots_extend_listener_reachability_explicitly() {
+    let profile = profile_id("embedded");
+    let route = route_id("embedded");
+    let pool = pool_id("embedded");
+    let upstream = upstream_id("embedded");
+    let plan = gateway(
+      BTreeMap::from([(
+        listener_id("api"),
+        llm_listener(41_005, tokn_policy::HttpAction::Reject),
+      )]),
+      BTreeMap::from([(profile.clone(), ProfilePlan::new(route.clone(), WireIdentity::None))]),
+      BTreeMap::from([(
+        route.clone(),
+        managed_route("embedded", UpstreamSelector::Fixed(upstream.clone())),
+      )]),
+      BTreeMap::from([(pool, empty_pool())]),
+      BTreeMap::from([(
+        upstream,
+        UpstreamPlan::new(
+          provider_id(ID_LLAMA_CPP),
+          Some("https://llama.example/v1/".into()),
+          Box::default(),
+          false,
+        ),
+      )]),
+    );
+    let accounts = [account("main")];
+
+    let listener_only = link_builtin_gateway_runtime(&plan, &accounts).unwrap();
+    assert!(listener_only.profiles().is_empty());
+    assert!(listener_only.routes().is_empty());
+
+    let roots = EmbeddedProfileRoots::one(profile.clone());
+    let embedded = link_builtin_gateway_runtime_with_profile_roots(&plan, &accounts, &roots).unwrap();
+    assert!(embedded.profiles().profile(&profile).is_some());
+    assert!(embedded.routes().route(&route).is_some());
+  }
+
+  #[test]
+  fn unknown_embedded_profile_root_has_no_synthetic_listener_site() {
+    let missing = profile_id("missing");
+    let plan = gateway(
+      BTreeMap::from([(
+        listener_id("api"),
+        llm_listener(41_006, tokn_policy::HttpAction::Reject),
+      )]),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+    );
+    let roots = EmbeddedProfileRoots::one(missing.clone());
+
+    assert!(matches!(
+      link_builtin_gateway_runtime_with_profile_roots(&plan, &[], &roots),
+      Err(GatewayLinkError::ProfileReachability {
+        source: ProfileLinkError::UnknownEmbeddedProfile { profile },
+      }) if profile == missing
+    ));
   }
 
   #[test]
