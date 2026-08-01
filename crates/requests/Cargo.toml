@@ -2,7 +2,7 @@
 name = "tokn-requests"
 version.workspace = true
 edition.workspace = true
-description = "Composable request pipeline stages, profiles, and eventing for tokn"
+description = "HTTP execution contracts and transports for selected tokn gateway targets"
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -13,20 +13,12 @@ tokn-accounts = { workspace = true }
 tokn-core = { workspace = true }
 tokn-headers = { workspace = true }
 tokn-convert = { workspace = true }
-arc-swap = { workspace = true }
-async-trait = { workspace = true }
 bytes = { workspace = true }
-flate2 = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-smol_str = { workspace = true }
 snafu = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-zstd = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

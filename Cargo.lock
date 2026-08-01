@@ -3107,16 +3107,11 @@ dependencies = [
 name = "tokn-requests"
 version = "0.2.1"
 dependencies = [
- "arc-swap",
- "async-trait",
  "bytes",
- "flate2",
  "futures-util",
  "http",
  "reqwest",
- "serde",
  "serde_json",
- "smol_str",
  "snafu",
  "tokio",
  "tokn-accounts",
@@ -3125,8 +3120,6 @@ dependencies = [
  "tokn-headers",
  "tokn-mock-server",
  "tokn-router-config",
- "tracing",
- "zstd",
 ]
 
 [[package]]
