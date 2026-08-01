@@ -113,9 +113,9 @@ impl PipelineRunner {
 
   /// Same as [`run`](Self::run) but with a caller-supplied [`RunConfig`]
   /// bag. The bag is attached to [`PipelineCtx::config`] (wrapped in an
-  /// `Arc`) and is visible to every stage via `ctx.config`. Used by
-  /// secondary pipeline variants (proxy passthrough) that thread
-  /// transport-level hints down to custom Resolve / Send stages.
+  /// `Arc`) and is visible to every stage via `ctx.config`. Callers use it
+  /// for per-run access constraints, endpoint overrides, and generation
+  /// options.
   pub async fn run_with(&self, raw: RawInbound, config: RunConfig) -> Result<ConvertedResponse, PipelineError> {
     let request_id = raw.request_id.clone().unwrap_or_else(|| SmolStr::new(uuid_like()));
     let config = Arc::new(config);

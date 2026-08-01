@@ -19,15 +19,13 @@ pub struct PipelineCtx {
   pub request_id: SmolStr,
   pub attempt: u32,
   /// Inbound request identity as observed by the transport. Known router
-  /// endpoints use `RequestEndpoint::Known`; proxy/custom paths may be
+  /// endpoints use `RequestEndpoint::Known`; opaque/custom paths may be
   /// `CustomPath`.
   pub request_endpoint: RequestEndpoint,
   pub events: Arc<EventBus>,
-  /// Caller-supplied per-run config bag. Stages may read transport-level
-  /// hints from it; secondary pipeline variants (e.g. proxy passthrough)
-  /// use it to thread `proxy.host` / `proxy.path` / `proxy.method` down
-  /// to their custom Resolve and Send stages. Empty for the default JSON
-  /// pipeline path that calls [`crate::Pipeline::run`].
+  /// Caller-supplied per-run config bag. Stages may read access, routing,
+  /// and generation overrides from it. Empty for the default pipeline path
+  /// that calls [`crate::Pipeline::run`].
   pub config: Arc<RunConfig>,
 }
 

@@ -16,8 +16,5 @@ pub use build_headers::{DefaultBuildHeaders, NoopBuildHeaders, PassthroughBuildH
 pub use convert_request::{DefaultConvertRequest, NoopConvertRequest, PassthroughConvertRequest};
 pub use convert_response::{DefaultConvertResponse, NoopConvertResponse, PassthroughConvertResponse};
 pub use extract::{DefaultExtract, PassthroughExtract};
-pub use resolve::{
-  AccountSelector, PoolAccountSelector, PoolResolve, ProxyProviderResolve, ProxyResolve, SelectorOutcome,
-  ACCESS_ALLOWED_PROVIDERS_KEY,
-};
-pub use send::{DefaultSend, NoopSend, ProxySend};
+pub use resolve::{AccountSelector, PoolAccountSelector, PoolResolve, SelectorOutcome, ACCESS_ALLOWED_PROVIDERS_KEY};
+pub use send::{DefaultSend, NoopSend};

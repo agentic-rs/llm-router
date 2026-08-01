@@ -2,15 +2,14 @@
 //! stage via [`PipelineCtx`].
 //!
 //! `RunConfig` carries typed policy overrides plus a generic bag for
-//! secondary pipeline variants (e.g. the MITM proxy passthrough) to pass
-//! transport-level hints to their custom stages without bloating the
-//! [`RawInbound`] / [`Extracted`] / [`Resolved`] structs with optional fields
-//! that only one variant ever reads.
+//! per-run access and routing hints without bloating the [`RawInbound`] /
+//! [`Extracted`] / [`Resolved`] structs with optional fields that only some
+//! stages read.
 //!
-//! Keys are namespaced — use a dotted prefix (`"proxy.host"`,
-//! `"proxy.path"`, etc.) so unrelated stages can coexist without clashes.
-//! Values are stored as [`serde_json::Value`] so the bag is trivially
-//! serialisable for diagnostics.
+//! Keys are namespaced — for example, `"access.allowed_providers"` and
+//! `"run.upstream_endpoint"` — so unrelated stages can coexist without
+//! clashes. Values are stored as [`serde_json::Value`] so the bag is
+//! trivially serialisable for diagnostics.
 //!
 //! Construct via [`RunConfig::builder`] or [`RunConfig::default`].
 
@@ -118,17 +117,18 @@ mod tests {
   #[test]
   fn builder_round_trip() {
     let cfg = RunConfig::builder()
-      .with_str("proxy.host", "api.openai.com")
-      .with_str("proxy.path", "/v1/chat/completions")
+      .with_str("run.upstream_endpoint", "responses")
+      .with("access.allowed_providers", serde_json::json!(["openai"]))
       .with_agent_id(AgentId::CodexCli)
-      .with("proxy.attempt", 0u64)
       .build();
-    assert_eq!(cfg.get_str("proxy.host"), Some("api.openai.com"));
-    assert_eq!(cfg.get_str("proxy.path"), Some("/v1/chat/completions"));
-    assert_eq!(cfg.get("proxy.attempt").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(cfg.get_str("run.upstream_endpoint"), Some("responses"));
+    assert_eq!(
+      cfg.get("access.allowed_providers"),
+      Some(&serde_json::json!(["openai"]))
+    );
     assert_eq!(cfg.agent_id(), Some(&AgentId::CodexCli));
     assert!(cfg.get("missing").is_none());
-    assert_eq!(cfg.len(), 3);
+    assert_eq!(cfg.len(), 2);
   }
 
   #[test]
