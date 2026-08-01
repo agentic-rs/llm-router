@@ -7,7 +7,6 @@ pub mod messages;
 pub mod responses;
 pub mod sse;
 pub mod tools;
-pub mod usage;
 pub mod value;
 
 use crate::provider::Endpoint;
