@@ -3248,6 +3248,7 @@ dependencies = [
  "tokn-endpoint-core",
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
+ "tokn-events",
  "tokn-headers",
  "tokn-mock-server",
  "tokn-policy",

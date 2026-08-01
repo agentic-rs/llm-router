@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
 use tokn_core::generation::GenerationOptions;
 use tokn_endpoint_core::Endpoint;
+use tokn_events::{GatewayEvent, Publisher};
 use tokn_policy::{ProfileId, RouteKind};
+use tokn_requests::RequestLifecycleEmitter;
 use tokn_router::runtime::{
   link_builtin_gateway_runtime_with_profile_roots, EmbeddedProfileRoots, ManagedGatewayExecutor, ManagedGatewayOutcome,
   ManagedGatewayRequest,
@@ -72,6 +74,7 @@ pub struct ClientBuilder {
   config_path: Option<PathBuf>,
   auth_path: Option<PathBuf>,
   profile: Option<String>,
+  event_publisher: Option<Publisher<GatewayEvent>>,
 }
 
 impl ClientBuilder {
@@ -94,6 +97,23 @@ impl ClientBuilder {
     self
   }
 
+  /// Publish comprehensive request lifecycle events to a caller-owned hub.
+  ///
+  /// The client retains the supplied publisher and clones it into each runtime
+  /// snapshot across successful and failed reloads. Reliable lifecycle
+  /// boundaries wait for capacity in the hub's bounded queue and can therefore
+  /// backpressure request execution.
+  ///
+  /// The caller remains responsible for the corresponding event hub. Before
+  /// shutting it down, stop starting requests, await buffered requests, and
+  /// fully drain or drop every live stream. Dropping [`Client`] never closes or
+  /// shuts down the hub. If this method is omitted, lifecycle publication is
+  /// disabled without creating a background dispatcher.
+  pub fn event_publisher(mut self, publisher: Publisher<GatewayEvent>) -> Self {
+    self.event_publisher = Some(publisher);
+    self
+  }
+
   pub fn build(self) -> Result<Client> {
     Client::build(self)
   }
@@ -109,8 +129,14 @@ struct Snapshot {
   gateway: ManagedGatewayExecutor,
 }
 
+/// In-process client bound to one profile and one optional event publisher.
+///
+/// Runtime snapshots are replaced atomically, while the lifecycle emitter is
+/// owned separately so every generation uses the same caller-owned publisher.
+/// This client never owns or shuts down the corresponding event hub.
 pub struct Client {
   source: Source,
+  request_events: RequestLifecycleEmitter,
   snapshot: ArcSwap<Snapshot>,
 }
 
@@ -124,11 +150,17 @@ impl Client {
   }
 
   fn build(builder: ClientBuilder) -> Result<Self> {
-    let profile = builder.profile.unwrap_or_else(|| DEFAULT_PROFILE.to_owned());
+    let ClientBuilder {
+      config_path,
+      auth_path,
+      profile,
+      event_publisher,
+    } = builder;
+    let profile = profile.unwrap_or_else(|| DEFAULT_PROFILE.to_owned());
     let profile = ProfileId::new(&profile).map_err(|source| Error::InvalidProfileId { profile, source })?;
-    let config_path = tokn_config::paths::resolve_config_path(builder.config_path.as_deref())
+    let config_path = tokn_config::paths::resolve_config_path(config_path.as_deref())
       .map_err(|source| Error::ResolveConfigPath { source })?;
-    let auth_path = match builder.auth_path {
+    let auth_path = match auth_path {
       Some(path) => path,
       None => default_auth_path().map_err(|source| Error::LoadCredentials {
         path: PathBuf::from("<default>"),
@@ -140,17 +172,25 @@ impl Client {
       auth_path,
       profile,
     };
-    let snapshot = load_snapshot(&source)?;
+    let request_events = event_publisher
+      .map(RequestLifecycleEmitter::new)
+      .unwrap_or_else(RequestLifecycleEmitter::disabled);
+    let snapshot = load_snapshot(&source, request_events.clone())?;
     Ok(Self {
       source,
+      request_events,
       snapshot: ArcSwap::from_pointee(snapshot),
     })
   }
 
   /// Atomically replace the compiled config, linked account graph, and
-  /// managed transport. In-flight requests retain the previous snapshot.
+  /// managed transport. In-flight requests retain the previous snapshot, and
+  /// every generation uses the publisher selected when this client was built.
+  /// A failed reload leaves both the previous snapshot and publisher usable.
   pub fn reload(&self) -> Result<()> {
-    self.snapshot.store(Arc::new(load_snapshot(&self.source)?));
+    self
+      .snapshot
+      .store(Arc::new(load_snapshot(&self.source, self.request_events.clone())?));
     Ok(())
   }
 
@@ -249,7 +289,7 @@ impl Client {
   }
 }
 
-fn load_snapshot(source: &Source) -> Result<Snapshot> {
+fn load_snapshot(source: &Source, request_events: RequestLifecycleEmitter) -> Result<Snapshot> {
   let compiled = tokn_config::v2::load(&source.config_path).map_err(|error| Error::LoadConfig {
     path: source.config_path.clone(),
     source: Box::new(error),
@@ -282,8 +322,10 @@ fn load_snapshot(source: &Source) -> Result<Snapshot> {
       source: Box::new(source),
     })?;
   let http_options = compiled.service().outbound().to_http_client_options();
-  let gateway = ManagedGatewayExecutor::build(Arc::new(runtime), &http_options)
-    .map_err(|source| Error::BuildExecutor { source })?;
+  let body_capture_limit = compiled.service().request_limits().max_decoded_bytes();
+  let gateway =
+    ManagedGatewayExecutor::build_with_events(Arc::new(runtime), &http_options, request_events, body_capture_limit)
+      .map_err(|source| Error::BuildExecutor { source })?;
 
   Ok(Snapshot { gateway })
 }
