@@ -6,6 +6,7 @@
 //! fact actually occurs.
 
 use super::{AdmittedHttpRequest, ServerError};
+use crate::runtime::observation::capture_headers;
 use crate::runtime::{ConnectDispatch, HttpRouteMatch, LinkedRouteKind};
 use axum::response::Response;
 use http::{HeaderMap, Request};
@@ -13,9 +14,9 @@ use smol_str::SmolStr;
 use tokn_access::AccessContext;
 use tokn_core::provider::ProviderRequestKind;
 use tokn_events::{
-  is_sensitive_header_name, CapturedHeader, CapturedHeaders, CapturedUri, ClientIdentity,
-  ConnectAction as EventConnectAction, Correlation, EventFailure, HttpFamily, HttpResponseHead, PolicySelection,
-  RequestAdmitted, RequestOutcome, RequestPhase, RequestSource, RequestStarted, SelectedAction,
+  CapturedUri, ClientIdentity, ConnectAction as EventConnectAction, Correlation, EventFailure, HttpFamily,
+  HttpResponseHead, PolicySelection, RequestAdmitted, RequestOutcome, RequestPhase, RequestSource, RequestStarted,
+  SelectedAction,
 };
 use tokn_headers::inbound::{first_present_smol, inbound_correlation, PROJECT_ID_HEADERS, REQUEST_ID_HEADERS};
 use tokn_headers::keys::{X_CLIENT_REQUEST_ID, X_PARENT_SESSION_ID};
@@ -34,21 +35,6 @@ pub(super) fn request_started<B>(source: RequestSource, request: &Request<B>, bo
     body_present,
     correlation: correlation(request.headers()),
   }
-}
-
-/// Preserve every HTTP field value while enforcing the event contract's
-/// minimum credential denylist before values leave the router.
-pub(super) fn capture_headers(headers: &HeaderMap) -> CapturedHeaders {
-  headers
-    .iter()
-    .map(|(name, value)| {
-      if is_sensitive_header_name(name.as_str()) {
-        CapturedHeader::redacted(name.as_str())
-      } else {
-        CapturedHeader::value(name.as_str(), bytes::Bytes::copy_from_slice(value.as_bytes()))
-      }
-    })
-    .collect()
 }
 
 /// Resolve all supported request-correlation inputs without interpreting a

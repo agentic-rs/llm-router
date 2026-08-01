@@ -11,7 +11,10 @@ use super::{
   buffer_matched_body, managed_response_to_axum, opaque_response_to_axum, AdmittedHttpRequest, BufferedRequestBody,
   ListenerServerState, ServerError,
 };
-use crate::runtime::{match_http, HttpExecutionOutcome, HttpExecutionRequest, HttpRequestSemantics, HttpRouteMatch};
+use crate::runtime::{
+  match_http, HttpExecutionOutcome, HttpExecutionRequest, HttpRequestSemantics, HttpRouteMatch,
+  ObservedHttpExecutionOutcome,
+};
 use axum::body::Body;
 use axum::response::Response;
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
@@ -91,17 +94,65 @@ pub async fn handle_admitted_http(
     ),
   };
   let routed = matched.resolve(semantics, session_id.as_deref(), &access.providers)?;
+  if !lifecycle.is_enabled() {
+    let outcome = state
+      .gateway()
+      .http_execution()
+      .execute(routed, execution_request)
+      .await?;
+    return match outcome {
+      HttpExecutionOutcome::Managed { response, .. } => managed_response_to_axum(response).map_err(ServerError::from),
+      HttpExecutionOutcome::Opaque { response, .. } => opaque_response_to_axum(response).map_err(ServerError::from),
+      HttpExecutionOutcome::CoolingDown { site, retry_at } => Err(ServerError::cooling_down(site, retry_at)),
+      HttpExecutionOutcome::NoEligible { site, reason } => Err(ServerError::no_eligible(site, reason)),
+    };
+  }
   let outcome = state
     .gateway()
     .http_execution()
-    .execute(routed, execution_request)
+    .execute_observed(
+      routed,
+      execution_request,
+      lifecycle,
+      state.gateway().defaults().request_body_limits().max_decoded_bytes(),
+    )
     .await?;
   match outcome {
-    HttpExecutionOutcome::Managed { response, .. } => managed_response_to_axum(response).map_err(ServerError::from),
-    HttpExecutionOutcome::Opaque { response, .. } => opaque_response_to_axum(response).map_err(ServerError::from),
-    HttpExecutionOutcome::CoolingDown { site, retry_at } => Err(ServerError::cooling_down(site, retry_at)),
-    HttpExecutionOutcome::NoEligible { site, reason } => Err(ServerError::no_eligible(site, reason)),
+    ObservedHttpExecutionOutcome::Managed { response, attempt, .. } => {
+      bridge_attempt(managed_response_to_axum(response), attempt, lifecycle).await
+    }
+    ObservedHttpExecutionOutcome::Opaque { response, attempt, .. } => {
+      bridge_attempt(opaque_response_to_axum(response), attempt, lifecycle).await
+    }
+    ObservedHttpExecutionOutcome::CoolingDown { site, retry_at } => Err(ServerError::cooling_down(site, retry_at)),
+    ObservedHttpExecutionOutcome::NoEligible { site, reason } => Err(ServerError::no_eligible(site, reason)),
   }
+}
+
+async fn bridge_attempt(
+  response: Result<Response, super::ResponseBridgeError>,
+  attempt: Option<crate::runtime::attempts::AttemptBodyPlan>,
+  lifecycle: &mut RequestLifecycle,
+) -> Result<Response, ServerError> {
+  match response {
+    Ok(response) => Ok(attach_attempt(response, attempt)),
+    Err(error) => {
+      if let Some(attempt) = attempt {
+        attempt
+          .publish_terminal(lifecycle)
+          .await
+          .map_err(|source| ServerError::event_publication(RequestPhase::UpstreamResponse, source))?;
+      }
+      Err(error.into())
+    }
+  }
+}
+
+fn attach_attempt(mut response: Response, attempt: Option<crate::runtime::attempts::AttemptBodyPlan>) -> Response {
+  if let Some(attempt) = attempt {
+    response.extensions_mut().insert(attempt);
+  }
+  response
 }
 
 /// Project native headers only for best-effort correlation lookup. Execution

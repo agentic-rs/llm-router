@@ -17,6 +17,7 @@ tokn-access = { workspace = true }
 tokn-headers = { workspace = true }
 tokn-requests = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }

@@ -4,6 +4,7 @@
 //! to this module. The observer then owns that non-cloneable lifecycle until
 //! the downstream body reaches EOF, fails, or is dropped by the client.
 
+use crate::runtime::attempts::AttemptBodyPlan;
 use axum::body::Body;
 use axum::response::Response;
 use bytes::{Bytes, BytesMut};
@@ -11,8 +12,10 @@ use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokn_events::{BodyCapture, BodyFinished, BodyLeg, BodyProgress, BodyResult, EventFailure};
-use tokn_requests::{RequestLifecycle, RequestTerminalEvent, RequestTermination};
+use tokn_events::{
+  BodyCapture, BodyFinished, BodyLeg, BodyProgress, BodyResult, EventFailure, RequestOutcome, RequestPhase,
+};
+use tokn_requests::{RequestCompletion, RequestLifecycle, RequestTerminalEvent, RequestTermination};
 
 const DOWNSTREAM_BODY_FAILURE_CODE: &str = "downstream_body_read_failed";
 const DOWNSTREAM_BODY_FAILURE_MESSAGE: &str = "the downstream response body could not be read";
@@ -22,20 +25,23 @@ const DOWNSTREAM_BODY_FAILURE_MESSAGE: &str = "the downstream response body coul
 /// The response head, extensions, and streaming body are preserved. `capture_limit`
 /// bounds the retained downstream prefix without limiting bytes delivered to the
 /// client. The caller must publish `DownstreamResponseHead` before calling this
-/// function. Body completion is appended to `termination`; its request outcome,
-/// phase, status, failure, and any earlier terminal facts are not rewritten.
+/// function. Body completion is appended to `termination`. A failure or
+/// cancellation replaces a provisional `Delivered` completion while preserving
+/// already-classified local `Rejected` and `Failed` responses.
 pub(super) fn observe_downstream_body(
   response: Response,
   lifecycle: RequestLifecycle,
   termination: RequestTermination,
   capture_limit: usize,
 ) -> Response {
-  let (parts, body) = response.into_parts();
-  let body = Body::new(DownstreamLifecycleBody::new(
+  let (mut parts, body) = response.into_parts();
+  let attempt = parts.extensions.remove::<AttemptBodyPlan>();
+  let body = Body::new(DownstreamLifecycleBody::with_attempt(
     body,
     lifecycle,
     termination,
     capture_limit,
+    attempt,
   ));
   Response::from_parts(parts, body)
 }
@@ -50,10 +56,26 @@ struct DownstreamLifecycleBody<B> {
   bytes_seen: u64,
   chunks: u64,
   progress_available: bool,
+  attempt_progress_available: bool,
+  attempt: Option<AttemptBodyPlan>,
 }
 
 impl<B> DownstreamLifecycleBody<B> {
-  fn new(inner: B, mut lifecycle: RequestLifecycle, termination: RequestTermination, capture_limit: usize) -> Self {
+  #[cfg(test)]
+  fn new(inner: B, lifecycle: RequestLifecycle, termination: RequestTermination, capture_limit: usize) -> Self {
+    Self::with_attempt(inner, lifecycle, termination, capture_limit, None)
+  }
+
+  fn with_attempt(
+    inner: B,
+    mut lifecycle: RequestLifecycle,
+    termination: RequestTermination,
+    capture_limit: usize,
+    attempt: Option<AttemptBodyPlan>,
+  ) -> Self {
+    if let Some(attempt) = &attempt {
+      attempt.arm(&mut lifecycle);
+    }
     lifecycle.arm_body(BodyLeg::Downstream);
     Self {
       inner: Box::pin(inner),
@@ -64,6 +86,24 @@ impl<B> DownstreamLifecycleBody<B> {
       bytes_seen: 0,
       chunks: 0,
       progress_available: true,
+      attempt_progress_available: true,
+      attempt,
+    }
+  }
+
+  fn publish_attempt_progress(&mut self) {
+    if !self.attempt_progress_available {
+      return;
+    }
+    let Some(progress) = self.attempt.as_ref().and_then(AttemptBodyPlan::take_progress) else {
+      return;
+    };
+    let Some(lifecycle) = &mut self.lifecycle else {
+      return;
+    };
+    if let Err(error) = lifecycle.try_publish_progress(progress) {
+      self.attempt_progress_available = false;
+      tracing::warn!(error = %error, "upstream body progress publication failed");
     }
   }
 
@@ -122,6 +162,27 @@ impl<B> DownstreamLifecycleBody<B> {
       .termination
       .take()
       .expect("a live downstream lifecycle always has a terminal plan");
+    if termination.completion().outcome == RequestOutcome::Delivered {
+      match &result {
+        BodyResult::Failed(failure) => termination.replace_completion(RequestCompletion::new(
+          RequestOutcome::Failed,
+          RequestPhase::DownstreamResponse,
+          None,
+          Some(failure.clone()),
+        )),
+        BodyResult::Cancelled => termination.replace_completion(RequestCompletion::new(
+          RequestOutcome::Cancelled,
+          RequestPhase::DownstreamResponse,
+          None,
+          None,
+        )),
+        BodyResult::Complete => {}
+        _ => {}
+      }
+    }
+    if let Some(attempt) = &self.attempt {
+      attempt.append_terminal(&mut termination);
+    }
     termination.push(RequestTerminalEvent::BodyFinished(BodyFinished {
       leg: BodyLeg::Downstream,
       capture,
@@ -153,12 +214,14 @@ where
 
     match this.inner.as_mut().poll_frame(context) {
       Poll::Ready(Some(Ok(frame))) => {
+        this.publish_attempt_progress();
         if let Some(data) = frame.data_ref() {
           this.observe_data(data);
         }
         Poll::Ready(Some(Ok(frame)))
       }
       Poll::Ready(Some(Err(error))) => {
+        this.publish_attempt_progress();
         tracing::warn!(error = %error, "downstream response body read failed");
         let failure = EventFailure {
           code: DOWNSTREAM_BODY_FAILURE_CODE.into(),
@@ -168,10 +231,14 @@ where
         Poll::Ready(Some(Err(error)))
       }
       Poll::Ready(None) => {
+        this.publish_attempt_progress();
         this.finish_complete();
         Poll::Ready(None)
       }
-      Poll::Pending => Poll::Pending,
+      Poll::Pending => {
+        this.publish_attempt_progress();
+        Poll::Pending
+      }
     }
   }
 
@@ -203,9 +270,10 @@ mod tests {
   use std::error::Error;
   use std::sync::{Arc, Mutex};
   use tokn_events::{
-    CapturedHeaders, CapturedUri, ConsumerResult, Correlation, EventConsumer, EventSeq, GatewayEvent, HttpResponseHead,
-    HubBuilder, IngressKind, RequestOutcome, RequestPhase, RequestSource, RequestStarted, TrafficEvent,
-    TrafficEventKind,
+    AttemptFinished, AttemptHttpRequest, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted,
+    CapturedHeaders, CapturedUri, ConsumerResult, Correlation, EventConsumer, EventSeq, GatewayEvent, HttpFamily,
+    HttpRequestSnapshot, HttpResponseHead, HubBuilder, IngressKind, RequestOutcome, RequestPhase, RequestSource,
+    RequestStarted, TargetSelection, TrafficEvent, TrafficEventKind,
   };
   use tokn_requests::{RequestCompletion, RequestLifecycleEmitter};
 
@@ -331,6 +399,66 @@ mod tests {
     (lifecycle, hub)
   }
 
+  async fn attempt_lifecycle(
+    events: &Arc<Mutex<Vec<GatewayEvent>>>,
+    status: u16,
+  ) -> (RequestLifecycle, tokn_events::EventHub<GatewayEvent>) {
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(CaptureConsumer {
+        events: Arc::clone(events),
+      })
+      .start()
+      .unwrap();
+    let emitter = RequestLifecycleEmitter::new(publisher);
+    let mut lifecycle = emitter.begin(started()).await.unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::AttemptStarted(AttemptStarted {
+        attempt: AttemptNo::FIRST,
+        target: TargetSelection {
+          family: HttpFamily::Transparent,
+          account_id: None,
+          provider_id: None,
+          upstream_id: None,
+          requested_model: None,
+          upstream_model: None,
+          requested_operation: None,
+          upstream_operation: None,
+        },
+      }))
+      .await
+      .unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::AttemptRequest(AttemptHttpRequest {
+        attempt: AttemptNo::FIRST,
+        request: HttpRequestSnapshot {
+          method: "GET".into(),
+          uri: CapturedUri::exact("https://upstream.example/"),
+          headers: CapturedHeaders::default(),
+          body: BodyCapture::Absent,
+        },
+      }))
+      .await
+      .unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::AttemptResponseHead(AttemptHttpResponseHead {
+        attempt: AttemptNo::FIRST,
+        response: HttpResponseHead {
+          status,
+          headers: CapturedHeaders::default(),
+        },
+      }))
+      .await
+      .unwrap();
+    lifecycle
+      .publish_boundary(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status,
+        headers: CapturedHeaders::default(),
+      }))
+      .await
+      .unwrap();
+    (lifecycle, hub)
+  }
+
   fn traffic(events: &Arc<Mutex<Vec<GatewayEvent>>>) -> Vec<TrafficEvent> {
     events
       .lock()
@@ -344,6 +472,12 @@ mod tests {
   }
 
   async fn next_frame(body: &mut DownstreamLifecycleBody<TestBody>) -> Option<Result<Frame<Bytes>, TestBodyError>> {
+    std::future::poll_fn(|context| Pin::new(&mut *body).poll_frame(context)).await
+  }
+
+  async fn next_attempt_frame(
+    body: &mut DownstreamLifecycleBody<crate::runtime::attempts::ObservedUpstreamBody<TestBody>>,
+  ) -> Option<Result<Frame<Bytes>, TestBodyError>> {
     std::future::poll_fn(|context| Pin::new(&mut *body).poll_frame(context)).await
   }
 
@@ -526,6 +660,152 @@ mod tests {
       Some(TrafficEventKind::Finished(finished))
         if finished.outcome == RequestOutcome::Rejected
           && finished.downstream_status == Some(StatusCode::IM_A_TEAPOT.as_u16())
+    ));
+  }
+
+  #[tokio::test]
+  async fn dropping_a_buffered_delivered_body_replaces_the_provisional_success() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (lifecycle, hub) = lifecycle(&events, 200).await;
+    let mut observed = DownstreamLifecycleBody::new(
+      TestBody::new([TestFrame::Data(b"abc"), TestFrame::Pending]),
+      lifecycle,
+      termination(RequestOutcome::Delivered, 200),
+      8,
+    );
+
+    assert!(next_frame(&mut observed).await.unwrap().is_ok());
+    drop(observed);
+    hub.shutdown().await.unwrap();
+
+    assert!(matches!(
+      traffic(&events).last().map(|event| &event.kind),
+      Some(TrafficEventKind::Finished(finished)) if finished.outcome == RequestOutcome::Cancelled
+    ));
+  }
+
+  #[tokio::test]
+  async fn dropped_live_attempt_closes_once_before_request_cancellation() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (lifecycle, hub) = attempt_lifecycle(&events, 200).await;
+    let upstream = crate::runtime::attempts::UpstreamBodyObservation::new(AttemptNo::FIRST, 32, None, false);
+    let raw = crate::runtime::attempts::ObservedUpstreamBody::new(
+      TestBody::new([TestFrame::Data(b"abc"), TestFrame::Pending]),
+      upstream.clone(),
+    );
+    let plan = AttemptBodyPlan::new(upstream, 200);
+    let mut observed = DownstreamLifecycleBody::with_attempt(
+      raw,
+      lifecycle,
+      termination(RequestOutcome::Delivered, 200),
+      32,
+      Some(plan),
+    );
+
+    assert!(next_attempt_frame(&mut observed).await.unwrap().is_ok());
+    drop(observed);
+    hub.shutdown().await.unwrap();
+
+    let traffic = traffic(&events);
+    let attempt_finishes = traffic
+      .iter()
+      .filter_map(|event| match &event.kind {
+        TrafficEventKind::AttemptFinished(finished) => Some(finished),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(attempt_finishes.len(), 1);
+    assert!(matches!(
+      attempt_finishes[0],
+      AttemptFinished {
+        outcome: AttemptOutcome::Cancelled,
+        retry: None,
+        ..
+      }
+    ));
+    let upstream_finished = traffic
+      .iter()
+      .position(|event| {
+        matches!(
+          event.kind,
+          TrafficEventKind::BodyFinished(BodyFinished {
+            leg: BodyLeg::Upstream { .. },
+            ..
+          })
+        )
+      })
+      .unwrap();
+    let attempt_finished = traffic
+      .iter()
+      .position(|event| matches!(event.kind, TrafficEventKind::AttemptFinished(_)))
+      .unwrap();
+    let downstream_finished = traffic
+      .iter()
+      .position(|event| {
+        matches!(
+          event.kind,
+          TrafficEventKind::BodyFinished(BodyFinished {
+            leg: BodyLeg::Downstream,
+            ..
+          })
+        )
+      })
+      .unwrap();
+    assert!(upstream_finished < attempt_finished);
+    assert!(attempt_finished < downstream_finished);
+    assert!(matches!(
+      traffic.last().map(|event| &event.kind),
+      Some(TrafficEventKind::Finished(finished)) if finished.outcome == RequestOutcome::Cancelled
+    ));
+  }
+
+  #[tokio::test]
+  async fn failed_live_attempt_replaces_delivered_request_outcome() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (lifecycle, hub) = attempt_lifecycle(&events, 200).await;
+    let upstream = crate::runtime::attempts::UpstreamBodyObservation::new(AttemptNo::FIRST, 32, None, false);
+    let raw = crate::runtime::attempts::ObservedUpstreamBody::new(
+      TestBody::new([
+        TestFrame::Data(b"abc"),
+        TestFrame::Error(TestBodyError("upstream reset")),
+      ]),
+      upstream.clone(),
+    );
+    let plan = AttemptBodyPlan::new(upstream, 200);
+    let mut observed = DownstreamLifecycleBody::with_attempt(
+      raw,
+      lifecycle,
+      termination(RequestOutcome::Delivered, 200),
+      32,
+      Some(plan),
+    );
+
+    assert!(next_attempt_frame(&mut observed).await.unwrap().is_ok());
+    assert_eq!(
+      next_attempt_frame(&mut observed)
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string(),
+      "upstream reset"
+    );
+    hub.shutdown().await.unwrap();
+
+    let traffic = traffic(&events);
+    assert!(matches!(
+      traffic.iter().find_map(|event| match &event.kind {
+        TrafficEventKind::AttemptFinished(finished) => Some(finished),
+        _ => None,
+      }),
+      Some(AttemptFinished {
+        outcome: AttemptOutcome::Failed,
+        retry: None,
+        ..
+      })
+    ));
+    assert!(matches!(
+      traffic.last().map(|event| &event.kind),
+      Some(TrafficEventKind::Finished(finished)) if finished.outcome == RequestOutcome::Failed
     ));
   }
 }
