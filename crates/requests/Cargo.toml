@@ -29,9 +29,6 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
-serde_yaml = { workspace = true }
 tokio = { workspace = true }
 tokn-config = { workspace = true }
 tokn-mock-server = { workspace = true }
-tokn-provider-copilot = { workspace = true }
-tokn-provider-openai = { workspace = true }

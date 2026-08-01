@@ -831,79 +831,12 @@ fn unsupported<T>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::event::{EventBus, Stage};
-  use crate::pipeline::config::RunConfig;
-  use crate::pipeline::ctx::PipelineCtx;
-  use crate::pipeline::error::RequestsError;
-  use crate::pipeline::stages::{ConvertRequestStage, Extracted, Resolved, ResolvedRoute};
-  use crate::stages::DefaultConvertRequest;
-  use crate::test_support::mock_handle;
-  use crate::utils::codec::ContentEncodingKind;
-  use bytes::Bytes;
-  use std::sync::Arc;
   use tokn_core::generation::ReasoningSummary;
-  use tokn_core::provider::{Endpoint, ID_OPENAI, ID_ZAI};
-  use tokn_headers::HeaderMap;
+  use tokn_core::provider::ID_ZAI;
 
-  fn ctx_at(endpoint: Endpoint) -> PipelineCtx {
-    PipelineCtx::new("req-cr", endpoint.into(), Arc::new(EventBus::new(64)))
-  }
-
-  fn ctx() -> PipelineCtx {
-    ctx_at(Endpoint::ChatCompletions)
-  }
-
-  fn ctx_with_config(endpoint: Endpoint, config: RunConfig) -> PipelineCtx {
-    PipelineCtx::new_with_config("req-cr", endpoint.into(), Arc::new(EventBus::new(64)), Arc::new(config))
-  }
-
-  fn ctx_with_generation_options(endpoint: Endpoint, options: GenerationOptions) -> PipelineCtx {
-    ctx_with_config(endpoint, RunConfig::builder().with_generation_options(options).build())
-  }
-
-  fn extracted_with(
-    body: Value,
-    encoding: Option<ContentEncodingKind>,
-    wire: Bytes,
-    initiator: Option<&str>,
-  ) -> Extracted {
-    Extracted {
-      agent_id: None,
-      model: smol_str::SmolStr::new("input-model"),
-      stream: false,
-      session_id: None,
-      project_id: None,
-      initiator: initiator.map(smol_str::SmolStr::new),
-      header_initiator: None,
-      route_mode_hint: None,
-      headers: HeaderMap::new(),
-      raw_body: wire.clone(),
-      decoded_body: Bytes::from(serde_json::to_vec(&body).unwrap()),
-      body_json: Arc::new(body),
-      content_encoding: encoding,
-    }
-  }
-
-  fn resolved_with(
-    handle: Arc<tokn_accounts::AccountHandle>,
-    resolved_endpoint: Endpoint,
-    upstream_endpoint: Endpoint,
-    upstream_model: &str,
-  ) -> Resolved {
-    Resolved {
-      agent_id: None,
-      model: smol_str::SmolStr::new("input-model"),
-      upstream_model: smol_str::SmolStr::new(upstream_model),
-      route: ResolvedRoute::operation(resolved_endpoint, upstream_endpoint),
-      account_id: smol_str::SmolStr::new("acct-1"),
-      provider_id: smol_str::SmolStr::from(handle.provider.id()),
-      account_handle: handle,
-    }
-  }
-
-  #[tokio::test]
-  async fn openai_responses_lowers_effort_and_summary() {
-    let body = serde_json::json!({
+  #[test]
+  fn openai_responses_lowers_effort_and_summary() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "input": [{"role": "user", "content": "hi"}],
       "reasoning": {
@@ -914,96 +847,61 @@ mod tests {
         "provider_extension": true
       }
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_OPENAI),
-      Endpoint::Responses,
-      Endpoint::Responses,
-      "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::Responses,
-      GenerationOptions {
-        reasoning: Some(ReasoningOptions {
-          effort: Some(ReasoningEffort::High),
-          summary: Some(ReasoningSummary::Concise),
-          ..ReasoningOptions::default()
-        }),
-        ..GenerationOptions::default()
-      },
-    );
+    let options = GenerationOptions {
+      reasoning: Some(ReasoningOptions {
+        effort: Some(ReasoningEffort::High),
+        summary: Some(ReasoningSummary::Concise),
+        ..ReasoningOptions::default()
+      }),
+      ..GenerationOptions::default()
+    };
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
+    lower_generation_options(&mut body, Endpoint::Responses, ID_OPENAI, "input-model", &options).unwrap();
 
-    assert_eq!(out.upstream_body["reasoning"]["effort"], "high");
-    assert_eq!(out.upstream_body["reasoning"]["summary"], "concise");
-    assert_eq!(out.upstream_body["reasoning"]["provider_extension"], true);
-    assert!(out.upstream_body["reasoning"].get("mode").is_none());
-    assert!(out.upstream_body["reasoning"].get("budget_tokens").is_none());
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "concise");
+    assert_eq!(body["reasoning"]["provider_extension"], true);
+    assert!(body["reasoning"].get("mode").is_none());
+    assert!(body["reasoning"].get("budget_tokens").is_none());
   }
 
-  #[tokio::test]
-  async fn openai_chat_uses_max_completion_tokens() {
-    let body = serde_json::json!({
+  #[test]
+  fn openai_chat_uses_max_completion_tokens() {
+    let mut body = serde_json::json!({
       "model": "gpt-4o",
-      "input": [{"role": "user", "content": "hi"}],
+      "messages": [{"role": "user", "content": "hi"}],
       "max_output_tokens": 512
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_OPENAI),
-      Endpoint::Responses,
-      Endpoint::ChatCompletions,
-      "gpt-4o",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::Responses,
-      GenerationOptions {
-        max_output_tokens: Some(512),
-        ..GenerationOptions::default()
-      },
-    );
+    let options = GenerationOptions {
+      max_output_tokens: Some(512),
+      ..GenerationOptions::default()
+    };
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
+    lower_generation_options(&mut body, Endpoint::ChatCompletions, ID_OPENAI, "gpt-4o", &options).unwrap();
 
-    assert_eq!(out.upstream_body["max_completion_tokens"], 512);
-    assert!(out.upstream_body.get("max_tokens").is_none());
-    assert!(out.upstream_body.get("max_output_tokens").is_none());
+    assert_eq!(body["max_completion_tokens"], 512);
+    assert!(body.get("max_tokens").is_none());
+    assert!(body.get("max_output_tokens").is_none());
   }
 
-  #[tokio::test]
-  async fn codex_responses_rejects_explicit_output_token_limit() {
-    let body = serde_json::json!({
+  #[test]
+  fn codex_responses_rejects_explicit_output_token_limit() {
+    let mut body = serde_json::json!({
       "model": "gpt-5-codex",
       "input": [{"role": "user", "content": "hi"}],
       "max_output_tokens": 512
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_CODEX),
-      Endpoint::Responses,
-      Endpoint::Responses,
-      "gpt-5-codex",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::Responses,
-      GenerationOptions {
-        max_output_tokens: Some(512),
-        ..GenerationOptions::default()
-      },
-    );
+    let options = GenerationOptions {
+      max_output_tokens: Some(512),
+      ..GenerationOptions::default()
+    };
 
-    let error = DefaultConvertRequest
-      .convert_request(&ctx, &ex, &res)
-      .await
-      .unwrap_err();
+    let error =
+      lower_generation_options(&mut body, Endpoint::Responses, ID_CODEX, "gpt-5-codex", &options).unwrap_err();
 
     assert!(matches!(
-      error.inner(),
-      RequestsError::UnsupportedGenerationControl {
+      error,
+      GenerationControlError::UnsupportedControl {
         control: "max_output_tokens",
         provider_id,
         endpoint: Endpoint::Responses,
@@ -1012,80 +910,52 @@ mod tests {
     ));
   }
 
-  #[tokio::test]
-  async fn responses_rejects_explicit_top_k() {
-    let body = serde_json::json!({
+  #[test]
+  fn responses_rejects_explicit_top_k() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "input": [{"role": "user", "content": "hi"}]
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_OPENAI),
-      Endpoint::Responses,
-      Endpoint::Responses,
-      "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::Responses,
-      GenerationOptions {
-        top_k: Some(40),
-        ..GenerationOptions::default()
-      },
-    );
+    let options = GenerationOptions {
+      top_k: Some(40),
+      ..GenerationOptions::default()
+    };
 
-    let err = DefaultConvertRequest
-      .convert_request(&ctx, &ex, &res)
-      .await
-      .unwrap_err();
+    let error =
+      lower_generation_options(&mut body, Endpoint::Responses, ID_OPENAI, "input-model", &options).unwrap_err();
 
-    assert_eq!(err.stage, Stage::ConvertRequest);
-    assert!(!err.recoverable);
-    match err.inner() {
-      RequestsError::UnsupportedGenerationControl {
+    match error {
+      GenerationControlError::UnsupportedControl {
         control,
         provider_id,
         endpoint,
         ..
       } => {
-        assert_eq!(*control, "top_k");
+        assert_eq!(control, "top_k");
         assert_eq!(provider_id, ID_OPENAI);
-        assert_eq!(*endpoint, Endpoint::Responses);
+        assert_eq!(endpoint, Endpoint::Responses);
       }
       other => panic!("expected UnsupportedGenerationControl, got {other:?}"),
     }
   }
 
-  #[tokio::test]
-  async fn openai_chat_rejects_explicit_top_k() {
-    let body = serde_json::json!({
+  #[test]
+  fn openai_chat_rejects_explicit_top_k() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "messages": [{"role": "user", "content": "hi"}]
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_OPENAI),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::ChatCompletions,
-      GenerationOptions {
-        top_k: Some(40),
-        ..GenerationOptions::default()
-      },
-    );
+    let options = GenerationOptions {
+      top_k: Some(40),
+      ..GenerationOptions::default()
+    };
 
-    let err = DefaultConvertRequest
-      .convert_request(&ctx, &ex, &res)
-      .await
-      .unwrap_err();
+    let error =
+      lower_generation_options(&mut body, Endpoint::ChatCompletions, ID_OPENAI, "input-model", &options).unwrap_err();
 
     assert!(matches!(
-      err.inner(),
-      RequestsError::UnsupportedGenerationControl {
+      error,
+      GenerationControlError::UnsupportedControl {
         control: "top_k",
         provider_id,
         endpoint: Endpoint::ChatCompletions,
@@ -1094,32 +964,28 @@ mod tests {
     ));
   }
 
-  #[tokio::test]
-  async fn llama_chat_lowers_top_k_and_overwrites_legacy_value() {
-    let body = serde_json::json!({
+  #[test]
+  fn llama_chat_lowers_top_k_and_overwrites_legacy_value() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "messages": [{"role": "user", "content": "hi"}],
       "top_k": 7
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_LLAMA_CPP),
+    let options = GenerationOptions {
+      top_k: Some(40),
+      ..GenerationOptions::default()
+    };
+
+    lower_generation_options(
+      &mut body,
       Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
+      ID_LLAMA_CPP,
       "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::ChatCompletions,
-      GenerationOptions {
-        top_k: Some(40),
-        ..GenerationOptions::default()
-      },
-    );
+      &options,
+    )
+    .unwrap();
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
-
-    assert_eq!(out.upstream_body["top_k"], 40);
+    assert_eq!(body["top_k"], 40);
   }
 
   #[test]
@@ -1150,40 +1016,36 @@ mod tests {
     ));
   }
 
-  #[tokio::test]
-  async fn deepseek_chat_lowers_mode_and_effort_for_provider_transformer() {
-    let body = serde_json::json!({
+  #[test]
+  fn deepseek_chat_lowers_mode_and_effort_for_provider_transformer() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "messages": [{"role": "user", "content": "hi"}],
       "reasoning": {"effort": "low"},
       "reasoning_effort": "low"
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_DEEPSEEK),
+    let options = GenerationOptions {
+      reasoning: Some(ReasoningOptions {
+        mode: Some(ReasoningMode::Enabled),
+        effort: Some(ReasoningEffort::High),
+        ..ReasoningOptions::default()
+      }),
+      ..GenerationOptions::default()
+    };
+
+    lower_generation_options(
+      &mut body,
       Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
+      ID_DEEPSEEK,
       "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::ChatCompletions,
-      GenerationOptions {
-        reasoning: Some(ReasoningOptions {
-          mode: Some(ReasoningMode::Enabled),
-          effort: Some(ReasoningEffort::High),
-          ..ReasoningOptions::default()
-        }),
-        ..GenerationOptions::default()
-      },
-    );
+      &options,
+    )
+    .unwrap();
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
-
-    assert!(out.upstream_body.get("reasoning").is_none());
-    assert_eq!(out.upstream_body["thinking"]["type"], "enabled");
-    assert_eq!(out.upstream_body["thinking"]["effort"], "high");
-    assert_eq!(out.upstream_body["reasoning_effort"], "high");
+    assert!(body.get("reasoning").is_none());
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["effort"], "high");
+    assert_eq!(body["reasoning_effort"], "high");
   }
 
   #[test]
@@ -1271,113 +1133,87 @@ mod tests {
     ));
   }
 
-  #[tokio::test]
-  async fn zai_chat_lowers_disabled_mode() {
-    let body = serde_json::json!({
+  #[test]
+  fn zai_chat_lowers_disabled_mode() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "messages": [{"role": "user", "content": "hi"}],
       "reasoning": {"mode": "enabled"},
       "thinking": {"type": "enabled", "clear_thinking": false}
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_ZAI),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::ChatCompletions,
-      GenerationOptions {
-        reasoning: Some(ReasoningOptions {
-          mode: Some(ReasoningMode::Disabled),
-          ..ReasoningOptions::default()
-        }),
-        ..GenerationOptions::default()
-      },
-    );
+    let options = GenerationOptions {
+      reasoning: Some(ReasoningOptions {
+        mode: Some(ReasoningMode::Disabled),
+        ..ReasoningOptions::default()
+      }),
+      ..GenerationOptions::default()
+    };
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
+    lower_generation_options(&mut body, Endpoint::ChatCompletions, ID_ZAI, "input-model", &options).unwrap();
 
-    assert!(out.upstream_body.get("reasoning").is_none());
-    assert_eq!(out.upstream_body["thinking"]["type"], "disabled");
-    assert!(out.upstream_body["thinking"].get("clear_thinking").is_none());
+    assert!(body.get("reasoning").is_none());
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert!(body["thinking"].get("clear_thinking").is_none());
   }
 
-  #[tokio::test]
-  async fn zai_chat_lowers_enabled_mode_with_clear_thinking_disabled() {
-    let body = serde_json::json!({
+  #[test]
+  fn zai_chat_lowers_enabled_mode_with_clear_thinking_disabled() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "messages": [{"role": "user", "content": "hi"}]
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_ZAI),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::ChatCompletions,
-      GenerationOptions {
-        reasoning: Some(ReasoningOptions {
-          mode: Some(ReasoningMode::Enabled),
-          ..ReasoningOptions::default()
-        }),
-        ..GenerationOptions::default()
-      },
-    );
+    let options = GenerationOptions {
+      reasoning: Some(ReasoningOptions {
+        mode: Some(ReasoningMode::Enabled),
+        ..ReasoningOptions::default()
+      }),
+      ..GenerationOptions::default()
+    };
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
+    lower_generation_options(&mut body, Endpoint::ChatCompletions, ID_ZAI, "input-model", &options).unwrap();
 
     assert_eq!(
-      out.upstream_body["thinking"],
+      body["thinking"],
       serde_json::json!({"type": "enabled", "clear_thinking": false})
     );
   }
 
-  #[tokio::test]
-  async fn copilot_messages_lowers_adaptive_mode_and_effort() {
-    let body = serde_json::json!({
+  #[test]
+  fn copilot_messages_lowers_adaptive_mode_and_effort() {
+    let mut body = serde_json::json!({
       "model": "claude-sonnet-4.6",
       "messages": [{"role": "user", "content": "hi"}],
       "max_tokens": 1024,
       "thinking": {"mode": "adaptive", "effort": "low"},
       "output_config": {"effort": "low"}
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_GITHUB_COPILOT),
+    let options = GenerationOptions {
+      reasoning: Some(ReasoningOptions {
+        mode: Some(ReasoningMode::Adaptive),
+        effort: Some(ReasoningEffort::Medium),
+        ..ReasoningOptions::default()
+      }),
+      ..GenerationOptions::default()
+    };
+
+    lower_generation_options(
+      &mut body,
       Endpoint::Messages,
-      Endpoint::Messages,
+      ID_GITHUB_COPILOT,
       "claude-sonnet-4.6",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::Messages,
-      GenerationOptions {
-        reasoning: Some(ReasoningOptions {
-          mode: Some(ReasoningMode::Adaptive),
-          effort: Some(ReasoningEffort::Medium),
-          ..ReasoningOptions::default()
-        }),
-        ..GenerationOptions::default()
-      },
-    );
+      &options,
+    )
+    .unwrap();
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
-
-    assert_eq!(out.upstream_body["thinking"], serde_json::json!({"type": "adaptive"}));
-    assert_eq!(out.upstream_body["output_config"]["effort"], "medium");
+    assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(body["output_config"]["effort"], "medium");
   }
 
-  #[tokio::test]
-  async fn copilot_claude_chat_fallback_lowers_manual_budget_and_effort() {
-    let body = serde_json::json!({
+  #[test]
+  fn copilot_claude_chat_lowers_manual_budget_and_effort() {
+    let mut body = serde_json::json!({
       "model": "claude-sonnet-4.6",
-      "input": [{"role": "user", "content": "hi"}],
+      "messages": [{"role": "user", "content": "hi"}],
       "reasoning": {
         "mode": "enabled",
         "effort": "high",
@@ -1385,37 +1221,33 @@ mod tests {
       },
       "max_output_tokens": 4096
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_GITHUB_COPILOT),
-      Endpoint::Responses,
+    let options = GenerationOptions {
+      max_output_tokens: Some(4096),
+      reasoning: Some(ReasoningOptions {
+        mode: Some(ReasoningMode::Enabled),
+        effort: Some(ReasoningEffort::High),
+        budget_tokens: Some(2048),
+        ..ReasoningOptions::default()
+      }),
+      ..GenerationOptions::default()
+    };
+
+    lower_generation_options(
+      &mut body,
       Endpoint::ChatCompletions,
+      ID_GITHUB_COPILOT,
       "claude-sonnet-4.6",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::Responses,
-      GenerationOptions {
-        max_output_tokens: Some(4096),
-        reasoning: Some(ReasoningOptions {
-          mode: Some(ReasoningMode::Enabled),
-          effort: Some(ReasoningEffort::High),
-          budget_tokens: Some(2048),
-          ..ReasoningOptions::default()
-        }),
-        ..GenerationOptions::default()
-      },
-    );
+      &options,
+    )
+    .unwrap();
 
-    let out = DefaultConvertRequest.convert_request(&ctx, &ex, &res).await.unwrap();
-
-    assert!(out.upstream_body.get("reasoning").is_none());
+    assert!(body.get("reasoning").is_none());
     assert_eq!(
-      out.upstream_body["thinking"],
+      body["thinking"],
       serde_json::json!({"type": "enabled", "budget_tokens": 2048})
     );
-    assert_eq!(out.upstream_body["max_tokens"], 4096);
-    assert_eq!(out.upstream_body["output_config"]["effort"], "high");
+    assert_eq!(body["max_tokens"], 4096);
+    assert_eq!(body["output_config"]["effort"], "high");
   }
 
   #[test]
@@ -1696,56 +1528,26 @@ mod tests {
     assert_eq!(body, original);
   }
 
-  #[tokio::test]
-  async fn invalid_generation_options_in_run_config_fail_before_lowering() {
-    let body = serde_json::json!({
-      "model": "input-model",
-      "messages": [{"role": "user", "content": "hi"}]
-    });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body, None, raw, None);
-    let res = resolved_with(
-      mock_handle("acct", ID_OPENAI),
-      Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
-      "input-model",
-    );
-    let ctx = ctx_with_generation_options(
-      Endpoint::ChatCompletions,
-      GenerationOptions {
-        max_output_tokens: Some(0),
-        ..GenerationOptions::default()
-      },
-    );
-
-    let error = DefaultConvertRequest
-      .convert_request(&ctx, &ex, &res)
-      .await
-      .expect_err("invalid generation options");
-    assert!(matches!(error.inner(), RequestsError::InvalidGenerationOptions { .. }));
-  }
-
-  #[tokio::test]
-  async fn raw_request_without_generation_options_keeps_control_fields() {
-    let body = serde_json::json!({
+  #[test]
+  fn raw_request_without_generation_options_keeps_control_fields() {
+    let mut body = serde_json::json!({
       "model": "input-model",
       "messages": [{"role": "user", "content": "hi"}],
       "top_k": 7,
       "reasoning_effort": "custom",
       "thinking": {"type": "provider-specific"}
     });
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let ex = extracted_with(body.clone(), None, raw.clone(), None);
-    let res = resolved_with(
-      mock_handle("acct", ID_OPENAI),
+    let original = body.clone();
+
+    lower_generation_options(
+      &mut body,
       Endpoint::ChatCompletions,
-      Endpoint::ChatCompletions,
+      ID_OPENAI,
       "input-model",
-    );
+      &GenerationOptions::default(),
+    )
+    .unwrap();
 
-    let out = DefaultConvertRequest.convert_request(&ctx(), &ex, &res).await.unwrap();
-
-    assert_eq!(*out.upstream_body, body);
-    assert_eq!(out.upstream_wire_body, raw);
+    assert_eq!(body, original);
   }
 }
