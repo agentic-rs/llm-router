@@ -19,6 +19,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 use tokn_access::AuthenticationError;
 use tokn_accounts::link::{NoEligibleReason, TargetResolveError};
+use tokn_events::RequestPhase;
 use tokn_policy::ListenerId;
 use tokn_requests::execution::{ManagedAttemptError, ManagedResponseError, OpaqueAttemptError};
 
@@ -57,6 +58,10 @@ impl fmt::Display for ConnectUpgradeUnavailableReason {
 /// An error ready to cross the v2 HTTP serving boundary.
 #[derive(Debug)]
 pub enum ServerError {
+  EventPublication {
+    phase: RequestPhase,
+    source: anyhow::Error,
+  },
   Admission(AdmissionError),
   ClientAuth {
     boundary: AuthBoundary,
@@ -99,6 +104,18 @@ pub enum ServerError {
 }
 
 impl ServerError {
+  /// Fail a request when its reliable public lifecycle cannot be published.
+  ///
+  /// An enabled event hub is part of the serving generation's durability
+  /// contract. Continuing without it would make persistence and library
+  /// consumers observe a different request history from the wire.
+  pub fn event_publication(phase: RequestPhase, source: impl Into<anyhow::Error>) -> Self {
+    Self::EventPublication {
+      phase,
+      source: source.into(),
+    }
+  }
+
   /// Classify authentication failure at a direct LLM API listener.
   pub fn llm_auth(source: ClientAuthError) -> Self {
     Self::ClientAuth {
@@ -159,6 +176,27 @@ impl ServerError {
     self.descriptor().status
   }
 
+  /// Stable lifecycle location at which this request stopped.
+  pub fn phase(&self) -> RequestPhase {
+    match self {
+      Self::EventPublication { phase, .. } => *phase,
+      Self::Admission(_) => RequestPhase::Admission,
+      Self::ClientAuth { .. } => RequestPhase::Authentication,
+      Self::ConnectDispatch(_)
+      | Self::ConnectBodyUnsupported { .. }
+      | Self::ConnectRejected { .. }
+      | Self::ConnectInterceptionSetup { .. }
+      | Self::TunnelConnect { .. }
+      | Self::ConnectUpgradeUnavailable { .. } => RequestPhase::Connect,
+      Self::RequestBody(_) => RequestPhase::RequestBody,
+      Self::RouteRejected { .. } => RequestPhase::Policy,
+      Self::Dispatch(_) | Self::NoEligible { .. } | Self::CoolingDown { .. } => RequestPhase::TargetSelection,
+      Self::Execution(HttpExecutionError::ManagedResponse { .. }) => RequestPhase::UpstreamResponse,
+      Self::Execution(_) => RequestPhase::UpstreamRequest,
+      Self::ResponseBridge(_) => RequestPhase::DownstreamResponse,
+    }
+  }
+
   /// Stable, snake-case machine-readable error code.
   pub fn code(&self) -> &'static str {
     self.descriptor().code
@@ -186,6 +224,11 @@ impl ServerError {
 
   fn descriptor(&self) -> ErrorDescriptor {
     match self {
+      Self::EventPublication { .. } => ErrorDescriptor::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "event_publication_failed",
+        "the request lifecycle could not be recorded",
+      ),
       Self::Admission(source) => admission_descriptor(source),
       Self::ClientAuth { boundary, source } => auth_descriptor(*boundary, *source),
       Self::ConnectDispatch(_) | Self::ConnectInterceptionSetup { .. } | Self::ConnectUpgradeUnavailable { .. } => {
@@ -262,6 +305,12 @@ impl ServerError {
 impl fmt::Display for ServerError {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
+      Self::EventPublication { phase, source } => {
+        write!(
+          formatter,
+          "request lifecycle publication failed during {phase:?}: {source}"
+        )
+      }
       Self::Admission(source) => write!(formatter, "HTTP request admission failed: {source}"),
       Self::ClientAuth { boundary, source } => {
         write!(formatter, "{boundary:?} client authentication failed: {source}")
@@ -300,6 +349,7 @@ impl fmt::Display for ServerError {
 impl std::error::Error for ServerError {
   fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
     match self {
+      Self::EventPublication { source, .. } => Some(source.as_ref()),
       Self::Admission(source) => Some(source),
       Self::ClientAuth { source, .. } => Some(source),
       Self::ConnectDispatch(source) => Some(source),

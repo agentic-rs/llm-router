@@ -7,9 +7,10 @@
 use serde_json::Value;
 use smol_str::SmolStr;
 use snafu::Snafu;
+use std::fmt;
 
 /// An owned managed request body with its validated inbound model.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedRequestBody {
   value: Value,
   requested_model: SmolStr,
@@ -26,6 +27,27 @@ impl ManagedRequestBody {
 
   pub fn into_parts(self) -> (Value, SmolStr) {
     (self.value, self.requested_model)
+  }
+}
+
+impl fmt::Debug for ManagedRequestBody {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("ManagedRequestBody")
+      .field("requested_model_bytes", &self.requested_model.len())
+      .field("value_kind", &json_kind(&self.value))
+      .finish()
+  }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+  match value {
+    Value::Null => "null",
+    Value::Bool(_) => "boolean",
+    Value::Number(_) => "number",
+    Value::String(_) => "string",
+    Value::Array(_) => "array",
+    Value::Object(_) => "object",
   }
 }
 
@@ -87,6 +109,21 @@ mod tests {
     let (actual_value, requested_model) = body.into_parts();
     assert_eq!(actual_value, value);
     assert_eq!(requested_model, "inbound-model");
+  }
+
+  #[test]
+  fn debug_output_describes_shape_without_disclosing_payload() {
+    let body = ManagedRequestBody::try_from(json!({
+      "model": "secret-model",
+      "input": "secret-prompt"
+    }))
+    .unwrap();
+
+    let debug = format!("{body:?}");
+    assert!(debug.contains("requested_model_bytes"));
+    assert!(debug.contains("value_kind: \"object\""));
+    assert!(!debug.contains("secret-model"));
+    assert!(!debug.contains("secret-prompt"));
   }
 
   #[test]

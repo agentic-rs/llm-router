@@ -6,9 +6,10 @@
 
 use super::adapter::{handle_forward_proxy_request, handle_intercepted_https_request, handle_llm_api_request};
 use super::connect::{
-  connect_upgrade_channel, ConnectRunError, ConnectRunOutcome, ConnectRunReport, ConnectRunResult, ConnectTransport,
-  ConnectUpgrade,
+  connect_upgrade_channel, ConnectRunError, ConnectRunOutcome, ConnectRunReport, ConnectRunResult, ConnectSession,
+  ConnectTransport, ConnectUpgrade,
 };
+use super::events::connect_action;
 use super::{BoundGatewayListeners, BoundListener, ListenerServerState};
 use axum::body::Body;
 use http::Request;
@@ -27,7 +28,9 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
 use tokio_rustls::TlsAcceptor;
+use tokn_events::{BodyResult, ConnectClosed, EventFailure, RequestOutcome, RequestPhase};
 use tokn_policy::{ListenerId, ListenerKind};
+use tokn_requests::{RequestCompletion, RequestTerminalEvent, RequestTermination};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -232,7 +235,66 @@ async fn run_connect_upgrade(
   upgrade: ConnectUpgrade,
   state: Arc<ListenerServerState>,
 ) -> ConnectRunResult<ConnectRunReport> {
-  let (session, on_upgrade, transport) = upgrade.into_parts();
+  let (session, on_upgrade, transport, lifecycle) = upgrade.into_parts();
+  let action = connect_action(session.dispatch().action());
+  let result = run_connect_transport(session, on_upgrade, transport, state).await;
+  let (closed, outcome, failure) = match &result {
+    Ok(report) => {
+      let (client_to_upstream_bytes, upstream_to_client_bytes) = match report.outcome() {
+        ConnectRunOutcome::Tunnel {
+          client_to_upstream,
+          upstream_to_client,
+        } => (Some(client_to_upstream), Some(upstream_to_client)),
+        ConnectRunOutcome::Intercept => (None, None),
+      };
+      (
+        ConnectClosed {
+          action,
+          client_to_upstream_bytes,
+          upstream_to_client_bytes,
+          result: BodyResult::Complete,
+        },
+        RequestOutcome::Delivered,
+        None,
+      )
+    }
+    Err(_) => {
+      let failure = EventFailure {
+        code: "connect_session_failed".into(),
+        message: "the CONNECT session ended with a transport failure".into(),
+      };
+      (
+        ConnectClosed {
+          action,
+          client_to_upstream_bytes: None,
+          upstream_to_client_bytes: None,
+          result: BodyResult::Failed(failure.clone()),
+        },
+        RequestOutcome::Failed,
+        Some(failure),
+      )
+    }
+  };
+  let termination = RequestTermination::new(RequestCompletion::new(
+    outcome,
+    RequestPhase::Connect,
+    Some(200),
+    failure,
+  ))
+  .with_event(RequestTerminalEvent::ConnectClosed(closed));
+  let request_id = lifecycle.request_id().clone();
+  if let Err(error) = lifecycle.finish(termination) {
+    tracing::warn!(%request_id, error = %error, "CONNECT terminal publication failed");
+  }
+  result
+}
+
+async fn run_connect_transport(
+  session: Arc<ConnectSession>,
+  on_upgrade: hyper::upgrade::OnUpgrade,
+  transport: ConnectTransport,
+  state: Arc<ListenerServerState>,
+) -> ConnectRunResult<ConnectRunReport> {
   let site = session.dispatch().site().clone();
   let upgraded = on_upgrade.await.map_err(|source| ConnectRunError::DownstreamUpgrade {
     site: site.clone(),

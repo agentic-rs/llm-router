@@ -6,6 +6,7 @@
 //! before polling the body, admits that body according to the route family,
 //! resolves one target, executes one attempt, and bridges the response.
 
+use super::events::policy_selection;
 use super::{
   buffer_matched_body, managed_response_to_axum, opaque_response_to_axum, AdmittedHttpRequest, BufferedRequestBody,
   ListenerServerState, ServerError,
@@ -18,6 +19,8 @@ use http::{HeaderMap, Request};
 use hyper::body::Body as HttpBody;
 use smol_str::SmolStr;
 use tokn_access::AccessContext;
+use tokn_events::{RequestPhase, TrafficEventKind};
+use tokn_requests::RequestLifecycle;
 
 /// Retain whether the inbound request carried a body representation before
 /// its body is moved or polled.
@@ -42,23 +45,36 @@ pub async fn handle_admitted_http(
   access: &AccessContext,
   request: Request<Body>,
   body_present: bool,
+  lifecycle: &mut RequestLifecycle,
 ) -> Result<Response, ServerError> {
   let (head, request_kind) = admitted.into_parts();
-  let matched = match match_http(state.listener(), head, request_kind) {
+  let route_match = match_http(state.listener(), head, request_kind);
+  let selection = policy_selection(&route_match);
+  lifecycle
+    .publish_boundary(TrafficEventKind::PolicySelected(selection))
+    .await
+    .map_err(|source| ServerError::event_publication(RequestPhase::Policy, source))?;
+  let matched = match route_match {
     HttpRouteMatch::Reject(site) => return Err(ServerError::route_rejected(site)),
     HttpRouteMatch::Route(matched) => matched,
   };
 
   let (parts, body) = request.into_parts();
   let headers = parts.headers;
-  let buffered = buffer_matched_body(
+  let (observation, buffered) = buffer_matched_body(
     &matched,
     &headers,
     body,
     body_present,
     state.gateway().defaults().request_body_limits(),
   )
-  .await?;
+  .await
+  .into_parts();
+  lifecycle
+    .publish_boundary(TrafficEventKind::RequestBody(observation))
+    .await
+    .map_err(|source| ServerError::event_publication(RequestPhase::RequestBody, source))?;
+  let buffered = buffered?;
   let session_id = inbound_session_id(&headers);
 
   let (semantics, execution_request) = match buffered {
@@ -115,7 +131,9 @@ mod tests {
   use tokn_access::AccessContext;
   use tokn_accounts::registry::Registry;
   use tokn_core::util::http::HttpClientOptions;
+  use tokn_events::{CapturedHeaders, CapturedUri, Correlation, IngressKind, RequestSource, RequestStarted};
   use tokn_policy::{ClientAuthPlan, GatewayPlan, HttpAction, ListenerId, ListenerPlan, LlmApiListenerPlan};
+  use tokn_requests::RequestLifecycleEmitter;
 
   fn listener_id() -> ListenerId {
     ListenerId::new("listener").unwrap()
@@ -214,8 +232,31 @@ mod tests {
       .body(Body::new(PanicOnPollBody))
       .unwrap();
     let admitted = admit_llm_api_request(&request).unwrap();
+    let started = RequestStarted {
+      source: RequestSource::Listener {
+        listener_id: "listener".into(),
+        ingress: IngressKind::LlmApi,
+        local_addr: None,
+        peer_addr: None,
+      },
+      http_version: Some("HTTP/1.1".into()),
+      method: "POST".into(),
+      target: CapturedUri::exact("/v1/responses"),
+      headers: CapturedHeaders::default(),
+      body_present: true,
+      correlation: Correlation::default(),
+    };
+    let mut lifecycle = RequestLifecycleEmitter::disabled().begin(started).await.unwrap();
 
-    let result = handle_admitted_http(&state, admitted, &AccessContext::unrestricted(), request, true).await;
+    let result = handle_admitted_http(
+      &state,
+      admitted,
+      &AccessContext::unrestricted(),
+      request,
+      true,
+      &mut lifecycle,
+    )
+    .await;
 
     let Err(ServerError::RouteRejected { site }) = result else {
       panic!("expected explicit route rejection")

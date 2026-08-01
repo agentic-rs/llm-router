@@ -5,6 +5,11 @@
 //! framed HTTP/1 request because the body may not have been fully consumed.
 
 use super::connect::{prepare_connect_upgrade, ConnectSession, ConnectUpgradeSender};
+use super::events::{
+  client_identity, connect_action, connect_policy_selection, downstream_response_head, error_termination,
+  request_admitted_connect, request_admitted_http, request_started,
+};
+use super::response_body::observe_downstream_body;
 use super::{
   admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request,
   authenticate_forward_proxy_client, authenticate_llm_api_client, handle_admitted_http, request_body_present,
@@ -15,7 +20,9 @@ use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use http::header::{HeaderValue, CONNECTION, PROXY_AUTHORIZATION};
 use http::{Method, Request, StatusCode, Version};
+use tokn_events::{ConnectReady, IngressKind, RequestOutcome, RequestPhase, RequestSource, TrafficEventKind};
 use tokn_policy::ListenerId;
+use tokn_requests::{RequestCompletion, RequestLifecycle, RequestTermination};
 
 /// Serve one request received by a direct LLM API listener.
 ///
@@ -26,20 +33,53 @@ use tokn_policy::ListenerId;
 pub(super) async fn handle_llm_api_request(state: &ListenerServerState, mut request: Request<Body>) -> Response {
   let version = request.version();
   let body_present = request_body_present(&request);
+  let started = request_started(listener_source(state, IngressKind::LlmApi), &request, body_present);
+  let mut lifecycle = match begin_lifecycle(state, started).await {
+    Ok(lifecycle) => lifecycle,
+    Err(error) => return materialize_local_error(state.listener().id(), error, version, body_present),
+  };
 
-  let result: Result<Response, ServerError> = async {
-    let admitted = admit_llm_api_request(&request)?;
-    let access = authenticate_llm_api_client(state.resource().client_auth(), request.headers_mut())
-      .await
-      .map_err(ServerError::llm_auth)?;
-    handle_admitted_http(state, admitted, &access, request, body_present).await
+  let admitted = match admit_llm_api_request(&request) {
+    Ok(admitted) => admitted,
+    Err(error) => {
+      return complete_http_result(state, lifecycle, Err(error.into()), version, body_present).await;
+    }
+  };
+  if let Err(error) = publish_boundary(
+    &mut lifecycle,
+    TrafficEventKind::Admitted(request_admitted_http(&admitted)),
+    RequestPhase::Admission,
+  )
+  .await
+  {
+    return complete_http_result(state, lifecycle, Err(error), version, body_present).await;
   }
-  .await;
 
-  match result {
-    Ok(response) => response,
-    Err(error) => materialize_local_error(state.listener().id(), error, version, body_present),
+  let access = match authenticate_llm_api_client(state.resource().client_auth(), request.headers_mut()).await {
+    Ok(access) => access,
+    Err(error) => {
+      return complete_http_result(
+        state,
+        lifecycle,
+        Err(ServerError::llm_auth(error)),
+        version,
+        body_present,
+      )
+      .await;
+    }
+  };
+  if let Err(error) = publish_boundary(
+    &mut lifecycle,
+    TrafficEventKind::Authenticated(client_identity(&access)),
+    RequestPhase::Authentication,
+  )
+  .await
+  {
+    return complete_http_result(state, lifecycle, Err(error), version, body_present).await;
   }
+
+  let result = handle_admitted_http(state, admitted, &access, request, body_present, &mut lifecycle).await;
+  complete_http_result(state, lifecycle, result, version, body_present).await
 }
 
 /// Serve one request received by a cleartext forward-proxy listener.
@@ -56,44 +96,152 @@ pub(super) async fn handle_forward_proxy_request(
   let version = request.version();
   let body_present = request_body_present(&request);
   let is_connect = request.method() == Method::CONNECT;
-
-  let result: Result<Response, ServerError> = async {
-    let admitted = admit_forward_proxy_request(&request)?;
-    match admitted {
-      ForwardProxyAdmission::Http(admitted) => {
-        let access = authenticate_forward_proxy_client(state.resource().client_auth(), request.headers_mut())
-          .await
-          .map_err(ServerError::proxy_auth)?;
-        handle_admitted_http(state, admitted, &access, request, body_present).await
-      }
-      ForwardProxyAdmission::Connect(authority) => {
-        if body_present {
-          return Err(ServerError::connect_body_unsupported(state.listener().id().clone()));
-        }
-
-        let access = authenticate_forward_proxy_client(state.resource().client_auth(), request.headers_mut())
-          .await
-          .map_err(ServerError::proxy_auth)?;
-        let dispatch = dispatch_connect(state.listener(), authority)?;
-        let upgrade = prepare_connect_upgrade(state, dispatch, access, &mut request).await?;
-        let site = upgrade.session().dispatch().site().clone();
-        upgrades.try_send(upgrade).map_err(|error| match error {
-          tokio::sync::mpsc::error::TrySendError::Full(_) => {
-            ServerError::connect_upgrade_unavailable(site, ConnectUpgradeUnavailableReason::QueueFull)
-          }
-          tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            ServerError::connect_upgrade_unavailable(site, ConnectUpgradeUnavailableReason::OwnerClosed)
-          }
-        })?;
-        Ok(StatusCode::OK.into_response())
-      }
+  let close_http1 = body_present || is_connect;
+  let started = request_started(
+    listener_source(state, IngressKind::ForwardProxy),
+    &request,
+    body_present,
+  );
+  let mut lifecycle = match begin_lifecycle(state, started).await {
+    Ok(lifecycle) => lifecycle,
+    Err(error) => return materialize_local_error(state.listener().id(), error, version, close_http1),
+  };
+  let admitted = match admit_forward_proxy_request(&request) {
+    Ok(admitted) => admitted,
+    Err(error) => {
+      return complete_http_result(state, lifecycle, Err(error.into()), version, close_http1).await;
     }
-  }
-  .await;
+  };
 
-  match result {
-    Ok(response) => response,
-    Err(error) => materialize_local_error(state.listener().id(), error, version, body_present || is_connect),
+  match admitted {
+    ForwardProxyAdmission::Http(admitted) => {
+      if let Err(error) = publish_boundary(
+        &mut lifecycle,
+        TrafficEventKind::Admitted(request_admitted_http(&admitted)),
+        RequestPhase::Admission,
+      )
+      .await
+      {
+        return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+      }
+      let access = match authenticate_forward_proxy_client(state.resource().client_auth(), request.headers_mut()).await
+      {
+        Ok(access) => access,
+        Err(error) => {
+          return complete_http_result(
+            state,
+            lifecycle,
+            Err(ServerError::proxy_auth(error)),
+            version,
+            close_http1,
+          )
+          .await;
+        }
+      };
+      if let Err(error) = publish_boundary(
+        &mut lifecycle,
+        TrafficEventKind::Authenticated(client_identity(&access)),
+        RequestPhase::Authentication,
+      )
+      .await
+      {
+        return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+      }
+      let result = handle_admitted_http(state, admitted, &access, request, body_present, &mut lifecycle).await;
+      complete_http_result(state, lifecycle, result, version, close_http1).await
+    }
+    ForwardProxyAdmission::Connect(authority) => {
+      if let Err(error) = publish_boundary(
+        &mut lifecycle,
+        TrafficEventKind::Admitted(request_admitted_connect(&authority)),
+        RequestPhase::Admission,
+      )
+      .await
+      {
+        return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+      }
+      if body_present {
+        let error = ServerError::connect_body_unsupported(state.listener().id().clone());
+        return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+      }
+
+      let access = match authenticate_forward_proxy_client(state.resource().client_auth(), request.headers_mut()).await
+      {
+        Ok(access) => access,
+        Err(error) => {
+          return complete_http_result(
+            state,
+            lifecycle,
+            Err(ServerError::proxy_auth(error)),
+            version,
+            close_http1,
+          )
+          .await;
+        }
+      };
+      if let Err(error) = publish_boundary(
+        &mut lifecycle,
+        TrafficEventKind::Authenticated(client_identity(&access)),
+        RequestPhase::Authentication,
+      )
+      .await
+      {
+        return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+      }
+
+      let dispatch = match dispatch_connect(state.listener(), authority) {
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+          return complete_http_result(state, lifecycle, Err(error.into()), version, close_http1).await;
+        }
+      };
+      if let Err(error) = publish_boundary(
+        &mut lifecycle,
+        TrafficEventKind::PolicySelected(connect_policy_selection(&dispatch)),
+        RequestPhase::Policy,
+      )
+      .await
+      {
+        return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+      }
+      let event_action = connect_action(dispatch.action());
+      let event_authority = dispatch.authority().to_string();
+      let request_id = lifecycle.request_id().clone();
+      let mut upgrade = match prepare_connect_upgrade(state, dispatch, access, request_id, &mut request).await {
+        Ok(upgrade) => upgrade,
+        Err(error) => {
+          return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+        }
+      };
+      let permit = match upgrades.clone().try_reserve_owned() {
+        Ok(permit) => permit,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+          let site = upgrade.session().dispatch().site().clone();
+          let error = ServerError::connect_upgrade_unavailable(site, ConnectUpgradeUnavailableReason::QueueFull);
+          return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+          let site = upgrade.session().dispatch().site().clone();
+          let error = ServerError::connect_upgrade_unavailable(site, ConnectUpgradeUnavailableReason::OwnerClosed);
+          return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+        }
+      };
+      if let Err(error) = publish_boundary(
+        &mut lifecycle,
+        TrafficEventKind::ConnectReady(ConnectReady {
+          action: event_action,
+          authority: event_authority.into(),
+        }),
+        RequestPhase::Connect,
+      )
+      .await
+      {
+        return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+      }
+      upgrade.attach_lifecycle(lifecycle);
+      permit.send(upgrade);
+      StatusCode::OK.into_response()
+    }
   }
 }
 
@@ -111,18 +259,124 @@ pub(super) async fn handle_intercepted_https_request(
   let version = request.version();
   let body_present = request_body_present(&request);
   let is_connect = request.method() == Method::CONNECT;
+  let close_http1 = body_present || is_connect;
+  let started = request_started(
+    listener_source(
+      state,
+      IngressKind::InterceptedHttps {
+        parent_connect_id: session.request_id().clone(),
+      },
+    ),
+    &request,
+    body_present,
+  );
+  let mut lifecycle = match begin_lifecycle(state, started).await {
+    Ok(lifecycle) => lifecycle,
+    Err(error) => return materialize_local_error(state.listener().id(), error, version, close_http1),
+  };
   request.headers_mut().remove(PROXY_AUTHORIZATION);
-
-  let result: Result<Response, ServerError> = async {
-    let admitted = admit_intercepted_https_request(&request, session.dispatch().authority())?;
-    handle_admitted_http(state, admitted, session.access(), request, body_present).await
+  let admitted = match admit_intercepted_https_request(&request, session.dispatch().authority()) {
+    Ok(admitted) => admitted,
+    Err(error) => {
+      return complete_http_result(state, lifecycle, Err(error.into()), version, close_http1).await;
+    }
+  };
+  if let Err(error) = publish_boundary(
+    &mut lifecycle,
+    TrafficEventKind::Admitted(request_admitted_http(&admitted)),
+    RequestPhase::Admission,
+  )
+  .await
+  {
+    return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
   }
-  .await;
-
-  match result {
-    Ok(response) => response,
-    Err(error) => materialize_local_error(state.listener().id(), error, version, body_present || is_connect),
+  if let Err(error) = publish_boundary(
+    &mut lifecycle,
+    TrafficEventKind::Authenticated(client_identity(session.access())),
+    RequestPhase::Authentication,
+  )
+  .await
+  {
+    return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
   }
+  let result = handle_admitted_http(state, admitted, session.access(), request, body_present, &mut lifecycle).await;
+  complete_http_result(state, lifecycle, result, version, close_http1).await
+}
+
+fn listener_source(state: &ListenerServerState, ingress: IngressKind) -> RequestSource {
+  RequestSource::Listener {
+    listener_id: state.listener().id().as_str().into(),
+    ingress,
+    local_addr: None,
+    peer_addr: None,
+  }
+}
+
+async fn begin_lifecycle(
+  state: &ListenerServerState,
+  started: tokn_events::RequestStarted,
+) -> Result<RequestLifecycle, ServerError> {
+  state
+    .gateway()
+    .request_events()
+    .begin(started)
+    .await
+    .map_err(|source| ServerError::event_publication(RequestPhase::Admission, source))
+}
+
+async fn publish_boundary(
+  lifecycle: &mut RequestLifecycle,
+  kind: TrafficEventKind,
+  phase: RequestPhase,
+) -> Result<(), ServerError> {
+  lifecycle
+    .publish_boundary(kind)
+    .await
+    .map(|_| ())
+    .map_err(|source| ServerError::event_publication(phase, source))
+}
+
+async fn complete_http_result(
+  state: &ListenerServerState,
+  mut lifecycle: RequestLifecycle,
+  result: Result<Response, ServerError>,
+  version: Version,
+  close_http1: bool,
+) -> Response {
+  let (response, termination) = match result {
+    Ok(response) => {
+      let status = response.status().as_u16();
+      let termination = RequestTermination::new(RequestCompletion::new(
+        RequestOutcome::Delivered,
+        RequestPhase::Complete,
+        Some(status),
+        None,
+      ));
+      (response, termination)
+    }
+    Err(error) => {
+      let phase = error.phase();
+      let termination = error_termination(&error, phase);
+      let response = materialize_local_error(state.listener().id(), error, version, close_http1);
+      (response, termination)
+    }
+  };
+
+  if let Err(source) = publish_boundary(
+    &mut lifecycle,
+    TrafficEventKind::DownstreamResponseHead(downstream_response_head(&response)),
+    RequestPhase::DownstreamResponse,
+  )
+  .await
+  {
+    return materialize_local_error(state.listener().id(), source, version, close_http1);
+  }
+  observe_downstream_body(
+    response,
+    lifecycle,
+    termination,
+    state.gateway().defaults().request_body_limits().max_decoded_bytes(),
+  )
 }
 
 /// Turn a classified local failure into its stable wire response.
@@ -158,10 +412,13 @@ mod tests {
   use super::super::connect::connect_upgrade_channel;
   use super::*;
   use crate::runtime::{link_gateway_runtime, materialize_listeners, GatewayServerState, GatewayServingDefaults};
+  use axum::body::to_bytes;
   use http::header::{CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, TRANSFER_ENCODING, WWW_AUTHENTICATE};
   use http::{Method, StatusCode};
-  use std::collections::BTreeMap;
+  use smol_str::SmolStr;
+  use std::collections::{BTreeMap, BTreeSet};
   use std::net::{Ipv4Addr, SocketAddr};
+  use std::path::PathBuf;
   use std::sync::Arc;
   use tokio::io::AsyncReadExt;
   use tokio::net::TcpListener;
@@ -169,10 +426,18 @@ mod tests {
   use tokio::time::{timeout, Duration};
   use tokn_access::AccessContext;
   use tokn_accounts::registry::Registry;
+  use tokn_core::account::{AccountConfig, AccountTier};
+  use tokn_core::provider::ID_LLAMA_CPP;
   use tokn_core::util::http::HttpClientOptions;
+  use tokn_events::{EventHub, GatewayEvent, HubBuilder};
+  use tokn_persistence::RequestPersistenceConsumer;
   use tokn_policy::{
-    ClientAuthPlan, ConnectAction, ForwardProxyListenerPlan, GatewayPlan, HttpAction, ListenerPlan, LlmApiListenerPlan,
+    AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction,
+    ForwardProxyListenerPlan, GatewayPlan, HttpAction, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ManagedRoute,
+    ManagedTarget, ModelGroupId, ModelSelector, ProfileId, ProfilePlan, ProviderId, RouteId, RoutePlan, UpstreamId,
+    UpstreamPlan, UpstreamSelector, WireIdentity,
   };
+  use tokn_requests::RequestLifecycleEmitter;
 
   fn listener_id() -> ListenerId {
     ListenerId::new("listener").unwrap()
@@ -245,6 +510,96 @@ mod tests {
     )))
   }
 
+  fn managed_event_state() -> (tempfile::TempDir, ListenerServerState, EventHub<GatewayEvent>, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let requests_dir = temp.path().join("requests");
+    let persistence = RequestPersistenceConsumer::open(&requests_dir, "test-version").unwrap();
+    let (publisher, hub) = HubBuilder::new().consumer(persistence).start().unwrap();
+
+    let listener = listener_id();
+    let profile = ProfileId::new("profile").unwrap();
+    let route = RouteId::new("route").unwrap();
+    let pool = AccountPoolId::new("pool").unwrap();
+    let upstream = UpstreamId::new("upstream").unwrap();
+    let plan = GatewayPlan::new(
+      BTreeMap::from([(
+        listener.clone(),
+        ListenerPlan::LlmApi(LlmApiListenerPlan::new(
+          SocketAddr::from((Ipv4Addr::LOCALHOST, 42_502)),
+          ClientAuthPlan::None,
+          Box::default(),
+          HttpAction::Route(profile.clone()),
+        )),
+      )]),
+      BTreeMap::from([(profile, ProfilePlan::new(route.clone(), WireIdentity::None))]),
+      BTreeMap::from([(
+        route,
+        RoutePlan::Managed(ManagedRoute::new(
+          ManagedTarget::new(
+            pool.clone(),
+            UpstreamSelector::Fixed(upstream.clone()),
+            ModelSelector::Capability,
+          ),
+          tokn_policy::OperationPolicy::TranslateCompatible,
+          None,
+          ManagedRetry::Never,
+        )),
+      )]),
+      BTreeMap::from([(
+        pool,
+        AccountPoolPlan::new(
+          AccountSelector::all(),
+          AccountSelectionStrategy::RoundRobin,
+          Duration::from_secs(30),
+          None,
+        ),
+      )]),
+      BTreeMap::from([(
+        upstream,
+        UpstreamPlan::new(
+          ProviderId::new(ID_LLAMA_CPP).unwrap(),
+          Some("https://upstream.example/v1/".into()),
+          Box::default(),
+          false,
+        )
+        .with_eligible_accounts(Some(BTreeSet::from([SmolStr::new("fixture")]))),
+      )]),
+      BTreeMap::<ModelGroupId, _>::new(),
+    );
+    let mut account: AccountConfig = toml::from_str(
+      r#"
+        id = "fixture"
+        provider = "llama-cpp"
+      "#,
+    )
+    .unwrap();
+    account.tier = AccountTier::Active;
+    let runtime = Arc::new(
+      link_gateway_runtime(
+        &plan,
+        &[account],
+        &Registry::builtin(),
+        &crate::runtime::RuntimeNameRegistry::builtin(),
+      )
+      .unwrap(),
+    );
+    let resources = materialize_listeners(runtime.listeners(), None).unwrap();
+    let resource = resources.listener(&listener).unwrap().clone();
+    let gateway = Arc::new(
+      GatewayServerState::build_with_events(
+        runtime,
+        &HttpClientOptions {
+          system: false,
+          ..HttpClientOptions::default()
+        },
+        GatewayServingDefaults::new(super::super::RequestBodyLimits::new(1024, 1024)),
+        RequestLifecycleEmitter::new(publisher),
+      )
+      .unwrap(),
+    );
+    (temp, ListenerServerState::new(gateway, resource), hub, requests_dir)
+  }
+
   fn connect_request(target: SocketAddr) -> http::request::Builder {
     Request::builder()
       .method(Method::CONNECT)
@@ -298,6 +653,59 @@ mod tests {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
     assert_eq!(response.headers()[CONNECTION], "close");
+  }
+
+  #[tokio::test]
+  async fn invalid_managed_json_is_persisted_from_started_through_terminal_response() {
+    let (_temp, state, hub, requests_dir) = managed_event_state();
+    let request = Request::builder()
+      .method(Method::POST)
+      .uri("/v1/responses")
+      .version(Version::HTTP_11)
+      .header(HOST, "client.example")
+      .header(CONTENT_LENGTH, "1")
+      .body(Body::from("{"))
+      .unwrap();
+
+    let response = handle_llm_api_request(&state, request).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()[CONNECTION], "close");
+    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(std::str::from_utf8(&response_body)
+      .unwrap()
+      .contains("invalid_request_body"));
+    hub.shutdown().await.unwrap();
+
+    let day_files = tokn_persistence::requests::day_files(&requests_dir).unwrap();
+    assert_eq!(day_files.len(), 1);
+    let connection = tokn_persistence::requests::open_day_db(&day_files[0]).unwrap();
+    let row = connection
+      .query_row(
+        "SELECT status, request_error, inbound_req_method, inbound_req_url,
+                inbound_req_body, account_id, provider_id, model
+         FROM requests",
+        [],
+        |row| {
+          Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+          ))
+        },
+      )
+      .unwrap();
+    assert_eq!(row.0, 400);
+    assert_eq!(row.1, "request_body: the managed request body is not valid JSON");
+    assert_eq!(row.2, "POST");
+    assert_eq!(row.3, "/v1/responses");
+    assert_eq!(row.4, b"{");
+    assert_eq!((&row.5, &row.6, &row.7), (&None, &None, &None));
   }
 
   #[tokio::test]
