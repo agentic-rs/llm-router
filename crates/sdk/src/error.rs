@@ -1,11 +1,18 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-  #[error("failed to load configuration")]
-  LoadConfig {
+  #[error("failed to resolve the default gateway configuration path")]
+  ResolveConfigPath {
     #[source]
     source: tokn_config::Error,
+  },
+  #[error("failed to load version 2 gateway configuration from {path}")]
+  LoadConfig {
+    path: PathBuf,
+    #[source]
+    source: Box<tokn_config::v2::Error>,
   },
   #[error("failed to load credentials from {path}")]
   LoadCredentials {
@@ -13,13 +20,42 @@ pub enum Error {
     #[source]
     source: anyhow::Error,
   },
-  #[error("failed to build the provider engine")]
-  BuildEngine {
+  #[error("invalid SDK profile id '{profile}'")]
+  InvalidProfileId {
+    profile: String,
     #[source]
-    source: anyhow::Error,
+    source: tokn_policy::InvalidIdentifier,
   },
   #[error("unknown SDK profile '{profile}'")]
   UnknownProfile { profile: String },
+  #[error("SDK profile '{profile}' uses {kind:?} route '{route}'; the embedded SDK requires a managed route")]
+  NonManagedProfile {
+    profile: String,
+    route: String,
+    kind: tokn_policy::RouteKind,
+  },
+  #[error("failed to link the SDK profile runtime")]
+  LinkRuntime {
+    #[source]
+    source: Box<tokn_router::runtime::GatewayLinkError>,
+  },
+  #[error("failed to build the SDK managed executor")]
+  BuildExecutor {
+    #[source]
+    source: tokn_router::runtime::ManagedGatewayBuildError,
+  },
+  #[error("invalid request header name '{name}'")]
+  InvalidHeaderName {
+    name: String,
+    #[source]
+    source: http::header::InvalidHeaderName,
+  },
+  #[error("invalid value for request header '{name}'")]
+  InvalidHeaderValue {
+    name: String,
+    #[source]
+    source: http::header::InvalidHeaderValue,
+  },
   #[error("failed to serialize request")]
   SerializeRequest {
     #[source]
@@ -46,11 +82,15 @@ pub enum Error {
     #[source]
     source: serde_json::Error,
   },
-  #[error("request pipeline failed")]
-  Pipeline {
+  #[error("managed SDK request failed")]
+  ManagedRequest {
     #[source]
-    source: tokn_requests::PipelineError,
+    source: Box<tokn_router::runtime::ManagedGatewayError>,
   },
+  #[error("all targets for SDK profile '{profile}' are cooling down until {retry_at:?}")]
+  CoolingDown { profile: String, retry_at: Instant },
+  #[error("SDK profile '{profile}' found no eligible target: {reason}")]
+  NoEligible { profile: String, reason: String },
   #[error("expected a buffered response but received a stream; use the endpoint's stream method")]
   UnexpectedStream,
   #[error("expected a streaming response but received a buffered body")]

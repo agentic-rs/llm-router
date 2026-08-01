@@ -3,7 +3,7 @@ use futures_util::stream::BoxStream;
 use futures_util::TryStreamExt;
 use serde::de::DeserializeOwned;
 use tokn_headers::HeaderMap;
-use tokn_requests::pipeline::stages::{ConvertedBody, ConvertedResponse};
+use tokn_requests::execution::{ManagedClientBody, ManagedClientResponse};
 
 use crate::{Error, Result};
 
@@ -43,15 +43,16 @@ impl std::fmt::Debug for ResponseBody {
   }
 }
 
-impl From<ConvertedResponse> for RawResponse {
-  fn from(response: ConvertedResponse) -> Self {
-    let body = match response.body {
-      ConvertedBody::Buffered { body_bytes, .. } => ResponseBody::Buffered(body_bytes),
-      ConvertedBody::Stream { body } => ResponseBody::Stream(body),
+impl From<ManagedClientResponse> for RawResponse {
+  fn from(response: ManagedClientResponse) -> Self {
+    let (status, headers, body) = response.into_parts();
+    let body = match body {
+      ManagedClientBody::Buffered(body) => ResponseBody::Buffered(body),
+      ManagedClientBody::Stream(body) => ResponseBody::Stream(body),
     };
     Self {
-      status: response.status,
-      headers: response.headers,
+      status: status.as_u16(),
+      headers: HeaderMap::from(&headers),
       body,
     }
   }

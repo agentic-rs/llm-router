@@ -15,7 +15,8 @@ use tokn_convert::ir::{
 };
 use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary};
 use tokn_core::provider::Endpoint;
-use tokn_requests::pipeline::error::RequestsError;
+use tokn_requests::execution::ManagedAttemptError;
+use tokn_router::runtime::ManagedGatewayError;
 
 use crate::response::ResponseBody;
 use crate::{Client, Error, RequestOptions, Result};
@@ -598,11 +599,6 @@ macro_rules! generate_builder_methods {
         self
       }
 
-      pub fn profile(mut self, profile: impl Into<String>) -> Self {
-        self.request.options.profile = Some(profile.into());
-        self
-      }
-
       pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request.options.request_id = Some(request_id.into());
         self
@@ -719,21 +715,22 @@ impl Client {
 }
 
 fn map_generation_error(error: Error) -> Error {
-  let Error::Pipeline { source } = error else {
-    return error;
-  };
-  match source.inner() {
-    RequestsError::UpstreamStatus { status, body } => Error::GenerateResponseStatus {
-      status: *status,
-      body: body.clone(),
+  let generation_control = match &error {
+    Error::ManagedRequest { source } => match source.as_ref() {
+      ManagedGatewayError::Attempt {
+        source: ManagedAttemptError::GenerationControl { source },
+        ..
+      } => Some(source),
+      _ => None,
     },
-    RequestsError::InvalidGenerationOptions { .. } | RequestsError::UnsupportedGenerationControl { .. } => {
-      Error::InvalidGenerateRequest {
-        message: source.inner().to_string(),
-      }
-    }
-    _ => Error::Pipeline { source },
+    _ => None,
+  };
+  if let Some(source) = generation_control {
+    return Error::InvalidGenerateRequest {
+      message: source.to_string(),
+    };
   }
+  error
 }
 
 fn ensure_raw_success(response: &crate::RawResponse) -> Result<()> {
@@ -850,16 +847,24 @@ mod tests {
     let request: GenerateRequest = serde_json::from_value(serde_json::json!({
       "model": "smart",
       "messages": [{"role": "user", "content": "Hello"}],
-      "options": {"profile": "fast"}
+      "options": {"session_id": "session-1"}
     }))
     .expect("deserialize sparse request options");
 
-    assert_eq!(request.options.profile.as_deref(), Some("fast"));
+    assert_eq!(request.options.session_id.as_deref(), Some("session-1"));
     assert!(request.options.headers.is_empty());
     assert!(serde_json::to_value(request)
       .expect("serialize request")
       .pointer("/options/headers")
       .is_none());
+
+    let error = serde_json::from_value::<GenerateRequest>(serde_json::json!({
+      "model": "smart",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "options": {"profile": "legacy-per-request-profile"}
+    }))
+    .expect_err("per-request profiles must not be silently ignored");
+    assert!(error.to_string().contains("unknown field `profile`"));
   }
 
   #[test]

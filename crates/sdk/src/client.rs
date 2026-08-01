@@ -1,31 +1,27 @@
 use arc_swap::ArcSwap;
+use http::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use smol_str::SmolStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
-use tokn_config::Config;
-use tokn_core::event::EventBus;
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
-use tokn_core::request_event::RequestEndpoint;
-use tokn_headers::keys::{ACCEPT, CONTENT_TYPE};
-use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
-use tokn_requests::{RawInbound, RunConfig};
-use tokn_router::api::{AppState, RequestPolicyRuntime};
+use tokn_policy::{ProfileId, RouteKind};
+use tokn_router::runtime::{
+  link_builtin_gateway_runtime_with_profile_roots, EmbeddedProfileRoots, ManagedGatewayExecutor, ManagedGatewayOutcome,
+  ManagedGatewayRequest,
+};
 
 use crate::endpoint::{ChatCompletions, Messages, Responses};
 use crate::response::RawResponse;
 use crate::{Error, Result};
 
-const EVENT_BUS_CAPACITY: usize = 256;
+const DEFAULT_PROFILE: &str = "default";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RequestOptions {
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub profile: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub request_id: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,9 +30,8 @@ pub struct RequestOptions {
   pub project_id: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub initiator: Option<String>,
-  /// Additional inbound headers made available to provider persona and
-  /// overlay normalization. Managed routes do not forward arbitrary headers
-  /// verbatim.
+  /// Additional semantic inbound headers made available to provider persona
+  /// rendering. Managed profiles do not forward arbitrary headers verbatim.
   #[serde(skip_serializing_if = "Vec::is_empty")]
   pub headers: Vec<(String, String)>,
 }
@@ -44,11 +39,6 @@ pub struct RequestOptions {
 impl RequestOptions {
   pub fn is_empty(&self) -> bool {
     self == &Self::default()
-  }
-
-  pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
-    self.profile = Some(profile.into());
-    self
   }
 
   pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
@@ -95,6 +85,10 @@ impl ClientBuilder {
     self
   }
 
+  /// Bind the client to one managed profile for its complete lifetime.
+  ///
+  /// Build a separate client when an application needs another profile. If
+  /// omitted, the conventional `default` profile is used.
   pub fn profile(mut self, profile: impl Into<String>) -> Self {
     self.profile = Some(profile.into());
     self
@@ -106,16 +100,13 @@ impl ClientBuilder {
 }
 
 struct Source {
-  config_path: Option<PathBuf>,
-  auth_path: Option<PathBuf>,
-  profile: Option<String>,
+  config_path: PathBuf,
+  auth_path: PathBuf,
+  profile: ProfileId,
 }
 
 struct Snapshot {
-  state: AppState,
-  default_profile: Option<String>,
-  config_path: PathBuf,
-  auth_path: PathBuf,
+  gateway: ManagedGatewayExecutor,
 }
 
 pub struct Client {
@@ -133,10 +124,23 @@ impl Client {
   }
 
   fn build(builder: ClientBuilder) -> Result<Self> {
+    let profile = builder.profile.unwrap_or_else(|| DEFAULT_PROFILE.to_owned());
+    let profile = ProfileId::new(&profile).map_err(|source| Error::InvalidProfileId { profile, source })?;
+    let config_path = match builder.config_path {
+      Some(path) => path,
+      None => tokn_config::paths::config_path().map_err(|source| Error::ResolveConfigPath { source })?,
+    };
+    let auth_path = match builder.auth_path {
+      Some(path) => path,
+      None => default_auth_path().map_err(|source| Error::LoadCredentials {
+        path: PathBuf::from("<default>"),
+        source,
+      })?,
+    };
     let source = Source {
-      config_path: builder.config_path,
-      auth_path: builder.auth_path,
-      profile: builder.profile,
+      config_path,
+      auth_path,
+      profile,
     };
     let snapshot = load_snapshot(&source)?;
     Ok(Self {
@@ -145,17 +149,23 @@ impl Client {
     })
   }
 
+  /// Atomically replace the compiled config, linked account graph, and
+  /// managed transport. In-flight requests retain the previous snapshot.
   pub fn reload(&self) -> Result<()> {
     self.snapshot.store(Arc::new(load_snapshot(&self.source)?));
     Ok(())
   }
 
+  pub fn profile(&self) -> &str {
+    self.source.profile.as_str()
+  }
+
   pub fn config_path(&self) -> PathBuf {
-    self.snapshot.load().config_path.clone()
+    self.source.config_path.clone()
   }
 
   pub fn auth_path(&self) -> PathBuf {
-    self.snapshot.load().auth_path.clone()
+    self.source.auth_path.clone()
   }
 
   pub fn responses(&self) -> Responses<'_> {
@@ -194,54 +204,36 @@ impl Client {
     endpoint: Endpoint,
     body: Value,
     options: RequestOptions,
-    mut generation_options: Option<GenerationOptions>,
+    generation_options: Option<GenerationOptions>,
   ) -> Result<RawResponse> {
     let snapshot = self.snapshot.load_full();
-    let policy = select_policy(&snapshot, options.profile.as_deref())?;
-    let verbatim_mode = match policy.mode {
-      tokn_config::RouteMode::Passthrough => Some("passthrough"),
-      tokn_config::RouteMode::Switch => Some("switch"),
-      _ => None,
-    };
-    if let (Some(mode), Some(generation)) = (verbatim_mode, generation_options.as_ref()) {
-      if generation.top_k.is_some() || generation.reasoning.is_some() {
-        return Err(Error::InvalidGenerateRequest {
-          message: format!(
-            "typed top_k and reasoning controls require a managed route; profile mode '{mode}' forwards the generated Responses payload verbatim"
-          ),
-        });
-      }
-      if let Some(max_output_tokens) = generation.max_output_tokens {
-        let wire_limit = body.get("max_output_tokens").and_then(Value::as_u64);
-        if endpoint != Endpoint::Responses || wire_limit != Some(max_output_tokens) {
-          return Err(Error::InvalidGenerateRequest {
-            message: format!(
-              "typed max_output_tokens cannot be lowered in profile mode '{mode}'; the verbatim request must already contain the matching Responses field"
-            ),
-          });
-        }
-      }
-      // The friendly generator already rendered a Responses-native output
-      // limit into `body`. Do not carry the same intent into a verbatim stage,
-      // where out-of-band controls are deliberately rejected.
-      generation_options = None;
+    let headers = request_headers(&options)?;
+    let mut request = ManagedGatewayRequest::new(endpoint, body).with_headers(headers);
+    if let Some(session_id) = options.session_id.as_deref() {
+      request = request.with_session_id(session_id);
     }
-    let raw = raw_request(endpoint, body, &options)?;
-    let mut config = RunConfig::builder().with_agent_id_opt(policy.agent_id.clone());
     if let Some(generation_options) = generation_options {
-      config = config.with_generation_options(generation_options);
+      request = request.with_generation_options(generation_options);
     }
-    let config = config.build();
-    let pipeline = match policy.mode {
-      tokn_config::RouteMode::Passthrough => &policy.passthrough_pipeline,
-      tokn_config::RouteMode::Switch => &policy.switch_pipeline,
-      _ => &policy.request_pipeline,
-    };
-    let response = pipeline
-      .run_with(raw, config)
+
+    let outcome = snapshot
+      .gateway
+      .execute(&self.source.profile, request)
       .await
-      .map_err(|source| Error::Pipeline { source })?;
-    Ok(response.into())
+      .map_err(|source| Error::ManagedRequest {
+        source: Box::new(source),
+      })?;
+    match outcome {
+      ManagedGatewayOutcome::Response { response, .. } => Ok(response.into()),
+      ManagedGatewayOutcome::CoolingDown { retry_at, .. } => Err(Error::CoolingDown {
+        profile: self.source.profile.to_string(),
+        retry_at,
+      }),
+      ManagedGatewayOutcome::NoEligible { reason, .. } => Err(Error::NoEligible {
+        profile: self.source.profile.to_string(),
+        reason: reason.to_string(),
+      }),
+    }
   }
 
   pub(crate) async fn execute_typed<T: Serialize>(
@@ -260,83 +252,76 @@ impl Client {
 }
 
 fn load_snapshot(source: &Source) -> Result<Snapshot> {
-  let (config, config_path) =
-    Config::load(source.config_path.as_deref()).map_err(|source| Error::LoadConfig { source })?;
-  let auth_path = match &source.auth_path {
-    Some(path) => path.clone(),
-    None => default_auth_path().map_err(|source| Error::LoadCredentials {
-      path: PathBuf::from("<default>"),
-      source,
-    })?,
-  };
-  let credentials = AuthStore::load(Some(&auth_path), Some(&config_path)).map_err(|source| Error::LoadCredentials {
-    path: auth_path.clone(),
+  let compiled = tokn_config::v2::load(&source.config_path).map_err(|error| Error::LoadConfig {
+    path: source.config_path.clone(),
+    source: Box::new(error),
+  })?;
+  let profile = compiled
+    .gateway()
+    .profile(&source.profile)
+    .ok_or_else(|| Error::UnknownProfile {
+      profile: source.profile.to_string(),
+    })?;
+  if let Some(route) = compiled.gateway().route(profile.route()) {
+    let kind = route.kind();
+    if kind != RouteKind::Managed {
+      return Err(Error::NonManagedProfile {
+        profile: source.profile.to_string(),
+        route: profile.route().to_string(),
+        kind,
+      });
+    }
+  }
+
+  let credentials =
+    AuthStore::load(Some(&source.auth_path), Some(&source.config_path)).map_err(|error| Error::LoadCredentials {
+      path: source.auth_path.clone(),
+      source: error,
+    })?;
+  let roots = EmbeddedProfileRoots::one(source.profile.clone());
+  let runtime = link_builtin_gateway_runtime_with_profile_roots(compiled.gateway(), &credentials.accounts, &roots)
+    .map_err(|source| Error::LinkRuntime {
+      source: Box::new(source),
+    })?;
+  let http_options = compiled.service().outbound().to_http_client_options();
+  let gateway = ManagedGatewayExecutor::build(Arc::new(runtime), &http_options)
+    .map_err(|source| Error::BuildExecutor { source })?;
+
+  Ok(Snapshot { gateway })
+}
+
+fn request_headers(options: &RequestOptions) -> Result<HeaderMap> {
+  let mut headers = HeaderMap::new();
+  for (name, value) in &options.headers {
+    insert_header(&mut headers, name, value)?;
+  }
+  headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+  headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+  insert_option(&mut headers, "x-request-id", options.request_id.as_deref())?;
+  insert_option(&mut headers, "x-session-id", options.session_id.as_deref())?;
+  insert_option(&mut headers, "x-project-cwd", options.project_id.as_deref())?;
+  insert_option(&mut headers, "x-initiator", options.initiator.as_deref())?;
+  Ok(headers)
+}
+
+fn insert_option(headers: &mut HeaderMap, name: &'static str, value: Option<&str>) -> Result<()> {
+  if let Some(value) = value {
+    insert_header(headers, name, value)?;
+  }
+  Ok(())
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
+  let header_name = name.parse::<HeaderName>().map_err(|source| Error::InvalidHeaderName {
+    name: name.to_owned(),
     source,
   })?;
-  let events = Arc::new(EventBus::new(EVENT_BUS_CAPACITY));
-  let state = tokn_router::api::build_state(&config, &credentials.accounts, events)
-    .map_err(|source| Error::BuildEngine { source })?;
-  if let Some(profile) = &source.profile {
-    ensure_profile(&state, profile)?;
-  }
-  Ok(Snapshot {
-    state,
-    default_profile: source.profile.clone(),
-    config_path,
-    auth_path,
-  })
-}
-
-fn ensure_profile(state: &AppState, profile: &str) -> Result<()> {
-  if state.profiles.contains_key(profile) {
-    Ok(())
-  } else {
-    Err(Error::UnknownProfile {
-      profile: profile.to_string(),
-    })
-  }
-}
-
-fn select_policy(snapshot: &Snapshot, request_profile: Option<&str>) -> Result<Arc<RequestPolicyRuntime>> {
-  let profile = request_profile.or(snapshot.default_profile.as_deref());
-  match profile {
-    Some(profile) => snapshot
-      .state
-      .profiles
-      .get(profile)
-      .cloned()
-      .ok_or_else(|| Error::UnknownProfile {
-        profile: profile.to_string(),
-      }),
-    None => Ok(snapshot.state.default_policy.clone()),
-  }
-}
-
-fn raw_request(endpoint: Endpoint, body: Value, options: &RequestOptions) -> Result<RawInbound> {
-  let bytes = serde_json::to_vec(&body).map_err(|source| Error::SerializeRequest { source })?;
-  let mut headers = HeaderMap::new();
-  headers.insert(CONTENT_TYPE.clone(), HeaderValue::from_static("application/json"));
-  headers.insert(ACCEPT.clone(), HeaderValue::from_static("application/json"));
-  insert_option(&mut headers, "x-request-id", options.request_id.as_deref());
-  insert_option(&mut headers, "x-session-id", options.session_id.as_deref());
-  insert_option(&mut headers, "x-project-cwd", options.project_id.as_deref());
-  insert_option(&mut headers, "x-initiator", options.initiator.as_deref());
-  for (name, value) in &options.headers {
-    headers.insert(HeaderName::new(name.clone()), HeaderValue::from_string(value.clone()));
-  }
-  let bytes = bytes::Bytes::from(bytes);
-  Ok(RawInbound {
-    request_endpoint: RequestEndpoint::from(endpoint),
-    headers,
-    raw_body: bytes.clone(),
-    decoded_body: bytes,
-    body_json: body,
-    request_id: options.request_id.as_deref().map(SmolStr::new),
-  })
-}
-
-fn insert_option(headers: &mut HeaderMap, name: &'static str, value: Option<&str>) {
-  if let Some(value) = value {
-    headers.insert(HeaderName::new(name), HeaderValue::from_string(value.to_string()));
-  }
+  let header_value = value
+    .parse::<HeaderValue>()
+    .map_err(|source| Error::InvalidHeaderValue {
+      name: name.to_owned(),
+      source,
+    })?;
+  headers.insert(header_name, header_value);
+  Ok(())
 }

@@ -1,8 +1,9 @@
 //! Embedded SDK for routing LLM requests through configured providers.
 //!
-//! [`Client`] loads the same configuration and credential files as the
-//! `tokn-gateway` runtime, then executes requests in-process through the shared
-//! account pool, routing, conversion, retry, and provider implementations.
+//! A [`Client`] binds one managed profile from the strict version 2 gateway
+//! configuration, then executes requests in-process through the same linked
+//! account selection, conversion, and provider implementation used by serving.
+//! Build separate clients when an application needs separate profiles.
 
 mod client;
 mod endpoint;
