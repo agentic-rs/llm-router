@@ -19,7 +19,9 @@ pub use dispatch::{
 pub use execution::{
   HttpExecutionCoordinator, HttpExecutionError, HttpExecutionOutcome, HttpExecutionRequest, HttpExecutionResult,
 };
-pub use gateway::{link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime};
+pub use gateway::{
+  link_builtin_gateway_runtime, link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime,
+};
 pub use listeners::{
   link_listeners, BindingKind, ConnectActionSite, HttpActionSite, LinkedConnectDecision, LinkedConnectPolicy,
   LinkedConnectRule, LinkedForwardProxyPolicy, LinkedHttpAction, LinkedHttpBinding, LinkedHttpDecision,

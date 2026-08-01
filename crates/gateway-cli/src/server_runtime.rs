@@ -7,14 +7,13 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokn_accounts::registry::Registry;
 use tokn_auth::AuthStore;
 use tokn_config::{v2::CompiledConfig, RouteMode};
 use tokn_core::account::AccountConfig;
 use tokn_core::event::{EventBus, EventHandler};
 use tokn_router::runtime::{
-  bind_gateway_listeners, link_gateway_runtime, materialize_listeners, BoundGatewayListeners, GatewayServerState,
-  GatewayServingDefaults, RequestBodyLimits, RuntimeNameRegistry,
+  bind_gateway_listeners, link_builtin_gateway_runtime, materialize_listeners, BoundGatewayListeners,
+  GatewayServerState, GatewayServingDefaults, RequestBodyLimits,
 };
 
 type EventBusParts = (
@@ -97,11 +96,8 @@ pub async fn bind_compiled_gateway(
   accounts: &[AccountConfig],
   local_access_db_path: Option<&Path>,
 ) -> Result<BoundGatewayListeners> {
-  let provider_registry = Registry::builtin();
-  let runtime_names = RuntimeNameRegistry::builtin();
   let runtime = Arc::new(
-    link_gateway_runtime(compiled.gateway(), accounts, &provider_registry, &runtime_names)
-      .context("failed to link compiled gateway runtime")?,
+    link_builtin_gateway_runtime(compiled.gateway(), accounts).context("failed to link compiled gateway runtime")?,
   );
   let outbound = compiled.service().outbound().to_http_client_options();
   let request_limits = compiled.service().request_limits();

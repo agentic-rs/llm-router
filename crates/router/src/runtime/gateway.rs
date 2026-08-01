@@ -54,6 +54,21 @@ impl LinkedGatewayRuntime {
   }
 }
 
+/// Link a compiled gateway plan with the providers, operations, and wire
+/// identities shipped by the gateway binary.
+///
+/// This is the production default for callers that do not install runtime
+/// extensions. Keeping registry construction beside the linker ensures
+/// startup and preflight validation use the same built-in namespace.
+pub fn link_builtin_gateway_runtime(
+  plan: &GatewayPlan,
+  accounts: &[AccountConfig],
+) -> GatewayLinkResult<LinkedGatewayRuntime> {
+  let registry = Registry::builtin();
+  let names = RuntimeNameRegistry::builtin();
+  link_gateway_runtime(plan, accounts, &registry, &names)
+}
+
 /// Link a compiled gateway plan and account snapshot into one runtime graph.
 ///
 /// The plan, account slice, and registries are no longer needed after this
@@ -219,6 +234,72 @@ mod tests {
       Duration::from_secs(5),
       None,
     )
+  }
+
+  fn builtin_managed_gateway(wire_identity: WireIdentity) -> (GatewayPlan, ProfileId, ProviderId) {
+    let profile = profile_id("default");
+    let route = route_id("managed");
+    let pool = pool_id("all");
+    let upstream = upstream_id("local");
+    let provider = provider_id(ID_LLAMA_CPP);
+    let plan = gateway(
+      BTreeMap::from([(
+        listener_id("api"),
+        llm_listener(41_000, tokn_policy::HttpAction::Route(profile.clone())),
+      )]),
+      BTreeMap::from([(profile.clone(), ProfilePlan::new(route.clone(), wire_identity))]),
+      BTreeMap::from([(route, managed_route("all", UpstreamSelector::Fixed(upstream.clone())))]),
+      BTreeMap::from([(pool, empty_pool())]),
+      BTreeMap::from([(
+        upstream,
+        UpstreamPlan::new(
+          provider.clone(),
+          Some("https://llama.example/v1/".into()),
+          Box::default(),
+          false,
+        ),
+      )]),
+    );
+    (plan, profile, provider)
+  }
+
+  #[test]
+  fn builtin_linker_resolves_shipped_provider_and_wire_identity() {
+    let (plan, profile, provider) = builtin_managed_gateway(WireIdentity::Named(
+      tokn_policy::WireIdentityId::new("opencode").unwrap(),
+    ));
+
+    let runtime = link_builtin_gateway_runtime(&plan, &[account("main")]).unwrap();
+
+    assert!(runtime
+      .provider_graph()
+      .binding(&upstream_id("local"), "main")
+      .is_some());
+    assert_eq!(
+      runtime
+        .profiles()
+        .profile(&profile)
+        .unwrap()
+        .wire_identity()
+        .resolve(&provider),
+      Some(&tokn_core::AgentId::Opencode)
+    );
+  }
+
+  #[test]
+  fn builtin_linker_rejects_unregistered_wire_identity() {
+    let unknown = tokn_policy::WireIdentityId::new("not-installed").unwrap();
+    let (plan, profile, _) = builtin_managed_gateway(WireIdentity::Named(unknown.clone()));
+
+    assert!(matches!(
+      link_builtin_gateway_runtime(&plan, &[account("main")]),
+      Err(GatewayLinkError::Profiles {
+        source: ProfileLinkError::UnknownWireIdentity {
+          profile: failed_profile,
+          identity,
+        },
+      }) if failed_profile == profile && identity == unknown
+    ));
   }
 
   #[test]
