@@ -1,4 +1,3 @@
-use crate::account::AccountConfig;
 use crate::upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy, InvalidUpstreamUrl};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -594,14 +593,6 @@ pub trait Provider: Send + Sync {
   }
 
   fn on_unauthorized(&self) {}
-
-  fn needs_refresh(&self, _cfg: &AccountConfig) -> bool {
-    false
-  }
-
-  async fn refresh(&self, cfg: &AccountConfig, _http: &reqwest::Client) -> Result<AccountConfig> {
-    Ok(cfg.clone())
-  }
 }
 
 #[cfg(test)]
