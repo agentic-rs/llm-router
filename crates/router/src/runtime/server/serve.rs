@@ -381,9 +381,9 @@ mod tests {
     LinkedGatewayRuntime, RequestBodyLimits, RuntimeNameRegistry,
   };
   use rustls::pki_types::ServerName;
-  use rustls::{ClientConfig, RootCertStore};
+  use rustls::{ClientConfig, ClientConnection, RootCertStore};
   use std::collections::BTreeMap;
-  use std::io::BufReader;
+  use std::io::{BufReader, Read as _, Write as _};
   use std::net::Ipv4Addr;
   use std::path::{Path, PathBuf};
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -503,6 +503,84 @@ mod tests {
       .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Arc::new(config)
+  }
+
+  fn trusted_tls_client(ca_cert: &Path, host: &str) -> ClientConnection {
+    ClientConnection::new(
+      tls_client_config(ca_cert),
+      ServerName::try_from(host.to_owned()).unwrap(),
+    )
+    .unwrap()
+  }
+
+  fn take_tls_output(tls: &mut ClientConnection) -> Vec<u8> {
+    let mut output = Vec::new();
+    while tls.wants_write() {
+      let written = tls.write_tls(&mut output).unwrap();
+      assert_ne!(written, 0, "rustls made no write progress");
+    }
+    output
+  }
+
+  fn feed_tls_input(tls: &mut ClientConnection, mut encrypted: &[u8]) {
+    while !encrypted.is_empty() {
+      let read = tls.read_tls(&mut encrypted).unwrap();
+      assert_ne!(read, 0, "rustls made no read progress");
+    }
+    tls.process_new_packets().unwrap();
+  }
+
+  async fn flush_tls_output(stream: &mut TcpStream, tls: &mut ClientConnection) {
+    let encrypted = take_tls_output(tls);
+    if !encrypted.is_empty() {
+      stream.write_all(&encrypted).await.unwrap();
+      stream.flush().await.unwrap();
+    }
+  }
+
+  async fn read_tls_input(stream: &mut TcpStream, tls: &mut ClientConnection) {
+    let mut encrypted = [0u8; 32 * 1024];
+    let read = stream.read(&mut encrypted).await.unwrap();
+    assert_ne!(read, 0, "TLS peer closed unexpectedly");
+    feed_tls_input(tls, &encrypted[..read]);
+  }
+
+  async fn finish_tls_handshake(stream: &mut TcpStream, tls: &mut ClientConnection, outer_read_ahead: &[u8]) {
+    feed_tls_input(tls, outer_read_ahead);
+    while tls.is_handshaking() {
+      flush_tls_output(stream, tls).await;
+      if tls.is_handshaking() {
+        assert!(tls.wants_read(), "TLS handshake stalled");
+        read_tls_input(stream, tls).await;
+      }
+    }
+    // TLS 1.3 can finish while the client Finished record is still queued.
+    flush_tls_output(stream, tls).await;
+    assert_eq!(tls.alpn_protocol(), Some(b"http/1.1".as_slice()));
+  }
+
+  fn drain_tls_plaintext(tls: &mut ClientConnection, output: &mut Vec<u8>) {
+    let mut chunk = [0u8; 4096];
+    loop {
+      match tls.reader().read(&mut chunk) {
+        Ok(0) => return,
+        Ok(read) => output.extend_from_slice(&chunk[..read]),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+        Err(error) => panic!("read TLS plaintext: {error}"),
+      }
+    }
+  }
+
+  async fn read_tls_plaintext_until(stream: &mut TcpStream, tls: &mut ClientConnection, needle: &[u8]) -> Vec<u8> {
+    let mut plaintext = Vec::new();
+    loop {
+      drain_tls_plaintext(tls, &mut plaintext);
+      if plaintext.windows(needle.len()).any(|window| window == needle) {
+        return plaintext;
+      }
+      flush_tls_output(stream, tls).await;
+      read_tls_input(stream, tls).await;
+    }
   }
 
   async fn bound_generation() -> (BoundGatewayListeners, SocketAddr, std::sync::Weak<GatewayServerState>) {
@@ -756,6 +834,57 @@ mod tests {
       report.session().dispatch().authority().authority().to_string(),
       "api.example.test:443"
     );
+    drop(shutdown_tx);
+  }
+
+  #[tokio::test]
+  async fn intercepted_connect_preserves_coalesced_client_hello_read_ahead() {
+    let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let (_temp, state, ca_cert) = intercept_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_504)));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let connection = tokio::spawn(async move {
+      let (stream, _) = proxy_listener.accept().await.unwrap();
+      serve_forward_proxy_connection(stream, state, shutdown_rx).await
+    });
+
+    let mut tls = trusted_tls_client(&ca_cert, "api.example.test");
+    let client_hello = take_tls_output(&mut tls);
+    assert_eq!(client_hello.first(), Some(&0x16));
+    let mut coalesced = b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n".to_vec();
+    coalesced.extend_from_slice(&client_hello);
+
+    let mut client = TcpStream::connect(proxy_address).await.unwrap();
+    client.write_all(&coalesced).await.unwrap();
+    let (head, tls_read_ahead) = timeout(TEST_TIMEOUT, read_response_head(&mut client)).await.unwrap();
+    assert!(std::str::from_utf8(&head).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+    timeout(
+      TEST_TIMEOUT,
+      finish_tls_handshake(&mut client, &mut tls, &tls_read_ahead),
+    )
+    .await
+    .unwrap();
+
+    tls
+      .writer()
+      .write_all(b"GET /v1/models HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n")
+      .unwrap();
+    flush_tls_output(&mut client, &mut tls).await;
+    let inner = timeout(
+      TEST_TIMEOUT,
+      read_tls_plaintext_until(&mut client, &mut tls, b"route_rejected"),
+    )
+    .await
+    .unwrap();
+    assert!(inner.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+
+    let report = timeout(TEST_TIMEOUT, connection)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap()
+      .expect("a successful intercepted CONNECT returns one report");
+    assert_eq!(report.outcome(), ConnectRunOutcome::Intercept);
     drop(shutdown_tx);
   }
 
