@@ -172,8 +172,8 @@ fn print_provider_json(
 }
 
 async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str) -> Result<Vec<String>> {
-  let (cfg, resolved_cfg_path) = Config::load(cfg_path)?;
-  let mut accounts = crate::server_runtime::load_accounts(Some(&resolved_cfg_path))?;
+  let (cfg, _) = Config::load(cfg_path)?;
+  let mut accounts = crate::server_runtime::load_default_accounts()?;
   filter_accounts(&mut accounts, Some(provider_id), None)?;
 
   let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&cfg)?;

@@ -131,8 +131,8 @@ fn parse_header_kv(raw: &str) -> std::result::Result<(String, String), String> {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
-  let (mut cfg, resolved_cfg_path) = Config::load(cfg_path.as_deref())?;
-  let mut accounts = crate::server_runtime::load_accounts(Some(&resolved_cfg_path))?;
+  let (mut cfg, _) = Config::load(cfg_path.as_deref())?;
+  let mut accounts = crate::server_runtime::load_default_accounts()?;
 
   let route_mode = args.route.map(RouteMode::from).unwrap_or(cfg.defaults.mode);
   cfg.defaults.mode = route_mode;

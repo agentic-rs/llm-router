@@ -72,13 +72,9 @@ pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
   Ok((Arc::new(bus), receiver, handlers, archive_runtime))
 }
 
-/// Load accounts from the root `auth.yaml` and any `auth.d` fragments.
-///
-/// `config_path` is accepted for compatibility with call sites that already
-/// have the effective config path; legacy schema migration runs before latest
-/// config/auth loading.
-pub fn load_accounts(config_path: Option<&Path>) -> Result<Vec<AccountConfig>> {
-  let store = AuthStore::load(None, config_path)?;
+/// Load accounts from the default root `auth.yaml` and `auth.d` fragments.
+pub fn load_default_accounts() -> Result<Vec<AccountConfig>> {
+  let store = AuthStore::load(None, None)?;
   Ok(store.accounts)
 }
 

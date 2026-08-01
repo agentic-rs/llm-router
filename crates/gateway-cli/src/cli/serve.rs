@@ -8,7 +8,7 @@ pub async fn run(config_path: Option<PathBuf>) -> Result<()> {
   };
   let compiled = tokn_config::v2::load(&config_path)
     .with_context(|| format!("load compiled gateway config `{}`", config_path.display()))?;
-  let accounts = crate::server_runtime::load_accounts(Some(&config_path))?;
+  let accounts = crate::server_runtime::load_default_accounts()?;
   let listener_count = compiled.gateway().listeners().len();
   let account_count = accounts.len();
   let bound = crate::server_runtime::bind_compiled_gateway(&compiled, &accounts, None).await?;

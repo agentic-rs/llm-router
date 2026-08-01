@@ -160,11 +160,11 @@ async fn start(cfg_path: Option<PathBuf>, args: StartArgs) -> Result<()> {
   if args.passthrough && args.route_mode.is_some() {
     anyhow::bail!("--passthrough and --route-mode cannot be used together");
   }
-  let (mut cfg, resolved_cfg_path) = Config::load(cfg_path.as_deref())?;
+  let (mut cfg, _) = Config::load(cfg_path.as_deref())?;
   if args.no_proxy {
     cfg.proxy = ProxyConfig::default();
   }
-  let accounts = crate::server_runtime::load_accounts(Some(&resolved_cfg_path))?;
+  let accounts = crate::server_runtime::load_default_accounts()?;
 
   let host = args.host.unwrap_or_else(|| cfg.proxy_mode.host.clone());
   let port = args.port.unwrap_or(cfg.proxy_mode.port);
