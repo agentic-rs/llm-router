@@ -4,18 +4,46 @@
 //! provider and its upstream endpoint are known. Unsupported combinations
 //! fail locally instead of being silently dropped or reinterpreted.
 
-use crate::pipeline::error::RequestsError;
 use serde_json::{Map, Value};
-use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, ReasoningOptions};
+use snafu::Snafu;
+use tokn_core::generation::{
+  GenerationOptions, GenerationOptionsError, ReasoningEffort, ReasoningMode, ReasoningOptions,
+};
 use tokn_core::provider::{Endpoint, ID_CODEX, ID_DEEPSEEK, ID_GITHUB_COPILOT, ID_LLAMA_CPP, ID_OPENAI, ZAI_PROVIDERS};
 
-pub(super) fn lower_generation_options(
+/// Provider-aware generation-control validation or lowering failure.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum GenerationControlError {
+  /// Provider-neutral generation options failed structural validation.
+  #[snafu(display("invalid generation options: {source}"))]
+  InvalidOptions { source: GenerationOptionsError },
+
+  /// The selected provider, operation, or model cannot represent a control.
+  #[snafu(display(
+    "generation control `{control}` is not supported by provider `{provider_id}` on {endpoint}: {reason}"
+  ))]
+  UnsupportedControl {
+    control: &'static str,
+    provider_id: String,
+    endpoint: Endpoint,
+    reason: &'static str,
+  },
+}
+
+/// Lower provider-neutral generation options into one selected provider dialect.
+///
+/// Options are validated before the request body is inspected or mutated.
+pub fn lower_generation_options(
   body: &mut Value,
   endpoint: Endpoint,
   provider_id: &str,
   model: &str,
   options: &GenerationOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
+  options
+    .validate()
+    .map_err(|source| GenerationControlError::InvalidOptions { source })?;
   if options.is_empty() {
     return Ok(());
   }
@@ -59,7 +87,7 @@ fn lower_max_output_tokens(
   provider_id: &str,
   model: &str,
   max_output_tokens: u64,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   match endpoint {
     Endpoint::Responses if provider_id == ID_CODEX => unsupported(
       "max_output_tokens",
@@ -105,12 +133,16 @@ fn uses_max_completion_tokens(provider_id: &str, model: &str) -> bool {
       .any(|prefix| model.starts_with(prefix))
 }
 
-pub(super) fn ensure_model_supports_reasoning(
+/// Reject typed reasoning when model metadata explicitly marks it unsupported.
+///
+/// Unknown model capability remains admissible so newly released reasoning
+/// models are not rejected solely because catalogue metadata is incomplete.
+pub fn ensure_model_supports_reasoning(
   endpoint: Endpoint,
   provider_id: &str,
   reasoning_supported: Option<bool>,
   options: &GenerationOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   if options.reasoning.is_some() && reasoning_supported == Some(false) {
     return unsupported(
       "reasoning",
@@ -127,7 +159,7 @@ fn lower_top_k(
   endpoint: Endpoint,
   provider_id: &str,
   top_k: u64,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   if provider_id == ID_LLAMA_CPP && endpoint == Endpoint::ChatCompletions {
     obj.insert("top_k".into(), Value::from(top_k));
     return Ok(());
@@ -144,7 +176,7 @@ fn lower_responses_reasoning(
   obj: &mut Map<String, Value>,
   provider_id: &str,
   reasoning: &ReasoningOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   reject_mode(
     reasoning,
     provider_id,
@@ -182,7 +214,7 @@ fn lower_chat_reasoning(
   provider_id: &str,
   model: &str,
   reasoning: &ReasoningOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   if provider_id == ID_LLAMA_CPP {
     return unsupported(
       "reasoning",
@@ -241,7 +273,7 @@ fn lower_deepseek_reasoning(
   endpoint: Endpoint,
   provider_id: &str,
   reasoning: &ReasoningOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   let messages_endpoint = match endpoint {
     Endpoint::ChatCompletions => false,
     Endpoint::Messages => true,
@@ -330,7 +362,7 @@ fn lower_zai_reasoning(
   obj: &mut Map<String, Value>,
   provider_id: &str,
   reasoning: &ReasoningOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   reject_mode(
     reasoning,
     provider_id,
@@ -378,7 +410,7 @@ fn lower_messages_reasoning(
   provider_id: &str,
   model: &str,
   reasoning: &ReasoningOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   if provider_id == ID_DEEPSEEK {
     return lower_deepseek_reasoning(obj, Endpoint::Messages, provider_id, reasoning);
   }
@@ -391,7 +423,7 @@ fn lower_claude_reasoning(
   provider_id: &str,
   model: &str,
   reasoning: &ReasoningOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   reject_present(
     reasoning.summary.as_ref(),
     "reasoning.summary",
@@ -489,7 +521,7 @@ fn validate_claude_reasoning(
   provider_id: &str,
   model: &str,
   reasoning: &ReasoningOptions,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   let support = claude_thinking_support(model);
   let manual = reasoning.mode == Some(ReasoningMode::Enabled) || reasoning.budget_tokens.is_some();
 
@@ -596,7 +628,7 @@ fn validate_claude_effort(
   provider_id: &str,
   model: &str,
   effort: Option<&ReasoningEffort>,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   let Some(effort) = effort else {
     return Ok(());
   };
@@ -668,7 +700,7 @@ fn validate_claude_sampling(
   provider_id: &str,
   model: &str,
   thinking_enabled: bool,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   if claude_rejects_sampling_controls(model) {
     if obj.get("temperature").is_some_and(|value| value.as_f64() != Some(1.0)) {
       return unsupported(
@@ -762,7 +794,7 @@ fn reject_mode(
   endpoint: Endpoint,
   rejected: &[ReasoningMode],
   reason: &'static str,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   if reasoning.mode.as_ref().is_some_and(|mode| rejected.contains(mode)) {
     return unsupported("reasoning.mode", provider_id, endpoint, reason);
   }
@@ -775,7 +807,7 @@ fn reject_present<T>(
   provider_id: &str,
   endpoint: Endpoint,
   reason: &'static str,
-) -> Result<(), RequestsError> {
+) -> Result<(), GenerationControlError> {
   if value.is_some() {
     return unsupported(control, provider_id, endpoint, reason);
   }
@@ -787,8 +819,8 @@ fn unsupported<T>(
   provider_id: &str,
   endpoint: Endpoint,
   reason: &'static str,
-) -> Result<T, RequestsError> {
-  Err(RequestsError::UnsupportedGenerationControl {
+) -> Result<T, GenerationControlError> {
+  Err(GenerationControlError::UnsupportedControl {
     control,
     provider_id: provider_id.into(),
     endpoint,
@@ -798,12 +830,13 @@ fn unsupported<T>(
 
 #[cfg(test)]
 mod tests {
-  use super::super::default::DefaultConvertRequest;
   use super::*;
   use crate::event::{EventBus, Stage};
   use crate::pipeline::config::RunConfig;
   use crate::pipeline::ctx::PipelineCtx;
+  use crate::pipeline::error::RequestsError;
   use crate::pipeline::stages::{ConvertRequestStage, Extracted, Resolved, ResolvedRoute};
+  use crate::stages::DefaultConvertRequest;
   use crate::test_support::mock_handle;
   use crate::utils::codec::ContentEncodingKind;
   use bytes::Bytes;
@@ -1108,7 +1141,7 @@ mod tests {
 
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl {
+      GenerationControlError::UnsupportedControl {
         control: "reasoning",
         provider_id,
         endpoint: Endpoint::ChatCompletions,
@@ -1172,7 +1205,7 @@ mod tests {
 
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl {
+      GenerationControlError::UnsupportedControl {
         control: "reasoning",
         provider_id,
         endpoint: Endpoint::Responses,
@@ -1202,7 +1235,7 @@ mod tests {
 
       assert!(matches!(
         error,
-        RequestsError::UnsupportedGenerationControl {
+        GenerationControlError::UnsupportedControl {
           control: "reasoning.effort",
           ..
         }
@@ -1234,7 +1267,7 @@ mod tests {
 
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl { control: "top_p", .. }
+      GenerationControlError::UnsupportedControl { control: "top_p", .. }
     ));
   }
 
@@ -1482,7 +1515,7 @@ mod tests {
       assert!(
         matches!(
           error,
-          RequestsError::UnsupportedGenerationControl { control, .. } if control == expected_control
+          GenerationControlError::UnsupportedControl { control, .. } if control == expected_control
         ),
         "{name}: {error}"
       );
@@ -1512,7 +1545,7 @@ mod tests {
 
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl {
+      GenerationControlError::UnsupportedControl {
         control: "max_output_tokens",
         ..
       }
@@ -1579,7 +1612,7 @@ mod tests {
     .expect_err("non-default temperature is incompatible with thinking");
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl {
+      GenerationControlError::UnsupportedControl {
         control: "temperature",
         ..
       }
@@ -1606,7 +1639,7 @@ mod tests {
     .expect_err("current Claude models reject explicit non-default sampling");
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl { control: "top_p", .. }
+      GenerationControlError::UnsupportedControl { control: "top_p", .. }
     ));
   }
 
@@ -1618,7 +1651,7 @@ mod tests {
       ensure_model_supports_reasoning(Endpoint::Responses, ID_OPENAI, Some(false), &options).expect_err("reject");
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl {
+      GenerationControlError::UnsupportedControl {
         control: "reasoning",
         ..
       }
@@ -1637,11 +1670,30 @@ mod tests {
 
     assert!(matches!(
       error,
-      RequestsError::UnsupportedGenerationControl {
+      GenerationControlError::UnsupportedControl {
         control: "max_output_tokens",
         ..
       }
     ));
+  }
+
+  #[test]
+  fn lowering_rejects_invalid_generation_options_before_mutating_body() {
+    let mut body = serde_json::json!({
+      "model": "gpt-5",
+      "max_output_tokens": 512
+    });
+    let original = body.clone();
+    let options = GenerationOptions {
+      max_output_tokens: Some(0),
+      ..GenerationOptions::default()
+    };
+
+    let error = lower_generation_options(&mut body, Endpoint::Responses, ID_OPENAI, "gpt-5", &options)
+      .expect_err("zero output tokens must fail validation");
+
+    assert!(matches!(error, GenerationControlError::InvalidOptions { .. }));
+    assert_eq!(body, original);
   }
 
   #[tokio::test]

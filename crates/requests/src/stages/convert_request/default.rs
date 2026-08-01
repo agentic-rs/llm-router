@@ -23,8 +23,8 @@
 //! Failures map to permanent [`PipelineError`]s — the upstream body
 //! shape isn't going to change between retries.
 
-use super::generation::{ensure_model_supports_reasoning, lower_generation_options};
 use crate::event::Stage;
+use crate::execution::{ensure_model_supports_reasoning, lower_generation_options, GenerationControlError};
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, RequestsError};
 use crate::pipeline::stages::{
@@ -52,7 +52,7 @@ impl ConvertRequestStage for DefaultConvertRequest {
     if let Some(options) = generation_options {
       options
         .validate()
-        .map_err(|source| perm(RequestsError::InvalidGenerationOptions { source }))?;
+        .map_err(|source| generation_error(GenerationControlError::InvalidOptions { source }))?;
       ensure_model_supports_reasoning(
         upstream_endpoint,
         resolved.account_handle.provider.info().id.as_str(),
@@ -63,7 +63,7 @@ impl ConvertRequestStage for DefaultConvertRequest {
           .map(|info| info.capabilities.reasoning),
         options,
       )
-      .map_err(perm)?;
+      .map_err(generation_error)?;
     }
     let mut upstream_body = rewrite_model(&extracted.body_json, resolved.upstream_model.as_str());
 
@@ -80,7 +80,7 @@ impl ConvertRequestStage for DefaultConvertRequest {
         resolved.upstream_model.as_str(),
         options,
       )
-      .map_err(perm)?;
+      .map_err(generation_error)?;
     }
 
     if let Some(transformer) = resolved.account_handle.provider.input_transformer() {
@@ -126,6 +126,10 @@ fn rewrite_model(body: &Value, model: &str) -> Value {
 
 fn perm(source: RequestsError) -> PipelineError {
   PipelineError::permanent(Stage::ConvertRequest, source)
+}
+
+fn generation_error(source: GenerationControlError) -> PipelineError {
+  perm(source.into())
 }
 
 #[cfg(test)]

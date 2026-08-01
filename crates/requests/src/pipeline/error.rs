@@ -15,6 +15,7 @@
 //! [`EventBus`]: crate::event::EventBus
 
 use crate::event::Stage;
+use crate::execution::GenerationControlError;
 use crate::utils::codec::CodecError;
 use smol_str::SmolStr;
 use snafu::Snafu;
@@ -108,6 +109,25 @@ pub enum RequestsError {
 
   #[snafu(display("{source}"))]
   Other { source: BoxError },
+}
+
+impl From<GenerationControlError> for RequestsError {
+  fn from(source: GenerationControlError) -> Self {
+    match source {
+      GenerationControlError::InvalidOptions { source } => Self::InvalidGenerationOptions { source },
+      GenerationControlError::UnsupportedControl {
+        control,
+        provider_id,
+        endpoint,
+        reason,
+      } => Self::UnsupportedGenerationControl {
+        control,
+        provider_id: provider_id.into(),
+        endpoint,
+        reason,
+      },
+    }
+  }
 }
 
 /// Chain-formatted wrapper for [`tokn_core::provider::Error`]. Reqwest's

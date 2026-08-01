@@ -4,9 +4,11 @@
 //! graph. These types borrow those exact decisions so execution cannot drift
 //! by reconstructing provider, account, upstream, or destination identity.
 
+mod generation;
 mod managed;
 mod opaque;
 
+pub use generation::{ensure_model_supports_reasoning, lower_generation_options, GenerationControlError};
 pub use managed::{
   ManagedAttemptError, ManagedClientBody, ManagedClientResponse, ManagedHttpAttempt, ManagedHttpExecutor,
   ManagedHttpResponse, ManagedResponseAdapter, ManagedResponseError, ManagedResponseMetadata,
