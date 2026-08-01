@@ -19,9 +19,11 @@ pub use runtime::{
   WaitFailedError,
 };
 pub use traffic::{
-  BodyFinished, BodyLeg, BodyOutcome, BodyProgress, BodyResult, ClientIdentity, ConnectAction, ConnectClosed,
-  ConnectReady, Correlation, EventFailure, GatewayEvent, HttpFamily, HttpRequestSnapshot, HttpResponseHead,
-  IngressKind, PolicySelection, RequestAdmitted, RequestBodyObservation, RequestFinished, RequestOutcome, RequestPhase,
-  RequestSource, RequestStarted, SelectedAction, TargetSelection, TrafficEvent, TrafficEventKind,
+  AttemptFinished, AttemptHttpRequest, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted,
+  AttemptUsage, BodyFinished, BodyLeg, BodyOutcome, BodyProgress, BodyResult, ClientIdentity, ConnectAction,
+  ConnectClosed, ConnectReady, Correlation, EventFailure, GatewayEvent, HttpFamily, HttpRequestSnapshot,
+  HttpResponseHead, IngressKind, PolicySelection, RequestAdmitted, RequestBodyObservation, RequestFinished,
+  RequestOutcome, RequestPhase, RequestSource, RequestStarted, RetryDecision, SelectedAction, TargetSelection,
+  TrafficEvent, TrafficEventKind,
 };
 pub use usage::{TokenUsage, UsageKind};

@@ -1,6 +1,8 @@
 use crate::{BodyCapture, CapturedHeaders, CapturedUri, RequestId, TokenUsage};
 use smol_str::SmolStr;
+use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 
 /// Public gateway event domain.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13,10 +15,8 @@ pub enum GatewayEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrafficEvent {
   pub request_id: RequestId,
-  /// Zero for the current single-attempt runtime. Future retries increment it.
-  pub attempt: u32,
-  /// Monotonic sequence within this request attempt.
-  pub sequence: u32,
+  /// Monotonic sequence across the complete logical request, starting at one.
+  pub sequence: u64,
   pub at_unix_ms: i64,
   /// Monotonic elapsed time since [`TrafficEventKind::Started`].
   pub elapsed_ms: u64,
@@ -32,13 +32,14 @@ pub enum TrafficEventKind {
   Authenticated(ClientIdentity),
   PolicySelected(PolicySelection),
   RequestBody(RequestBodyObservation),
-  TargetSelected(TargetSelection),
-  UpstreamRequest(HttpRequestSnapshot),
-  UpstreamResponseHead(HttpResponseHead),
+  AttemptStarted(AttemptStarted),
+  AttemptRequest(AttemptHttpRequest),
+  AttemptResponseHead(AttemptHttpResponseHead),
   BodyProgress(BodyProgress),
   BodyFinished(BodyFinished),
   DownstreamResponseHead(HttpResponseHead),
-  Usage(TokenUsage),
+  AttemptUsage(AttemptUsage),
+  AttemptFinished(AttemptFinished),
   ConnectReady(ConnectReady),
   ConnectClosed(ConnectClosed),
   Finished(RequestFinished),
@@ -184,6 +185,63 @@ pub struct TargetSelection {
   pub upstream_operation: Option<SmolStr>,
 }
 
+/// One-based identifier for an upstream attempt within a logical request.
+///
+/// Request-wide observations deliberately carry no attempt value. This makes
+/// an early admission or parsing failure unambiguously a request with zero
+/// attempts rather than a synthetic "attempt zero".
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AttemptNo(NonZeroU32);
+
+impl AttemptNo {
+  pub const FIRST: Self = Self(NonZeroU32::MIN);
+
+  pub const fn new(value: u32) -> Option<Self> {
+    match NonZeroU32::new(value) {
+      Some(value) => Some(Self(value)),
+      None => None,
+    }
+  }
+
+  pub const fn get(self) -> u32 {
+    self.0.get()
+  }
+}
+
+impl fmt::Display for AttemptNo {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    self.get().fmt(formatter)
+  }
+}
+
+/// Opens one selected upstream attempt immediately before execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptStarted {
+  pub attempt: AttemptNo,
+  pub target: TargetSelection,
+}
+
+/// Wire-truth request for one selected upstream attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptHttpRequest {
+  pub attempt: AttemptNo,
+  pub request: HttpRequestSnapshot,
+}
+
+/// Response metadata observed for one selected upstream attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptHttpResponseHead {
+  pub attempt: AttemptNo,
+  pub response: HttpResponseHead,
+}
+
+/// Provider-reported usage attributed to one selected upstream attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptUsage {
+  pub attempt: AttemptNo,
+  pub usage: TokenUsage,
+}
+
 /// One fully prepared HTTP request at a transport boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpRequestSnapshot {
@@ -203,7 +261,7 @@ pub struct HttpResponseHead {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BodyLeg {
-  Upstream,
+  Upstream { attempt: AttemptNo },
   Downstream,
 }
 
@@ -245,6 +303,35 @@ pub struct ConnectClosed {
   pub result: BodyResult,
 }
 
+/// How one opened upstream attempt ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AttemptOutcome {
+  /// An upstream response was accepted, whether or not policy schedules a
+  /// subsequent retry from its status or contents.
+  Response,
+  Failed,
+  Cancelled,
+}
+
+/// Explicit policy decision to retry after an attempt closes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryDecision {
+  pub delay_ms: Option<u64>,
+  pub reason: EventFailure,
+}
+
+/// Exactly one closing observation for every [`AttemptStarted`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptFinished {
+  pub attempt: AttemptNo,
+  pub outcome: AttemptOutcome,
+  pub phase: RequestPhase,
+  pub upstream_status: Option<u16>,
+  pub failure: Option<EventFailure>,
+  pub retry: Option<RetryDecision>,
+}
+
 /// Safe, stable failure classification exposed to every consumer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventFailure {
@@ -284,7 +371,8 @@ pub struct RequestFinished {
   pub phase: RequestPhase,
   pub downstream_status: Option<u16>,
   pub failure: Option<EventFailure>,
-  pub attempts: u32,
+  /// Number of [`AttemptStarted`] observations in this logical request.
+  pub attempt_count: u32,
 }
 
 #[cfg(test)]
@@ -301,7 +389,6 @@ mod tests {
     };
     let body_event = TrafficEvent {
       request_id: request_id.clone(),
-      attempt: 0,
       sequence: 2,
       at_unix_ms: 10,
       elapsed_ms: 1,
@@ -316,7 +403,6 @@ mod tests {
     };
     let finished = TrafficEvent {
       request_id,
-      attempt: 0,
       sequence: 3,
       at_unix_ms: 10,
       elapsed_ms: 1,
@@ -325,7 +411,7 @@ mod tests {
         phase: RequestPhase::RequestBody,
         downstream_status: Some(400),
         failure: Some(body_failure),
-        attempts: 0,
+        attempt_count: 0,
       }),
     };
 
@@ -346,5 +432,31 @@ mod tests {
 
     assert_eq!(capture.bytes(), None);
     assert_eq!(capture.bytes_seen(), 8192);
+  }
+
+  #[test]
+  fn attempt_numbers_are_one_based_and_request_sequence_does_not_reset() {
+    assert_eq!(AttemptNo::new(0), None);
+    assert_eq!(AttemptNo::FIRST.get(), 1);
+    assert_eq!(AttemptNo::new(2).unwrap().get(), 2);
+
+    let retry = RetryDecision {
+      delay_ms: Some(250),
+      reason: EventFailure {
+        code: SmolStr::new("rate_limited"),
+        message: SmolStr::new("the selected upstream requested a retry"),
+      },
+    };
+    let finished = AttemptFinished {
+      attempt: AttemptNo::FIRST,
+      outcome: AttemptOutcome::Response,
+      phase: RequestPhase::UpstreamResponse,
+      upstream_status: Some(429),
+      failure: None,
+      retry: Some(retry),
+    };
+
+    assert_eq!(finished.attempt.get(), 1);
+    assert_eq!(finished.retry.unwrap().delay_ms, Some(250));
   }
 }
