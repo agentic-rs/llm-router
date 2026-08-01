@@ -31,7 +31,9 @@ pub use listeners::{
   LinkedConnectRule, LinkedForwardProxyPolicy, LinkedHttpAction, LinkedHttpBinding, LinkedHttpDecision,
   LinkedHttpPolicy, LinkedListener, LinkedListenerKind, LinkedListeners, ListenerLinkError, ListenerLinkResult,
 };
-pub use managed::{ManagedProfileResolveError, ManagedProfileResolveResult, ManagedProfileSite};
+pub use managed::{
+  ManagedProfileResolveError, ManagedProfileResolveResult, ManagedProfileSite, ManagedSelectionSummary,
+};
 pub use matchers::{
   link_connect_matcher, link_http_matcher, ConnectFactsError, ConnectFactsResult, ConnectRequestFacts,
   HttpRequestFacts, LinkedConnectMatcher, LinkedHttpMatcher, MatcherLinkError, MatcherLinkResult,

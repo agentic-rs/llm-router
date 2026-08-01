@@ -8,6 +8,7 @@
 //! HTTP policy.
 
 use super::dispatch::SelectedHttpTarget;
+use super::managed::{ManagedAttemptCoordinator, ManagedAttemptCoordinatorError, RoutedManagedTarget};
 use super::{HttpDispatchSite, RoutedHttpDispatch};
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
@@ -18,8 +19,8 @@ use std::time::Instant;
 use tokn_accounts::link::{NoEligibleReason, SelectionOutcome, TargetResolution};
 use tokn_requests::execution::{
   classify_selection_outcome, ExecutionTarget, HttpAttemptHead, ManagedAttemptError, ManagedClientResponse,
-  ManagedHttpAttempt, ManagedHttpExecutor, ManagedHttpResponse, ManagedResponseAdapter, ManagedResponseError,
-  OpaqueAttemptError, OpaqueHttpAttempt, OpaqueHttpExecutor, OpaqueHttpTarget,
+  ManagedHttpExecutor, ManagedResponseError, OpaqueAttemptError, OpaqueHttpAttempt, OpaqueHttpExecutor,
+  OpaqueHttpTarget,
 };
 
 /// Shared one-attempt transports for routed v2 HTTP requests.
@@ -28,17 +29,15 @@ use tokn_requests::execution::{
 /// serving generation and shared through this cloneable coordinator.
 #[derive(Clone, Debug)]
 pub struct HttpExecutionCoordinator {
-  managed: ManagedHttpExecutor,
+  managed: ManagedAttemptCoordinator,
   opaque: OpaqueHttpExecutor,
-  adapter: ManagedResponseAdapter,
 }
 
 impl HttpExecutionCoordinator {
   pub fn new(managed: ManagedHttpExecutor, opaque: OpaqueHttpExecutor) -> Self {
     Self {
-      managed,
+      managed: ManagedAttemptCoordinator::new(managed),
       opaque,
-      adapter: ManagedResponseAdapter::new(),
     }
   }
 
@@ -63,48 +62,80 @@ impl HttpExecutionCoordinator {
       }
     };
 
-    // `receive_head` borrows the exact selected target. Its owned result is
-    // retained only after that borrow ends, which makes settlement the sole
-    // operation possible before response adaptation or downstream exposure.
-    let received = self.receive_head(&head, &target, &request).await;
+    match target {
+      SelectedHttpTarget::Managed(target) => self.execute_managed(site, target, request).await,
+      target @ (SelectedHttpTarget::Relay(_) | SelectedHttpTarget::Transparent(_)) => {
+        self.execute_opaque(site, head, target, request).await
+      }
+    }
+  }
+
+  async fn execute_managed(
+    &self,
+    dispatch_site: HttpDispatchSite,
+    target: RoutedManagedTarget,
+    request: HttpExecutionRequest,
+  ) -> HttpExecutionResult<HttpExecutionOutcome> {
+    let HttpExecutionBody::Managed(body) = &request.body else {
+      settle_managed_mismatch(&dispatch_site, target);
+      return Err(HttpExecutionError::RequestFamilyMismatch { site: dispatch_site });
+    };
+    let semantic_headers = tokn_headers::HeaderMap::from(&request.headers);
+    match self.managed.execute(target, &semantic_headers, body, None).await {
+      Ok(success) => {
+        let (_profile_site, _summary, response) = success.into_parts();
+        Ok(HttpExecutionOutcome::Managed {
+          site: dispatch_site,
+          response,
+        })
+      }
+      Err(ManagedAttemptCoordinatorError::Attempt {
+        site: _profile_site,
+        summary: _summary,
+        source,
+      }) => Err(HttpExecutionError::ManagedAttempt {
+        site: dispatch_site,
+        source,
+      }),
+      Err(ManagedAttemptCoordinatorError::Response {
+        site: _profile_site,
+        summary: _summary,
+        source,
+      }) => Err(HttpExecutionError::ManagedResponse {
+        site: dispatch_site,
+        source,
+      }),
+    }
+  }
+
+  async fn execute_opaque(
+    &self,
+    site: HttpDispatchSite,
+    head: super::HttpRequestHead,
+    target: SelectedHttpTarget,
+    request: HttpExecutionRequest,
+  ) -> HttpExecutionResult<HttpExecutionOutcome> {
+    let received = self.receive_opaque_head(&head, &target, &request).await;
     let outcome = match &received {
-      Ok(response) => response.selection_outcome(),
+      Ok(response) => classify_selection_outcome(response.status()),
       Err(error) => error.selection_outcome(),
     };
     settle_selection(&site, target, outcome);
 
     match received {
-      Ok(ReceivedResponse::Managed(response)) => {
-        let response = match self.adapter.adapt(response).await {
-          Ok(response) => response,
-          Err(source) => return Err(HttpExecutionError::ManagedResponse { site, source }),
-        };
-        Ok(HttpExecutionOutcome::Managed { site, response })
-      }
-      Ok(ReceivedResponse::Opaque(response)) => Ok(HttpExecutionOutcome::Opaque { site, response }),
-      Err(AttemptFailure::Managed(source)) => Err(HttpExecutionError::ManagedAttempt { site, source }),
+      Ok(response) => Ok(HttpExecutionOutcome::Opaque { site, response }),
       Err(AttemptFailure::Opaque(source)) => Err(HttpExecutionError::OpaqueAttempt { site, source }),
       Err(AttemptFailure::RequestFamilyMismatch) => Err(HttpExecutionError::RequestFamilyMismatch { site }),
     }
   }
 
-  async fn receive_head(
+  async fn receive_opaque_head(
     &self,
     head: &super::HttpRequestHead,
     target: &SelectedHttpTarget,
     request: &HttpExecutionRequest,
-  ) -> Result<ReceivedResponse, AttemptFailure> {
+  ) -> Result<reqwest::Response, AttemptFailure> {
     match (target.execution_target(), &request.body) {
-      (ExecutionTarget::Managed(target), HttpExecutionBody::Managed(body)) => {
-        let semantic_headers = tokn_headers::HeaderMap::from(&request.headers);
-        let attempt = ManagedHttpAttempt::new(target, &semantic_headers, body);
-        self
-          .managed
-          .execute(attempt)
-          .await
-          .map(ReceivedResponse::Managed)
-          .map_err(AttemptFailure::Managed)
-      }
       (ExecutionTarget::Relay(target), HttpExecutionBody::Opaque(body)) => {
         let attempt = OpaqueHttpAttempt::new(
           HttpAttemptHead::new(head.method(), head.path_and_query()),
@@ -112,12 +143,7 @@ impl HttpExecutionCoordinator {
           &request.headers,
           body.as_ref(),
         );
-        self
-          .opaque
-          .execute(attempt)
-          .await
-          .map(ReceivedResponse::Opaque)
-          .map_err(AttemptFailure::Opaque)
+        self.opaque.execute(attempt).await.map_err(AttemptFailure::Opaque)
       }
       (ExecutionTarget::Transparent(target), HttpExecutionBody::Opaque(body)) => {
         let attempt = OpaqueHttpAttempt::new(
@@ -126,14 +152,9 @@ impl HttpExecutionCoordinator {
           &request.headers,
           body.as_ref(),
         );
-        self
-          .opaque
-          .execute(attempt)
-          .await
-          .map(ReceivedResponse::Opaque)
-          .map_err(AttemptFailure::Opaque)
+        self.opaque.execute(attempt).await.map_err(AttemptFailure::Opaque)
       }
-      (ExecutionTarget::Managed(_), HttpExecutionBody::Opaque(_))
+      (ExecutionTarget::Managed(_), _)
       | (ExecutionTarget::Relay(_) | ExecutionTarget::Transparent(_), HttpExecutionBody::Managed(_)) => {
         Err(AttemptFailure::RequestFamilyMismatch)
       }
@@ -252,26 +273,9 @@ impl HttpExecutionError {
 
 pub type HttpExecutionResult<T> = std::result::Result<T, HttpExecutionError>;
 
-/// A response whose final head has arrived but whose body has not been handed
-/// to an adapter or serving layer.
-enum ReceivedResponse {
-  Managed(ManagedHttpResponse),
-  Opaque(reqwest::Response),
-}
-
-impl ReceivedResponse {
-  fn selection_outcome(&self) -> SelectionOutcome {
-    match self {
-      Self::Managed(response) => response.selection_outcome(),
-      Self::Opaque(response) => classify_selection_outcome(response.status()),
-    }
-  }
-}
-
 /// A failure before any final upstream response head was received.
 enum AttemptFailure {
   RequestFamilyMismatch,
-  Managed(ManagedAttemptError),
   Opaque(OpaqueAttemptError),
 }
 
@@ -279,9 +283,23 @@ impl AttemptFailure {
   fn selection_outcome(&self) -> SelectionOutcome {
     match self {
       Self::RequestFamilyMismatch => SelectionOutcome::Unchanged,
-      Self::Managed(error) => error.selection_outcome(),
       Self::Opaque(error) => error.selection_outcome(),
     }
+  }
+}
+
+fn settle_managed_mismatch(site: &HttpDispatchSite, target: RoutedManagedTarget) {
+  match target.settle(SelectionOutcome::Unchanged) {
+    Ok(settlement) => tracing::trace!(
+      %site,
+      ?settlement,
+      "settled mismatched managed request without an upstream attempt"
+    ),
+    Err(error) => tracing::error!(
+      %site,
+      error = %error,
+      "could not record mismatched managed request settlement"
+    ),
   }
 }
 

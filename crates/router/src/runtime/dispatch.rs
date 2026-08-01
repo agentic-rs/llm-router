@@ -246,12 +246,7 @@ pub(super) enum SelectedHttpTarget {
 impl SelectedHttpTarget {
   pub(super) fn execution_target(&self) -> ExecutionTarget<'_> {
     match self {
-      Self::Managed(selected) => ExecutionTarget::managed(
-        selected.requested_model(),
-        selected.requested_operation(),
-        selected.target(),
-        selected.wire_identity(),
-      ),
+      Self::Managed(selected) => ExecutionTarget::Managed(selected.execution_target()),
       Self::Relay(selected) => {
         ExecutionTarget::relay(selected.request_kind(), selected.target(), selected.wire_identity())
       }

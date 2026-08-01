@@ -6,6 +6,7 @@
 //! routing invariants.
 
 use super::{LinkedProfile, LinkedWireIdentity};
+use serde_json::Value;
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::fmt;
@@ -14,9 +15,15 @@ use tokn_accounts::link::{
   resolve_managed_target, LinkedRouteKind, PoolRuntimeResult, SelectedManagedTarget, SelectionOutcome,
   SelectionSettlement, TargetResolution, TargetResolveError,
 };
+use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::AgentId;
-use tokn_policy::{ProfileId, ProviderId, RouteId, RouteKind};
+use tokn_headers::HeaderMap as SemanticHeaderMap;
+use tokn_policy::{ProfileId, ProviderId, RouteId, RouteKind, UpstreamId};
+use tokn_requests::execution::{
+  ManagedAttemptError, ManagedClientResponse, ManagedExecutionTarget, ManagedHttpAttempt, ManagedHttpExecutor,
+  ManagedResponseAdapter, ManagedResponseError,
+};
 
 /// Stable, non-secret location of a managed profile in the linked runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +59,69 @@ impl fmt::Display for ManagedProfileSite {
   }
 }
 
+/// Detached, non-secret identity and model facts for one selected managed
+/// attempt. The profile and route location remains separate in
+/// [`ManagedProfileSite`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedSelectionSummary {
+  account_id: SmolStr,
+  provider_id: ProviderId,
+  upstream_id: UpstreamId,
+  requested_model: SmolStr,
+  upstream_model: SmolStr,
+  requested_operation: Endpoint,
+  upstream_operation: Endpoint,
+  wire_identity: Option<AgentId>,
+}
+
+impl ManagedSelectionSummary {
+  fn from_target(target: &RoutedManagedTarget) -> Self {
+    let selected = target.target();
+    Self {
+      account_id: SmolStr::new(selected.binding().account_id()),
+      provider_id: selected.upstream().provider_id().clone(),
+      upstream_id: selected.upstream().id().clone(),
+      requested_model: SmolStr::new(target.requested_model()),
+      upstream_model: SmolStr::new(selected.model()),
+      requested_operation: target.requested_operation(),
+      upstream_operation: selected.operation(),
+      wire_identity: target.wire_identity().cloned(),
+    }
+  }
+
+  pub fn account_id(&self) -> &str {
+    self.account_id.as_str()
+  }
+
+  pub fn provider_id(&self) -> &ProviderId {
+    &self.provider_id
+  }
+
+  pub fn upstream_id(&self) -> &UpstreamId {
+    &self.upstream_id
+  }
+
+  pub fn requested_model(&self) -> &str {
+    self.requested_model.as_str()
+  }
+
+  pub fn upstream_model(&self) -> &str {
+    self.upstream_model.as_str()
+  }
+
+  pub fn requested_operation(&self) -> Endpoint {
+    self.requested_operation
+  }
+
+  pub fn upstream_operation(&self) -> Endpoint {
+    self.upstream_operation
+  }
+
+  pub fn wire_identity(&self) -> Option<&AgentId> {
+    self.wire_identity.as_ref()
+  }
+}
+
 /// A managed target carrying both inbound semantics and the selected outbound
 /// account state.
 #[derive(Debug)]
@@ -84,8 +154,129 @@ impl RoutedManagedTarget {
     self.wire_identity.as_ref()
   }
 
+  pub(crate) fn execution_target(&self) -> ManagedExecutionTarget<'_> {
+    ManagedExecutionTarget::new(
+      self.requested_model(),
+      self.requested_operation(),
+      self.target(),
+      self.wire_identity(),
+    )
+  }
+
   pub(crate) fn settle(self, outcome: SelectionOutcome) -> PoolRuntimeResult<SelectionSettlement> {
     self.target.into_selection_token().settle(outcome)
+  }
+}
+
+/// One-attempt managed execution independent of listener admission policy.
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedAttemptCoordinator {
+  executor: ManagedHttpExecutor,
+  adapter: ManagedResponseAdapter,
+}
+
+impl ManagedAttemptCoordinator {
+  pub(crate) fn new(executor: ManagedHttpExecutor) -> Self {
+    Self {
+      executor,
+      adapter: ManagedResponseAdapter::new(),
+    }
+  }
+
+  /// Execute exactly one selected managed target, settle its owned selection
+  /// immediately after the final response head or pre-head error, and only
+  /// then adapt the response body.
+  pub(crate) async fn execute(
+    &self,
+    target: RoutedManagedTarget,
+    headers: &SemanticHeaderMap,
+    body: &Value,
+    generation_options: Option<&GenerationOptions>,
+  ) -> Result<ManagedAttemptSuccess, ManagedAttemptCoordinatorError> {
+    let site = target.site().clone();
+    let summary = ManagedSelectionSummary::from_target(&target);
+    let received = {
+      let mut attempt = ManagedHttpAttempt::new(target.execution_target(), headers, body);
+      if let Some(generation_options) = generation_options {
+        attempt = attempt.with_generation_options(generation_options);
+      }
+      self.executor.execute(attempt).await
+    };
+    let outcome = match &received {
+      Ok(response) => response.selection_outcome(),
+      Err(source) => source.selection_outcome(),
+    };
+    settle_managed_selection(&site, &summary, target, outcome);
+
+    let response = match received {
+      Ok(response) => response,
+      Err(source) => {
+        return Err(ManagedAttemptCoordinatorError::Attempt { site, summary, source });
+      }
+    };
+    match self.adapter.adapt(response).await {
+      Ok(response) => Ok(ManagedAttemptSuccess {
+        site,
+        summary,
+        response,
+      }),
+      Err(source) => Err(ManagedAttemptCoordinatorError::Response { site, summary, source }),
+    }
+  }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedAttemptSuccess {
+  site: ManagedProfileSite,
+  summary: ManagedSelectionSummary,
+  response: ManagedClientResponse,
+}
+
+impl ManagedAttemptSuccess {
+  pub(crate) fn into_parts(self) -> (ManagedProfileSite, ManagedSelectionSummary, ManagedClientResponse) {
+    (self.site, self.summary, self.response)
+  }
+}
+
+#[derive(Debug)]
+pub(crate) enum ManagedAttemptCoordinatorError {
+  Attempt {
+    site: ManagedProfileSite,
+    summary: ManagedSelectionSummary,
+    source: ManagedAttemptError,
+  },
+  Response {
+    site: ManagedProfileSite,
+    summary: ManagedSelectionSummary,
+    source: ManagedResponseError,
+  },
+}
+
+fn settle_managed_selection(
+  site: &ManagedProfileSite,
+  summary: &ManagedSelectionSummary,
+  target: RoutedManagedTarget,
+  outcome: SelectionOutcome,
+) {
+  match target.settle(outcome) {
+    Ok(settlement) => tracing::trace!(
+      %site,
+      account = summary.account_id(),
+      provider = %summary.provider_id(),
+      upstream = %summary.upstream_id(),
+      ?outcome,
+      ?settlement,
+      "settled selected managed target after final attempt head"
+    ),
+    Err(error) => tracing::error!(
+      %site,
+      account = summary.account_id(),
+      provider = %summary.provider_id(),
+      upstream = %summary.upstream_id(),
+      ?outcome,
+      error = %error,
+      "could not record selected managed target settlement"
+    ),
   }
 }
 
@@ -189,6 +380,7 @@ mod tests {
   use tokn_accounts::registry::Registry;
   use tokn_core::account::{AccountConfig, AccountTier};
   use tokn_core::provider::ID_LLAMA_CPP;
+  use tokn_core::util::http::{build_managed_client, HttpClientOptions};
   use tokn_policy::{
     AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, GatewayPlan, ManagedRetry, ManagedRoute,
     ManagedTarget, ModelSelector, OperationPolicy, ProfilePlan, QualificationNamespace, RelayRetry, RelayRoute,
@@ -319,13 +511,15 @@ mod tests {
     runtime.profiles().profile(&profile_id("managed-profile")).unwrap()
   }
 
-  #[test]
-  fn selects_managed_target_with_exact_site_semantics_and_identity() {
-    let runtime = managed_runtime(ModelSelector::Capability, WireIdentity::ProviderDefault);
+  fn selected_target(
+    runtime: &LinkedGatewayRuntime,
+    requested_model: &str,
+    requested_operation: Endpoint,
+  ) -> RoutedManagedTarget {
     let resolution = resolve_managed_profile(
-      managed_profile(&runtime),
-      SmolStr::new("requested-model"),
-      Endpoint::ChatCompletions,
+      managed_profile(runtime),
+      SmolStr::new(requested_model),
+      requested_operation,
       Some("session"),
       &ProviderAccess::All,
     )
@@ -333,6 +527,14 @@ mod tests {
     let TargetResolution::Selected(target) = resolution else {
       panic!("expected selected managed target, got {resolution:?}");
     };
+    target
+  }
+
+  #[test]
+  fn selects_managed_target_with_exact_site_semantics_and_identity() {
+    let runtime = managed_runtime(ModelSelector::Capability, WireIdentity::ProviderDefault);
+    let target = selected_target(&runtime, "requested-model", Endpoint::ChatCompletions);
+    let summary = ManagedSelectionSummary::from_target(&target);
 
     assert_eq!(target.site().profile_id().as_str(), "managed-profile");
     assert_eq!(target.site().route_id().as_str(), "managed-route");
@@ -345,7 +547,56 @@ mod tests {
     assert_eq!(target.target().model(), "requested-model");
     assert_eq!(target.target().operation(), Endpoint::ChatCompletions);
     assert_eq!(target.wire_identity(), Some(&AgentId::Opencode));
-    assert_eq!(target.target().selection_token().key().account_id(), "account");
+    assert_eq!(summary.account_id(), "account");
+    assert_eq!(summary.provider_id(), &provider_id(ID_LLAMA_CPP));
+    assert_eq!(summary.upstream_id(), &upstream_id("upstream"));
+    assert_eq!(summary.requested_model(), "requested-model");
+    assert_eq!(summary.upstream_model(), "requested-model");
+    assert_eq!(summary.requested_operation(), Endpoint::ChatCompletions);
+    assert_eq!(summary.upstream_operation(), Endpoint::ChatCompletions);
+    assert_eq!(summary.wire_identity(), Some(&AgentId::Opencode));
+  }
+
+  #[tokio::test]
+  async fn local_generation_control_error_settles_unchanged_without_exposing_token() {
+    let runtime = managed_runtime(ModelSelector::Capability, WireIdentity::ProviderDefault);
+    let target = selected_target(&runtime, "requested-model", Endpoint::ChatCompletions);
+    let coordinator = ManagedAttemptCoordinator::new(ManagedHttpExecutor::new(
+      build_managed_client(&HttpClientOptions::default()).unwrap(),
+    ));
+    let headers = SemanticHeaderMap::new();
+    let body = serde_json::json!({"model": "requested-model", "messages": []});
+    let options = GenerationOptions::new().with_max_output_tokens(0);
+
+    let error = coordinator
+      .execute(target, &headers, &body, Some(&options))
+      .await
+      .unwrap_err();
+    let ManagedAttemptCoordinatorError::Attempt { site, summary, source } = error else {
+      panic!("expected a pre-head managed attempt error");
+    };
+    assert!(matches!(&source, ManagedAttemptError::GenerationControl { .. }));
+    assert_eq!(source.selection_outcome(), SelectionOutcome::Unchanged);
+    assert_eq!(site.profile_id().as_str(), "managed-profile");
+    assert_eq!(site.route_id().as_str(), "managed-route");
+    assert_eq!(summary.account_id(), "account");
+    assert_eq!(summary.provider_id(), &provider_id(ID_LLAMA_CPP));
+    assert_eq!(summary.upstream_id(), &upstream_id("upstream"));
+    assert_eq!(summary.requested_model(), "requested-model");
+    assert_eq!(summary.upstream_model(), "requested-model");
+    assert_eq!(summary.wire_identity(), Some(&AgentId::Opencode));
+
+    assert!(matches!(
+      resolve_managed_profile(
+        managed_profile(&runtime),
+        SmolStr::new("requested-model"),
+        Endpoint::ChatCompletions,
+        Some("session"),
+        &ProviderAccess::All,
+      )
+      .unwrap(),
+      TargetResolution::Selected(_)
+    ));
   }
 
   #[test]
