@@ -40,7 +40,8 @@ pub enum OperationPolicy {
 }
 
 /// Base header behavior derived from the route family and destination.
-/// Optional patch sets may add safe, non-structural changes after this step.
+/// Named patch sets are future policy vocabulary and must be rejected by a
+/// runtime linker until it can resolve and execute them safely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeaderStrategy {
   ProviderOwned,
@@ -145,6 +146,8 @@ impl RelayTarget {
   }
 }
 
+/// Named retry policies are future policy vocabulary. Runtime linkers must
+/// reject non-`Never` values until retry resolution and execution exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedRetry {
   Never,
@@ -152,6 +155,8 @@ pub enum ManagedRetry {
 }
 
 /// Retrying an opaque request requires an explicit replay-safety choice.
+/// Runtime linkers must reject non-`Never` values until retry resolution and
+/// execution exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelayRetry {
   Never,
