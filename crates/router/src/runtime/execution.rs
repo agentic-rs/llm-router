@@ -212,15 +212,20 @@ impl HttpExecutionCoordinator {
         (Err(AttemptFailure::RequestFamilyMismatch), None)
       }
     };
+    if let Some(source) = request_publication_error {
+      // The opaque executor transports an observer rejection through
+      // `OpaqueAttemptError::Transport`, but a failed event boundary says
+      // nothing about the selected binding. Release the owned selection
+      // without cooling it down before surfacing the lifecycle failure.
+      settle_selection(&site, target, SelectionOutcome::Unchanged);
+      let _ = close_pre_head_failure(lifecycle, RequestPhase::UpstreamRequest).await;
+      return Err(lifecycle_error(site, RequestPhase::UpstreamRequest, source));
+    }
     let outcome = match &received {
       Ok(response) => classify_selection_outcome(response.status()),
       Err(error) => error.selection_outcome(),
     };
     settle_selection(&site, target, outcome);
-    if let Some(source) = request_publication_error {
-      let _ = close_pre_head_failure(lifecycle, RequestPhase::UpstreamRequest).await;
-      return Err(lifecycle_error(site, RequestPhase::UpstreamRequest, source));
-    }
 
     let response = match received {
       Ok(response) => response,
@@ -560,6 +565,10 @@ mod tests {
   use tokn_core::account::{AccountConfig, AccountTier};
   use tokn_core::provider::{Endpoint, ProviderRequestKind, ID_LLAMA_CPP};
   use tokn_core::util::http::{build_client, build_managed_client, build_opaque_client, HttpClientOptions};
+  use tokn_events::{
+    CapturedHeaders, CapturedUri, ConsumerResult, Correlation, EventConsumer, EventSeq, GatewayEvent, HubBuilder,
+    IngressKind, RequestSource, RequestStarted,
+  };
   use tokn_policy::{
     AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, CanonicalAuthority, ClientAuthPlan,
     FallbackSelector, GatewayPlan, HttpAction, HttpIngress, HttpScheme, ListenerId, ListenerPlan, LlmApiListenerPlan,
@@ -567,6 +576,7 @@ mod tests {
     OperationPolicy, ProfileId, ProfilePlan, ProviderId, RelayRetry, RelayRoute, RelayTarget, RouteId, RoutePlan,
     SessionAffinityPlan, UpstreamId, UpstreamPlan, UpstreamSelector, WireIdentity,
   };
+  use tokn_requests::RequestLifecycleEmitter;
 
   const SESSION: &str = "stable-session";
 
@@ -760,6 +770,35 @@ mod tests {
     )
   }
 
+  struct NoopEventConsumer;
+
+  impl EventConsumer<GatewayEvent> for NoopEventConsumer {
+    fn name(&self) -> &str {
+      "opaque-settlement-test"
+    }
+
+    fn handle(&mut self, _sequence: EventSeq, _event: &GatewayEvent) -> ConsumerResult {
+      Ok(())
+    }
+  }
+
+  fn started() -> RequestStarted {
+    RequestStarted {
+      source: RequestSource::Listener {
+        listener_id: "listener".into(),
+        ingress: IngressKind::LlmApi,
+        local_addr: None,
+        peer_addr: None,
+      },
+      http_version: Some("HTTP/1.1".into()),
+      method: "POST".into(),
+      target: CapturedUri::exact("/opaque"),
+      headers: CapturedHeaders::default(),
+      body_present: false,
+      correlation: Correlation::default(),
+    }
+  }
+
   fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
@@ -925,6 +964,50 @@ mod tests {
       .unwrap();
     assert!(matches!(outcome, HttpExecutionOutcome::CoolingDown { .. }));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+  }
+
+  #[tokio::test]
+  async fn opaque_attempt_request_publication_failure_settles_unchanged() {
+    let runtime = link(&relay_plan("http://127.0.0.1:9/"), &[account("account")]);
+    let dispatch = relay_dispatch(&runtime, Some(SESSION), &ProviderAccess::All);
+    let (site, head, _profile, resolution) = dispatch.into_parts();
+    let TargetResolution::Selected(target) = resolution else {
+      panic!("expected selected relay target");
+    };
+    let (publisher, hub) = HubBuilder::new().consumer(NoopEventConsumer).start().unwrap();
+    let emitter = RequestLifecycleEmitter::new(publisher);
+    let mut lifecycle = emitter.begin(started()).await.unwrap();
+    publish_attempt_started(&mut lifecycle, target.event_selection())
+      .await
+      .unwrap();
+    let shutdown = hub.force_shutdown().await.unwrap();
+    assert_eq!(shutdown.abandoned_terminal_obligations, 1);
+
+    let result = coordinator()
+      .execute_opaque_observed(
+        site,
+        head,
+        target,
+        HttpExecutionRequest::opaque(HeaderMap::new(), None),
+        &mut lifecycle,
+        1_024,
+      )
+      .await;
+    let Err(error) = result else {
+      panic!("closed event ingress must reject the observed opaque attempt");
+    };
+
+    assert!(matches!(
+      error,
+      HttpExecutionError::Lifecycle {
+        phase: RequestPhase::UpstreamRequest,
+        ..
+      }
+    ));
+    assert!(matches!(
+      relay_dispatch(&runtime, Some(SESSION), &ProviderAccess::All).resolution(),
+      TargetResolution::Selected(_)
+    ));
   }
 
   #[tokio::test]
