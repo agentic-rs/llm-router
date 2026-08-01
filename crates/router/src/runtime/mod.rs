@@ -32,7 +32,8 @@ pub use listeners::{
   LinkedHttpPolicy, LinkedListener, LinkedListenerKind, LinkedListeners, ListenerLinkError, ListenerLinkResult,
 };
 pub use managed::{
-  ManagedProfileResolveError, ManagedProfileResolveResult, ManagedProfileSite, ManagedSelectionSummary,
+  ManagedProfileResolveError, ManagedProfileResolveResult, ManagedProfileSite, ManagedRequestBody,
+  ManagedRequestBodyError, ManagedRequestBodyResult, ManagedSelectionSummary,
 };
 pub use matchers::{
   link_connect_matcher, link_http_matcher, ConnectFactsError, ConnectFactsResult, ConnectRequestFacts,
@@ -55,7 +56,7 @@ pub use server::{
   BoundListener, BoxTunnelIo, BufferedRequestBody, ClientAuthError, ConnectUpgradeUnavailableReason,
   ExpectedRequestTarget, ForwardProxyAdmission, GatewayServeError, GatewayServeResult, GatewayServerState,
   GatewayServerStateError, GatewayServerStateResult, GatewayServingDefaults, ListenerBindError, ListenerBindResult,
-  ListenerServerState, ManagedRequestBody, RequestBodyError, RequestBodyLimits, RequestBodyResult, RequestTargetForm,
-  ResponseBridgeError, ResponseBridgeResult, ServerError, TunnelConnectError, TunnelConnectResult, TunnelConnector,
+  ListenerServerState, RequestBodyError, RequestBodyLimits, RequestBodyResult, RequestTargetForm, ResponseBridgeError,
+  ResponseBridgeResult, ServerError, TunnelConnectError, TunnelConnectResult, TunnelConnector,
   TunnelConnectorBuildError, TunnelConnectorBuildResult, TunnelIo,
 };

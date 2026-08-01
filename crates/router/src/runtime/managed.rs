@@ -1,9 +1,13 @@
-//! Site-free managed-profile target resolution.
+//! Site-free managed request semantics, target resolution, and execution.
 //!
-//! This layer resolves an already linked profile without depending on an HTTP
-//! listener or request admission site. It owns the selected account token and
-//! the post-selection wire identity so every caller observes the same managed
-//! routing invariants.
+//! This layer validates structured request bodies and resolves an already
+//! linked profile without depending on an HTTP listener or request admission
+//! site. It owns the selected account token and post-selection wire identity
+//! so every caller observes the same managed routing invariants.
+
+mod body;
+
+pub use body::{ManagedRequestBody, ManagedRequestBodyError, ManagedRequestBodyResult};
 
 use super::{LinkedProfile, LinkedWireIdentity};
 use serde_json::Value;

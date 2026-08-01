@@ -8,7 +8,7 @@
 use super::{AdmissionError, ClientAuthError, RequestBodyError, ResponseBridgeError, TunnelConnectError};
 use crate::runtime::{
   ConnectDispatchError, ConnectDispatchSite, HttpDispatchError, HttpDispatchSite, HttpExecutionError,
-  ManagedProfileResolveError,
+  ManagedProfileResolveError, ManagedRequestBodyError,
 };
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -514,14 +514,25 @@ fn request_body_descriptor(source: &RequestBodyError) -> ErrorDescriptor {
       "internal_error",
       "managed request processing is unavailable",
     ),
-    RequestBodyError::InvalidManagedJson { .. } | RequestBodyError::ManagedBodyObjectRequired => ErrorDescriptor::new(
+    RequestBodyError::InvalidManagedJson { .. } => ErrorDescriptor::new(
       StatusCode::BAD_REQUEST,
       "invalid_request_body",
       "the managed request body must be a valid JSON object",
     ),
-    RequestBodyError::ManagedModelStringRequired
-    | RequestBodyError::ManagedModelEmpty
-    | RequestBodyError::ManagedModelSurroundingWhitespace => ErrorDescriptor::new(
+    RequestBodyError::InvalidManagedBody { source } => managed_request_body_descriptor(source),
+  }
+}
+
+fn managed_request_body_descriptor(source: &ManagedRequestBodyError) -> ErrorDescriptor {
+  match source {
+    ManagedRequestBodyError::ObjectRequired => ErrorDescriptor::new(
+      StatusCode::BAD_REQUEST,
+      "invalid_request_body",
+      "the managed request body must be a valid JSON object",
+    ),
+    ManagedRequestBodyError::ModelStringRequired
+    | ManagedRequestBodyError::ModelEmpty
+    | ManagedRequestBodyError::ModelSurroundingWhitespace => ErrorDescriptor::new(
       StatusCode::BAD_REQUEST,
       "invalid_model",
       "the managed request field 'model' must be a non-empty canonical string",
@@ -867,6 +878,18 @@ mod tests {
     });
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     assert_eq!(malformed.code(), "invalid_content_encoding");
+
+    let invalid_object = ServerError::from(RequestBodyError::InvalidManagedBody {
+      source: ManagedRequestBodyError::ObjectRequired,
+    });
+    assert_eq!(invalid_object.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(invalid_object.code(), "invalid_request_body");
+
+    let invalid_model = ServerError::from(RequestBodyError::InvalidManagedBody {
+      source: ManagedRequestBodyError::ModelEmpty,
+    });
+    assert_eq!(invalid_model.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(invalid_model.code(), "invalid_model");
   }
 
   #[tokio::test]

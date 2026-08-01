@@ -5,7 +5,7 @@
 //! bytes, while managed routes decode and validate their structured payload
 //! without allowing payload facts to change the matched route.
 
-use super::super::MatchedHttpRoute;
+use super::super::{ManagedRequestBody, ManagedRequestBodyError, MatchedHttpRoute};
 use axum::body::Body;
 use bytes::{Bytes, BytesMut};
 use flate2::read::MultiGzDecoder;
@@ -13,7 +13,6 @@ use futures_util::StreamExt;
 use http::header::CONTENT_ENCODING;
 use http::HeaderMap;
 use serde_json::Value;
-use smol_str::SmolStr;
 use snafu::Snafu;
 use std::io::{self, Read};
 use tokn_accounts::link::LinkedRouteKind;
@@ -86,27 +85,6 @@ enum ContentEncoding {
   Identity,
   Gzip,
   Zstd,
-}
-
-/// A decoded and validated managed request body.
-#[derive(Clone, Debug)]
-pub struct ManagedRequestBody {
-  value: Value,
-  requested_model: SmolStr,
-}
-
-impl ManagedRequestBody {
-  pub fn value(&self) -> &Value {
-    &self.value
-  }
-
-  pub fn requested_model(&self) -> &str {
-    self.requested_model.as_str()
-  }
-
-  pub fn into_parts(self) -> (Value, SmolStr) {
-    (self.value, self.requested_model)
-  }
 }
 
 /// Buffer and validate one request body after listener matching but before
@@ -227,23 +205,9 @@ fn decode_and_validate(
 
   let value: Value =
     serde_json::from_slice(&decoded_body).map_err(|source| RequestBodyError::InvalidManagedJson { source })?;
-  let object = value.as_object().ok_or(RequestBodyError::ManagedBodyObjectRequired)?;
-  let model = object
-    .get("model")
-    .and_then(Value::as_str)
-    .ok_or(RequestBodyError::ManagedModelStringRequired)?;
-  if model.trim().is_empty() {
-    return Err(RequestBodyError::ManagedModelEmpty);
-  }
-  if model.trim() != model {
-    return Err(RequestBodyError::ManagedModelSurroundingWhitespace);
-  }
-  let requested_model = SmolStr::new(model);
+  let body = ManagedRequestBody::try_from(value).map_err(|source| RequestBodyError::InvalidManagedBody { source })?;
 
-  Ok(BufferedRequestBody::Managed(ManagedRequestBody {
-    value,
-    requested_model,
-  }))
+  Ok(BufferedRequestBody::Managed(body))
 }
 
 fn decode_gzip(body: Bytes, limit: usize) -> RequestBodyResult<Bytes> {
@@ -348,17 +312,8 @@ pub enum RequestBodyError {
   #[snafu(display("managed request body is not valid JSON: {source}"))]
   InvalidManagedJson { source: serde_json::Error },
 
-  #[snafu(display("managed request body must be a JSON object"))]
-  ManagedBodyObjectRequired,
-
-  #[snafu(display("managed request body field 'model' must be a string"))]
-  ManagedModelStringRequired,
-
-  #[snafu(display("managed request body field 'model' must not be empty"))]
-  ManagedModelEmpty,
-
-  #[snafu(display("managed request body field 'model' must not have surrounding whitespace"))]
-  ManagedModelSurroundingWhitespace,
+  #[snafu(display("{source}"))]
+  InvalidManagedBody { source: ManagedRequestBodyError },
 }
 
 pub type RequestBodyResult<T> = std::result::Result<T, RequestBodyError>;
@@ -837,7 +792,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn managed_body_validates_json_object_and_model_shape() {
+  async fn managed_body_rejects_invalid_json_and_propagates_semantic_errors() {
     type ErrorPredicate = fn(&RequestBodyError) -> bool;
 
     let matched = matched_route(
@@ -849,25 +804,20 @@ mod tests {
         matches!(error, RequestBodyError::InvalidManagedJson { .. })
       }),
       (b"[]", |error| {
-        matches!(error, RequestBodyError::ManagedBodyObjectRequired)
-      }),
-      (b"{}", |error| {
-        matches!(error, RequestBodyError::ManagedModelStringRequired)
-      }),
-      (br#"{"model":42}"#, |error| {
-        matches!(error, RequestBodyError::ManagedModelStringRequired)
+        matches!(
+          error,
+          RequestBodyError::InvalidManagedBody {
+            source: ManagedRequestBodyError::ObjectRequired
+          }
+        )
       }),
       (br#"{"model":""}"#, |error| {
-        matches!(error, RequestBodyError::ManagedModelEmpty)
-      }),
-      (br#"{"model":"   "}"#, |error| {
-        matches!(error, RequestBodyError::ManagedModelEmpty)
-      }),
-      (br#"{"model":" model"}"#, |error| {
-        matches!(error, RequestBodyError::ManagedModelSurroundingWhitespace)
-      }),
-      (br#"{"model":"model "}"#, |error| {
-        matches!(error, RequestBodyError::ManagedModelSurroundingWhitespace)
+        matches!(
+          error,
+          RequestBodyError::InvalidManagedBody {
+            source: ManagedRequestBodyError::ModelEmpty
+          }
+        )
       }),
     ];
 
