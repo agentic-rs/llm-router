@@ -17,6 +17,10 @@ pub struct ConnectDispatchSite {
 }
 
 impl ConnectDispatchSite {
+  pub(crate) fn new(listener_id: ListenerId, rule_id: Option<BindingId>) -> Self {
+    Self { listener_id, rule_id }
+  }
+
   pub fn listener_id(&self) -> &ListenerId {
     &self.listener_id
   }
@@ -79,10 +83,7 @@ pub fn dispatch_connect(
   let decision = policy.connect().decide(&facts);
 
   Ok(ConnectDispatch {
-    site: ConnectDispatchSite {
-      listener_id: listener.id().clone(),
-      rule_id: decision.binding_id().cloned(),
-    },
+    site: ConnectDispatchSite::new(listener.id().clone(), decision.binding_id().cloned()),
     authority,
     action: decision.action(),
   })

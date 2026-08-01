@@ -5,8 +5,10 @@
 //! text. This module deliberately classifies those errors into a small,
 //! stable response contract instead of forwarding their `Display` output.
 
-use super::{AdmissionError, ClientAuthError, RequestBodyError, ResponseBridgeError};
-use crate::runtime::{HttpDispatchError, HttpDispatchSite, HttpExecutionError};
+use super::{AdmissionError, ClientAuthError, RequestBodyError, ResponseBridgeError, TunnelConnectError};
+use crate::runtime::{
+  ConnectDispatchError, ConnectDispatchSite, HttpDispatchError, HttpDispatchSite, HttpExecutionError,
+};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use http::header::{ALLOW, PROXY_AUTHENTICATE, RETRY_AFTER, WWW_AUTHENTICATE};
@@ -16,6 +18,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 use tokn_access::AuthenticationError;
 use tokn_accounts::link::{NoEligibleReason, TargetResolveError};
+use tokn_policy::ListenerId;
 use tokn_requests::execution::{ManagedAttemptError, ManagedResponseError, OpaqueAttemptError};
 
 const BEARER_CHALLENGE: HeaderValue = HeaderValue::from_static("Bearer");
@@ -32,6 +35,24 @@ pub enum AuthBoundary {
   ForwardProxy,
 }
 
+/// Internal reason a prepared CONNECT upgrade could not be handed off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectUpgradeUnavailableReason {
+  MissingToken,
+  QueueFull,
+  OwnerClosed,
+}
+
+impl fmt::Display for ConnectUpgradeUnavailableReason {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(match self {
+      Self::MissingToken => "the HTTP connection supplied no upgrade token",
+      Self::QueueFull => "the connection upgrade queue was already full",
+      Self::OwnerClosed => "the connection upgrade owner was already closed",
+    })
+  }
+}
+
 /// An error ready to cross the v2 HTTP serving boundary.
 #[derive(Debug)]
 pub enum ServerError {
@@ -39,6 +60,24 @@ pub enum ServerError {
   ClientAuth {
     boundary: AuthBoundary,
     source: ClientAuthError,
+  },
+  ConnectDispatch(ConnectDispatchError),
+  ConnectBodyUnsupported {
+    listener: ListenerId,
+  },
+  ConnectRejected {
+    site: ConnectDispatchSite,
+  },
+  ConnectInterceptionUnavailable {
+    site: ConnectDispatchSite,
+  },
+  TunnelConnect {
+    site: ConnectDispatchSite,
+    source: TunnelConnectError,
+  },
+  ConnectUpgradeUnavailable {
+    site: ConnectDispatchSite,
+    reason: ConnectUpgradeUnavailableReason,
   },
   RequestBody(RequestBodyError),
   RouteRejected {
@@ -72,6 +111,31 @@ impl ServerError {
       boundary: AuthBoundary::ForwardProxy,
       source,
     }
+  }
+
+  /// Reject CONNECT framing before authentication, policy, or transport I/O.
+  pub fn connect_body_unsupported(listener: ListenerId) -> Self {
+    Self::ConnectBodyUnsupported { listener }
+  }
+
+  /// Preserve the policy location that explicitly rejected CONNECT.
+  pub fn connect_rejected(site: ConnectDispatchSite) -> Self {
+    Self::ConnectRejected { site }
+  }
+
+  /// Report an interception decision until pinned TLS serving is available.
+  pub fn connect_interception_unavailable(site: ConnectDispatchSite) -> Self {
+    Self::ConnectInterceptionUnavailable { site }
+  }
+
+  /// Preserve the policy location and rich outbound tunnel failure for logs.
+  pub fn tunnel_connect(site: ConnectDispatchSite, source: TunnelConnectError) -> Self {
+    Self::TunnelConnect { site, source }
+  }
+
+  /// Report failure to transfer a prepared upgrade to its connection owner.
+  pub fn connect_upgrade_unavailable(site: ConnectDispatchSite, reason: ConnectUpgradeUnavailableReason) -> Self {
+    Self::ConnectUpgradeUnavailable { site, reason }
   }
 
   /// Preserve the policy location that explicitly rejected a matched route.
@@ -122,6 +186,39 @@ impl ServerError {
     match self {
       Self::Admission(source) => admission_descriptor(source),
       Self::ClientAuth { boundary, source } => auth_descriptor(*boundary, *source),
+      Self::ConnectDispatch(_) | Self::ConnectUpgradeUnavailable { .. } => ErrorDescriptor::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+        "the CONNECT request could not be processed",
+      ),
+      Self::ConnectBodyUnsupported { .. } => ErrorDescriptor::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_connect_body",
+        "CONNECT requests must not contain a body representation",
+      ),
+      Self::ConnectRejected { .. } => ErrorDescriptor::new(
+        StatusCode::FORBIDDEN,
+        "connect_rejected",
+        "listener policy rejected this CONNECT request",
+      ),
+      Self::ConnectInterceptionUnavailable { .. } => ErrorDescriptor::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "connect_interception_unavailable",
+        "CONNECT interception is not available",
+      ),
+      Self::TunnelConnect {
+        source: TunnelConnectError::Timeout { .. },
+        ..
+      } => ErrorDescriptor::new(
+        StatusCode::GATEWAY_TIMEOUT,
+        "tunnel_timeout",
+        "the tunnel could not be established before its deadline",
+      ),
+      Self::TunnelConnect { .. } => ErrorDescriptor::new(
+        StatusCode::BAD_GATEWAY,
+        "tunnel_unavailable",
+        "the tunnel could not be established",
+      ),
       Self::RequestBody(source) => request_body_descriptor(source),
       Self::RouteRejected { .. } => ErrorDescriptor::new(
         StatusCode::FORBIDDEN,
@@ -170,6 +267,24 @@ impl fmt::Display for ServerError {
       Self::ClientAuth { boundary, source } => {
         write!(formatter, "{boundary:?} client authentication failed: {source}")
       }
+      Self::ConnectDispatch(source) => write!(formatter, "CONNECT dispatch failed: {source}"),
+      Self::ConnectBodyUnsupported { listener } => {
+        write!(formatter, "listener '{listener}' rejected CONNECT request body framing")
+      }
+      Self::ConnectRejected { site } => write!(formatter, "{site} explicitly rejected CONNECT"),
+      Self::ConnectInterceptionUnavailable { site } => {
+        write!(
+          formatter,
+          "{site} selected CONNECT interception before its transport was available"
+        )
+      }
+      Self::TunnelConnect { site, source } => write!(formatter, "failed to establish tunnel for {site}: {source}"),
+      Self::ConnectUpgradeUnavailable { site, reason } => {
+        write!(
+          formatter,
+          "prepared CONNECT upgrade for {site} was unavailable: {reason}"
+        )
+      }
       Self::RequestBody(source) => write!(formatter, "HTTP request body admission failed: {source}"),
       Self::RouteRejected { site } => write!(formatter, "{site} explicitly rejected the HTTP request"),
       Self::Dispatch(source) => write!(formatter, "HTTP dispatch failed: {source}"),
@@ -191,11 +306,19 @@ impl std::error::Error for ServerError {
     match self {
       Self::Admission(source) => Some(source),
       Self::ClientAuth { source, .. } => Some(source),
+      Self::ConnectDispatch(source) => Some(source),
+      Self::TunnelConnect { source, .. } => Some(source),
       Self::RequestBody(source) => Some(source),
       Self::Dispatch(source) => Some(source),
       Self::Execution(source) => Some(source),
       Self::ResponseBridge(source) => Some(source),
-      Self::RouteRejected { .. } | Self::NoEligible { .. } | Self::CoolingDown { .. } => None,
+      Self::ConnectBodyUnsupported { .. }
+      | Self::ConnectRejected { .. }
+      | Self::ConnectInterceptionUnavailable { .. }
+      | Self::ConnectUpgradeUnavailable { .. }
+      | Self::RouteRejected { .. }
+      | Self::NoEligible { .. }
+      | Self::CoolingDown { .. } => None,
     }
   }
 }
@@ -229,6 +352,12 @@ impl From<AdmissionError> for ServerError {
 impl From<RequestBodyError> for ServerError {
   fn from(source: RequestBodyError) -> Self {
     Self::RequestBody(source)
+  }
+}
+
+impl From<ConnectDispatchError> for ServerError {
+  fn from(source: ConnectDispatchError) -> Self {
+    Self::ConnectDispatch(source)
   }
 }
 
@@ -535,11 +664,23 @@ mod tests {
   use http::Method;
   use serde_json::Value;
   use std::io;
+  use std::num::NonZeroU16;
   use tokn_core::provider::Error as ProviderError;
-  use tokn_policy::ListenerId;
+  use tokn_policy::{CanonicalHost, ListenerId, ResolvedAuthority};
 
   fn dispatch_site() -> HttpDispatchSite {
     HttpDispatchSite::new(ListenerId::new("listener").unwrap(), None)
+  }
+
+  fn connect_site() -> ConnectDispatchSite {
+    ConnectDispatchSite::new(ListenerId::new("proxy").unwrap(), None)
+  }
+
+  fn tunnel_target() -> ResolvedAuthority {
+    ResolvedAuthority::new(
+      CanonicalHost::parse("private.example").unwrap(),
+      NonZeroU16::new(8443).unwrap(),
+    )
   }
 
   #[test]
@@ -598,6 +739,79 @@ mod tests {
 
     let unavailable = ServerError::proxy_auth(ClientAuthError::Unavailable).into_response();
     assert!(!unavailable.headers().contains_key(PROXY_AUTHENTICATE));
+  }
+
+  #[test]
+  fn connect_errors_preserve_distinct_wire_classifications() {
+    let body = ServerError::connect_body_unsupported(ListenerId::new("proxy").unwrap());
+    assert_eq!(body.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body.code(), "invalid_connect_body");
+
+    let rejected = ServerError::connect_rejected(connect_site());
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert_eq!(rejected.code(), "connect_rejected");
+
+    let unavailable = ServerError::connect_interception_unavailable(connect_site());
+    assert_eq!(unavailable.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(unavailable.code(), "connect_interception_unavailable");
+
+    let scheduling =
+      ServerError::connect_upgrade_unavailable(connect_site(), ConnectUpgradeUnavailableReason::OwnerClosed);
+    assert_eq!(scheduling.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(scheduling.code(), "internal_error");
+    assert!(scheduling.to_string().contains("owner was already closed"));
+
+    let full = ServerError::connect_upgrade_unavailable(connect_site(), ConnectUpgradeUnavailableReason::QueueFull);
+    assert_eq!(full.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(full.to_string().contains("queue was already full"));
+
+    let dispatch = ServerError::from(ConnectDispatchError::UnsupportedListener {
+      listener: ListenerId::new("direct").unwrap(),
+    });
+    assert_eq!(dispatch.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(dispatch.code(), "internal_error");
+  }
+
+  #[test]
+  fn tunnel_timeout_and_other_setup_failures_are_distinct() {
+    let timeout = ServerError::tunnel_connect(
+      connect_site(),
+      TunnelConnectError::Timeout {
+        target: tunnel_target(),
+      },
+    );
+    assert_eq!(timeout.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(timeout.code(), "tunnel_timeout");
+
+    let rejected = ServerError::tunnel_connect(
+      connect_site(),
+      TunnelConnectError::ProxyRejected {
+        target: tunnel_target(),
+        status: 407,
+      },
+    );
+    assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(rejected.code(), "tunnel_unavailable");
+    assert!(rejected.to_string().contains("private.example:8443"));
+    assert!(rejected.to_string().contains("407"));
+  }
+
+  #[tokio::test]
+  async fn tunnel_setup_response_hides_target_and_proxy_details() {
+    let response = ServerError::tunnel_connect(
+      connect_site(),
+      TunnelConnectError::ProxyRejected {
+        target: tunnel_target(),
+        status: 407,
+      },
+    )
+    .into_response();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+
+    assert!(!text.contains("private.example"));
+    assert!(!text.contains("8443"));
+    assert!(!text.contains("407"));
   }
 
   #[test]
