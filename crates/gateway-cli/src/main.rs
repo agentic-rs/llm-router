@@ -8,9 +8,6 @@ mod cli;
 use tokn_persistence as db;
 mod error;
 mod logging;
-// Removed in the next request-runtime cleanup checkpoint; sessions still use
-// the shared progress surface while legacy request handlers are retired.
-#[allow(dead_code)]
 mod progress;
 mod provider;
 mod server_runtime;
