@@ -7,6 +7,7 @@ use tokn_accounts::link::{
 };
 use tokn_accounts::registry::Registry;
 use tokn_core::account::{AccountConfig, Secret};
+use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::{Endpoint, ID_CODEX, ID_LLAMA_CPP};
 use tokn_core::util::http::{build_managed_client, HttpClientOptions};
 use tokn_headers::HeaderMap;
@@ -120,7 +121,9 @@ upstream = "selected"
   inbound_headers.insert("content-encoding", "gzip");
 
   let target = ManagedExecutionTarget::new(REQUESTED_MODEL, Endpoint::Responses, &selected, None);
-  let attempt = ManagedHttpAttempt::new(target, &inbound_headers, &inbound_json);
+  let generation_options = GenerationOptions::new().with_top_k(40);
+  let attempt =
+    ManagedHttpAttempt::new(target, &inbound_headers, &inbound_json).with_generation_options(&generation_options);
   let http = build_managed_client(&HttpClientOptions::default()).unwrap();
   let result = ManagedHttpExecutor::new(http).execute(attempt).await.unwrap();
 
@@ -151,6 +154,7 @@ upstream = "selected"
   assert_eq!(upstream_json["model"], UPSTREAM_MODEL);
   assert_eq!(upstream_json["messages"][0]["role"], "user");
   assert_eq!(upstream_json["messages"][0]["content"], "hello from responses");
+  assert_eq!(upstream_json["top_k"], 40);
   assert!(upstream_json.get("input").is_none());
 
   assert!(decoy_server.requests().is_empty());

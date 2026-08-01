@@ -604,11 +604,13 @@ fn execution_descriptor(source: &HttpExecutionError) -> ErrorDescriptor {
 
 fn managed_attempt_descriptor(source: &ManagedAttemptError) -> ErrorDescriptor {
   match source {
-    ManagedAttemptError::RequestConversion { .. } => ErrorDescriptor::new(
-      StatusCode::BAD_REQUEST,
-      "invalid_managed_request",
-      "the managed request is not valid for the selected operation",
-    ),
+    ManagedAttemptError::RequestConversion { .. } | ManagedAttemptError::GenerationControl { .. } => {
+      ErrorDescriptor::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_managed_request",
+        "the managed request is not valid for the selected operation",
+      )
+    }
     ManagedAttemptError::ProviderRequest { .. } => ErrorDescriptor::new(
       StatusCode::BAD_GATEWAY,
       "upstream_unavailable",

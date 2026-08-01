@@ -9,15 +9,18 @@ mod response;
 
 pub use response::{ManagedClientBody, ManagedClientResponse, ManagedResponseAdapter, ManagedResponseError};
 
-use super::ManagedExecutionTarget;
+use super::{
+  ensure_model_supports_reasoning, lower_generation_options, GenerationControlError, ManagedExecutionTarget,
+};
 use bytes::Bytes;
 use serde_json::Value;
 use snafu::Snafu;
 use tokn_accounts::link::SelectionOutcome;
 use tokn_convert::error::ConvertError;
 use tokn_convert::value::messages::DEFAULT_MESSAGES_MAX_TOKENS;
+use tokn_core::generation::GenerationOptions;
 use tokn_core::pipeline::InputTransformer;
-use tokn_core::provider::{Endpoint, Error as ProviderError, RequestCtx};
+use tokn_core::provider::{Endpoint, Error as ProviderError, Provider, RequestCtx};
 use tokn_core::AgentId;
 use tokn_headers::inbound::build_template_vars;
 use tokn_headers::registry::build_wire_identity_headers;
@@ -32,11 +35,23 @@ pub struct ManagedHttpAttempt<'a> {
   target: ManagedExecutionTarget<'a>,
   headers: &'a HeaderMap,
   body: &'a Value,
+  generation_options: Option<&'a GenerationOptions>,
 }
 
 impl<'a> ManagedHttpAttempt<'a> {
   pub fn new(target: ManagedExecutionTarget<'a>, headers: &'a HeaderMap, body: &'a Value) -> Self {
-    Self { target, headers, body }
+    Self {
+      target,
+      headers,
+      body,
+      generation_options: None,
+    }
+  }
+
+  /// Apply typed, provider-neutral controls during managed preparation.
+  pub fn with_generation_options(mut self, generation_options: &'a GenerationOptions) -> Self {
+    self.generation_options = Some(generation_options);
+    self
   }
 
   pub fn target(&self) -> ManagedExecutionTarget<'a> {
@@ -49,6 +64,10 @@ impl<'a> ManagedHttpAttempt<'a> {
 
   pub fn body(&self) -> &'a Value {
     self.body
+  }
+
+  pub fn generation_options(&self) -> Option<&'a GenerationOptions> {
+    self.generation_options
   }
 }
 
@@ -145,6 +164,9 @@ pub enum ManagedAttemptError {
     source: ConvertError,
   },
 
+  #[snafu(display("managed generation controls could not be applied: {source}"))]
+  GenerationControl { source: GenerationControlError },
+
   #[snafu(display("provider '{provider}' could not transform managed request: {source}"))]
   InputTransform { provider: String, source: ProviderError },
 
@@ -163,6 +185,7 @@ impl ManagedAttemptError {
       Self::BodyObjectRequired
       | Self::DispatchBodyMismatch { .. }
       | Self::RequestConversion { .. }
+      | Self::GenerationControl { .. }
       | Self::InputTransform { .. }
       | Self::RequestSerialization { .. } => SelectionOutcome::Unchanged,
     }
@@ -201,10 +224,10 @@ impl ManagedHttpExecutor {
         upstream_operation: selected.operation(),
         headers: attempt.headers(),
         body: attempt.body(),
+        generation_options: attempt.generation_options(),
         wire_identity: target.wire_identity(),
       },
-      provider.info().id.as_str(),
-      provider.input_transformer(),
+      PrepareProvider::for_selected_model(provider.as_ref(), selected.model()),
     )?;
     let metadata = ManagedResponseMetadata::new(
       target.requested_operation(),
@@ -249,7 +272,27 @@ struct PrepareInput<'a> {
   upstream_operation: Endpoint,
   headers: &'a HeaderMap,
   body: &'a Value,
+  generation_options: Option<&'a GenerationOptions>,
   wire_identity: Option<&'a AgentId>,
+}
+
+#[derive(Clone, Copy)]
+struct PrepareProvider<'a> {
+  id: &'a str,
+  reasoning_supported: Option<bool>,
+  transformer: Option<&'a dyn InputTransformer>,
+}
+
+impl<'a> PrepareProvider<'a> {
+  fn for_selected_model(provider: &'a dyn Provider, upstream_model: &str) -> Self {
+    Self {
+      id: provider.info().id.as_str(),
+      reasoning_supported: provider
+        .model_info(upstream_model)
+        .map(|model| model.capabilities.reasoning),
+      transformer: provider.input_transformer(),
+    }
+  }
 }
 
 struct PreparedManagedRequest {
@@ -264,8 +307,7 @@ struct PreparedManagedRequest {
 
 fn prepare_managed_request(
   input: PrepareInput<'_>,
-  provider_id: &str,
-  transformer: Option<&dyn InputTransformer>,
+  provider: PrepareProvider<'_>,
 ) -> Result<PreparedManagedRequest, ManagedAttemptError> {
   let Some(original) = input.body.as_object() else {
     return Err(ManagedAttemptError::BodyObjectRequired);
@@ -295,11 +337,32 @@ fn prepare_managed_request(
         source,
       })?;
   }
-  if let Some(transformer) = transformer {
+  if let Some(options) = input.generation_options {
+    options
+      .validate()
+      .map_err(|source| GenerationControlError::InvalidOptions { source })
+      .map_err(generation_control_error)?;
+    ensure_model_supports_reasoning(
+      input.upstream_operation,
+      provider.id,
+      provider.reasoning_supported,
+      options,
+    )
+    .map_err(generation_control_error)?;
+    lower_generation_options(
+      &mut upstream_body,
+      input.upstream_operation,
+      provider.id,
+      input.upstream_model,
+      options,
+    )
+    .map_err(generation_control_error)?;
+  }
+  if let Some(transformer) = provider.transformer {
     upstream_body = transformer
       .transform_input(input.upstream_operation, upstream_body)
       .map_err(|source| ManagedAttemptError::InputTransform {
-        provider: provider_id.to_string(),
+        provider: provider.id.to_string(),
         source,
       })?;
   }
@@ -313,7 +376,7 @@ fn prepare_managed_request(
   let vars = build_template_vars(input.headers);
   let client_headers = input
     .wire_identity
-    .map(|identity| build_wire_identity_headers(provider_id, identity.as_str(), &vars, input.headers))
+    .map(|identity| build_wire_identity_headers(provider.id, identity.as_str(), &vars, input.headers))
     .unwrap_or_default();
 
   Ok(PreparedManagedRequest {
@@ -325,6 +388,10 @@ fn prepare_managed_request(
     client_headers,
     vars,
   })
+}
+
+fn generation_control_error(source: GenerationControlError) -> ManagedAttemptError {
+  ManagedAttemptError::GenerationControl { source }
 }
 
 fn apply_messages_compat_default(endpoint: Endpoint, body: &mut Value) {
@@ -400,6 +467,7 @@ fn classify_provider_error(error: &ProviderError) -> SelectionOutcome {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::test_support::MockProvider;
   use tokn_core::provider;
   use tokn_headers::{HeaderName, HeaderValue};
 
@@ -409,6 +477,44 @@ mod tests {
     fn transform_input(&self, _endpoint: Endpoint, mut body: Value) -> provider::Result<Value> {
       body.as_object_mut().unwrap().insert("stream".into(), Value::Bool(true));
       Ok(body)
+    }
+  }
+
+  struct AssertGenerationLowered;
+
+  impl InputTransformer for AssertGenerationLowered {
+    fn transform_input(&self, endpoint: Endpoint, mut body: Value) -> provider::Result<Value> {
+      assert_eq!(endpoint, Endpoint::ChatCompletions);
+      assert_eq!(body["model"], "upstream-model");
+      assert!(body.get("messages").is_some());
+      assert_eq!(body["top_k"], 40);
+      body
+        .as_object_mut()
+        .unwrap()
+        .insert("transformer_saw_generation".into(), Value::Bool(true));
+      Ok(body)
+    }
+  }
+
+  fn model_info(id: &str, reasoning: bool) -> provider::ModelInfo {
+    provider::ModelInfo {
+      id: id.to_string(),
+      name: id.to_string(),
+      capabilities: provider::Capabilities {
+        temperature: true,
+        reasoning,
+        attachment: false,
+        toolcall: true,
+        input: provider::Modalities::TEXT_ONLY,
+        output: provider::Modalities::TEXT_ONLY,
+        interleaved: provider::Interleaved::Disabled(false),
+      },
+      cost: None,
+      limit: provider::Limits {
+        context: 128_000,
+        output: 16_384,
+      },
+      release_date: None,
     }
   }
 
@@ -433,7 +539,16 @@ mod tests {
       upstream_operation,
       headers,
       body,
+      generation_options: None,
       wire_identity: None,
+    }
+  }
+
+  fn prepare_provider<'a>(id: &'a str, transformer: Option<&'a dyn InputTransformer>) -> PrepareProvider<'a> {
+    PrepareProvider {
+      id,
+      reasoning_supported: None,
+      transformer,
     }
   }
 
@@ -448,8 +563,7 @@ mod tests {
 
     let prepared = prepare_managed_request(
       input(&headers, &body, Endpoint::Responses, Endpoint::Responses),
-      "codex",
-      Some(&ForceStream),
+      prepare_provider("codex", Some(&ForceStream)),
     )
     .unwrap();
 
@@ -476,8 +590,7 @@ mod tests {
     });
     let prepared = prepare_managed_request(
       input(&HeaderMap::new(), &body, Endpoint::Responses, Endpoint::ChatCompletions),
-      "llama-cpp",
-      None,
+      prepare_provider("llama-cpp", None),
     )
     .unwrap();
 
@@ -488,13 +601,83 @@ mod tests {
   }
 
   #[test]
+  fn generation_lowering_runs_after_conversion_and_before_input_transformer() {
+    let body = serde_json::json!({
+      "model": "client-model",
+      "input": [{"role": "user", "content": "hello"}]
+    });
+    let options = GenerationOptions::new().with_top_k(40);
+    let headers = HeaderMap::new();
+    let mut input = input(&headers, &body, Endpoint::Responses, Endpoint::ChatCompletions);
+    input.generation_options = Some(&options);
+
+    let prepared =
+      prepare_managed_request(input, prepare_provider("llama-cpp", Some(&AssertGenerationLowered))).unwrap();
+
+    assert_eq!(prepared.body["transformer_saw_generation"], true);
+  }
+
+  #[test]
+  fn generation_lowering_uses_selected_provider_dialect() {
+    let body = serde_json::json!({
+      "model": "client-model",
+      "messages": [{"role": "user", "content": "hello"}],
+      "max_tokens": 32
+    });
+    let options = GenerationOptions::new().with_max_output_tokens(256);
+    let headers = HeaderMap::new();
+    let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
+    input.generation_options = Some(&options);
+
+    let prepared = prepare_managed_request(input, prepare_provider("openai", None)).unwrap();
+
+    assert_eq!(prepared.body["max_completion_tokens"], 256);
+    assert!(prepared.body.get("max_tokens").is_none());
+  }
+
+  #[test]
+  fn selected_model_capability_failure_is_local() {
+    let body = serde_json::json!({
+      "model": "client-model",
+      "messages": [{"role": "user", "content": "hello"}]
+    });
+    let options = GenerationOptions::new().with_reasoning(
+      tokn_core::generation::ReasoningOptions::new().with_effort(tokn_core::generation::ReasoningEffort::High),
+    );
+    let headers = HeaderMap::new();
+    let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
+    input.generation_options = Some(&options);
+    let selected_provider = MockProvider::new("openai").with_default_models(vec![model_info("upstream-model", false)]);
+
+    let error = prepare_managed_request(
+      input,
+      PrepareProvider::for_selected_model(&selected_provider, "upstream-model"),
+    )
+    .err()
+    .expect("known non-reasoning model must reject typed reasoning");
+
+    assert!(matches!(
+      &error,
+      ManagedAttemptError::GenerationControl {
+        source: GenerationControlError::UnsupportedControl {
+          control: "reasoning",
+          provider_id,
+          endpoint: Endpoint::ChatCompletions,
+          ..
+        }
+      } if provider_id == "openai"
+    ));
+    assert_eq!(error.selection_outcome(), SelectionOutcome::Unchanged);
+  }
+
+  #[test]
   fn unchanged_preparation_serializes_the_parsed_body() {
     let body = serde_json::json!({"model": "client-model", "messages": []});
     let headers = HeaderMap::new();
     let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
     input.upstream_model = "client-model";
 
-    let prepared = prepare_managed_request(input, "llama-cpp", None).unwrap();
+    let prepared = prepare_managed_request(input, prepare_provider("llama-cpp", None)).unwrap();
 
     assert_eq!(prepared.body, body);
     assert_eq!(prepared.wire_body, Bytes::from(serde_json::to_vec(&body).unwrap()));
@@ -505,8 +688,7 @@ mod tests {
     let body = serde_json::json!({"model": "client-model", "messages": []});
     let prepared = prepare_managed_request(
       input(&HeaderMap::new(), &body, Endpoint::Messages, Endpoint::Messages),
-      "deepseek",
-      None,
+      prepare_provider("deepseek", None),
     )
     .unwrap();
 
@@ -523,8 +705,7 @@ mod tests {
         Endpoint::ChatCompletions,
         Endpoint::ChatCompletions,
       ),
-      "openai",
-      None,
+      prepare_provider("openai", None),
     )
     .err()
     .unwrap();
@@ -543,8 +724,7 @@ mod tests {
         Endpoint::ChatCompletions,
         Endpoint::ChatCompletions,
       ),
-      "openai",
-      None,
+      prepare_provider("openai", None),
     )
     .err()
     .unwrap();
@@ -560,7 +740,7 @@ mod tests {
     let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
     input.wire_identity = Some(&AgentId::Opencode);
 
-    let prepared = prepare_managed_request(input, "openai", None).unwrap();
+    let prepared = prepare_managed_request(input, prepare_provider("openai", None)).unwrap();
 
     assert!(!prepared.client_headers.is_empty());
     assert_eq!(prepared.vars.session_id.as_deref(), Some("session-1"));
