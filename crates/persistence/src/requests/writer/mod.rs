@@ -886,6 +886,9 @@ impl RequestPersistenceConsumer {
     }
     let target = row_target_for_attempt(request_id, state, event.attempt)?;
     let mut context = target.context.clone();
+    if event.request.uri.is_redacted() {
+      context.insert("outbound_target_redacted".to_string(), Value::Bool(true));
+    }
     let body = project_body(
       &mut context,
       "outbound_request_body_capture",

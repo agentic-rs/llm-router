@@ -6,7 +6,9 @@
 //! fact actually occurs.
 
 use super::{AdmittedHttpRequest, ServerError};
-use crate::runtime::observation::{capture_headers, native_correlation};
+use crate::runtime::observation::{
+  capture_headers, capture_path_and_query, capture_request_target, native_correlation,
+};
 use crate::runtime::{ConnectDispatch, HttpRouteMatch, LinkedRouteKind};
 use axum::response::Response;
 use http::Request;
@@ -14,8 +16,8 @@ use smol_str::SmolStr;
 use tokn_access::AccessContext;
 use tokn_core::provider::ProviderRequestKind;
 use tokn_events::{
-  CapturedUri, ClientIdentity, ConnectAction as EventConnectAction, EventFailure, HttpFamily, HttpResponseHead,
-  PolicySelection, RequestAdmitted, RequestOutcome, RequestPhase, RequestSource, RequestStarted, SelectedAction,
+  ClientIdentity, ConnectAction as EventConnectAction, EventFailure, HttpFamily, HttpResponseHead, PolicySelection,
+  RequestAdmitted, RequestOutcome, RequestPhase, RequestSource, RequestStarted, SelectedAction,
 };
 use tokn_policy::IngressAuthority;
 use tokn_requests::{RequestCompletion, RequestTermination};
@@ -27,7 +29,7 @@ pub(super) fn request_started<B>(source: RequestSource, request: &Request<B>, bo
     source,
     http_version: Some(SmolStr::new(format!("{:?}", request.version()))),
     method: SmolStr::new(request.method().as_str()),
-    target: CapturedUri::exact(request.uri().to_string()),
+    target: capture_request_target(request.uri()),
     headers: capture_headers(request.headers()),
     body_present,
     correlation: native_correlation(request.headers()),
@@ -47,7 +49,7 @@ pub(super) fn request_admitted_http(admitted: &AdmittedHttpRequest) -> RequestAd
   RequestAdmitted::Http {
     scheme: SmolStr::new_static(head.ingress().scheme().as_str()),
     authority: SmolStr::new(head.ingress().authority().to_string()),
-    path_and_query: CapturedUri::exact(head.path_and_query().as_str()),
+    path_and_query: capture_path_and_query(head.path_and_query()),
     operation,
   }
 }
@@ -154,7 +156,7 @@ mod tests {
   use http::header::{AUTHORIZATION, COOKIE, HOST};
   use http::{HeaderValue, Method, Version};
   use tokn_access::{AuthenticationError, ProviderAccess};
-  use tokn_events::{CapturedHeaderValue, IngressKind};
+  use tokn_events::{CapturedHeaderValue, CapturedUri, IngressKind};
 
   fn source() -> RequestSource {
     RequestSource::Listener {
@@ -177,8 +179,8 @@ mod tests {
     let started = request_started(source(), &request, true);
 
     assert_eq!(started.method, "PATCH");
-    assert_eq!(started.target.as_str(), "https://api.example/v1/responses?stream=true");
-    assert!(!started.target.is_redacted());
+    assert_eq!(started.target.as_str(), "https://api.example/v1/responses");
+    assert!(started.target.is_redacted());
     assert_eq!(started.http_version.as_deref(), Some("HTTP/2.0"));
     assert!(started.body_present);
     assert_eq!(started.source, source());
@@ -265,7 +267,7 @@ mod tests {
       RequestAdmitted::Http {
         scheme: SmolStr::new_static("http"),
         authority: SmolStr::new_static("api.example:80"),
-        path_and_query: CapturedUri::exact("/v1/responses?stream=true"),
+        path_and_query: CapturedUri::redacted("/v1/responses"),
         operation: Some(SmolStr::new_static("responses")),
       }
     );

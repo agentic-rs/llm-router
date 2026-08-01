@@ -6,7 +6,7 @@
 //! the outer downstream body owner drains progress in-order and closes the
 //! attempt atomically with request termination.
 
-use crate::runtime::observation::capture_headers;
+use crate::runtime::observation::{capture_headers, capture_upstream_uri};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
@@ -19,8 +19,8 @@ use std::task::{Context, Poll};
 use tokn_core::provider::{Endpoint, Error as ProviderError, OutboundRequestObserver};
 use tokn_events::{
   AttemptFinished, AttemptHttpRequest, AttemptHttpResponseHead, AttemptNo, AttemptOutcome, AttemptStarted,
-  AttemptUsage, BodyCapture, BodyFinished, BodyLeg, BodyProgress, BodyResult, CapturedUri, EventFailure,
-  HttpRequestSnapshot, HttpResponseHead, RequestPhase, TargetSelection, TokenUsage, TrafficEventKind, UsageKind,
+  AttemptUsage, BodyCapture, BodyFinished, BodyLeg, BodyProgress, BodyResult, EventFailure, HttpRequestSnapshot,
+  HttpResponseHead, RequestPhase, TargetSelection, TokenUsage, TrafficEventKind, UsageKind,
 };
 use tokn_requests::{BoundaryPublishError, RequestLifecycle, RequestTerminalEvent, RequestTermination};
 
@@ -123,7 +123,7 @@ impl OutboundRequestObserver for AttemptRequestObserver<'_> {
       attempt: self.attempt,
       request: HttpRequestSnapshot {
         method: request.method().as_str().into(),
-        uri: CapturedUri::exact(request.url().as_str()),
+        uri: capture_upstream_uri(request.url()),
         headers: capture_headers(request.headers()),
         body,
       },
