@@ -172,6 +172,13 @@ pub fn ensure_bind_host(host: &str, insecure_allow_remote: bool) -> Result<()> {
 mod tests {
   use super::*;
   use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+  use std::time::Duration;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::net::TcpStream;
+  use tokio::sync::oneshot;
+  use tokio::time::timeout;
+
+  const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
   fn compile_reject_only_gateway(listeners: &[(&str, SocketAddr)]) -> CompiledConfig {
     let mut config = String::from("schema_version = 2\n");
@@ -261,6 +268,56 @@ default_http_action = {{ kind = "reject" }}
     let rebound = StdTcpListener::bind(first_address).expect("the earlier socket must be released after rollback");
     assert_eq!(rebound.local_addr().unwrap(), first_address);
     drop(second_reservation);
+  }
+
+  #[tokio::test]
+  async fn compiled_gateway_serves_and_stops_two_reject_only_listeners() {
+    let reservations = (0..2)
+      .map(|_| StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+      .collect::<Vec<_>>();
+    let first_address = reservations[0].local_addr().unwrap();
+    let second_address = reservations[1].local_addr().unwrap();
+    let compiled = compile_reject_only_gateway(&[("first", first_address), ("second", second_address)]);
+    drop(reservations);
+
+    let bound = bind_compiled_gateway(&compiled, &[], None).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+      tokn_router::runtime::serve_gateway_listeners(bound, async {
+        let _ = shutdown_rx.await;
+      })
+      .await
+    });
+
+    for (listener, address) in [("first", first_address), ("second", second_address)] {
+      let mut client = timeout(TEST_TIMEOUT, TcpStream::connect(address))
+        .await
+        .unwrap()
+        .unwrap();
+      client
+        .write_all(
+          format!("GET /from-{listener} HTTP/1.1\r\nHost: {listener}.example\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+      let mut response = Vec::new();
+      timeout(TEST_TIMEOUT, client.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+      let response = std::str::from_utf8(&response).unwrap();
+      assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "listener {listener} returned an unexpected response: {response:?}"
+      );
+      assert!(
+        response.contains("\"code\":\"route_rejected\""),
+        "listener {listener} did not apply its reject policy: {response:?}"
+      );
+    }
+
+    shutdown_tx.send(()).unwrap();
+    timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().unwrap();
   }
 
   #[test]
