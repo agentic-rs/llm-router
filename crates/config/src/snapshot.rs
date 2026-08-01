@@ -10,6 +10,67 @@ pub struct StableLoadedConfig {
   pub snapshot: ConfigSourcesSnapshot,
 }
 
+/// Exact bytes from one direct config file, captured without parsing a schema.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConfigFileSnapshot {
+  path: PathBuf,
+  contents: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ConfigFileSnapshot {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("ConfigFileSnapshot")
+      .field("path", &self.path)
+      .field("present", &self.contents.is_some())
+      .finish()
+  }
+}
+
+impl ConfigFileSnapshot {
+  /// Capture stable exact bytes from a direct regular file.
+  ///
+  /// A missing file is represented by `None`. Symbolic links, non-files, and
+  /// changes during capture are rejected. Sibling `config.d` fragments are
+  /// deliberately outside this root-only snapshot.
+  pub fn capture(path: &Path) -> Result<Self> {
+    let before = read_optional_source(path)?;
+    let after = read_optional_source(path)?;
+    if before != after {
+      return Err(Error::ConfigSourceChanged {
+        path: path.to_path_buf(),
+      });
+    }
+    Ok(Self {
+      path: path.to_path_buf(),
+      contents: before,
+    })
+  }
+
+  /// Captured path.
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Exact captured bytes, or `None` when the file was missing.
+  pub fn contents(&self) -> Option<&[u8]> {
+    self.contents.as_deref()
+  }
+
+  /// Require the direct file to remain present or missing with the same exact
+  /// bytes. Sibling fragments do not participate.
+  pub fn validate(&self) -> Result<()> {
+    let current = Self::capture(&self.path)?;
+    if current == *self {
+      Ok(())
+    } else {
+      Err(Error::ConfigSourceChanged {
+        path: self.path.clone(),
+      })
+    }
+  }
+}
+
 impl std::fmt::Debug for StableLoadedConfig {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter
@@ -387,6 +448,42 @@ mod tests {
   }
 
   #[test]
+  fn file_snapshot_tracks_only_exact_root_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("config.toml");
+    std::fs::write(&root, ROOT_CONTENTS).unwrap();
+    let snapshot = ConfigFileSnapshot::capture(&root).unwrap();
+
+    assert_eq!(snapshot.path(), root);
+    assert_eq!(snapshot.contents(), Some(ROOT_CONTENTS.as_bytes()));
+    assert!(!format!("{snapshot:?}").contains("sentinel-root-secret"));
+
+    write_fragment(&root, "alpha", "fragment-change-is-inactive-for-v2");
+    snapshot.validate().unwrap();
+
+    std::fs::write(&root, "schema_version = 2\n").unwrap();
+    let error = snapshot.validate().unwrap_err();
+    assert!(matches!(error, Error::ConfigSourceChanged { path } if path == root));
+  }
+
+  #[test]
+  fn file_snapshot_represents_a_missing_root_without_creating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("config.toml");
+    let snapshot = ConfigFileSnapshot::capture(&root).unwrap();
+
+    assert_eq!(snapshot.contents(), None);
+    snapshot.validate().unwrap();
+    assert!(!root.exists());
+
+    std::fs::write(&root, ROOT_CONTENTS).unwrap();
+    assert!(matches!(
+      snapshot.validate().unwrap_err(),
+      Error::ConfigSourceChanged { path } if path == root
+    ));
+  }
+
+  #[test]
   fn stable_load_captures_exact_root_and_sorted_fragments_without_debugging_contents() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("config.toml");
@@ -566,6 +663,8 @@ mod tests {
 
     let error = Config::load_stable(Some(&root)).unwrap_err();
 
+    assert!(matches!(error, Error::ConfigSourceSymlink { path } if path == root));
+    let error = ConfigFileSnapshot::capture(&root).unwrap_err();
     assert!(matches!(error, Error::ConfigSourceSymlink { path } if path == root));
     assert_eq!(std::fs::read_to_string(target).unwrap(), "not valid toml = [");
   }

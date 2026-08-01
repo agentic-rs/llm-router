@@ -78,6 +78,23 @@ fn execute_with_confirmation(
   stderr: &mut dyn Write,
   confirm: &mut dyn FnMut(&str) -> Result<bool>,
 ) -> Result<()> {
+  if validate_already_v2(config_path, auth_path)? {
+    if !args.apply {
+      bail!(
+        "config `{}` already uses schema version 2; no migration preview is needed",
+        config_path.display()
+      );
+    }
+    writeln!(
+      stderr,
+      "version 2 config `{}` is already active and valid; no files changed",
+      config_path.display()
+    )
+    .context("write already-active migration result")?;
+    stderr.flush().context("flush already-active migration result")?;
+    return Ok(());
+  }
+
   let prepared = prepare(config_path, args, auth_path)?;
   if !args.apply {
     return emit_dry_run(&prepared.output, stdout, stderr);
@@ -198,6 +215,39 @@ fn load_stable_auth(auth_path: Option<&Path>) -> Result<(AuthStore, AuthPreimage
     bail!("modern credential sources changed while they were being loaded; retry the command");
   }
   Ok((second, second_preimage))
+}
+
+fn validate_already_v2(config_path: &Path, auth_path: Option<&Path>) -> Result<bool> {
+  let snapshot = tokn_config::ConfigFileSnapshot::capture(config_path)
+    .with_context(|| format!("capture config root `{}` for schema detection", config_path.display()))?;
+  let Some(contents) = snapshot.contents() else {
+    return Ok(false);
+  };
+  let contents = std::str::from_utf8(contents)
+    .with_context(|| format!("read config `{}` as UTF-8 for schema detection", config_path.display()))?;
+  let raw = match tokn_config::v2::decode(contents, config_path) {
+    Ok(raw) => raw,
+    Err(tokn_config::v2::Error::MissingSchemaVersion { .. }) => return Ok(false),
+    Err(error) => return Err(error).context("validate existing version 2 config syntax"),
+  };
+  let compiled = tokn_config::v2::compile(&raw, config_path).context("compile existing version 2 config")?;
+  let (store, auth_preimage) = load_stable_auth(auth_path)?;
+  tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), &store.accounts)
+    .context("link existing version 2 gateway runtime")?;
+
+  snapshot
+    .validate()
+    .context("revalidate existing version 2 config after runtime linking")?;
+  let (_, final_auth_preimage) = load_stable_auth(auth_path)?;
+  if final_auth_preimage != auth_preimage {
+    bail!(
+      "modern credential sources changed while the existing version 2 config was being validated; retry the command"
+    );
+  }
+  snapshot
+    .validate()
+    .context("revalidate existing version 2 config after credential validation")?;
+  Ok(true)
 }
 
 fn emit_dry_run(output: &PlannedOutput, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<()> {
@@ -788,5 +838,46 @@ mode = "route"
     assert!(diagnostics.contains("inspect the active config"));
     assert!(!diagnostics.contains("rerun"));
     tokn_config::v2::load(&config_path).unwrap();
+
+    let active = fs::read(&config_path).unwrap();
+    let durable_auth = fs::read(&auth_path).unwrap();
+    let backup_path = backup::legacy_backup_path(&config_path).unwrap();
+    fs::remove_file(&backup_path).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut retry_args = apply_args();
+    retry_args.yes = false;
+    let mut unexpected_confirmation = |_: &str| -> Result<bool> { panic!("already-v2 apply must not confirm") };
+    execute_with_confirmation(
+      &config_path,
+      &retry_args,
+      Some(&auth_path),
+      &mut stdout,
+      &mut stderr,
+      &mut unexpected_confirmation,
+    )
+    .unwrap();
+
+    assert!(stdout.is_empty());
+    assert!(std::str::from_utf8(&stderr)
+      .unwrap()
+      .contains("already active and valid; no files changed"));
+    assert_eq!(fs::read(&config_path).unwrap(), active);
+    assert_eq!(fs::read(&auth_path).unwrap(), durable_auth);
+    assert!(!backup_path.exists());
+
+    stdout.clear();
+    stderr.clear();
+    let error = execute(
+      &config_path,
+      &args(V2ActivationArg::Api),
+      Some(&auth_path),
+      &mut stdout,
+      &mut stderr,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("already uses schema version 2"));
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
   }
 }

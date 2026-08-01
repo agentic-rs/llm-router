@@ -5,7 +5,7 @@ mod snapshot;
 pub mod v2;
 
 pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
-pub use snapshot::{ConfigSourcesSnapshot, StableLoadedConfig};
+pub use snapshot::{ConfigFileSnapshot, ConfigSourcesSnapshot, StableLoadedConfig};
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
 pub use tokn_core::AgentId;
 
