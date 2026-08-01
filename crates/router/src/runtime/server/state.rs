@@ -6,7 +6,7 @@
 //! authentication and interception resources.
 
 use super::super::{HttpExecutionCoordinator, LinkedGatewayRuntime, LinkedListener, MaterializedListener};
-use super::RequestBodyLimits;
+use super::{RequestBodyLimits, TunnelConnector, TunnelConnectorBuildError};
 use snafu::Snafu;
 use std::sync::Arc;
 use tokn_core::util::http::{build_client, build_managed_client, build_opaque_client, HttpClientOptions};
@@ -39,6 +39,7 @@ impl GatewayServingDefaults {
 pub struct GatewayServerState {
   runtime: Arc<LinkedGatewayRuntime>,
   http_execution: HttpExecutionCoordinator,
+  tunnel_connector: TunnelConnector,
   defaults: GatewayServingDefaults,
 }
 
@@ -58,10 +59,13 @@ impl GatewayServerState {
       ManagedHttpExecutor::new(managed_http),
       OpaqueHttpExecutor::new(authorization_http, opaque_http),
     );
+    let tunnel_connector =
+      TunnelConnector::build(http_options).map_err(|source| GatewayServerStateError::TunnelConnector { source })?;
 
     Ok(Self {
       runtime,
       http_execution,
+      tunnel_connector,
       defaults,
     })
   }
@@ -72,6 +76,10 @@ impl GatewayServerState {
 
   pub fn http_execution(&self) -> &HttpExecutionCoordinator {
     &self.http_execution
+  }
+
+  pub fn tunnel_connector(&self) -> &TunnelConnector {
+    &self.tunnel_connector
   }
 
   pub const fn defaults(&self) -> GatewayServingDefaults {
@@ -119,6 +127,9 @@ pub enum GatewayServerStateError {
 
   #[snafu(display("failed to build the opaque data-plane HTTP client: {source}"))]
   OpaqueHttpClient { source: anyhow::Error },
+
+  #[snafu(display("failed to build the CONNECT tunnel transport: {source}"))]
+  TunnelConnector { source: TunnelConnectorBuildError },
 }
 
 pub type GatewayServerStateResult<T> = std::result::Result<T, GatewayServerStateError>;

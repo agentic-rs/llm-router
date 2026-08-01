@@ -33,7 +33,7 @@ flate2 = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["client-proxy"] }
 ipnet = { workspace = true }
 parking_lot = { workspace = true }
 rcgen = { workspace = true }
