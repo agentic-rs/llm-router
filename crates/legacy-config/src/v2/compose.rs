@@ -77,6 +77,7 @@ pub fn plan_v2_migration(
 
   let account_index = index_accounts(accounts)?;
   let mut warnings = base_warnings(legacy);
+  let outbound = migrated_outbound(legacy, &mut warnings)?;
   let policies = effective_policies(legacy, &mut warnings)?;
   let upstreams = build_upstreams(accounts, &policies, options.allow_insecure_upstreams, &mut warnings)?;
   let bind = api_bind(legacy)?;
@@ -147,11 +148,7 @@ pub fn plan_v2_migration(
   let raw_config = RawConfig {
     schema_version: SCHEMA_VERSION,
     service: RawService {
-      outbound: RawOutbound {
-        proxy_url: legacy.proxy.url.clone(),
-        no_proxy: legacy.proxy.no_proxy.clone(),
-        use_system_proxy: legacy.proxy.system,
-      },
+      outbound,
       request_limits: RawRequestLimits::default(),
     },
     listeners: BTreeMap::from([(
@@ -180,6 +177,32 @@ pub fn plan_v2_migration(
     .map_err(|source| V2MigrationError::InvalidGeneratedConfig { source })?;
 
   Ok(V2MigrationPlan { raw_config, warnings })
+}
+
+fn migrated_outbound(legacy: &Config, warnings: &mut Vec<V2MigrationWarning>) -> Result<RawOutbound, V2MigrationError> {
+  let Some(proxy_url) = legacy.proxy.url.as_deref() else {
+    if !legacy.proxy.no_proxy.is_empty() {
+      warnings.push(V2MigrationWarning::LegacyNoProxyWithoutExplicitProxyIgnored);
+    }
+    return Ok(RawOutbound {
+      proxy_url: None,
+      no_proxy: Vec::new(),
+      use_system_proxy: legacy.proxy.system,
+    });
+  };
+
+  let parsed = reqwest::Url::parse(proxy_url).map_err(|_| V2MigrationError::InvalidLegacyProxyUrl)?;
+  if !parsed.username().is_empty() || parsed.password().is_some() {
+    return Err(V2MigrationError::CredentialedOutboundProxyUnsupported);
+  }
+  if legacy.proxy.system {
+    warnings.push(V2MigrationWarning::LegacySystemProxyShadowedByExplicitProxy);
+  }
+  Ok(RawOutbound {
+    proxy_url: Some(proxy_url.to_string()),
+    no_proxy: legacy.proxy.no_proxy.clone(),
+    use_system_proxy: false,
+  })
 }
 
 fn managed_model_recipe(policy: &EffectivePolicy) -> Result<RawModelSelector, V2MigrationError> {
@@ -315,5 +338,40 @@ enabled = true
       ),
       Err(V2MigrationError::InvalidGeneratedConfig { .. })
     ));
+  }
+
+  #[test]
+  fn migrates_effective_proxy_behavior_without_rendering_credentials() {
+    let mut explicit = Config::default();
+    explicit.proxy.url = Some("http://proxy.example:8080".into());
+    explicit.proxy.no_proxy = vec!["localhost".into()];
+    explicit.proxy.system = true;
+
+    let plan = plan_v2_migration(&explicit, &[account(None)], V2MigrationOptions::default()).unwrap();
+    let outbound = &plan.raw_config().service.outbound;
+    assert_eq!(outbound.proxy_url.as_deref(), Some("http://proxy.example:8080"));
+    assert_eq!(outbound.no_proxy, ["localhost"]);
+    assert!(!outbound.use_system_proxy);
+    assert!(plan
+      .warnings()
+      .contains(&V2MigrationWarning::LegacySystemProxyShadowedByExplicitProxy));
+
+    let mut system = Config::default();
+    system.proxy.system = true;
+    system.proxy.no_proxy = vec!["ignored.example".into()];
+    let plan = plan_v2_migration(&system, &[account(None)], V2MigrationOptions::default()).unwrap();
+    let outbound = &plan.raw_config().service.outbound;
+    assert_eq!(outbound.proxy_url, None);
+    assert!(outbound.no_proxy.is_empty());
+    assert!(outbound.use_system_proxy);
+    assert!(plan
+      .warnings()
+      .contains(&V2MigrationWarning::LegacyNoProxyWithoutExplicitProxyIgnored));
+
+    let mut credentialed = Config::default();
+    credentialed.proxy.url = Some("http://user:sentinel-password@proxy.example".into());
+    let error = plan_v2_migration(&credentialed, &[account(None)], V2MigrationOptions::default()).unwrap_err();
+    assert!(matches!(error, V2MigrationError::CredentialedOutboundProxyUnsupported));
+    assert!(!error.to_string().contains("sentinel-password"));
   }
 }

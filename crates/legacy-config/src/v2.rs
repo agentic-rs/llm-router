@@ -112,6 +112,8 @@ pub enum V2MigrationWarning {
   ProfileResourceRenamed { profile: String, resource_id: String },
   CleartextUpstreamAllowed { accounts: Vec<String>, base_url: String },
   LegacyPoolStrategyIgnored { strategy: String },
+  LegacySystemProxyShadowedByExplicitProxy,
+  LegacyNoProxyWithoutExplicitProxyIgnored,
 }
 
 #[derive(Debug, Error)]
@@ -121,6 +123,10 @@ pub enum V2MigrationError {
     #[source]
     source: tokn_config::Error,
   },
+  #[error("legacy outbound proxy URL is invalid")]
+  InvalidLegacyProxyUrl,
+  #[error("cannot safely render a credential-bearing legacy outbound proxy URL; remove embedded proxy credentials before migration")]
+  CredentialedOutboundProxyUnsupported,
   #[error("v2 migration does not yet support the {selection:?} listener selection")]
   UnsupportedListenerSelection { selection: V2ListenerSelection },
   #[error("cannot migrate {policy}: legacy route mode {mode:?} has no exact v2 recipe")]

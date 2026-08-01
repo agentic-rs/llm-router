@@ -3314,6 +3314,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "directories",
+ "reqwest",
  "serde",
  "serde_yaml",
  "tempfile",
