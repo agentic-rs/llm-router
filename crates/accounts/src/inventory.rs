@@ -48,13 +48,6 @@ pub struct AccountInventory {
 }
 
 impl AccountInventory {
-  pub fn empty() -> Arc<Self> {
-    Arc::new(Self {
-      accounts: Vec::new(),
-      by_id: BTreeMap::new(),
-    })
-  }
-
   pub fn from_accounts_with<F>(accounts_in: &[AccountConfig], build_provider: F) -> Result<Arc<Self>>
   where
     F: Fn(Arc<AccountConfig>) -> tokn_core::provider::Result<Arc<dyn Provider>>,
