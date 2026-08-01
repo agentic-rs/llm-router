@@ -23,7 +23,7 @@ pub use path::{CanonicalHttpPath, HttpPathPattern, HttpPathPrefix, InvalidHttpPa
 pub use route::{
   CredentialPolicy, DestinationPolicy, FallbackSelector, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget,
   ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, QualificationNamespace, RelayRetry, RelayRoute,
-  RelayTarget, RouteKind, RoutePlan, UpstreamSelector, WireIdentity,
+  RelayTarget, RouteKind, RoutePlan, TransparentRoute, UpstreamSelector, WireIdentity,
 };
 pub use topology::{
   AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
