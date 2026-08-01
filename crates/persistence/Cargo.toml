@@ -8,10 +8,6 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[features]
-default = ["lzma"]
-lzma = ["dep:lzma-rust2"]
-
 [dependencies]
 tokn-core = { workspace = true }
 tokn-headers = { workspace = true }
@@ -24,12 +20,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 snafu = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }
-lzma-rust2 = { workspace = true, optional = true }
 
 [dev-dependencies]
-parking_lot = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
