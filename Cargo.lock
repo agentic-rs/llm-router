@@ -2956,7 +2956,6 @@ dependencies = [
  "sha2",
  "snafu",
  "time",
- "tokn-core",
  "tokn-headers",
  "tracing",
  "uuid",
