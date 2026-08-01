@@ -275,15 +275,9 @@ impl Provider for ZaiProvider {
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    let resp = crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      url.as_str(),
-      headers,
-      Some(body_bytes),
-      "zai chat",
-    )
-    .await?;
+    let resp = ctx
+      .send(Method::POST, url.as_str(), headers, Some(body_bytes), "zai chat")
+      .await?;
     span.record("status", resp.status().as_u16());
     Ok(resp)
   }
@@ -514,6 +508,7 @@ mod tests {
       client_headers: None,
       vars: TemplateVars::default(),
       wire_identity: Some(tokn_core::AgentId::Opencode),
+      request_observer: None,
     };
     let resp = provider.chat(ctx).await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);

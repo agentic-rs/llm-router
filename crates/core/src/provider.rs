@@ -272,6 +272,12 @@ pub struct RequestCtx<'a> {
   /// Explicit client identity to present on the upstream wire. `None` means
   /// provider-required headers only; providers must not invent a persona.
   pub wire_identity: Option<AgentId>,
+  /// Optional observer invoked after the provider has prepared the final URL,
+  /// headers, and body, but before the request is handed to reqwest.
+  ///
+  /// This is deliberately transport-shaped rather than event-shaped. Library
+  /// users that do not need request lifecycle observation leave it as `None`.
+  pub request_observer: Option<&'a mut dyn OutboundRequestObserver>,
 }
 
 impl RequestCtx<'_> {
@@ -281,6 +287,39 @@ impl RequestCtx<'_> {
       .cloned()
       .unwrap_or_else(|| Bytes::from(serde_json::to_vec(self.body).unwrap_or_default()))
   }
+
+  /// Send the final provider-prepared request through the shared transport
+  /// boundary, notifying the optional observer before any network I/O begins.
+  pub async fn send(
+    mut self,
+    method: reqwest::Method,
+    url: &str,
+    headers: HeaderMap,
+    body: Option<Bytes>,
+    what: &'static str,
+  ) -> Result<reqwest::Response> {
+    crate::util::http::send_observed(
+      self.http,
+      method,
+      url,
+      headers,
+      body,
+      what,
+      self.request_observer.take(),
+    )
+    .await
+  }
+}
+
+/// Async observation hook for one fully prepared outbound HTTP request.
+///
+/// The supplied [`reqwest::Request`] has already had transport-derived `Host`
+/// and `Content-Length` fields removed. Its URL, remaining native headers, and
+/// reusable byte body are the last application-visible representation before
+/// reqwest performs connection-specific framing.
+#[async_trait]
+pub trait OutboundRequestObserver: Send {
+  async fn observe(&mut self, request: &reqwest::Request) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

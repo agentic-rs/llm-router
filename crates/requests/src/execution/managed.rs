@@ -19,7 +19,9 @@ use tokn_accounts::link::SelectionOutcome;
 use tokn_convert::error::ConvertError;
 use tokn_convert::value::messages::DEFAULT_MESSAGES_MAX_TOKENS;
 use tokn_core::generation::GenerationOptions;
-use tokn_core::provider::{Endpoint, Error as ProviderError, InputTransformer, Provider, RequestCtx};
+use tokn_core::provider::{
+  Endpoint, Error as ProviderError, InputTransformer, OutboundRequestObserver, Provider, RequestCtx,
+};
 use tokn_core::AgentId;
 use tokn_headers::inbound::build_template_vars;
 use tokn_headers::registry::build_wire_identity_headers;
@@ -123,6 +125,10 @@ pub struct ManagedHttpResponse {
 }
 
 impl ManagedHttpResponse {
+  pub fn new(response: reqwest::Response, metadata: ManagedResponseMetadata) -> Self {
+    Self { response, metadata }
+  }
+
   pub fn response(&self) -> &reqwest::Response {
     &self.response
   }
@@ -211,6 +217,15 @@ impl ManagedHttpExecutor {
   /// Prepare and send one request through the exact provider binding selected
   /// by dispatch. Every received HTTP status is returned as a response.
   pub async fn execute(&self, attempt: ManagedHttpAttempt<'_>) -> Result<ManagedHttpResponse, ManagedAttemptError> {
+    self.execute_observed(attempt, None).await
+  }
+
+  /// Execute with an optional observer for the provider-prepared wire request.
+  pub async fn execute_observed(
+    &self,
+    attempt: ManagedHttpAttempt<'_>,
+    request_observer: Option<&mut dyn OutboundRequestObserver>,
+  ) -> Result<ManagedHttpResponse, ManagedAttemptError> {
     let target = attempt.target();
     let selected = target.target();
     let provider = selected.binding().provider().clone();
@@ -234,31 +249,68 @@ impl ManagedHttpExecutor {
       prepared.requested_stream,
       prepared.upstream_stream,
     );
-    let request = RequestCtx {
-      endpoint: selected.operation(),
-      http: &self.http,
-      body: &prepared.body,
-      body_bytes: Some(&prepared.wire_body),
-      content_encoding: None,
-      stream: prepared.upstream_stream,
-      initiator: prepared.initiator.as_deref().unwrap_or("user"),
-      inbound_headers: attempt.headers(),
-      client_headers: Some(prepared.client_headers),
-      vars: prepared.vars,
-      wire_identity: target.wire_identity().cloned(),
-    };
-
-    let response = match selected.operation() {
-      Endpoint::ChatCompletions => provider.chat(request).await,
-      Endpoint::Responses => provider.responses(request).await,
-      Endpoint::Messages => provider.messages(request).await,
+    let response = match request_observer {
+      Some(observer) => {
+        send_prepared_managed(
+          &self.http,
+          provider.as_ref(),
+          selected.operation(),
+          attempt.headers(),
+          &prepared,
+          target.wire_identity().cloned(),
+          Some(&mut *observer),
+        )
+        .await
+      }
+      None => {
+        send_prepared_managed(
+          &self.http,
+          provider.as_ref(),
+          selected.operation(),
+          attempt.headers(),
+          &prepared,
+          target.wire_identity().cloned(),
+          None,
+        )
+        .await
+      }
     }
     .map_err(|source| ManagedAttemptError::ProviderRequest {
       provider: provider_id,
       source,
     })?;
 
-    Ok(ManagedHttpResponse { response, metadata })
+    Ok(ManagedHttpResponse::new(response, metadata))
+  }
+}
+
+async fn send_prepared_managed<'a>(
+  http: &'a reqwest::Client,
+  provider: &'a dyn Provider,
+  endpoint: Endpoint,
+  inbound_headers: &'a HeaderMap,
+  prepared: &'a PreparedManagedRequest,
+  wire_identity: Option<AgentId>,
+  request_observer: Option<&'a mut dyn OutboundRequestObserver>,
+) -> Result<reqwest::Response, ProviderError> {
+  let request = RequestCtx {
+    endpoint,
+    http,
+    body: &prepared.body,
+    body_bytes: Some(&prepared.wire_body),
+    content_encoding: None,
+    stream: prepared.upstream_stream,
+    initiator: prepared.initiator.as_deref().unwrap_or("user"),
+    inbound_headers,
+    client_headers: Some(prepared.client_headers.clone()),
+    vars: prepared.vars.clone(),
+    wire_identity,
+    request_observer,
+  };
+  match endpoint {
+    Endpoint::ChatCompletions => provider.chat(request).await,
+    Endpoint::Responses => provider.responses(request).await,
+    Endpoint::Messages => provider.messages(request).await,
   }
 }
 
@@ -457,6 +509,7 @@ fn classify_provider_error(error: &ProviderError) -> SelectionOutcome {
     | ProviderError::InvalidOperationPath { .. }
     | ProviderError::HeaderValue { .. }
     | ProviderError::HeaderName { .. }
+    | ProviderError::RequestObservation { .. }
     | ProviderError::UnsupportedEndpoint { .. }
     | ProviderError::Profiles { .. } => SelectionOutcome::Unchanged,
   }
