@@ -229,10 +229,34 @@ mod tests {
       let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
       let root = std::env::temp_dir().join(format!("tokn-typescript-lifecycle-{}-{id}", std::process::id()));
       fs::create_dir(&root).expect("create lifecycle fixture directory");
-      fs::write(root.join("config.toml"), "[defaults]\nmode = \"exact\"\n").expect("write lifecycle fixture config");
+      fs::write(
+        root.join("config.toml"),
+        r#"schema_version = 2
+
+[profiles.lifecycle]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "default"
+upstream = { kind = "fixed", upstream = "local" }
+model = { kind = "qualified", namespace = "provider" }
+operation = "translate_compatible"
+
+[account_pools.default]
+active_accounts = ["*"]
+providers = ["llama-cpp"]
+
+[upstreams.local]
+provider = "llama-cpp"
+base_url = "http://127.0.0.1:1"
+accounts = ["local"]
+"#,
+      )
+      .expect("write lifecycle fixture config");
       fs::write(
         root.join("auth.yaml"),
-        "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n    base_url: http://127.0.0.1:1\n",
+        "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n",
       )
       .expect("write lifecycle fixture credentials");
       Self { root }
@@ -242,6 +266,7 @@ mod tests {
       Client::builder()
         .config_path(self.root.join("config.toml"))
         .auth_path(self.root.join("auth.yaml"))
+        .profile("lifecycle")
         .build()
         .expect("build lifecycle fixture client")
     }

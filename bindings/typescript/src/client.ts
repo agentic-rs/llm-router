@@ -9,6 +9,7 @@ import type {
   NativeTextStream,
 } from "./native.js";
 import {
+  REQUEST_OPTION_NAMES,
   RequestBuilder,
   createRequest,
   normalizeRequestOptions,
@@ -80,8 +81,13 @@ function splitRawOptions(options: RawRequestOptions): {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new RequestError("request options must be an object");
   }
+  const unknownOption = Object.keys(options).find(
+    (name) => name !== "signal" && !REQUEST_OPTION_NAMES.has(name),
+  );
+  if (unknownOption !== undefined) {
+    throw new RequestError(`unknown request option '${unknownOption}'`);
+  }
   const requestOptions = normalizeRequestOptions({
-    ...(options.profile === undefined ? {} : { profile: options.profile }),
     ...(options.request_id === undefined ? {} : { request_id: options.request_id }),
     ...(options.session_id === undefined ? {} : { session_id: options.session_id }),
     ...(options.project_id === undefined ? {} : { project_id: options.project_id }),
@@ -199,6 +205,10 @@ export class Client implements AsyncDisposable {
 
   get authPath(): string {
     return this.native.authPath;
+  }
+
+  get profile(): string {
+    return this.native.profile;
   }
 
   get isClosed(): boolean {

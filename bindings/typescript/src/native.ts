@@ -37,6 +37,7 @@ export interface NativeTextStream {
 export interface NativeClient {
   readonly configPath: string;
   readonly authPath: string;
+  readonly profile: string;
   reload(cancellation: NativeCancellation): Promise<void>;
   close(): Promise<void>;
   request(
@@ -88,7 +89,7 @@ function validateNativeBinding(value: unknown): NativeBinding {
   } catch (cause) {
     throw new ConfigurationError("failed to read the native @tokn/sdk binding ABI version", { cause });
   }
-  if (abiVersion !== 1) {
+  if (abiVersion !== 2) {
     throw new ConfigurationError("the native @tokn/sdk binding uses an unsupported ABI version");
   }
   return value;

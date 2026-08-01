@@ -79,6 +79,7 @@ class FakePullStream<T> {
 class FakeClient implements NativeClient {
   readonly configPath = "/config.toml";
   readonly authPath = "/auth.yaml";
+  readonly profile = "work";
   closeCalls = 0;
   reloadCalls = 0;
   lastRequestJson: string | undefined;
@@ -189,7 +190,7 @@ function fakeBinding(client: FakeClient): NativeBinding & { readonly options: st
     options,
     NativeCancellation: FakeCancellation,
     nativeAbiVersion(): number {
-      return 1;
+      return 2;
     },
     async createClient(optionsJson: string): Promise<NativeClient> {
       options.push(optionsJson);
@@ -215,6 +216,7 @@ test("Client.create is async and exposes resolved source paths", async () => {
 
   assert.equal(client.configPath, "/config.toml");
   assert.equal(client.authPath, "/auth.yaml");
+  assert.equal(client.profile, "work");
   assert.deepEqual(JSON.parse(binding.options[0] ?? ""), {
     config_path: "/custom/config.toml",
     auth_path: "/custom/auth.yaml",
@@ -247,7 +249,7 @@ test("native binding validation uses the public configuration error type", async
 
   setNativeBindingForTests({
     ...fakeBinding(new FakeClient()),
-    nativeAbiVersion: () => 2,
+    nativeAbiVersion: () => 3,
   });
   await assert.rejects(
     Client.create(),
@@ -298,17 +300,33 @@ test("raw endpoint namespaces and methods share the same request path", async ()
 
   const response = await client.chat.completions.create<{ readonly id: string }>(
     { model: "smart", messages: [] },
-    { profile: "work", request_id: "request-1" },
+    { request_id: "request-1" },
   );
 
   assert.equal(response.status, 201);
   assert.equal(response.data.id, "response-1");
   assert.equal(native.lastEndpoint, "chat_completions");
   assert.deepEqual(JSON.parse(native.lastOptionsJson ?? ""), {
-    profile: "work",
     request_id: "request-1",
   });
   assert.deepEqual(response.headers["x-test"], ["one", "two"]);
+});
+
+test("raw requests reject request-scoped profiles before calling native code", async () => {
+  const native = new FakeClient();
+  setNativeBindingForTests(fakeBinding(native));
+  const client = await Client.create({ profile: "work" });
+
+  await assert.rejects(
+    client.responses.create(
+      { model: "smart", input: "hello" },
+      { profile: "other" } as never,
+    ),
+    (error: unknown) =>
+      error instanceof RequestError &&
+      error.message === "unknown request option 'profile'",
+  );
+  assert.equal(native.lastEndpoint, undefined);
 });
 
 test("AbortSignal cancels the native operation", async () => {

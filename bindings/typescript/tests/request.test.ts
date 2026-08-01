@@ -58,7 +58,6 @@ test("detached builder exposes neutral generation controls with snake_case wire 
     .reasoningMode("adaptive")
     .reasoningEffort("high")
     .reasoningSummary("auto")
-    .profile("default")
     .requestId("request-1")
     .header("x-example", "value")
     .extra("metadata", { source: "test" })
@@ -73,12 +72,24 @@ test("detached builder exposes neutral generation controls with snake_case wire 
     summary: "auto",
   });
   assert.deepEqual(value.options, {
-    profile: "default",
     request_id: "request-1",
     headers: [["x-example", "value"]],
   });
   assert.equal("topP" in value, false);
   assert.equal("maxTokens" in value, false);
+});
+
+test("profiles are client-bound and rejected in generation request options", () => {
+  assert.throws(
+    () => createRequest({
+      model: "smart",
+      prompt: "hello",
+      options: { profile: "work" },
+    } as never),
+    (error: unknown) =>
+      error instanceof RequestError &&
+      error.message === "unknown request option 'profile'",
+  );
 });
 
 test("built requests are independent snapshots", () => {
