@@ -25,10 +25,10 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 /// noise from `tokn_router`.
 #[derive(Copy, Clone, Debug)]
 pub enum RunMode {
-  /// Read-only CLI subcommand (account ls, usage stats, config get).
+  /// Read-only CLI subcommand (account ls, usage stats).
   /// Suppresses our own info-level chatter to keep stdout clean.
   ReadOnlyCli,
-  /// Mutating CLI subcommand (login, import, config set).
+  /// Mutating CLI subcommand (login, import).
   MutatingCli,
 }
 

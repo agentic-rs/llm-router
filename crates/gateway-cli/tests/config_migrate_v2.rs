@@ -46,19 +46,35 @@ api_key = {EMBEDDED_SECRET:?}
     self.run_with_args(activation, &[])
   }
 
-  fn run_with_args(&self, activation: &str, args: &[&str]) -> Output {
+  fn command(&self) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tokn-gateway"));
     command
       .arg("--config")
       .arg(&self.config_path)
-      .args(["config", "migrate-v2", "--activate", activation])
-      .args(args)
       .env("HOME", &self.home)
       .env("TOKN_ROUTER_HOME", &self.router_home)
       .env("XDG_CONFIG_HOME", self.home.join(".config"))
       .env("XDG_DATA_HOME", self.home.join(".local/share"))
       .env("XDG_CACHE_HOME", self.home.join(".cache"));
-    command.output().expect("run the gateway CLI")
+    command
+  }
+
+  fn run_config(&self, args: &[&str]) -> Output {
+    self
+      .command()
+      .arg("config")
+      .args(args)
+      .output()
+      .expect("run a config command")
+  }
+
+  fn run_with_args(&self, activation: &str, args: &[&str]) -> Output {
+    self
+      .command()
+      .args(["config", "migrate-v2", "--activate", activation])
+      .args(args)
+      .output()
+      .expect("run the gateway CLI")
   }
 
   fn assert_config_unchanged(&self) {
@@ -114,6 +130,38 @@ fn dry_run_bypasses_legacy_home_and_logging_side_effects() {
   assert!(stderr(&output).lines().all(|line| line.starts_with("warning: ")));
   assert!(!stderr(&output).contains("migrated legacy tokn-router config"));
   fixture.assert_config_unchanged();
+  assert!(!fixture.router_home.join("auth.yaml").exists());
+  fixture.assert_no_logging_state();
+}
+
+#[test]
+fn ordinary_read_only_config_bypasses_legacy_home_and_logging_side_effects() {
+  let fixture = Fixture::new();
+
+  let output = fixture.run_config(&["get", "logging.target"]);
+
+  assert!(output.status.success(), "stderr: {}", stderr(&output));
+  assert_eq!(stdout(&output), "file\n");
+  assert!(!stderr(&output).contains("migrated legacy tokn-router config"));
+  assert_secret_absent(&output);
+  fixture.assert_config_unchanged();
+  assert!(!fixture.router_home.join("auth.yaml").exists());
+  fixture.assert_no_logging_state();
+}
+
+#[test]
+fn ordinary_mutating_config_bypasses_legacy_home_and_logging_side_effects() {
+  let fixture = Fixture::new();
+
+  let output = fixture.run_config(&["set", "logging.target", "stderr"]);
+
+  assert!(output.status.success(), "stderr: {}", stderr(&output));
+  assert_eq!(stdout(&output), "set logging.target\n");
+  assert!(!stderr(&output).contains("migrated legacy tokn-router config"));
+  assert_secret_absent(&output);
+  let config = fs::read_to_string(&fixture.config_path).unwrap();
+  assert!(config.contains("target = \"stderr\""));
+  assert!(config.contains(EMBEDDED_SECRET));
   assert!(!fixture.router_home.join("auth.yaml").exists());
   fixture.assert_no_logging_state();
 }
