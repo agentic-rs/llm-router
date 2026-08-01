@@ -660,6 +660,11 @@ fn execution_descriptor(source: &HttpExecutionError) -> ErrorDescriptor {
     HttpExecutionError::ManagedAttempt { source, .. } => managed_attempt_descriptor(source),
     HttpExecutionError::OpaqueAttempt { source, .. } => opaque_attempt_descriptor(source),
     HttpExecutionError::ManagedResponse { source, .. } => managed_response_descriptor(source),
+    HttpExecutionError::Lifecycle { .. } => ErrorDescriptor::new(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "event_publication_failed",
+      "the request lifecycle could not be recorded",
+    ),
   }
 }
 

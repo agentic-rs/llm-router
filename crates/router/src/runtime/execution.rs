@@ -7,6 +7,10 @@
 //! poll the response body. It does not retry or map outcomes into downstream
 //! HTTP policy.
 
+use super::attempts::{
+  close_pre_head_failure, endpoint_usage_kind, observe_upstream_response, publish_attempt_started,
+  publish_response_head, AttemptBodyPlan, AttemptRequestObserver,
+};
 use super::dispatch::SelectedHttpTarget;
 use super::managed::{
   strip_managed_wire_metadata, ManagedAttemptCoordinator, ManagedAttemptCoordinatorError, RoutedManagedTarget,
@@ -16,13 +20,16 @@ use bytes::Bytes;
 use http::HeaderMap;
 use serde_json::Value;
 use snafu::Snafu;
+use std::future::Future;
 use std::time::Instant;
 use tokn_accounts::link::{NoEligibleReason, SelectionOutcome, TargetResolution};
+use tokn_events::{AttemptNo, RequestPhase};
 use tokn_requests::execution::{
   classify_selection_outcome, ExecutionTarget, HttpAttemptHead, ManagedAttemptError, ManagedClientResponse,
   ManagedHttpExecutor, ManagedResponseError, OpaqueAttemptError, OpaqueHttpAttempt, OpaqueHttpExecutor,
   OpaqueHttpTarget,
 };
+use tokn_requests::{BoundaryPublishError, RequestLifecycle};
 
 /// Shared one-attempt transports for routed v2 HTTP requests.
 ///
@@ -69,6 +76,224 @@ impl HttpExecutionCoordinator {
         self.execute_opaque(site, head, target, request).await
       }
     }
+  }
+
+  /// Execute one routed request while publishing the complete one-attempt
+  /// lifecycle. Live raw response-body ownership is returned to the server
+  /// adapter without buffering.
+  pub(crate) async fn execute_observed(
+    &self,
+    dispatch: RoutedHttpDispatch,
+    request: HttpExecutionRequest,
+    lifecycle: &mut RequestLifecycle,
+    capture_limit: usize,
+  ) -> HttpExecutionResult<ObservedHttpExecutionOutcome> {
+    let (site, head, _profile, resolution) = dispatch.into_parts();
+    let target = match resolution {
+      TargetResolution::Selected(target) => target,
+      TargetResolution::CoolingDown { retry_at } => {
+        return Ok(ObservedHttpExecutionOutcome::CoolingDown { site, retry_at });
+      }
+      TargetResolution::NoEligible { reason } => {
+        return Ok(ObservedHttpExecutionOutcome::NoEligible { site, reason });
+      }
+    };
+
+    publish_attempt_started(lifecycle, target.event_selection())
+      .await
+      .map_err(|source| lifecycle_error(site.clone(), RequestPhase::TargetSelection, source))?;
+    match target {
+      SelectedHttpTarget::Managed(target) => {
+        self
+          .execute_managed_observed(site, target, request, lifecycle, capture_limit)
+          .await
+      }
+      target @ (SelectedHttpTarget::Relay(_) | SelectedHttpTarget::Transparent(_)) => {
+        self
+          .execute_opaque_observed(site, head, target, request, lifecycle, capture_limit)
+          .await
+      }
+    }
+  }
+
+  async fn execute_managed_observed(
+    &self,
+    dispatch_site: HttpDispatchSite,
+    target: RoutedManagedTarget,
+    request: HttpExecutionRequest,
+    lifecycle: &mut RequestLifecycle,
+    capture_limit: usize,
+  ) -> HttpExecutionResult<ObservedHttpExecutionOutcome> {
+    let HttpExecutionBody::Managed(body) = &request.body else {
+      settle_managed_mismatch(&dispatch_site, target);
+      close_pre_head_failure(lifecycle, RequestPhase::TargetSelection)
+        .await
+        .map_err(|source| lifecycle_error(dispatch_site.clone(), RequestPhase::TargetSelection, source))?;
+      return Err(HttpExecutionError::RequestFamilyMismatch { site: dispatch_site });
+    };
+    let semantic_headers = tokn_headers::HeaderMap::from(&request.headers);
+    let received = {
+      let mut observer = AttemptRequestObserver::new(lifecycle, AttemptNo::FIRST, capture_limit);
+      self
+        .managed
+        .receive_observed(target, &semantic_headers, body, None, Some(&mut observer))
+        .await
+    };
+    let received = match received {
+      Ok(received) => received,
+      Err(ManagedAttemptCoordinatorError::Attempt {
+        site: _profile_site,
+        summary: _summary,
+        source,
+      }) => {
+        close_pre_head_failure(lifecycle, RequestPhase::UpstreamRequest)
+          .await
+          .map_err(|event_source| {
+            lifecycle_error(dispatch_site.clone(), RequestPhase::UpstreamRequest, event_source)
+          })?;
+        return Err(HttpExecutionError::ManagedAttempt {
+          site: dispatch_site,
+          source,
+        });
+      }
+      Err(ManagedAttemptCoordinatorError::Response { .. }) => {
+        unreachable!("receiving a managed response cannot adapt its body")
+      }
+    };
+    publish_response_head(lifecycle, received.response().response())
+      .await
+      .map_err(|source| lifecycle_error(dispatch_site.clone(), RequestPhase::UpstreamResponse, source))?;
+    let usage_kind = Some(endpoint_usage_kind(received.response().metadata().upstream_operation()));
+    let mut plan = None;
+    let received = received.map_response(|response| {
+      let (response, metadata) = response.into_parts();
+      let (response, body_plan) = observe_upstream_response(response, capture_limit, usage_kind);
+      plan = Some(body_plan);
+      tokn_requests::execution::ManagedHttpResponse::new(response, metadata)
+    });
+    let body_plan = plan.expect("managed response observation plan is installed before adaptation");
+    body_plan.arm(lifecycle);
+    let mut adaptation = Box::pin(self.managed.adapt(received));
+    let mut progress_available = true;
+    let adapted = std::future::poll_fn(|context| {
+      let result = adaptation.as_mut().poll(context);
+      if progress_available {
+        if let Some(progress) = body_plan.take_progress() {
+          if let Err(error) = lifecycle.try_publish_progress(progress) {
+            progress_available = false;
+            tracing::warn!(error = %error, "upstream body progress publication failed during managed adaptation");
+          }
+        }
+      }
+      result
+    })
+    .await;
+    match adapted {
+      Ok(success) => {
+        let (_profile_site, _summary, response) = success.into_parts();
+        let attempt = if body_plan.is_finished() {
+          body_plan
+            .publish_terminal(lifecycle)
+            .await
+            .map_err(|source| lifecycle_error(dispatch_site.clone(), RequestPhase::UpstreamResponse, source))?;
+          None
+        } else {
+          Some(body_plan)
+        };
+        Ok(ObservedHttpExecutionOutcome::Managed { response, attempt })
+      }
+      Err(ManagedAttemptCoordinatorError::Response {
+        site: _profile_site,
+        summary: _summary,
+        source,
+      }) => {
+        body_plan.publish_terminal(lifecycle).await.map_err(|event_source| {
+          lifecycle_error(dispatch_site.clone(), RequestPhase::UpstreamResponse, event_source)
+        })?;
+        Err(HttpExecutionError::ManagedResponse {
+          site: dispatch_site,
+          source,
+        })
+      }
+      Err(ManagedAttemptCoordinatorError::Attempt { .. }) => {
+        unreachable!("adapting a received managed response cannot send another attempt")
+      }
+    }
+  }
+
+  async fn execute_opaque_observed(
+    &self,
+    site: HttpDispatchSite,
+    head: super::HttpRequestHead,
+    target: SelectedHttpTarget,
+    request: HttpExecutionRequest,
+    lifecycle: &mut RequestLifecycle,
+    capture_limit: usize,
+  ) -> HttpExecutionResult<ObservedHttpExecutionOutcome> {
+    let received = match (target.execution_target(), &request.body) {
+      (ExecutionTarget::Relay(target), HttpExecutionBody::Opaque(body)) => {
+        let attempt = OpaqueHttpAttempt::new(
+          HttpAttemptHead::new(head.method(), head.path_and_query()),
+          OpaqueHttpTarget::Relay(target),
+          &request.headers,
+          body.as_ref(),
+        );
+        let mut observer = AttemptRequestObserver::new(lifecycle, AttemptNo::FIRST, capture_limit);
+        self
+          .opaque
+          .execute_observed(attempt, Some(&mut observer))
+          .await
+          .map_err(AttemptFailure::Opaque)
+      }
+      (ExecutionTarget::Transparent(target), HttpExecutionBody::Opaque(body)) => {
+        let attempt = OpaqueHttpAttempt::new(
+          HttpAttemptHead::new(head.method(), head.path_and_query()),
+          OpaqueHttpTarget::Transparent(target),
+          &request.headers,
+          body.as_ref(),
+        );
+        let mut observer = AttemptRequestObserver::new(lifecycle, AttemptNo::FIRST, capture_limit);
+        self
+          .opaque
+          .execute_observed(attempt, Some(&mut observer))
+          .await
+          .map_err(AttemptFailure::Opaque)
+      }
+      (ExecutionTarget::Managed(_), _)
+      | (ExecutionTarget::Relay(_) | ExecutionTarget::Transparent(_), HttpExecutionBody::Managed(_)) => {
+        Err(AttemptFailure::RequestFamilyMismatch)
+      }
+    };
+    let outcome = match &received {
+      Ok(response) => classify_selection_outcome(response.status()),
+      Err(error) => error.selection_outcome(),
+    };
+    settle_selection(&site, target, outcome);
+
+    let response = match received {
+      Ok(response) => response,
+      Err(AttemptFailure::Opaque(source)) => {
+        close_pre_head_failure(lifecycle, RequestPhase::UpstreamRequest)
+          .await
+          .map_err(|event_source| lifecycle_error(site.clone(), RequestPhase::UpstreamRequest, event_source))?;
+        return Err(HttpExecutionError::OpaqueAttempt { site, source });
+      }
+      Err(AttemptFailure::RequestFamilyMismatch) => {
+        close_pre_head_failure(lifecycle, RequestPhase::TargetSelection)
+          .await
+          .map_err(|event_source| lifecycle_error(site.clone(), RequestPhase::TargetSelection, event_source))?;
+        return Err(HttpExecutionError::RequestFamilyMismatch { site });
+      }
+    };
+    publish_response_head(lifecycle, &response)
+      .await
+      .map_err(|source| lifecycle_error(site.clone(), RequestPhase::UpstreamResponse, source))?;
+    let (response, attempt) = observe_upstream_response(response, capture_limit, None);
+    attempt.arm(lifecycle);
+    Ok(ObservedHttpExecutionOutcome::Opaque {
+      response,
+      attempt: Some(attempt),
+    })
   }
 
   async fn execute_managed(
@@ -221,6 +446,26 @@ pub enum HttpExecutionOutcome {
   },
 }
 
+/// Server-only execution result retaining ownership of a live attempt body.
+pub(crate) enum ObservedHttpExecutionOutcome {
+  Managed {
+    response: ManagedClientResponse,
+    attempt: Option<AttemptBodyPlan>,
+  },
+  Opaque {
+    response: reqwest::Response,
+    attempt: Option<AttemptBodyPlan>,
+  },
+  CoolingDown {
+    site: HttpDispatchSite,
+    retry_at: Instant,
+  },
+  NoEligible {
+    site: HttpDispatchSite,
+    reason: NoEligibleReason,
+  },
+}
+
 impl HttpExecutionOutcome {
   pub fn site(&self) -> &HttpDispatchSite {
     match self {
@@ -257,6 +502,13 @@ pub enum HttpExecutionError {
     site: HttpDispatchSite,
     source: ManagedResponseError,
   },
+
+  #[snafu(display("{site} request lifecycle publication failed during {phase:?}: {source}"))]
+  Lifecycle {
+    site: HttpDispatchSite,
+    phase: RequestPhase,
+    source: Box<BoundaryPublishError>,
+  },
 }
 
 impl HttpExecutionError {
@@ -265,8 +517,17 @@ impl HttpExecutionError {
       Self::RequestFamilyMismatch { site }
       | Self::ManagedAttempt { site, .. }
       | Self::OpaqueAttempt { site, .. }
-      | Self::ManagedResponse { site, .. } => site,
+      | Self::ManagedResponse { site, .. }
+      | Self::Lifecycle { site, .. } => site,
     }
+  }
+}
+
+fn lifecycle_error(site: HttpDispatchSite, phase: RequestPhase, source: BoundaryPublishError) -> HttpExecutionError {
+  HttpExecutionError::Lifecycle {
+    site,
+    phase,
+    source: Box::new(source),
   }
 }
 

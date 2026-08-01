@@ -28,12 +28,13 @@ use tokn_accounts::link::{
 };
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
+use tokn_core::provider::OutboundRequestObserver;
 use tokn_core::AgentId;
 use tokn_headers::HeaderMap as SemanticHeaderMap;
 use tokn_policy::{ProfileId, ProviderId, RouteId, RouteKind, UpstreamId};
 use tokn_requests::execution::{
   ManagedAttemptError, ManagedClientResponse, ManagedExecutionTarget, ManagedHttpAttempt, ManagedHttpExecutor,
-  ManagedResponseAdapter, ManagedResponseError,
+  ManagedHttpResponse, ManagedResponseAdapter, ManagedResponseError,
 };
 
 /// Stable, non-secret location of a managed profile in the linked runtime.
@@ -217,6 +218,21 @@ impl ManagedAttemptCoordinator {
     body: &Value,
     generation_options: Option<&GenerationOptions>,
   ) -> Result<ManagedAttemptSuccess, ManagedAttemptCoordinatorError> {
+    let received = self
+      .receive_observed(target, headers, body, generation_options, None)
+      .await?;
+    self.adapt(received).await
+  }
+
+  /// Send and settle one managed attempt without polling its response body.
+  pub(crate) async fn receive_observed(
+    &self,
+    target: RoutedManagedTarget,
+    headers: &SemanticHeaderMap,
+    body: &Value,
+    generation_options: Option<&GenerationOptions>,
+    request_observer: Option<&mut dyn OutboundRequestObserver>,
+  ) -> Result<ManagedAttemptReceived, ManagedAttemptCoordinatorError> {
     let site = target.site().clone();
     let summary = ManagedSelectionSummary::from_target(&target);
     let received = {
@@ -224,7 +240,7 @@ impl ManagedAttemptCoordinator {
       if let Some(generation_options) = generation_options {
         attempt = attempt.with_generation_options(generation_options);
       }
-      self.executor.execute(attempt).await
+      self.executor.execute_observed(attempt, request_observer).await
     };
     let outcome = match &received {
       Ok(response) => response.selection_outcome(),
@@ -238,6 +254,24 @@ impl ManagedAttemptCoordinator {
         return Err(ManagedAttemptCoordinatorError::Attempt { site, summary, source });
       }
     };
+    Ok(ManagedAttemptReceived {
+      site,
+      summary,
+      response,
+    })
+  }
+
+  /// Adapt a previously settled response, polling it only after callers have
+  /// observed its final upstream head.
+  pub(crate) async fn adapt(
+    &self,
+    received: ManagedAttemptReceived,
+  ) -> Result<ManagedAttemptSuccess, ManagedAttemptCoordinatorError> {
+    let ManagedAttemptReceived {
+      site,
+      summary,
+      response,
+    } = received;
     match self.adapter.adapt(response).await {
       Ok(response) => Ok(ManagedAttemptSuccess {
         site,
@@ -245,6 +279,27 @@ impl ManagedAttemptCoordinator {
         response,
       }),
       Err(source) => Err(ManagedAttemptCoordinatorError::Response { site, summary, source }),
+    }
+  }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedAttemptReceived {
+  site: ManagedProfileSite,
+  summary: ManagedSelectionSummary,
+  response: ManagedHttpResponse,
+}
+
+impl ManagedAttemptReceived {
+  pub(crate) fn response(&self) -> &ManagedHttpResponse {
+    &self.response
+  }
+
+  pub(crate) fn map_response(self, map: impl FnOnce(ManagedHttpResponse) -> ManagedHttpResponse) -> Self {
+    Self {
+      site: self.site,
+      summary: self.summary,
+      response: map(self.response),
     }
   }
 }

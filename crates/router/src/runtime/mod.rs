@@ -1,3 +1,4 @@
+mod attempts;
 mod connect;
 mod dispatch;
 mod execution;
@@ -7,6 +8,7 @@ mod listeners;
 mod managed;
 mod matchers;
 mod names;
+mod observation;
 mod profiles;
 mod resources;
 mod routes;
@@ -19,6 +21,7 @@ pub use dispatch::{
   match_http, HttpDispatchError, HttpDispatchResult, HttpDispatchSite, HttpRequestHead, HttpRequestSemantics,
   HttpRouteMatch, MatchedHttpRoute, RoutedHttpDispatch,
 };
+pub(crate) use execution::ObservedHttpExecutionOutcome;
 pub use execution::{
   HttpExecutionCoordinator, HttpExecutionError, HttpExecutionOutcome, HttpExecutionRequest, HttpExecutionResult,
 };

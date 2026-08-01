@@ -23,6 +23,7 @@ use tokn_accounts::link::{
 use tokn_core::provider::ProviderRequestKind;
 use tokn_core::upstream_url::CanonicalHttpOrigin;
 use tokn_core::AgentId;
+use tokn_events::{HttpFamily, TargetSelection};
 use tokn_policy::{
   BindingId, CanonicalHttpPath, HttpIngress, InvalidHttpPath, ListenerId, ProfileId, ProviderId, RouteId,
 };
@@ -244,6 +245,44 @@ pub(super) enum SelectedHttpTarget {
 }
 
 impl SelectedHttpTarget {
+  pub(super) fn event_selection(&self) -> TargetSelection {
+    match self {
+      Self::Managed(selected) => {
+        let target = selected.target();
+        TargetSelection {
+          family: HttpFamily::Managed,
+          account_id: Some(target.binding().account_id().into()),
+          provider_id: Some(target.upstream().provider_id().as_str().into()),
+          upstream_id: Some(target.upstream().id().as_str().into()),
+          requested_model: Some(selected.requested_model().into()),
+          upstream_model: Some(target.model().into()),
+          requested_operation: Some(selected.requested_operation().as_str().into()),
+          upstream_operation: Some(target.operation().as_str().into()),
+        }
+      }
+      Self::Relay(selected) => TargetSelection {
+        family: HttpFamily::Relay,
+        account_id: Some(selected.target().binding().account_id().into()),
+        provider_id: Some(selected.target().upstream().provider_id().as_str().into()),
+        upstream_id: Some(selected.target().upstream().id().as_str().into()),
+        requested_model: None,
+        upstream_model: None,
+        requested_operation: None,
+        upstream_operation: None,
+      },
+      Self::Transparent(_) => TargetSelection {
+        family: HttpFamily::Transparent,
+        account_id: None,
+        provider_id: None,
+        upstream_id: None,
+        requested_model: None,
+        upstream_model: None,
+        requested_operation: None,
+        upstream_operation: None,
+      },
+    }
+  }
+
   pub(super) fn execution_target(&self) -> ExecutionTarget<'_> {
     match self {
       Self::Managed(selected) => ExecutionTarget::Managed(selected.execution_target()),

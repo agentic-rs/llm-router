@@ -237,6 +237,12 @@ impl RequestTermination {
     self.events.push(event);
   }
 
+  /// Replace request-wide completion when a live response changes outcome
+  /// after its head was delivered (for example, body failure or cancellation).
+  pub fn replace_completion(&mut self, completion: RequestCompletion) {
+    self.completion = completion;
+  }
+
   pub fn events(&self) -> &[RequestTerminalEvent] {
     &self.events
   }
