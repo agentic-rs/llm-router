@@ -14,7 +14,7 @@ use tokn_accounts::AccountHandle;
 use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
 use tokn_core::provider::error;
-use tokn_core::provider::{AuthKind, Endpoint, ModelCache, ModelInfo, Provider, ProviderInfo, RequestCtx};
+use tokn_core::provider::{AuthKind, Endpoint, ModelCache, Provider, ProviderInfo, RequestCtx};
 
 /// One-shot canned response or error returned by a mocked provider endpoint.
 /// Stored behind a [`Mutex`] because the trait method takes `&self`.
@@ -57,11 +57,6 @@ impl MockProvider {
 
   pub fn with_transformer(mut self, t: impl InputTransformer + 'static) -> Self {
     self.transformer = Some(Box::new(t));
-    self
-  }
-
-  pub fn with_default_models(mut self, models: Vec<ModelInfo>) -> Self {
-    self.info.default_models = models;
     self
   }
 

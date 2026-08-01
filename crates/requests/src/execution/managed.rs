@@ -467,7 +467,6 @@ fn classify_provider_error(error: &ProviderError) -> SelectionOutcome {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::test_support::MockProvider;
   use tokn_core::provider;
   use tokn_headers::{HeaderName, HeaderValue};
 
@@ -493,28 +492,6 @@ mod tests {
         .unwrap()
         .insert("transformer_saw_generation".into(), Value::Bool(true));
       Ok(body)
-    }
-  }
-
-  fn model_info(id: &str, reasoning: bool) -> provider::ModelInfo {
-    provider::ModelInfo {
-      id: id.to_string(),
-      name: id.to_string(),
-      capabilities: provider::Capabilities {
-        temperature: true,
-        reasoning,
-        attachment: false,
-        toolcall: true,
-        input: provider::Modalities::TEXT_ONLY,
-        output: provider::Modalities::TEXT_ONLY,
-        interleaved: provider::Interleaved::Disabled(false),
-      },
-      cost: None,
-      limit: provider::Limits {
-        context: 128_000,
-        output: 16_384,
-      },
-      release_date: None,
     }
   }
 
@@ -647,14 +624,15 @@ mod tests {
     let headers = HeaderMap::new();
     let mut input = input(&headers, &body, Endpoint::ChatCompletions, Endpoint::ChatCompletions);
     input.generation_options = Some(&options);
-    let selected_provider = MockProvider::new("openai").with_default_models(vec![model_info("upstream-model", false)]);
+    let selected_provider = PrepareProvider {
+      id: "openai",
+      reasoning_supported: Some(false),
+      transformer: None,
+    };
 
-    let error = prepare_managed_request(
-      input,
-      PrepareProvider::for_selected_model(&selected_provider, "upstream-model"),
-    )
-    .err()
-    .expect("known non-reasoning model must reject typed reasoning");
+    let error = prepare_managed_request(input, selected_provider)
+      .err()
+      .expect("known non-reasoning model must reject typed reasoning");
 
     assert!(matches!(
       &error,
