@@ -5,13 +5,14 @@
 //! every later phase reuses the exact `Arc` nodes produced by the earlier one.
 
 use super::{
-  include_embedded_profile_roots, link_listeners, link_profiles, scan_profile_reachability, EmbeddedProfileRoots,
-  LinkedListeners, LinkedProfiles, ListenerLinkError, ProfileLinkError, RuntimeNameRegistry,
+  include_embedded_profile_roots, link_listeners, link_profiles, link_routes, scan_profile_reachability,
+  EmbeddedProfileRoots, LinkedListeners, LinkedProfiles, LinkedRoutes, ListenerLinkError, ProfileLinkError,
+  RouteLinkError, RuntimeNameRegistry,
 };
 use snafu::Snafu;
 use tokn_accounts::link::{
-  build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes, AccountPoolRuntimes, LinkError,
-  LinkedAccountPools, LinkedRoutes, PoolLinkError, ProviderGraph, RouteLinkError,
+  build_account_pool_runtimes, link_account_pools, link_provider_graph, AccountPoolRuntimes, LinkError,
+  LinkedAccountPools, PoolLinkError, ProviderGraph,
 };
 use tokn_accounts::registry::Registry;
 use tokn_core::account::AccountConfig;
@@ -155,14 +156,12 @@ pub type GatewayLinkResult<T> = std::result::Result<T, GatewayLinkError>;
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::runtime::LinkedHttpAction;
+  use crate::runtime::{LinkedHttpAction, LinkedRouteKind};
   use std::collections::{BTreeMap, BTreeSet};
   use std::net::{Ipv4Addr, SocketAddr};
   use std::sync::Arc;
   use std::time::Duration;
-  use tokn_accounts::link::{
-    LinkError as ProviderGraphLinkError, LinkedRouteKind, PoolLinkError, RouteLinkError, TargetLinkError,
-  };
+  use tokn_accounts::link::{LinkError as ProviderGraphLinkError, PoolLinkError, TargetLinkError};
   use tokn_core::provider::ID_LLAMA_CPP;
   use tokn_policy::{
     AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction,
@@ -385,7 +384,7 @@ mod tests {
 
     assert!(Arc::ptr_eq(action_profile, stored_profile));
     assert!(Arc::ptr_eq(stored_profile.route(), stored_route));
-    assert!(Arc::ptr_eq(managed.pool(), stored_runtime));
+    assert!(Arc::ptr_eq(managed.target().pool(), stored_runtime));
     assert!(Arc::ptr_eq(stored_runtime.pool(), stored_pool));
     assert!(Arc::ptr_eq(graph_binding, pool_binding));
   }

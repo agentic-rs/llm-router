@@ -1,7 +1,7 @@
-//! Request-time target resolution over runtime-linked routes.
+//! Request-time selection over account-owned linked targets.
 //!
-//! Static linking has already removed invalid route, pool, upstream, and
-//! model-group references. This module applies the remaining request facts in
+//! Static linking has already removed invalid pool, upstream, and model-group
+//! references. This module applies the remaining request facts in
 //! a deliberate order: model candidate, operation candidate, then pool-local
 //! account/upstream selection. Selection never sleeps and does not commit
 //! session affinity until a [`SelectionToken`] is settled as healthy.
@@ -29,17 +29,17 @@ pub enum TargetResolution<T> {
   NoEligible { reason: NoEligibleReason },
 }
 
-/// Why a linked route could not select a request-time target.
+/// Why a linked target could not select a request-time account/upstream pair.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NoEligibleReason {
   /// A by-requested fallback selector had no exact group/member match.
   ModelSelectorNoMatch { requested_model: SmolStr },
-  /// A valid qualifier did not name a provider/upstream in the route domain.
+  /// A valid qualifier did not name a provider/upstream in the target domain.
   QualifiedTargetUnavailable {
     namespace: QualificationNamespace,
     qualifier: SmolStr,
   },
-  /// No route candidate serves the exact model and requested/compatible
+  /// No target candidate serves the exact model and requested/compatible
   /// operation combination.
   CapabilityUnavailable {
     requested_model: SmolStr,
@@ -721,14 +721,14 @@ fn retain_earliest(earliest: &mut Option<Instant>, candidate: Instant) {
 mod tests {
   use super::*;
   use crate::link::{
-    build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes, LinkedManagedRoute,
-    LinkedRelayRoute, LinkedRouteKind, LinkedRoutes,
+    build_account_pool_runtimes, link_account_pools, link_managed_target, link_provider_graph, link_relay_target,
+    LinkedManagedTarget, LinkedRelayTarget,
   };
   use crate::registry::Registry;
   use async_trait::async_trait;
   use serde_json::Value;
   use smol_str::SmolStr;
-  use std::collections::{BTreeMap, BTreeSet, HashSet};
+  use std::collections::{BTreeMap, HashSet};
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::time::Duration;
   use tokn_auth::descriptor::{EndpointSpec, ProviderDescriptor};
@@ -934,34 +934,58 @@ mod tests {
     )
   }
 
-  fn link_with_registry(gateway: &GatewayPlan, accounts: &[AccountConfig], registry: &Registry) -> LinkedRoutes {
+  struct ManagedTargetFixture {
+    target: LinkedManagedTarget,
+    operation: OperationPolicy,
+  }
+
+  #[derive(Default)]
+  struct LinkedTargets {
+    managed: BTreeMap<RouteId, ManagedTargetFixture>,
+    relay: BTreeMap<RouteId, LinkedRelayTarget>,
+  }
+
+  fn link_with_registry(gateway: &GatewayPlan, accounts: &[AccountConfig], registry: &Registry) -> LinkedTargets {
     let providers = link_provider_graph(gateway, accounts, registry).unwrap();
     let pools = link_account_pools(gateway, &providers, registry).unwrap();
     let runtimes = build_account_pool_runtimes(&pools);
-    let reachable = gateway.routes().keys().cloned().collect::<BTreeSet<_>>();
-    link_routes(gateway, &reachable, &providers, &runtimes).unwrap()
+    let mut targets = LinkedTargets::default();
+    for (route_id, route) in gateway.routes() {
+      match route {
+        RoutePlan::Managed(route) => {
+          let target = link_managed_target(route.target(), gateway, &providers, &runtimes).unwrap();
+          targets.managed.insert(
+            route_id.clone(),
+            ManagedTargetFixture {
+              target,
+              operation: route.operation(),
+            },
+          );
+        }
+        RoutePlan::Relay(route) => {
+          let target = link_relay_target(route.target(), gateway, &providers, &runtimes).unwrap();
+          targets.relay.insert(route_id.clone(), target);
+        }
+        RoutePlan::Transparent(_) => {}
+      }
+    }
+    targets
   }
 
-  fn link(gateway: &GatewayPlan, accounts: &[AccountConfig]) -> LinkedRoutes {
+  fn link(gateway: &GatewayPlan, accounts: &[AccountConfig]) -> LinkedTargets {
     link_with_registry(gateway, accounts, &Registry::builtin())
   }
 
-  fn managed<'a>(routes: &'a LinkedRoutes, id: &str) -> &'a LinkedManagedRoute {
-    match routes.route(&route_id(id)).unwrap().kind() {
-      LinkedRouteKind::Managed(route) => route,
-      other => panic!("expected managed route, got {other:?}"),
-    }
+  fn managed<'a>(targets: &'a LinkedTargets, id: &str) -> &'a ManagedTargetFixture {
+    targets.managed.get(&route_id(id)).expect("linked managed target")
   }
 
-  fn relay<'a>(routes: &'a LinkedRoutes, id: &str) -> &'a LinkedRelayRoute {
-    match routes.route(&route_id(id)).unwrap().kind() {
-      LinkedRouteKind::Relay(route) => route,
-      other => panic!("expected relay route, got {other:?}"),
-    }
+  fn relay<'a>(targets: &'a LinkedTargets, id: &str) -> &'a LinkedRelayTarget {
+    targets.relay.get(&route_id(id)).expect("linked relay target")
   }
 
   fn resolve_managed_target<F>(
-    route: &LinkedManagedRoute,
+    fixture: &ManagedTargetFixture,
     requested_model: &str,
     requested_operation: Endpoint,
     session_id: Option<&str>,
@@ -971,8 +995,8 @@ mod tests {
     F: Fn(&ProviderId) -> bool,
   {
     super::resolve_managed_target(
-      route.target(),
-      route.operation(),
+      &fixture.target,
+      fixture.operation,
       requested_model,
       requested_operation,
       session_id,
@@ -981,7 +1005,7 @@ mod tests {
   }
 
   fn resolve_relay_target<F>(
-    route: &LinkedRelayRoute,
+    target: &LinkedRelayTarget,
     ingress: &HttpIngress,
     session_id: Option<&str>,
     provider_allowed: F,
@@ -989,11 +1013,12 @@ mod tests {
   where
     F: Fn(&ProviderId) -> bool,
   {
-    super::resolve_relay_target(route.target(), ingress, session_id, provider_allowed)
+    super::resolve_relay_target(target, ingress, session_id, provider_allowed)
   }
 
-  fn warm(route: &LinkedManagedRoute, upstream: &str, models: &[&str]) {
-    route
+  fn warm(fixture: &ManagedTargetFixture, upstream: &str, models: &[&str]) {
+    fixture
+      .target
       .upstreams()
       .upstream(&upstream_id(upstream))
       .unwrap()
@@ -1026,7 +1051,7 @@ mod tests {
     )
   }
 
-  fn affinity_managed_routes(provider: &str, registry: &Registry) -> LinkedRoutes {
+  fn affinity_managed_routes(provider: &str, registry: &Registry) -> LinkedTargets {
     let affinity = SessionAffinityPlan::new(Duration::from_secs(300), Duration::from_secs(60));
     let gateway = gateway(
       BTreeMap::from([(

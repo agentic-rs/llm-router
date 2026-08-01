@@ -590,3 +590,571 @@ fn link_origin_relay_target(
     origins,
   })
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph};
+  use crate::registry::Registry;
+  use smol_str::SmolStr;
+  use std::time::Duration;
+  use tokn_core::account::{AccountConfig, AccountTier};
+  use tokn_core::provider::ID_LLAMA_CPP;
+  use tokn_policy::{
+    AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ModelCandidate, ModelGroupPlan, UpstreamOrigin,
+    UpstreamPlan,
+  };
+
+  struct Inputs {
+    providers: ProviderGraph,
+    runtimes: AccountPoolRuntimes,
+  }
+
+  fn pool_id(value: &str) -> AccountPoolId {
+    AccountPoolId::new(value).unwrap()
+  }
+
+  fn upstream_id(value: &str) -> UpstreamId {
+    UpstreamId::new(value).unwrap()
+  }
+
+  fn provider_id(value: &str) -> ProviderId {
+    ProviderId::new(value).unwrap()
+  }
+
+  fn group_id(value: &str) -> ModelGroupId {
+    ModelGroupId::new(value).unwrap()
+  }
+
+  fn account(id: &str, tier: AccountTier) -> AccountConfig {
+    let mut account: AccountConfig = toml::from_str(
+      r#"
+        id = "fixture"
+        provider = "llama-cpp"
+      "#,
+    )
+    .unwrap();
+    account.id = id.to_string();
+    account.tier = tier;
+    account
+  }
+
+  fn account_pool(account_ids: Option<&[&str]>) -> AccountPoolPlan {
+    AccountPoolPlan::new(
+      AccountSelector::new(
+        None,
+        account_ids.map(|ids| ids.iter().map(SmolStr::new).collect()),
+        BTreeSet::new(),
+      ),
+      AccountSelectionStrategy::RoundRobin,
+      Duration::from_secs(5),
+      None,
+    )
+  }
+
+  fn upstream(base_url: Option<&str>, eligible_accounts: Option<&[&str]>, origins: &[&str]) -> UpstreamPlan {
+    UpstreamPlan::new(
+      provider_id(ID_LLAMA_CPP),
+      base_url.map(Into::into),
+      origins
+        .iter()
+        .map(UpstreamOrigin::new)
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
+      false,
+    )
+    .with_eligible_accounts(eligible_accounts.map(|ids| ids.iter().map(SmolStr::new).collect()))
+  }
+
+  fn plan(
+    pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
+    upstreams: BTreeMap<UpstreamId, UpstreamPlan>,
+    groups: BTreeMap<ModelGroupId, ModelGroupPlan>,
+  ) -> GatewayPlan {
+    GatewayPlan::new(
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      pools,
+      upstreams,
+      groups,
+    )
+  }
+
+  fn build_inputs(plan: &GatewayPlan, accounts: &[AccountConfig]) -> Inputs {
+    let registry = Registry::builtin();
+    let providers = link_provider_graph(plan, accounts, &registry).unwrap();
+    let pools = link_account_pools(plan, &providers, &registry).unwrap();
+    let runtimes = build_account_pool_runtimes(&pools);
+    Inputs { providers, runtimes }
+  }
+
+  #[test]
+  fn managed_domains_follow_pool_bindings_and_share_the_pool_runtime() {
+    let a = upstream_id("a-live");
+    let z = upstream_id("z-live");
+    let gateway = plan(
+      BTreeMap::from([(pool_id("selected"), account_pool(Some(&["selected"])))]),
+      BTreeMap::from([
+        (
+          a.clone(),
+          upstream(Some("https://a.example/v1/"), Some(&["selected"]), &[]),
+        ),
+        (
+          upstream_id("m-dead"),
+          upstream(Some("https://dead.example/v1/"), Some(&["excluded"]), &[]),
+        ),
+        (
+          z.clone(),
+          upstream(Some("https://z.example/v1/"), Some(&["selected"]), &[]),
+        ),
+      ]),
+      BTreeMap::new(),
+    );
+    let inputs = build_inputs(
+      &gateway,
+      &[
+        account("selected", AccountTier::Active),
+        account("excluded", AccountTier::Active),
+      ],
+    );
+    let fixed = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("selected"),
+        UpstreamSelector::Fixed(z),
+        ModelSelector::Capability,
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    )
+    .unwrap();
+    let any = link_managed_target(
+      &ManagedTarget::new(pool_id("selected"), UpstreamSelector::Any, ModelSelector::Capability),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    )
+    .unwrap();
+
+    assert_eq!(
+      fixed
+        .upstreams()
+        .upstreams()
+        .iter()
+        .map(|upstream| upstream.id().as_str())
+        .collect::<Vec<_>>(),
+      ["z-live"]
+    );
+    assert_eq!(
+      any
+        .upstreams()
+        .upstreams()
+        .iter()
+        .map(|upstream| upstream.id().as_str())
+        .collect::<Vec<_>>(),
+      ["a-live", "z-live"]
+    );
+    assert!(Arc::ptr_eq(fixed.pool(), any.pool()));
+    assert!(Arc::ptr_eq(
+      any.pool(),
+      inputs.runtimes.runtime(&pool_id("selected")).unwrap()
+    ));
+    for upstream in any.upstreams().upstreams() {
+      assert!(Arc::ptr_eq(
+        upstream.target().model_cache(),
+        inputs.providers.target(upstream.id()).unwrap().model_cache()
+      ));
+    }
+  }
+
+  #[test]
+  fn managed_domains_reject_unusable_pool_bindings() {
+    let dead = upstream_id("dead");
+    let gateway = plan(
+      BTreeMap::from([(pool_id("empty"), account_pool(None))]),
+      BTreeMap::from([(dead.clone(), upstream(Some("https://dead.example/v1/"), None, &[]))]),
+      BTreeMap::new(),
+    );
+    let inputs = build_inputs(&gateway, &[]);
+
+    let fixed = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("empty"),
+        UpstreamSelector::Fixed(dead.clone()),
+        ModelSelector::Capability,
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      fixed,
+      Err(TargetLinkError::FixedUpstreamUnavailable { pool, upstream })
+        if pool.as_str() == "empty" && upstream == dead
+    ));
+
+    let any = link_managed_target(
+      &ManagedTarget::new(pool_id("empty"), UpstreamSelector::Any, ModelSelector::Capability),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      any,
+      Err(TargetLinkError::NoUsableUpstream { pool }) if pool.as_str() == "empty"
+    ));
+  }
+
+  #[test]
+  fn fallback_prunes_dead_candidates_but_preserves_order_and_request_names() {
+    let live = upstream_id("live");
+    let dead = upstream_id("dead");
+    let group = group_id("coding");
+    let gateway = plan(
+      BTreeMap::from([(pool_id("selected"), account_pool(Some(&["selected"])))]),
+      BTreeMap::from([
+        (
+          dead.clone(),
+          upstream(Some("https://dead.example/v1/"), Some(&["excluded"]), &[]),
+        ),
+        (
+          live.clone(),
+          upstream(Some("https://live.example/v1/"), Some(&["selected"]), &[]),
+        ),
+      ]),
+      BTreeMap::from([(
+        group.clone(),
+        ModelGroupPlan::new(
+          vec![
+            ModelCandidate::new(Some(dead), "dead-model"),
+            ModelCandidate::new(None, "first-live"),
+            ModelCandidate::new(Some(live.clone()), "second-live"),
+          ]
+          .into_boxed_slice(),
+        ),
+      )]),
+    );
+    let inputs = build_inputs(
+      &gateway,
+      &[
+        account("selected", AccountTier::Active),
+        account("excluded", AccountTier::Active),
+      ],
+    );
+    let target = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("selected"),
+        UpstreamSelector::Any,
+        ModelSelector::Fallback(FallbackSelector::Fixed(group.clone())),
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    )
+    .unwrap();
+    let LinkedModelSelector::Fallback(LinkedFallbackSelector::Fixed(group)) = target.model() else {
+      panic!("expected fixed fallback group");
+    };
+
+    assert_eq!(
+      group
+        .candidates()
+        .iter()
+        .map(LinkedModelCandidate::model)
+        .collect::<Vec<_>>(),
+      ["first-live", "second-live"]
+    );
+    assert!(group.matches_requested("dead-model"));
+    assert_eq!(group.candidates()[0].upstream_ids(), std::slice::from_ref(&live));
+    assert_eq!(group.candidates()[1].upstream_ids(), &[live]);
+  }
+
+  #[test]
+  fn fallback_rejects_groups_without_live_candidates_and_unknown_upstreams() {
+    let group = group_id("group");
+    let gateway = plan(
+      BTreeMap::from([(pool_id("selected"), account_pool(Some(&["selected"])))]),
+      BTreeMap::from([
+        (
+          upstream_id("dead"),
+          upstream(Some("https://dead.example/v1/"), Some(&["excluded"]), &[]),
+        ),
+        (
+          upstream_id("live"),
+          upstream(Some("https://live.example/v1/"), Some(&["selected"]), &[]),
+        ),
+      ]),
+      BTreeMap::from([(
+        group.clone(),
+        ModelGroupPlan::new(vec![ModelCandidate::new(Some(upstream_id("dead")), "dead-model")].into_boxed_slice()),
+      )]),
+    );
+    let inputs = build_inputs(
+      &gateway,
+      &[
+        account("selected", AccountTier::Active),
+        account("excluded", AccountTier::Active),
+      ],
+    );
+    let result = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("selected"),
+        UpstreamSelector::Any,
+        ModelSelector::Fallback(FallbackSelector::Fixed(group.clone())),
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      result,
+      Err(TargetLinkError::NoMaterializableCandidates { group: error_group }) if error_group == group
+    ));
+
+    let unknown_group = group_id("unknown-upstream");
+    let gateway = plan(
+      BTreeMap::from([(pool_id("all"), account_pool(None))]),
+      BTreeMap::from([(
+        upstream_id("live"),
+        upstream(Some("https://live.example/v1/"), None, &[]),
+      )]),
+      BTreeMap::from([(
+        unknown_group.clone(),
+        ModelGroupPlan::new(
+          vec![
+            ModelCandidate::new(Some(upstream_id("absent")), "broken"),
+            ModelCandidate::new(None, "live"),
+          ]
+          .into_boxed_slice(),
+        ),
+      )]),
+    );
+    let inputs = build_inputs(&gateway, &[account("account", AccountTier::Active)]);
+    let result = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("all"),
+        UpstreamSelector::Any,
+        ModelSelector::Fallback(FallbackSelector::Fixed(unknown_group)),
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      result,
+      Err(TargetLinkError::MissingUpstream { upstream }) if upstream.as_str() == "absent"
+    ));
+  }
+
+  #[test]
+  fn fallback_rejects_malformed_candidates_and_empty_by_requested_selectors() {
+    let invalid_group = group_id("invalid");
+    let gateway = plan(
+      BTreeMap::from([(pool_id("all"), account_pool(None))]),
+      BTreeMap::from([(
+        upstream_id("live"),
+        upstream(Some("https://live.example/v1/"), None, &[]),
+      )]),
+      BTreeMap::from([(
+        invalid_group.clone(),
+        ModelGroupPlan::new(vec![ModelCandidate::new(None, " bad-model")].into_boxed_slice()),
+      )]),
+    );
+    let inputs = build_inputs(&gateway, &[account("account", AccountTier::Active)]);
+    let invalid = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("all"),
+        UpstreamSelector::Any,
+        ModelSelector::Fallback(FallbackSelector::Fixed(invalid_group.clone())),
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      invalid,
+      Err(TargetLinkError::InvalidModelCandidate {
+        group,
+        index: 0,
+        model,
+      }) if group == invalid_group && model == " bad-model"
+    ));
+
+    let empty = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("all"),
+        UpstreamSelector::Any,
+        ModelSelector::Fallback(FallbackSelector::ByRequested(Box::default())),
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(empty, Err(TargetLinkError::EmptyFallbackSelector)));
+  }
+
+  #[test]
+  fn origin_relay_unions_target_and_configured_origins_and_filters_by_pool() {
+    let live = upstream_id("live");
+    let gateway = plan(
+      BTreeMap::from([(pool_id("selected"), account_pool(Some(&["selected"])))]),
+      BTreeMap::from([
+        (
+          upstream_id("excluded"),
+          upstream(
+            Some("https://excluded.example/v1/"),
+            Some(&["excluded"]),
+            &["https://excluded-alias.example"],
+          ),
+        ),
+        (
+          live.clone(),
+          upstream(
+            Some("https://base.example/v1/"),
+            Some(&["selected"]),
+            &["https://base.example", "https://alias.example"],
+          ),
+        ),
+      ]),
+      BTreeMap::new(),
+    );
+    let inputs = build_inputs(
+      &gateway,
+      &[
+        account("selected", AccountTier::Active),
+        account("excluded", AccountTier::Active),
+      ],
+    );
+    let target = link_relay_target(
+      &RelayTarget::UpstreamFromOrigin {
+        account_pool: pool_id("selected"),
+      },
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    )
+    .unwrap();
+    let origins = target.origins().unwrap();
+    let base = CanonicalHttpOrigin::parse("https://base.example", CleartextHttpPolicy::LoopbackOnly).unwrap();
+    let alias = CanonicalHttpOrigin::parse("https://alias.example", CleartextHttpPolicy::LoopbackOnly).unwrap();
+
+    assert_eq!(target.upstreams().len(), 1);
+    assert!(target.preserves_original_destination());
+    assert_eq!(origins.len(), 2);
+    assert_eq!(origins.get(&base), Some(&live));
+    assert_eq!(origins.get(&alias), Some(&live));
+    assert_eq!(target.upstream_for_origin(&alias).map(LinkedUpstream::id), Some(&live));
+  }
+
+  #[test]
+  fn origin_relay_rejects_ambiguous_origins_and_empty_pools() {
+    let gateway = plan(
+      BTreeMap::from([(pool_id("all"), account_pool(None))]),
+      BTreeMap::from([
+        (upstream_id("first"), upstream(None, None, &[])),
+        (upstream_id("second"), upstream(None, None, &[])),
+      ]),
+      BTreeMap::new(),
+    );
+    let inputs = build_inputs(&gateway, &[account("account", AccountTier::Active)]);
+    let ambiguous = link_relay_target(
+      &RelayTarget::UpstreamFromOrigin {
+        account_pool: pool_id("all"),
+      },
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      ambiguous,
+      Err(TargetLinkError::AmbiguousOrigin {
+        first_upstream,
+        second_upstream,
+        ..
+      }) if first_upstream.as_str() == "first" && second_upstream.as_str() == "second"
+    ));
+
+    let gateway = plan(
+      BTreeMap::from([(pool_id("empty"), account_pool(None))]),
+      BTreeMap::from([(
+        upstream_id("upstream"),
+        upstream(Some("https://upstream.example/v1/"), None, &[]),
+      )]),
+      BTreeMap::new(),
+    );
+    let inputs = build_inputs(&gateway, &[]);
+    let empty = link_relay_target(
+      &RelayTarget::UpstreamFromOrigin {
+        account_pool: pool_id("empty"),
+      },
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      empty,
+      Err(TargetLinkError::NoUsableOrigin { pool }) if pool.as_str() == "empty"
+    ));
+  }
+
+  #[test]
+  fn target_linking_reports_missing_symbolic_references() {
+    let empty = plan(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    let inputs = build_inputs(&empty, &[]);
+    let missing_pool = link_managed_target(
+      &ManagedTarget::new(pool_id("absent"), UpstreamSelector::Any, ModelSelector::Capability),
+      &empty,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      missing_pool,
+      Err(TargetLinkError::MissingPoolRuntime { pool }) if pool.as_str() == "absent"
+    ));
+
+    let gateway = plan(
+      BTreeMap::from([(pool_id("empty"), account_pool(None))]),
+      BTreeMap::new(),
+      BTreeMap::new(),
+    );
+    let inputs = build_inputs(&gateway, &[]);
+    let missing_upstream = link_relay_target(
+      &RelayTarget::FixedUpstream {
+        upstream: upstream_id("absent"),
+        account_pool: pool_id("empty"),
+      },
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      missing_upstream,
+      Err(TargetLinkError::MissingUpstream { upstream }) if upstream.as_str() == "absent"
+    ));
+
+    let gateway = plan(
+      BTreeMap::from([(pool_id("all"), account_pool(None))]),
+      BTreeMap::from([(
+        upstream_id("live"),
+        upstream(Some("https://live.example/v1/"), None, &[]),
+      )]),
+      BTreeMap::new(),
+    );
+    let inputs = build_inputs(&gateway, &[account("account", AccountTier::Active)]);
+    let missing_group = link_managed_target(
+      &ManagedTarget::new(
+        pool_id("all"),
+        UpstreamSelector::Any,
+        ModelSelector::Fallback(FallbackSelector::Fixed(group_id("absent"))),
+      ),
+      &gateway,
+      &inputs.providers,
+      &inputs.runtimes,
+    );
+    assert!(matches!(
+      missing_group,
+      Err(TargetLinkError::MissingModelGroup { group }) if group.as_str() == "absent"
+    ));
+  }
+}

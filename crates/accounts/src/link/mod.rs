@@ -1,7 +1,6 @@
 mod pools;
 mod provider_graph;
 mod resolve;
-mod routes;
 mod selection;
 mod targets;
 
@@ -16,10 +15,6 @@ pub use resolve::{
   resolve_managed_target, resolve_relay_target, NoEligibleReason, QualificationSyntaxError, RelayDestination,
   SelectedManagedTarget, SelectedRelayTarget, SelectionOutcome, SelectionSettlement, SelectionToken, TargetResolution,
   TargetResolveError,
-};
-pub use routes::{
-  link_routes, LinkedManagedRoute, LinkedRelayRoute, LinkedRoute, LinkedRouteKind, LinkedRoutes,
-  LinkedTransparentRoute, RouteLinkError, RouteLinkResult,
 };
 pub use selection::{
   build_account_pool_runtimes, AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, PoolRuntimeError,

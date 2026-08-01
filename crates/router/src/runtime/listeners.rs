@@ -610,11 +610,11 @@ fn link_connect_policy(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::runtime::{link_profiles, scan_profile_reachability};
+  use crate::runtime::{link_profiles, link_routes, scan_profile_reachability};
   use std::collections::BTreeMap;
   use std::net::{IpAddr, Ipv4Addr};
   use std::path::Path;
-  use tokn_accounts::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes};
+  use tokn_accounts::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph};
   use tokn_accounts::registry::Registry;
   use tokn_core::provider::Endpoint;
   use tokn_policy::{

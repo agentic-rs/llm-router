@@ -5,12 +5,11 @@
 //! linked against the exact runtime route graph, without resolving unreachable
 //! symbolic names.
 
-use super::RuntimeNameRegistry;
+use super::{LinkedRoute, LinkedRoutes, RuntimeNameRegistry};
 use snafu::Snafu;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-use tokn_accounts::link::{LinkedRoute, LinkedRoutes};
 use tokn_core::AgentId;
 use tokn_policy::{
   BindingId, GatewayPlan, HttpAction, ListenerId, ProfileId, ProviderId, RouteId, RouteKind, WireIdentity,
@@ -363,12 +362,11 @@ pub type ProfileLinkResult<T> = std::result::Result<T, ProfileLinkError>;
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::runtime::link_routes;
   use smol_str::SmolStr;
   use std::net::{Ipv4Addr, SocketAddr};
   use std::time::Duration;
-  use tokn_accounts::link::{
-    build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes, LinkedRoutes,
-  };
+  use tokn_accounts::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph};
   use tokn_accounts::registry::Registry;
   use tokn_core::account::AccountConfig;
   use tokn_core::provider::{ID_LLAMA_CPP, ID_OPENAI};
