@@ -8,8 +8,8 @@ function usage(): never {
   bun --cwd scripts docker load [--tag <tag>] <image.tar>
   bun --cwd scripts docker load --pr <number>
   bun --cwd scripts docker load --branch <name>
-  bun --cwd scripts docker up [--tag <tag>] [--copy-local-config|--copy-local-accounts] [--force-copy-local] [--port <host-port>] [--proxy-port <host-port>]
-  bun --cwd scripts docker agent [--tag <tag>] [--no-tty] --agent codex|opencode|pi --mode api-route|proxy-switch|api-passthrough|proxy-passthrough [-- <args>]
+  bun --cwd scripts docker up [--tag <tag>] [--copy-local-config|--copy-local-accounts] [--force-copy-local] [--publish <host-port:listener-port>]...
+  bun --cwd scripts docker agent [--tag <tag>] [--no-tty] --agent codex|opencode|pi --transport api|proxy [--listener <id>] [-- <args>]
   bun --cwd scripts docker down [--tag <tag>]
   bun --cwd scripts docker reset [--tag <tag>] --yes
   bun --cwd scripts docker status [--tag <tag>]
