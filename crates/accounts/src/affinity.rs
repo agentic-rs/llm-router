@@ -98,24 +98,6 @@ impl<V: Clone> Affinity<V, SystemClock> {
   }
 }
 
-impl Affinity<String, SystemClock> {
-  #[cfg(test)]
-  pub(crate) fn rewind_live_entry(&self, key: &str, delta: Duration) -> bool {
-    let mut g = self.map.write();
-    let Some(entry) = g.get_mut(key) else {
-      return false;
-    };
-    if entry.value.is_empty() {
-      return false;
-    }
-    let Some(stamped_at) = entry.stamped_at.checked_sub(delta) else {
-      return false;
-    };
-    entry.stamped_at = stamped_at;
-    true
-  }
-}
-
 impl<V: Clone, C: Clock> Affinity<V, C> {
   fn with_clock_and_absolute_retention(ttl: C::Duration, retained_ttl: C::Duration, clock: C) -> Self {
     Self {

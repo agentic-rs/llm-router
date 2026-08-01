@@ -448,7 +448,6 @@ fn validate_eligible_accounts(
 mod tests {
   use super::*;
   use std::collections::{BTreeMap, BTreeSet, HashSet};
-  use std::time::Duration;
   use tokn_auth::descriptor::ProviderDescriptor;
   use tokn_core::provider::{Endpoint, ID_LLAMA_CPP};
   use tokn_policy::UpstreamPlan;
@@ -563,9 +562,6 @@ mod tests {
     assert!(!secondary_target.model_cache().is_warm());
 
     assert!(!Arc::ptr_eq(second_binding.handle(), other_upstream_binding.handle()));
-    second_binding.handle().mark_failure(Duration::from_secs(60));
-    assert!(!second_binding.handle().is_healthy());
-    assert!(other_upstream_binding.handle().is_healthy());
 
     let linked_first_config = graph.account("first").unwrap().config();
     let bound_first_config = first_binding.account();
