@@ -10,6 +10,8 @@ pub use tokn_core::AgentId;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokn_core::provider::ID_GITHUB_COPILOT;
@@ -43,6 +45,206 @@ impl<'a> ConfigEditPreimage<'a> {
   }
 }
 
+/// An exclusive advisory lock for one config file.
+///
+/// The lock is represented by a persistent, same-directory lock file. Dropping
+/// this guard releases the operating-system lock but deliberately leaves that
+/// file in place so concurrent processes always lock the same inode.
+#[derive(Debug)]
+#[must_use = "dropping the config lock immediately releases it"]
+pub struct ConfigFileLock {
+  path: PathBuf,
+  requested_path: PathBuf,
+  file: File,
+}
+
+impl ConfigFileLock {
+  /// The config file protected by this guard, with its parent directory
+  /// canonicalized so lexical aliases share one lock.
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Atomically replace arbitrary config contents under this already-held
+  /// lock when the target still has the expected exact preimage.
+  ///
+  /// `None` requires the target to remain missing. `Some(bytes)` requires it
+  /// to be present with those exact bytes. The target itself must not be a
+  /// symbolic link. That condition is checked before the initial read and
+  /// again immediately before the final preimage check and atomic replace.
+  pub fn replace_contents_if_unchanged(&self, expected: Option<&[u8]>, contents: &[u8]) -> GuardedEditResult<()> {
+    replace_contents_if_unchanged_locked(&self.path, &self.requested_path, expected, contents)
+  }
+}
+
+impl Drop for ConfigFileLock {
+  fn drop(&mut self) {
+    let _ = self.file.unlock();
+  }
+}
+
+/// Try to acquire the exclusive advisory writer lock for `path`.
+///
+/// This call never waits for another writer. It creates the target directory
+/// and a persistent same-directory lock file when needed, then returns
+/// [`Error::ConfigLocked`] when another cooperating process holds the lock.
+pub fn lock_config_file(path: &Path) -> Result<ConfigFileLock> {
+  ensure_config_parent(path)?;
+  let requested_path = path;
+  let path = canonical_config_path(path)?;
+  let lock_path = config_lock_path(&path)?;
+  reject_config_lock_symlink(requested_path, &lock_path)?;
+  let mut options = OpenOptions::new();
+  options.read(true).write(true).create(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+  }
+  let file = options.open(&lock_path).map_err(|source| Error::ConfigLock {
+    path: requested_path.to_path_buf(),
+    lock_path: lock_path.clone(),
+    source,
+  })?;
+  validate_open_config_lock(requested_path, &lock_path, &file)?;
+  match file.try_lock() {
+    Ok(()) => {
+      validate_open_config_lock(requested_path, &lock_path, &file)?;
+      Ok(ConfigFileLock {
+        path,
+        requested_path: requested_path.to_path_buf(),
+        file,
+      })
+    }
+    Err(std::fs::TryLockError::WouldBlock) => Err(Error::ConfigLocked {
+      path: requested_path.to_path_buf(),
+      lock_path,
+    }),
+    Err(std::fs::TryLockError::Error(source)) => Err(Error::ConfigLock {
+      path: requested_path.to_path_buf(),
+      lock_path,
+      source,
+    }),
+  }
+}
+
+fn config_parent(path: &Path) -> &Path {
+  path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."))
+}
+
+fn canonical_config_path(path: &Path) -> Result<PathBuf> {
+  let file_name = path.file_name().ok_or_else(|| Error::InvalidConfigLockPath {
+    path: path.to_path_buf(),
+  })?;
+  let parent = config_parent(path);
+  let canonical_parent = std::fs::canonicalize(parent).map_err(|source| Error::ResolveConfigDirectory {
+    path: path.to_path_buf(),
+    parent: parent.to_path_buf(),
+    source,
+  })?;
+  Ok(canonical_parent.join(file_name))
+}
+
+fn config_lock_path(path: &Path) -> Result<PathBuf> {
+  let file_name = path.file_name().ok_or_else(|| Error::InvalidConfigLockPath {
+    path: path.to_path_buf(),
+  })?;
+  let mut lock_name = OsString::from(".");
+  lock_name.push(file_name);
+  lock_name.push(".lock");
+  Ok(path.with_file_name(lock_name))
+}
+
+fn reject_config_lock_symlink(path: &Path, lock_path: &Path) -> Result<()> {
+  match std::fs::symlink_metadata(lock_path) {
+    Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::ConfigLockSymlink {
+      path: path.to_path_buf(),
+      lock_path: lock_path.to_path_buf(),
+    }),
+    Ok(metadata) if !metadata.is_file() => Err(invalid_config_lock_file(path, lock_path, "must be a regular file")),
+    Ok(_) => Ok(()),
+    Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    Err(source) => Err(Error::ConfigLock {
+      path: path.to_path_buf(),
+      lock_path: lock_path.to_path_buf(),
+      source,
+    }),
+  }
+}
+
+fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Result<()> {
+  let opened = file.metadata().map_err(|source| Error::ConfigLock {
+    path: path.to_path_buf(),
+    lock_path: lock_path.to_path_buf(),
+    source,
+  })?;
+  let linked = match std::fs::symlink_metadata(lock_path) {
+    Ok(metadata) if metadata.file_type().is_symlink() => {
+      return Err(Error::ConfigLockSymlink {
+        path: path.to_path_buf(),
+        lock_path: lock_path.to_path_buf(),
+      });
+    }
+    Ok(metadata) if !metadata.is_file() => {
+      return Err(invalid_config_lock_file(path, lock_path, "must be a regular file"));
+    }
+    Ok(metadata) => metadata,
+    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+      return Err(Error::ConfigLockChanged {
+        path: path.to_path_buf(),
+        lock_path: lock_path.to_path_buf(),
+      });
+    }
+    Err(source) => {
+      return Err(Error::ConfigLock {
+        path: path.to_path_buf(),
+        lock_path: lock_path.to_path_buf(),
+        source,
+      });
+    }
+  };
+
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    if opened.dev() != linked.dev() || opened.ino() != linked.ino() {
+      return Err(Error::ConfigLockChanged {
+        path: path.to_path_buf(),
+        lock_path: lock_path.to_path_buf(),
+      });
+    }
+  }
+
+  #[cfg(windows)]
+  {
+    use std::os::windows::fs::MetadataExt;
+    let opened_identity = (opened.volume_serial_number(), opened.file_index());
+    let linked_identity = (linked.volume_serial_number(), linked.file_index());
+    if opened_identity.0.is_some() && opened_identity.1.is_some() && opened_identity != linked_identity {
+      return Err(Error::ConfigLockChanged {
+        path: path.to_path_buf(),
+        lock_path: lock_path.to_path_buf(),
+      });
+    }
+  }
+
+  Ok(())
+}
+
+fn invalid_config_lock_file(path: &Path, lock_path: &Path, reason: &str) -> Error {
+  Error::ConfigLock {
+    path: path.to_path_buf(),
+    lock_path: lock_path.to_path_buf(),
+    source: std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      format!("config lock `{}` {reason}", lock_path.display()),
+    ),
+  }
+}
+
 /// Atomically replace arbitrary config contents when the target still has the
 /// expected exact preimage.
 ///
@@ -52,22 +254,34 @@ impl<'a> ConfigEditPreimage<'a> {
 ///
 /// A missing target is installed with create-if-absent semantics, so a file
 /// that appears while the replacement is being staged is never overwritten.
-/// For an existing target, portable filesystems do not offer content-based
-/// compare-and-swap; callers must serialize cooperating writers and must not
-/// externally edit the file concurrently with the final check-and-rename
-/// window.
+/// The target must not be a symbolic link. This function serializes project
+/// config writers with [`lock_config_file`], but a non-cooperating external
+/// editor can still race the final check-and-rename window for an existing
+/// target because portable filesystems do not offer content-based
+/// compare-and-swap.
 pub fn replace_contents_if_unchanged(path: &Path, expected: Option<&[u8]>, contents: &[u8]) -> GuardedEditResult<()> {
+  let lock = lock_config_file(path)?;
+  lock.replace_contents_if_unchanged(expected, contents)
+}
+
+fn replace_contents_if_unchanged_locked(
+  path: &Path,
+  error_path: &Path,
+  expected: Option<&[u8]>,
+  contents: &[u8],
+) -> GuardedEditResult<()> {
+  reject_config_symlink(path, error_path)?;
   let expected = ConfigEditPreimage::from_expected(expected);
   let current = read_optional_config_bytes(path)?;
   if !expected.matches(current.as_deref()) {
     return Err(GuardedEditError::Changed {
-      path: path.to_path_buf(),
+      path: error_path.to_path_buf(),
     });
   }
 
   ensure_config_parent(path)?;
   let staged = stage_atomic_contents(path, contents)?;
-  commit_staged_atomic_write_guarded(path, staged, expected)
+  commit_staged_atomic_write_guarded(path, error_path, staged, expected)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -718,13 +932,10 @@ impl Config {
   }
 
   pub fn save(&self, path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent).context(error::CreateDirSnafu {
-        path: parent.to_path_buf(),
-      })?;
-    }
+    let lock = lock_config_file(path)?;
+    let locked_path = lock.path();
     let toml = toml::to_string_pretty(self).context(error::SerializeSnafu)?;
-    write_atomic(path, &toml)?;
+    write_atomic_locked(locked_path, &toml)?;
     tracing::debug!(path = %path.display(), "config saved");
     Ok(())
   }
@@ -745,15 +956,17 @@ impl Config {
   where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
   {
-    let raw = if path.exists() {
-      std::fs::read_to_string(path).context(error::ReadSnafu {
+    let lock = lock_config_file(path)?;
+    let locked_path = lock.path();
+    let raw = if locked_path.exists() {
+      std::fs::read_to_string(locked_path).context(error::ReadSnafu {
         path: path.to_path_buf(),
       })?
     } else {
       String::new()
     };
     let serialised = Self::serialise_edit(path, raw, f)?;
-    write_config_contents(path, &serialised)?;
+    write_config_contents_locked(locked_path, &serialised)?;
     Ok(serialised)
   }
 
@@ -765,10 +978,10 @@ impl Config {
   /// the edit closure is invoked and again after the replacement is staged.
   ///
   /// A missing preimage is installed with create-if-absent semantics. For an
-  /// existing file, portable filesystems do not offer content-based
-  /// compare-and-swap; callers must serialize cooperating writers and must not
-  /// externally edit the generated file concurrently with the final
-  /// check-and-rename window.
+  /// existing file, this method serializes project config writers, but a
+  /// non-cooperating external editor can still race the final
+  /// check-and-rename window because portable filesystems do not offer
+  /// content-based compare-and-swap.
   pub fn edit_in_place_with_contents_if_unchanged<F>(
     path: &Path,
     expected: Option<&[u8]>,
@@ -777,8 +990,10 @@ impl Config {
   where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
   {
+    let lock = lock_config_file(path)?;
+    let locked_path = lock.path();
     let expected = ConfigEditPreimage::from_expected(expected);
-    let current = read_optional_config_bytes(path)?;
+    let current = read_optional_config_bytes(locked_path)?;
     if !expected.matches(current.as_deref()) {
       return Err(GuardedEditError::Changed {
         path: path.to_path_buf(),
@@ -792,8 +1007,8 @@ impl Config {
       None => String::new(),
     };
     let serialised = Self::serialise_edit(path, raw, f)?;
-    ensure_config_parent(path)?;
-    write_atomic_guarded(path, &serialised, expected)?;
+    ensure_config_parent(locked_path)?;
+    write_atomic_guarded_locked(locked_path, path, &serialised, expected)?;
     Ok(serialised)
   }
 
@@ -830,7 +1045,7 @@ impl Config {
 }
 
 fn ensure_config_parent(path: &Path) -> Result<()> {
-  if let Some(parent) = path.parent() {
+  if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
     std::fs::create_dir_all(parent).context(error::CreateDirSnafu {
       path: parent.to_path_buf(),
     })?;
@@ -838,9 +1053,9 @@ fn ensure_config_parent(path: &Path) -> Result<()> {
   Ok(())
 }
 
-fn write_config_contents(path: &Path, contents: &str) -> Result<()> {
+fn write_config_contents_locked(path: &Path, contents: &str) -> Result<()> {
   ensure_config_parent(path)?;
-  write_atomic(path, contents)
+  write_atomic_locked(path, contents)
 }
 
 fn read_optional_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1176,7 +1391,7 @@ fn is_proxy_host(s: &str) -> bool {
       .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'*'))
 }
 
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+fn write_atomic_locked(path: &Path, contents: &str) -> Result<()> {
   let staged = stage_atomic_write(path, contents)?;
   let from = staged.path().to_path_buf();
   staged.persist(path).map(|_| ()).map_err(|error| Error::Rename {
@@ -1186,20 +1401,27 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
   })
 }
 
-fn write_atomic_guarded(path: &Path, contents: &str, expected: ConfigEditPreimage<'_>) -> GuardedEditResult<()> {
+fn write_atomic_guarded_locked(
+  path: &Path,
+  error_path: &Path,
+  contents: &str,
+  expected: ConfigEditPreimage<'_>,
+) -> GuardedEditResult<()> {
   let staged = stage_atomic_write(path, contents)?;
-  commit_staged_atomic_write_guarded(path, staged, expected)
+  commit_staged_atomic_write_guarded(path, error_path, staged, expected)
 }
 
 fn commit_staged_atomic_write_guarded(
   path: &Path,
+  error_path: &Path,
   staged: tempfile::NamedTempFile,
   expected: ConfigEditPreimage<'_>,
 ) -> GuardedEditResult<()> {
+  reject_config_symlink(path, error_path)?;
   let current = read_optional_config_bytes(path)?;
   if !expected.matches(current.as_deref()) {
     return Err(GuardedEditError::Changed {
-      path: path.to_path_buf(),
+      path: error_path.to_path_buf(),
     });
   }
 
@@ -1208,7 +1430,7 @@ fn commit_staged_atomic_write_guarded(
     ConfigEditPreimage::Missing => match staged.persist_noclobber(path) {
       Ok(_) => Ok(()),
       Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Err(GuardedEditError::Changed {
-        path: path.to_path_buf(),
+        path: error_path.to_path_buf(),
       }),
       Err(error) => Err(
         Error::Write {
@@ -1226,6 +1448,20 @@ fn commit_staged_atomic_write_guarded(
       })?;
       Ok(())
     }
+  }
+}
+
+fn reject_config_symlink(path: &Path, error_path: &Path) -> Result<()> {
+  match std::fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::ConfigSymlink {
+      path: error_path.to_path_buf(),
+    }),
+    Ok(_) => Ok(()),
+    Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    Err(source) => Err(Error::Read {
+      path: path.to_path_buf(),
+      source,
+    }),
   }
 }
 
@@ -1927,6 +2163,120 @@ profile = "opencode"
   }
 
   #[test]
+  fn config_file_lock_reports_contention_and_can_be_reacquired_after_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let first = lock_config_file(&path).unwrap();
+
+    let error = lock_config_file(&path).unwrap_err();
+
+    assert!(matches!(error, Error::ConfigLocked { path: locked, .. } if locked == path));
+    let lock_path = config_lock_path(first.path()).unwrap();
+    assert_eq!(lock_path.parent(), first.path().parent());
+
+    drop(first);
+    assert!(lock_path.is_file());
+    let _reacquired = lock_config_file(&path).unwrap();
+  }
+
+  #[test]
+  fn config_file_lock_normalizes_parent_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("nested");
+    std::fs::create_dir(&parent).unwrap();
+    let path = parent.join("config.toml");
+    let alias = parent.join("../nested/config.toml");
+    let first = lock_config_file(&path).unwrap();
+
+    let error = lock_config_file(&alias).unwrap_err();
+
+    assert_eq!(first.path(), canonical_config_path(&path).unwrap());
+    assert!(matches!(error, Error::ConfigLocked { path: locked, .. } if locked == alias));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn config_file_lock_rejects_a_preexisting_lock_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let lock_path = config_lock_path(&canonical_config_path(&path).unwrap()).unwrap();
+    let victim = dir.path().join("victim.lock");
+    std::fs::write(&victim, "do not use as a lock").unwrap();
+    symlink(&victim, &lock_path).unwrap();
+
+    let error = lock_config_file(&path).unwrap_err();
+
+    assert!(matches!(
+      error,
+      Error::ConfigLockSymlink {
+        path: rejected,
+        lock_path: rejected_lock,
+      } if rejected == path && rejected_lock == lock_path
+    ));
+    assert!(std::fs::symlink_metadata(&lock_path).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not use as a lock");
+  }
+
+  #[test]
+  fn held_config_file_lock_can_replace_a_snapshotted_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"legacy contents";
+    let replacement = b"generated v2 contents";
+    std::fs::write(&path, initial).unwrap();
+    let lock = lock_config_file(&path).unwrap();
+    let snapshot = std::fs::read(lock.path()).unwrap();
+
+    lock
+      .replace_contents_if_unchanged(Some(&snapshot), replacement)
+      .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    let error = replace_contents_if_unchanged(&path, Some(replacement), b"recursive writer").unwrap_err();
+    assert!(matches!(error, GuardedEditError::Config(Error::ConfigLocked { path: locked, .. }) if locked == path));
+  }
+
+  #[test]
+  fn existing_config_writers_share_the_public_file_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let lock = lock_config_file(&path).unwrap();
+
+    let save_error = Config::default().save(&path).unwrap_err();
+    let edit_error = Config::edit_in_place(&path, |_| Ok(())).unwrap_err();
+
+    assert!(matches!(save_error, Error::ConfigLocked { path: locked, .. } if locked == path));
+    assert!(matches!(edit_error, Error::ConfigLocked { path: locked, .. } if locked == path));
+
+    drop(lock);
+    Config::default().save(&path).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn replace_contents_rejects_a_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let victim = dir.path().join("victim.toml");
+    let initial = b"victim contents";
+    std::fs::write(&victim, initial).unwrap();
+    symlink(&victim, &path).unwrap();
+
+    let error = replace_contents_if_unchanged(&path, Some(initial), b"replacement").unwrap_err();
+
+    assert!(matches!(
+      error,
+      GuardedEditError::Config(Error::ConfigSymlink { path: rejected }) if rejected == path
+    ));
+    assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read(&victim).unwrap(), initial);
+  }
+
+  #[test]
   fn replace_contents_rejects_changed_bytes_and_preserves_the_target() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -2018,7 +2368,8 @@ profile = "opencode"
     let staged_path = staged.path().to_path_buf();
     std::fs::write(&path, concurrent).unwrap();
 
-    let error = commit_staged_atomic_write_guarded(&path, staged, ConfigEditPreimage::Contents(initial)).unwrap_err();
+    let error =
+      commit_staged_atomic_write_guarded(&path, &path, staged, ConfigEditPreimage::Contents(initial)).unwrap_err();
 
     assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
     assert_eq!(std::fs::read(&path).unwrap(), concurrent);
@@ -2039,9 +2390,9 @@ profile = "opencode"
     let second_staged_path = second_staged.path().to_path_buf();
 
     assert_ne!(first_staged_path, second_staged_path);
-    commit_staged_atomic_write_guarded(&path, first_staged, ConfigEditPreimage::Contents(initial)).unwrap();
-    let error =
-      commit_staged_atomic_write_guarded(&path, second_staged, ConfigEditPreimage::Contents(initial)).unwrap_err();
+    commit_staged_atomic_write_guarded(&path, &path, first_staged, ConfigEditPreimage::Contents(initial)).unwrap();
+    let error = commit_staged_atomic_write_guarded(&path, &path, second_staged, ConfigEditPreimage::Contents(initial))
+      .unwrap_err();
 
     assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
     assert_eq!(std::fs::read(&path).unwrap(), first);
@@ -2058,7 +2409,7 @@ profile = "opencode"
     let staged_path = staged.path().to_path_buf();
     std::fs::write(&path, concurrent).unwrap();
 
-    let error = commit_staged_atomic_write_guarded(&path, staged, ConfigEditPreimage::Missing).unwrap_err();
+    let error = commit_staged_atomic_write_guarded(&path, &path, staged, ConfigEditPreimage::Missing).unwrap_err();
 
     assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
     assert_eq!(std::fs::read(&path).unwrap(), concurrent);
