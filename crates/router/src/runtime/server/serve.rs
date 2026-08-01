@@ -602,6 +602,26 @@ mod tests {
     (bound, address, weak)
   }
 
+  async fn bound_intercept_generation() -> (
+    tempfile::TempDir,
+    BoundGatewayListeners,
+    SocketAddr,
+    std::sync::Weak<GatewayServerState>,
+  ) {
+    let temp = tempfile::tempdir().unwrap();
+    let reservation = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let reserved_address = reservation.local_addr().unwrap();
+    let plan = intercept_plan(reserved_address, temp.path().join("ca"));
+    let runtime = linked_runtime(&plan);
+    let resources = materialize_listeners(runtime.listeners(), None).unwrap();
+    let gateway = serving_generation(runtime);
+    let weak = Arc::downgrade(&gateway);
+    drop(reservation);
+    let bound = bind_gateway_listeners(gateway, resources).await.unwrap();
+    let address = bound.listener(&listener_id()).unwrap().local_addr().unwrap();
+    (temp, bound, address, weak)
+  }
+
   async fn read_response_head<S>(stream: &mut S) -> (Vec<u8>, Vec<u8>)
   where
     S: tokio::io::AsyncRead + Unpin,
@@ -988,6 +1008,40 @@ mod tests {
       timeout(TEST_TIMEOUT, upstream.read(&mut byte)).await.unwrap().unwrap(),
       0
     );
+    assert!(weak_gateway.upgrade().is_none());
+  }
+
+  #[tokio::test]
+  async fn gateway_shutdown_cancels_stalled_interception_and_releases_generation() {
+    let (_temp, bound, proxy_address, weak_gateway) = bound_intercept_generation().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+      serve_gateway_listeners(bound, async {
+        let _ = shutdown_rx.await;
+      })
+      .await
+    });
+
+    let mut client = TcpStream::connect(proxy_address).await.unwrap();
+    client
+      .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
+      .await
+      .unwrap();
+    let (head, read_ahead) = timeout(TEST_TIMEOUT, read_response_head(&mut client)).await.unwrap();
+    assert!(std::str::from_utf8(&head).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(read_ahead.is_empty());
+
+    // Leave rustls waiting for the final byte of the TLS record header.
+    client.write_all(&[0x16, 0x03, 0x03, 0x00]).await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().unwrap();
+
+    let mut byte = [0u8; 1];
+    match timeout(TEST_TIMEOUT, client.read(&mut byte)).await.unwrap() {
+      Ok(0) => {}
+      Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+      result => panic!("intercepted client remained open after shutdown: {result:?}"),
+    }
     assert!(weak_gateway.upgrade().is_none());
   }
 }
