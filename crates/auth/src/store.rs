@@ -55,12 +55,22 @@ impl std::fmt::Debug for SourceBaseline {
   }
 }
 
-/// Exact bytes observed when a source was loaded. This lets a later save
-/// reject a concurrent credential rotation instead of overwriting it.
+/// Exact bytes observed when a source was loaded. This detects changes before
+/// a staged commit. Missing sources additionally use atomic create-if-absent;
+/// replacing an existing source retains the portable check-to-rename window.
 #[derive(Clone, PartialEq, Eq)]
 enum SourceSnapshot {
   Missing,
   Contents(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFileInstall {
+  /// Atomically install the staged inode only if the target is still absent.
+  CreateIfAbsent,
+  /// Replace after exact-byte validation. Portable filesystems do not expose
+  /// a content-based compare-and-swap for the final rename window.
+  Replace,
 }
 
 impl std::fmt::Debug for SourceSnapshot {
@@ -92,6 +102,13 @@ impl SourceSnapshot {
       );
     }
     Ok(())
+  }
+
+  fn install_mode(&self) -> AuthFileInstall {
+    match self {
+      Self::Missing => AuthFileInstall::CreateIfAbsent,
+      Self::Contents(_) => AuthFileInstall::Replace,
+    }
   }
 }
 
@@ -144,7 +161,16 @@ impl AuthStore {
   /// Persist every source whose accounts changed. New account ids added by
   /// direct mutation default to the root source; use [`Self::upsert_in_shard`]
   /// for an agent-owned credential.
+  ///
+  /// A source missing at load is installed atomically only if it remains
+  /// absent. Existing sources are revalidated after staging, but their final
+  /// portable rename is not a content-based compare-and-swap; cooperating
+  /// writers must still serialize replacements.
   pub fn save(&mut self) -> Result<()> {
+    self.save_with_before_commit(|_| {})
+  }
+
+  fn save_with_before_commit(&mut self, mut before_commit: impl FnMut(&Path)) -> Result<()> {
     let mut source_paths = self.source_paths.clone();
     let mut accounts_by_source = BTreeMap::<AuthSource, Vec<AccountConfig>>::new();
     let mut account_ids = BTreeSet::new();
@@ -174,8 +200,15 @@ impl AuthStore {
     }
 
     for (source, path, current, accounts) in changes {
+      let install = self
+        .source_snapshots
+        .get(&source)
+        .map(SourceSnapshot::install_mode)
+        .ok_or_else(|| anyhow!("missing load-time snapshot for {}", path.display()))?;
+      let staged = stage_auth_file(&path, &accounts)?;
       self.validate_sources_unchanged()?;
-      let contents = write_auth_file(&path, &accounts)?;
+      before_commit(&path);
+      let contents = staged.commit(&path, install)?;
       self.source_baselines.insert(source.clone(), current);
       self.source_snapshots.insert(source, SourceSnapshot::Contents(contents));
     }
@@ -464,7 +497,59 @@ fn account_fingerprints(accounts: &[AccountConfig]) -> Result<BTreeMap<String, S
   Ok(fingerprints)
 }
 
-fn write_auth_file(path: &Path, accounts: &[AccountConfig]) -> Result<Vec<u8>> {
+struct StagedAuthFile {
+  file: StagedPrivateFile,
+  contents: Vec<u8>,
+}
+
+impl StagedAuthFile {
+  fn commit(self, path: &Path, install: AuthFileInstall) -> Result<Vec<u8>> {
+    let Self { file, contents } = self;
+    match file.commit(path, install) {
+      Ok(()) => Ok(contents),
+      Err(error) if install == AuthFileInstall::CreateIfAbsent && error.kind() == std::io::ErrorKind::AlreadyExists => {
+        bail!(
+          "{} changed after loading the auth store; retry the command",
+          path.display()
+        )
+      }
+      Err(error) => Err(error).with_context(|| format!("writing {}", path.display())),
+    }
+  }
+}
+
+struct StagedPrivateFile {
+  path: Option<PathBuf>,
+}
+
+impl StagedPrivateFile {
+  fn commit(mut self, path: &Path, install: AuthFileInstall) -> std::io::Result<()> {
+    let temporary = self.path.as_deref().expect("staged auth file should have a path");
+    match install {
+      AuthFileInstall::CreateIfAbsent => {
+        fs::hard_link(temporary, path)?;
+        // The target is installed once the link succeeds. Temporary-name
+        // cleanup is best effort and retried by Drop; it must not make the
+        // successful credential write look like a failed save.
+        let _ = fs::remove_file(temporary);
+        return Ok(());
+      }
+      AuthFileInstall::Replace => fs::rename(temporary, path)?,
+    }
+    self.path = None;
+    Ok(())
+  }
+}
+
+impl Drop for StagedPrivateFile {
+  fn drop(&mut self) {
+    if let Some(path) = &self.path {
+      let _ = fs::remove_file(path);
+    }
+  }
+}
+
+fn stage_auth_file(path: &Path, accounts: &[AccountConfig]) -> Result<StagedAuthFile> {
   let file = AuthFile {
     version: CURRENT_VERSION,
     accounts: accounts.to_vec(),
@@ -472,11 +557,11 @@ fn write_auth_file(path: &Path, accounts: &[AccountConfig]) -> Result<Vec<u8>> {
   let bytes = serde_yaml::to_string(&file)
     .context("serialising auth.yaml")?
     .into_bytes();
-  write_secured_atomic(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
-  Ok(bytes)
+  let file = stage_secured_atomic(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+  Ok(StagedAuthFile { file, contents: bytes })
 }
 
-fn write_secured_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn stage_secured_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<StagedPrivateFile> {
   if let Some(parent) = path.parent() {
     fs::create_dir_all(parent)?;
     secure_shard_directory(parent)?;
@@ -491,11 +576,7 @@ fn write_secured_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(error);
       }
     }
-    if let Err(error) = replace_file(&temporary, path) {
-      let _ = fs::remove_file(&temporary);
-      return Err(error);
-    }
-    return Ok(());
+    return Ok(StagedPrivateFile { path: Some(temporary) });
   }
   Err(std::io::Error::new(
     std::io::ErrorKind::AlreadyExists,
@@ -512,10 +593,6 @@ fn temporary_path(path: &Path) -> std::io::Result<PathBuf> {
   })?;
   let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
   Ok(path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), sequence)))
-}
-
-fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
-  fs::rename(temporary, path)
 }
 
 #[cfg(unix)]
@@ -745,6 +822,52 @@ mod tests {
   }
 
   #[test]
+  fn save_does_not_clobber_root_created_after_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("auth.yaml");
+    let concurrent = b"concurrently created root credentials\n";
+    let mut store = AuthStore::load(Some(&root), None).unwrap();
+    store.upsert(sample_account("local"));
+    let mut before_commit_called = false;
+
+    let error = store
+      .save_with_before_commit(|path| {
+        assert_eq!(path, root);
+        fs::write(path, concurrent).unwrap();
+        before_commit_called = true;
+      })
+      .unwrap_err();
+
+    assert!(before_commit_called);
+    assert!(error.to_string().contains("changed after loading the auth store"));
+    assert_eq!(fs::read(&root).unwrap(), concurrent);
+  }
+
+  #[test]
+  fn save_does_not_clobber_shard_created_after_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("auth.yaml");
+    let shard = AuthStore::shard_path_for(&root, "opencode").unwrap();
+    let concurrent = b"concurrently created shard credentials\n";
+    let mut store = AuthStore::load(Some(&root), None).unwrap();
+    store.upsert_in_shard("opencode", sample_account("local")).unwrap();
+    let mut before_commit_called = false;
+
+    let error = store
+      .save_with_before_commit(|path| {
+        assert_eq!(path, shard);
+        fs::write(path, concurrent).unwrap();
+        before_commit_called = true;
+      })
+      .unwrap_err();
+
+    assert!(before_commit_called);
+    assert!(error.to_string().contains("changed after loading the auth store"));
+    assert_eq!(fs::read(&shard).unwrap(), concurrent);
+    assert!(!root.exists());
+  }
+
+  #[test]
   fn save_rejects_an_external_change_to_an_unchanged_source() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("auth.yaml");
@@ -806,16 +929,18 @@ mod tests {
 
   #[cfg(unix)]
   #[test]
-  fn created_shards_and_directories_are_private() {
+  fn created_auth_files_and_shard_directories_are_private() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("auth.yaml");
     let shard = AuthStore::shard_path_for(&root, "opencode").unwrap();
     let mut store = AuthStore::load(Some(&root), None).unwrap();
+    store.upsert(sample_account("main"));
     store.upsert_in_shard("opencode", sample_account("a1")).unwrap();
     store.save().unwrap();
 
+    assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(fs::metadata(&shard).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(
       fs::metadata(shard.parent().unwrap()).unwrap().permissions().mode() & 0o777,
