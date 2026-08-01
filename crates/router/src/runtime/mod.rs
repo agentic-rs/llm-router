@@ -2,6 +2,7 @@ mod connect;
 mod dispatch;
 mod execution;
 mod gateway;
+mod intercept_ca;
 mod listeners;
 mod matchers;
 mod names;
@@ -22,6 +23,7 @@ pub use execution::{
 pub use gateway::{
   link_builtin_gateway_runtime, link_gateway_runtime, GatewayLinkError, GatewayLinkResult, LinkedGatewayRuntime,
 };
+pub use intercept_ca::{load_or_generate_ca, ProxyCa};
 pub use listeners::{
   link_listeners, BindingKind, ConnectActionSite, HttpActionSite, LinkedConnectDecision, LinkedConnectPolicy,
   LinkedConnectRule, LinkedForwardProxyPolicy, LinkedHttpAction, LinkedHttpBinding, LinkedHttpDecision,

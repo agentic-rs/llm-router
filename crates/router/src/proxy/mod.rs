@@ -1,13 +1,12 @@
-mod ca;
 mod connect_proxy;
 pub mod passthrough_pipeline;
 mod transport;
 
 use crate::api::{AppState, LiveAppState};
+pub use crate::runtime::{load_or_generate_ca, ProxyCa};
 use anyhow::{Context, Result};
 use axum::http::Method;
 use axum::Router;
-pub use ca::{load_or_generate_ca, ProxyCa};
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;

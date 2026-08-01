@@ -4,8 +4,7 @@
 //! access store and prepares every proxy CA required by the linked graph, but
 //! deliberately does not bind or otherwise inspect listener sockets.
 
-use super::{LinkedListener, LinkedListenerKind, LinkedListeners};
-use crate::proxy::{load_or_generate_ca, ProxyCa};
+use super::{load_or_generate_ca, LinkedListener, LinkedListenerKind, LinkedListeners, ProxyCa};
 use anyhow::Context;
 use snafu::Snafu;
 use std::collections::BTreeMap;
