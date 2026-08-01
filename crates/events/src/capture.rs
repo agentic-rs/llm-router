@@ -37,6 +37,27 @@ impl CapturedHeader {
   }
 }
 
+/// Whether a header name belongs to the gateway's minimum credential denylist.
+///
+/// Producers should redact these values before publication. Durable consumers
+/// should apply the same check independently as defense in depth.
+pub fn is_sensitive_header_name(name: &str) -> bool {
+  let name = name.to_ascii_lowercase();
+  matches!(
+    name.as_str(),
+    "authorization"
+      | "proxy-authorization"
+      | "cookie"
+      | "set-cookie"
+      | "api-key"
+      | "x-api-key"
+      | "x-goog-api-key"
+      | "x-auth-token"
+      | "x-access-token"
+      | "ocp-apim-subscription-key"
+  ) || name.contains("api-key")
+}
+
 impl fmt::Debug for CapturedHeader {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
@@ -235,6 +256,23 @@ mod tests {
     let debug = format!("{headers:?}");
     assert!(!debug.contains("secret-cookie"));
     assert!(!debug.contains("second-cookie"));
+  }
+
+  #[test]
+  fn sensitive_header_policy_is_case_insensitive_and_covers_api_key_variants() {
+    for name in [
+      "Authorization",
+      "proxy-authorization",
+      "Cookie",
+      "set-cookie",
+      "X-Api-Key",
+      "x-vendor-api-key-id",
+      "ocp-apim-subscription-key",
+    ] {
+      assert!(is_sensitive_header_name(name), "expected `{name}` to be sensitive");
+    }
+    assert!(!is_sensitive_header_name("content-type"));
+    assert!(!is_sensitive_header_name("x-request-id"));
   }
 
   #[test]

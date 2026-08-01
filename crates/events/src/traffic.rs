@@ -155,6 +155,11 @@ pub enum ConnectAction {
 }
 
 /// Wire and semantic body facts, including failures before target selection.
+///
+/// Producers emit this boundary once after body admission, whether admission
+/// succeeds or fails. `decoded` is present only for bytes that represent the
+/// final decoded payload; an intermediate compression layer must not be
+/// reported as the decoded request body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestBodyObservation {
   pub wire: BodyCapture,
@@ -236,6 +241,9 @@ pub struct AttemptHttpResponseHead {
 }
 
 /// Provider-reported usage attributed to one selected upstream attempt.
+///
+/// Multiple observations may carry sparse updates. Consumers can combine them
+/// with [`TokenUsage::merge_from`] without erasing earlier fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptUsage {
   pub attempt: AttemptNo,
@@ -252,6 +260,9 @@ pub struct HttpRequestSnapshot {
 }
 
 /// Response metadata observed before polling its body.
+///
+/// This is wire truth. Matching status values later carried by terminal
+/// summaries are fallbacks for paths where no response head was observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpResponseHead {
   pub status: u16,
@@ -382,7 +393,7 @@ mod tests {
 
   #[test]
   fn body_parse_failure_requires_no_invented_routing_facts() {
-    let request_id = RequestId::new("gateway-request");
+    let request_id = RequestId::new("gateway-request").unwrap();
     let body_failure = EventFailure {
       code: SmolStr::new("invalid_json"),
       message: SmolStr::new("request body is not valid JSON"),

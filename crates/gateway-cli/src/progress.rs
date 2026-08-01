@@ -198,7 +198,7 @@ impl RequestState {
         self.final_status = Some(response.status);
       }
       TrafficEventKind::AttemptUsage(usage) if self.is_current_attempt(usage.attempt) => {
-        merge_usage(&mut self.usage, &usage.usage);
+        self.usage.merge_from(&usage.usage);
       }
       TrafficEventKind::AttemptFinished(finished) if self.is_current_attempt(finished.attempt) => {
         self.observe_attempt_finished(finished);
@@ -524,30 +524,6 @@ fn style_status(status: u16) -> StyledObject<u16> {
   }
 }
 
-fn merge_usage(current: &mut TokenUsage, update: &TokenUsage) {
-  if update.kind.is_some() {
-    current.kind = update.kind;
-  }
-  if update.input.is_some() {
-    current.input = update.input;
-  }
-  if update.output.is_some() {
-    current.output = update.output;
-  }
-  if update.total.is_some() {
-    current.total = update.total;
-  }
-  if update.cache_read.is_some() {
-    current.cache_read = update.cache_read;
-  }
-  if update.cache_write.is_some() {
-    current.cache_write = update.cache_write;
-  }
-  if update.reasoning.is_some() {
-    current.reasoning = update.reasoning;
-  }
-}
-
 fn format_usage(usage: &TokenUsage) -> String {
   let mut parts = Vec::with_capacity(6);
   for (label, value) in [
@@ -591,7 +567,7 @@ mod tests {
   }
 
   fn request_id() -> tokn_events::RequestId {
-    REQUEST_ID.into()
+    tokn_events::RequestId::new(REQUEST_ID).unwrap()
   }
 
   fn emit(handler: &mut ProgressEventHandler, sequence: u64, elapsed_ms: u64, kind: TrafficEventKind) {
@@ -599,7 +575,7 @@ mod tests {
       .handle(
         EventSeq::ZERO,
         &GatewayEvent::Traffic(TrafficEvent {
-          request_id: REQUEST_ID.into(),
+          request_id: request_id(),
           sequence,
           at_unix_ms: sequence as i64,
           elapsed_ms,
@@ -1049,14 +1025,11 @@ mod tests {
       cache_read: Some(3),
       ..TokenUsage::default()
     };
-    merge_usage(
-      &mut usage,
-      &TokenUsage {
-        output: Some(5),
-        cache_read: None,
-        ..TokenUsage::default()
-      },
-    );
+    usage.merge_from(&TokenUsage {
+      output: Some(5),
+      cache_read: None,
+      ..TokenUsage::default()
+    });
     assert_eq!(usage.input, Some(8));
     assert_eq!(usage.output, Some(5));
     assert_eq!(usage.cache_read, Some(3));
