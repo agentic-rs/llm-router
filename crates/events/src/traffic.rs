@@ -332,7 +332,12 @@ pub struct RetryDecision {
   pub reason: EventFailure,
 }
 
-/// Exactly one closing observation for every [`AttemptStarted`].
+/// Exactly one transport-closing observation for every [`AttemptStarted`].
+///
+/// Request snapshots, response heads, and upstream body facts must precede
+/// this event. A sparse [`AttemptUsage`] update may follow it when a provider
+/// exposes final usage only during terminal reduction, but it must still
+/// precede the request-wide `Finished` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptFinished {
   pub attempt: AttemptNo,
