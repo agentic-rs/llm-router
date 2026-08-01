@@ -246,10 +246,6 @@ class _GenerateBuilder(Generic[_BuilderT]):
     self._request.options = RequestOptions.from_dict(options.to_dict())
     return self._self()
 
-  def profile(self, profile: str) -> _BuilderT:
-    self._request.options.profile = profile
-    return self._self()
-
   def request_id(self, request_id: str) -> _BuilderT:
     self._request.options.request_id = request_id
     return self._self()
@@ -334,7 +330,7 @@ class _Chat:
 
 
 class Client:
-  """An in-process client using the gateway's configuration and credentials."""
+  """An in-process client bound to one managed gateway profile."""
 
   def __init__(
     self,
@@ -359,6 +355,10 @@ class Client:
   @property
   def auth_path(self) -> Path:
     return Path(self._native.auth_path())
+
+  @property
+  def profile(self) -> str:
+    return self._native.profile()
 
   def reload(self) -> None:
     self._native.reload()

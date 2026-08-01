@@ -1,8 +1,10 @@
 # tokn Python SDK
 
-The Python package embeds the same Rust routing engine as `tokn-sdk`. It uses
-the existing `config.toml`, `config.d`, `auth.yaml`, and `auth.d` sources and
-does not require a gateway process.
+The Python package embeds the same managed execution engine as `tokn-sdk` and
+does not require a gateway process. Each client loads one strict
+`schema_version = 2` configuration and binds to one managed profile. The
+configuration may be listener-free because the client supplies its profile
+root directly.
 
 ## Friendly generation API
 
@@ -11,7 +13,7 @@ For a one-off request, start with the client-bound builder:
 ```python
 from tokn import Client
 
-client = Client()
+client = Client(profile="default")
 
 response = await (
   client.generate("smart")
@@ -90,10 +92,10 @@ and sampling compatibility are checked against the selected model generation.
 Explicit controls unsupported by the selected route fail clearly after routing
 instead of being silently dropped or reinterpreted.
 
-`passthrough` and `switch` profiles preserve the generated Responses payload
-verbatim, so they reject typed `top_k` and reasoning controls that would
-require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
-the provider-neutral control API.
+Typed controls are lowered after the bound managed profile selects its
+upstream and operation. Relay and transparent profiles are not valid embedded
+SDK targets; create a separate `Client(profile=...)` for each managed profile
+an application needs.
 
 The snippets below continue using the `client` created above. Snippets after
 the detached-request example also reuse its `request`.
@@ -161,9 +163,9 @@ except ToknError as error:
 
 ## Raw endpoint escape hatches
 
-Raw endpoint clients are the exact-wire escape hatch for endpoint- or
-provider-specific fields. Unlike the friendly generation API, the mapping is
-sent in the selected endpoint's native shape:
+Raw endpoint clients accept endpoint-shaped input for endpoint- or
+provider-specific fields. The managed profile may still translate the
+operation, body, model, or response for its selected upstream:
 
 ```python
 raw = await client.responses.create({
@@ -182,5 +184,7 @@ async with stream:
 Raw stream chunks are transport bytes and do not necessarily align with SSE
 event or UTF-8 boundaries.
 
-Pass `config_path`, `auth_path`, or `profile` to `Client` to override the same
-defaults used by the gateway.
+Pass `config_path` or `auth_path` to select the strict v2 configuration and
+credential store. `profile` selects the client-bound managed profile and
+defaults to `default`; it cannot be changed per request and is available as
+the read-only `client.profile` property.

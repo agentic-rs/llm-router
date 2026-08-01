@@ -109,9 +109,8 @@ def _models(
 
 @dataclass(slots=True)
 class RequestOptions:
-  """Routing and request-correlation options shared by all SDK calls."""
+  """Request-correlation options shared by all SDK calls."""
 
-  profile: str | None = None
   request_id: str | None = None
   session_id: str | None = None
   project_id: str | None = None
@@ -121,8 +120,7 @@ class RequestOptions:
   @property
   def is_empty(self) -> bool:
     return (
-      self.profile is None
-      and self.request_id is None
+      self.request_id is None
       and self.session_id is None
       and self.project_id is None
       and self.initiator is None
@@ -131,8 +129,6 @@ class RequestOptions:
 
   def to_dict(self) -> JsonObject:
     data: JsonObject = {}
-    if self.profile is not None:
-      data["profile"] = self.profile
     if self.request_id is not None:
       data["request_id"] = self.request_id
     if self.session_id is not None:
@@ -147,6 +143,20 @@ class RequestOptions:
 
   @classmethod
   def from_dict(cls, data: Mapping[str, Any]) -> RequestOptions:
+    allowed = {
+      "request_id",
+      "session_id",
+      "project_id",
+      "initiator",
+      "headers",
+    }
+    unknown = next((name for name in data if name not in allowed), None)
+    if unknown == "profile":
+      raise TypeError(
+        "profile is client-bound; pass profile to Client(...)"
+      )
+    if unknown is not None:
+      raise TypeError(f"unknown request option '{unknown}'")
     headers: list[tuple[str, str]] = []
     for pair in _sequence(data.get("headers", []), "headers"):
       values = _sequence(pair, "header")
@@ -154,7 +164,6 @@ class RequestOptions:
         raise TypeError("each header must contain exactly two strings")
       headers.append((values[0], values[1]))
     return cls(
-      profile=_optional_string(data, "profile"),
       request_id=_optional_string(data, "request_id"),
       session_id=_optional_string(data, "session_id"),
       project_id=_optional_string(data, "project_id"),
