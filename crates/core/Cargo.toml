@@ -9,6 +9,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+tokn-endpoint-core = { workspace = true }
 tokn-headers = { workspace = true }
 tokn-policy = { workspace = true }
 async-trait = { workspace = true }

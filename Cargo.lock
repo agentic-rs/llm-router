@@ -2829,6 +2829,7 @@ dependencies = [
  "snafu",
  "time",
  "tokio",
+ "tokn-endpoint-core",
  "tokn-headers",
  "tokn-policy",
  "toml",

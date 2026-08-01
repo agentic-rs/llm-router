@@ -46,7 +46,7 @@ impl RequestEndpoint {
 
   pub fn infer_from_path(path: impl AsRef<str>) -> Self {
     let path = path.as_ref();
-    if let Some(endpoint) = Endpoint::infer_from(path) {
+    if let Some(endpoint) = infer_endpoint_from_path(path) {
       Self::Known(endpoint)
     } else {
       Self::CustomPath(SmolStr::new(path))
@@ -58,6 +58,22 @@ impl RequestEndpoint {
       RequestEndpoint::Known(endpoint) => Some(*endpoint),
       RequestEndpoint::CustomPath(_) => None,
     }
+  }
+}
+
+/// Best-effort endpoint inference for pipeline observation only.
+///
+/// This intentionally preserves the legacy suffix behavior: the input is not
+/// parsed as a URI and query strings are not stripped.
+fn infer_endpoint_from_path(path: &str) -> Option<Endpoint> {
+  if path.ends_with("/chat/completions") {
+    Some(Endpoint::ChatCompletions)
+  } else if path.ends_with("/responses") {
+    Some(Endpoint::Responses)
+  } else if path.ends_with("/messages") {
+    Some(Endpoint::Messages)
+  } else {
+    None
   }
 }
 
@@ -222,4 +238,36 @@ pub enum StageEvent {
   /// is `true` only when the pipeline produced a `ConvertedResponse`; both
   /// real failures and deliberate stops set it to `false`.
   Completed { success: bool, attempts: u32 },
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn request_endpoint_infers_every_known_path_suffix() {
+    for (path, endpoint) in [
+      ("/v1/chat/completions", Endpoint::ChatCompletions),
+      ("/v1/responses", Endpoint::Responses),
+      ("/v1/messages", Endpoint::Messages),
+    ] {
+      assert_eq!(RequestEndpoint::infer_from_path(path), endpoint);
+    }
+  }
+
+  #[test]
+  fn request_endpoint_preserves_custom_and_query_paths_exactly() {
+    assert_eq!(
+      RequestEndpoint::infer_from_path("/custom?next=/responses"),
+      Endpoint::Responses
+    );
+
+    for path in ["/v1/models", "/v1/responses?stream=true"] {
+      let inferred = RequestEndpoint::infer_from_path(path);
+
+      assert_eq!(inferred, RequestEndpoint::CustomPath(SmolStr::new(path)));
+      assert_eq!(inferred.as_str(), path);
+      assert_eq!(inferred.resolved(), None);
+    }
+  }
 }

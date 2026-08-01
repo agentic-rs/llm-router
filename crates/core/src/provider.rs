@@ -12,6 +12,7 @@ use tokn_headers::{AgentId, HeaderMap};
 pub mod error;
 
 pub use error::{Error, Result};
+pub use tokn_endpoint_core::Endpoint;
 
 pub const ID_GITHUB_COPILOT: &str = "github-copilot";
 pub const ID_DEEPSEEK: &str = "deepseek";
@@ -190,46 +191,6 @@ impl ProviderTarget {
 
   pub fn model_cache(&self) -> &Arc<ModelCache> {
     &self.model_cache
-  }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Endpoint {
-  ChatCompletions,
-  Responses,
-  Messages,
-}
-
-impl Endpoint {
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Endpoint::ChatCompletions => "chat_completions",
-      Endpoint::Responses => "responses",
-      Endpoint::Messages => "messages",
-    }
-  }
-
-  /// Best-effort guess at which [`Endpoint`] variant a given path
-  /// represents. Used only to populate [`tokn_requests::RawInbound::endpoint`];
-  /// the proxy passthrough pipeline never branches on it.
-  pub fn infer_from(path: impl AsRef<str>) -> Option<Self> {
-    let path = path.as_ref();
-    if path.ends_with("/chat/completions") {
-      Some(Endpoint::ChatCompletions)
-    } else if path.ends_with("/responses") {
-      Some(Endpoint::Responses)
-    } else if path.ends_with("/messages") {
-      Some(Endpoint::Messages)
-    } else {
-      None
-    }
-  }
-}
-
-impl std::fmt::Display for Endpoint {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(self.as_str())
   }
 }
 
