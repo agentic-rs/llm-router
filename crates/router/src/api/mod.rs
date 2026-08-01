@@ -185,11 +185,6 @@ struct PolicySpec {
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const SESSION_ID_HEADER: &str = "x-session-id";
 
-pub(crate) fn is_router_owned_header(name: &axum::http::HeaderName) -> bool {
-  let name = name.as_str();
-  name.starts_with("x-tokn-router-") || name == "x-route-mode" || name == "x-behave-as"
-}
-
 pub(crate) fn first_header<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
   names.iter().find_map(|name| {
     headers
@@ -876,7 +871,7 @@ mod tests {
   use axum::routing::get;
   use bytes::Bytes;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
-  use tokn_headers::inbound::{PROJECT_ID_HEADERS, REQUEST_ID_HEADERS, SESSION_ID_HEADERS};
+  use tokn_headers::inbound::SESSION_ID_HEADERS;
   use tower::ServiceExt;
 
   fn zai_account() -> AccountCfg {
@@ -2385,25 +2380,5 @@ mod tests {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-  }
-
-  #[test]
-  fn is_router_owned_header_does_not_include_request_session_project_id_headers() {
-    use axum::http::HeaderName;
-
-    for header in REQUEST_ID_HEADERS.iter() {
-      let name = HeaderName::try_from(*header).unwrap();
-      assert!(!is_router_owned_header(&name), "{header} should NOT be router-owned");
-    }
-
-    for header in SESSION_ID_HEADERS.iter() {
-      let name = HeaderName::try_from(*header).unwrap();
-      assert!(!is_router_owned_header(&name), "{header} should NOT be router-owned");
-    }
-
-    for header in PROJECT_ID_HEADERS.iter() {
-      let name = HeaderName::try_from(*header).unwrap();
-      assert!(!is_router_owned_header(&name), "{header} should NOT be router-owned");
-    }
   }
 }

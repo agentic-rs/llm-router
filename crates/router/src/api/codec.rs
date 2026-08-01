@@ -14,15 +14,6 @@ pub enum ContentEncodingKind {
   Zstd,
 }
 
-impl ContentEncodingKind {
-  pub(crate) fn as_str(self) -> &'static str {
-    match self {
-      ContentEncodingKind::Gzip => "gzip",
-      ContentEncodingKind::Zstd => "zstd",
-    }
-  }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedJsonRequest {
   pub raw_body: Bytes,

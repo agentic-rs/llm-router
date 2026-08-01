@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 
 pub mod api;
-pub mod pipeline;
+mod pipeline;
 pub mod proxy;
 pub mod runtime;
 
