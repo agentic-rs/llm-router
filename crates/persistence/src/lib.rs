@@ -17,9 +17,9 @@ pub use viewer::{
   SessionPartOmissionReason, SessionRequestUsage, SessionSummary, SessionUsage, StoredSessionDetail,
 };
 
-pub use sessions::{MessageRecord, PartRecord};
+pub use sessions::{MessageRecord, PartRecord, SessionPersistenceConsumer};
 use snafu::Snafu;
-pub use usage::UsageDb;
+pub use usage::{UsageDb, UsagePersistenceConsumer};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
