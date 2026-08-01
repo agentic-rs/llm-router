@@ -1,6 +1,10 @@
 //! Requests database schema, migration, and enumeration helpers for per-day
 //! SQLite files.
 
+mod writer;
+
+pub use writer::{RequestPersistenceConsumer, RequestPersistenceOptions};
+
 use crate::migrate;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
