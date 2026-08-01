@@ -1,6 +1,4 @@
-use super::send::filter_accounts;
 use super::OutputFormat;
-use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use std::collections::HashSet;
@@ -174,14 +172,18 @@ fn print_provider_json(
 }
 
 async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str) -> Result<Vec<String>> {
-  let (cfg, _) = Config::load(cfg_path)?;
-  let mut accounts = AuthStore::load(None, None)?.accounts;
-  filter_accounts(&mut accounts, Some(provider_id), None)?;
+  let config_path = match cfg_path {
+    Some(path) => path.to_path_buf(),
+    None => tokn_config::paths::config_path().context("resolve the default gateway config path")?,
+  };
+  let compiled = tokn_config::v2::load(&config_path)
+    .with_context(|| format!("load compiled gateway config `{}`", config_path.display()))?;
+  let accounts = AuthStore::load(None, Some(&config_path))?.accounts;
 
   let registry = Registry::builtin();
   let providers = accounts
     .into_iter()
-    .filter(|account| account.enabled)
+    .filter(|account| account.enabled && account.provider == provider_id)
     .map(|account| {
       let account_id = account.id.clone();
       registry
@@ -190,17 +192,17 @@ async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str
     })
     .collect::<Result<Vec<_>>>()?;
   if providers.is_empty() {
-    return Err(anyhow!("no accounts configured. Run `tokn-router account add` first."));
+    return Err(anyhow!(
+      "no enabled accounts configured for provider '{provider_id}'. Run `tokn-router account add` first."
+    ));
   }
-  let http = crate::util::http::build_client(&cfg.proxy)?;
+  let http_options = compiled.service().outbound().to_http_client_options();
+  let http = tokn_core::util::http::build_client(&http_options)?;
 
   let mut ids: Vec<String> = Vec::new();
   let mut seen: HashSet<String> = HashSet::new();
   let mut last_err: Option<String> = None;
   for provider in providers {
-    if provider.info().id != provider_id {
-      continue;
-    }
     match provider.list_models(&http).await {
       Ok(value) => extend_model_ids(&value, &mut ids, &mut seen),
       Err(e) => last_err = Some(e.to_string()),

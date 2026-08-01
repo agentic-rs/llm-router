@@ -93,6 +93,17 @@ impl Cli {
       return proxy::run(cfg_path, args).await.map_err(Error::from);
     }
 
+    // Catalogue smoke commands are either config-free or load the strict v2
+    // service plan themselves. Keep legacy migration, logging config, and
+    // partial config decoding out of both paths.
+    if matches!(&self.cmd, Cmd::Smoke(cmd) if cmd.bypasses_legacy_startup()) {
+      logging::init_basic();
+      let Cmd::Smoke(cmd) = self.cmd else {
+        unreachable!("the smoke predicate only matches smoke commands")
+      };
+      return smoke::run_cmd(cfg_path, cmd).await.map_err(Error::from);
+    }
+
     // Config migration must observe legacy files exactly as they are. In
     // particular, do not extract embedded accounts or initialize configured
     // logging before its read-only planner runs.

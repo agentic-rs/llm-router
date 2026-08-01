@@ -26,6 +26,14 @@ pub enum SmokeCmd {
   Provider(ProviderArgs),
 }
 
+impl SmokeCmd {
+  /// Static catalogue inspection and v2 live-provider inspection must not
+  /// trigger legacy config migration or partial legacy loading.
+  pub(super) fn bypasses_legacy_startup(&self) -> bool {
+    matches!(self, Self::Model(_) | Self::Provider(_))
+  }
+}
+
 pub async fn run_cmd(cfg_path: Option<PathBuf>, cmd: SmokeCmd) -> Result<()> {
   match cmd {
     SmokeCmd::Send(args) => send::run(cfg_path, args).await,
