@@ -5,7 +5,7 @@
 //! bytes, while managed routes decode and validate their structured payload
 //! without allowing payload facts to change the matched route.
 
-use super::super::{ManagedRequestBody, ManagedRequestBodyError, MatchedHttpRoute};
+use super::super::{LinkedRouteKind, ManagedRequestBody, ManagedRequestBodyError, MatchedHttpRoute};
 use axum::body::Body;
 use bytes::{Bytes, BytesMut};
 use flate2::read::MultiGzDecoder;
@@ -15,7 +15,6 @@ use http::HeaderMap;
 use serde_json::Value;
 use snafu::Snafu;
 use std::io::{self, Read};
-use tokn_accounts::link::LinkedRouteKind;
 use tokn_core::provider::ProviderRequestKind;
 
 const MAX_CONTENT_ENCODING_LAYERS: usize = 4;

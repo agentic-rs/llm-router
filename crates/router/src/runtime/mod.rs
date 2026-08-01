@@ -9,6 +9,7 @@ mod matchers;
 mod names;
 mod profiles;
 mod resources;
+mod routes;
 mod server;
 
 pub use connect::{
@@ -49,6 +50,10 @@ pub use profiles::{
 pub use resources::{
   materialize_listeners, ListenerResourceError, ListenerResourceResult, MaterializedClientAuth, MaterializedListener,
   MaterializedListenerKind, MaterializedListeners,
+};
+pub use routes::{
+  link_routes, LinkedManagedRoute, LinkedRelayRoute, LinkedRoute, LinkedRouteKind, LinkedRoutes,
+  LinkedTransparentRoute, RouteLinkError, RouteLinkResult,
 };
 pub use server::{
   admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request,

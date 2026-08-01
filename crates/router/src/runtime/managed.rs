@@ -14,7 +14,7 @@ pub use gateway::{
   ManagedGatewayOutcome, ManagedGatewayRequest, ManagedGatewayResult,
 };
 
-use super::{LinkedProfile, LinkedWireIdentity};
+use super::{LinkedManagedRoute, LinkedProfile, LinkedRouteKind, LinkedWireIdentity};
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderMap;
 use serde_json::Value;
@@ -23,8 +23,8 @@ use snafu::Snafu;
 use std::fmt;
 use tokn_access::ProviderAccess;
 use tokn_accounts::link::{
-  resolve_managed_target, LinkedRouteKind, PoolRuntimeResult, SelectedManagedTarget, SelectionOutcome,
-  SelectionSettlement, TargetResolution, TargetResolveError,
+  resolve_managed_target, PoolRuntimeResult, SelectedManagedTarget, SelectionOutcome, SelectionSettlement,
+  TargetResolution, TargetResolveError,
 };
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
@@ -344,7 +344,7 @@ pub(crate) fn resolve_managed_profile(
 
 fn managed_profile_route(
   profile: &LinkedProfile,
-) -> ManagedProfileResolveResult<(ManagedProfileSite, &tokn_accounts::link::LinkedManagedRoute)> {
+) -> ManagedProfileResolveResult<(ManagedProfileSite, &LinkedManagedRoute)> {
   let site = ManagedProfileSite::from_profile(profile);
   let LinkedRouteKind::Managed(route) = profile.route().kind() else {
     return Err(ManagedProfileResolveError::NonManagedRoute {
