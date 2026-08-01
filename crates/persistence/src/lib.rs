@@ -17,8 +17,9 @@ pub use viewer::{
   SessionPartOmissionReason, SessionRequestUsage, SessionSummary, SessionUsage, StoredSessionDetail,
 };
 
+pub use sessions::{MessageRecord, PartRecord};
 use snafu::Snafu;
-pub use tokn_core::db::{DbPaths, HttpSnapshot, MessageRecord, PartRecord};
+pub use tokn_core::db::{DbPaths, HttpSnapshot};
 pub use usage::UsageDb;
 
 #[derive(Debug, Snafu)]

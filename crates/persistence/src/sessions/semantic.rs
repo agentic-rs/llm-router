@@ -1,4 +1,4 @@
-use crate::{MessageRecord, PartRecord};
+use super::{MessageRecord, PartRecord};
 use bytes::Bytes;
 use serde_json::Value;
 use std::collections::BTreeMap;
