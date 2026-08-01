@@ -7,8 +7,8 @@
 //! session affinity until a [`SelectionToken`] is settled as healthy.
 
 use super::{
-  AccountPoolRuntime, LinkedManagedRoute, LinkedModelCandidate, LinkedModelSelector, LinkedRelayRoute,
-  LinkedRelayTarget, LinkedUpstream, PoolAcquire, PoolRuntimeResult, ProviderBinding, ProviderBindingKey,
+  AccountPoolRuntime, LinkedManagedTarget, LinkedModelCandidate, LinkedModelSelector, LinkedRelayTarget,
+  LinkedUpstream, PoolAcquire, PoolRuntimeResult, ProviderBinding, ProviderBindingKey,
 };
 use smol_str::SmolStr;
 use std::fmt;
@@ -331,7 +331,8 @@ impl std::error::Error for QualificationSyntaxError {
 ///
 /// `provider_allowed` may be evaluated more than once and must be pure.
 pub fn resolve_managed_target<F>(
-  route: &LinkedManagedRoute,
+  target: &LinkedManagedTarget,
+  operation_policy: OperationPolicy,
   requested_model: &str,
   requested_operation: Endpoint,
   session_id: Option<&str>,
@@ -340,9 +341,10 @@ pub fn resolve_managed_target<F>(
 where
   F: Fn(&ProviderId) -> bool,
 {
-  match route.model() {
+  match target.model() {
     LinkedModelSelector::Capability => Ok(resolve_managed_candidates(
-      route,
+      target,
+      operation_policy,
       requested_model,
       requested_operation,
       session_id,
@@ -354,7 +356,7 @@ where
     )),
     LinkedModelSelector::Qualified { namespace } => {
       let (qualification, model) = parse_qualification(*namespace, requested_model)?;
-      if !route
+      if !target
         .upstreams()
         .upstreams()
         .iter()
@@ -368,7 +370,8 @@ where
         });
       }
       Ok(resolve_managed_candidates(
-        route,
+        target,
+        operation_policy,
         requested_model,
         requested_operation,
         session_id,
@@ -388,7 +391,8 @@ where
         });
       };
       Ok(resolve_managed_candidates(
-        route,
+        target,
+        operation_policy,
         requested_model,
         requested_operation,
         session_id,
@@ -407,7 +411,7 @@ where
 ///
 /// `provider_allowed` may be evaluated more than once and must be pure.
 pub fn resolve_relay_target<F>(
-  route: &LinkedRelayRoute,
+  target: &LinkedRelayTarget,
   ingress: &HttpIngress,
   session_id: Option<&str>,
   provider_allowed: F,
@@ -415,7 +419,7 @@ pub fn resolve_relay_target<F>(
 where
   F: Fn(&ProviderId) -> bool,
 {
-  match route.target() {
+  match target {
     LinkedRelayTarget::Fixed { pool, upstream } => resolve_relay_upstream(
       pool,
       upstream,
@@ -496,7 +500,8 @@ struct ManagedCandidate<'a> {
 }
 
 fn resolve_managed_candidates<'a, F>(
-  route: &LinkedManagedRoute,
+  target: &LinkedManagedTarget,
+  operation_policy: OperationPolicy,
   requested_model: &str,
   requested_operation: Endpoint,
   session_id: Option<&str>,
@@ -510,46 +515,46 @@ where
   let mut earliest_retry = None;
 
   for candidate in candidates {
-    for operation in operation_candidates(route.operation(), requested_operation) {
-      denied_by_access |= route
+    for operation in operation_candidates(operation_policy, requested_operation) {
+      denied_by_access |= target
         .pool()
         .pool()
         .active()
         .iter()
-        .chain(route.pool().pool().fallback())
+        .chain(target.pool().pool().fallback())
         .flat_map(|account| account.bindings().values())
         .any(|binding| {
-          managed_binding_matches(route, &candidate, operation, binding)
+          managed_binding_matches(target, &candidate, operation, binding)
             && !provider_allowed(
-              route
+              target
                 .upstreams()
                 .upstream(binding.upstream_id())
-                .expect("matching binding must belong to the linked managed route")
+                .expect("matching binding must belong to the linked managed target")
                 .provider_id(),
             )
         });
 
-      let acquired = route.pool().acquire(session_id, |binding| {
-        if !managed_binding_matches(route, &candidate, operation, binding) {
+      let acquired = target.pool().acquire(session_id, |binding| {
+        if !managed_binding_matches(target, &candidate, operation, binding) {
           return false;
         }
         provider_allowed(
-          route
+          target
             .upstreams()
             .upstream(binding.upstream_id())
-            .expect("matching binding must belong to the linked managed route")
+            .expect("matching binding must belong to the linked managed target")
             .provider_id(),
         )
       });
 
       match acquired {
         PoolAcquire::Selected(binding) => {
-          let upstream = route
+          let upstream = target
             .upstreams()
             .upstream(binding.upstream_id())
-            .expect("selected binding must belong to the linked managed route")
+            .expect("selected binding must belong to the linked managed target")
             .clone();
-          let token = SelectionToken::new(route.pool().clone(), binding.clone(), session_id);
+          let token = SelectionToken::new(target.pool().clone(), binding.clone(), session_id);
           return TargetResolution::Selected(SelectedManagedTarget {
             binding,
             upstream,
@@ -679,12 +684,12 @@ fn qualification_name(namespace: QualificationNamespace) -> &'static str {
 }
 
 fn managed_binding_matches(
-  route: &LinkedManagedRoute,
+  target: &LinkedManagedTarget,
   candidate: &ManagedCandidate<'_>,
   operation: Endpoint,
   binding: &ProviderBinding,
 ) -> bool {
-  route
+  target
     .upstreams()
     .upstream(binding.upstream_id())
     .is_some_and(|upstream| {
@@ -716,7 +721,8 @@ fn retain_earliest(earliest: &mut Option<Instant>, candidate: Instant) {
 mod tests {
   use super::*;
   use crate::link::{
-    build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes, LinkedRouteKind, LinkedRoutes,
+    build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes, LinkedManagedRoute,
+    LinkedRelayRoute, LinkedRouteKind, LinkedRoutes,
   };
   use crate::registry::Registry;
   use async_trait::async_trait;
@@ -952,6 +958,38 @@ mod tests {
       LinkedRouteKind::Relay(route) => route,
       other => panic!("expected relay route, got {other:?}"),
     }
+  }
+
+  fn resolve_managed_target<F>(
+    route: &LinkedManagedRoute,
+    requested_model: &str,
+    requested_operation: Endpoint,
+    session_id: Option<&str>,
+    provider_allowed: F,
+  ) -> Result<TargetResolution<SelectedManagedTarget>, TargetResolveError>
+  where
+    F: Fn(&ProviderId) -> bool,
+  {
+    super::resolve_managed_target(
+      route.target(),
+      route.operation(),
+      requested_model,
+      requested_operation,
+      session_id,
+      provider_allowed,
+    )
+  }
+
+  fn resolve_relay_target<F>(
+    route: &LinkedRelayRoute,
+    ingress: &HttpIngress,
+    session_id: Option<&str>,
+    provider_allowed: F,
+  ) -> TargetResolution<SelectedRelayTarget>
+  where
+    F: Fn(&ProviderId) -> bool,
+  {
+    super::resolve_relay_target(route.target(), ingress, session_id, provider_allowed)
   }
 
   fn warm(route: &LinkedManagedRoute, upstream: &str, models: &[&str]) {

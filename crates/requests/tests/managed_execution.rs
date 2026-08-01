@@ -1,9 +1,8 @@
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 use std::path::Path;
 use tokn_accounts::link::{
-  build_account_pool_runtimes, link_account_pools, link_provider_graph, link_routes, resolve_managed_target,
-  LinkedRouteKind, SelectionOutcome, TargetResolution,
+  build_account_pool_runtimes, link_account_pools, link_managed_target, link_provider_graph, resolve_managed_target,
+  SelectionOutcome, TargetResolution,
 };
 use tokn_accounts::registry::Registry;
 use tokn_core::account::{AccountConfig, Secret};
@@ -91,17 +90,24 @@ upstream = "selected"
   let providers = link_provider_graph(plan, &accounts, &registry).unwrap();
   let pools = link_account_pools(plan, &providers, &registry).unwrap();
   let runtimes = build_account_pool_runtimes(&pools);
-  let reachable = plan.routes().keys().cloned().collect::<BTreeSet<_>>();
-  let linked_routes = link_routes(plan, &reachable, &providers, &runtimes).unwrap();
-  let (_, linked_route) = linked_routes.routes().next().expect("one linked route");
-  let LinkedRouteKind::Managed(managed_route) = linked_route.kind() else {
+  let (_, route) = plan.routes().iter().next().expect("one route");
+  let tokn_policy::RoutePlan::Managed(managed_route) = route else {
     panic!("expected a managed route");
   };
-  let selected =
-    match resolve_managed_target(managed_route, REQUESTED_MODEL, Endpoint::Responses, None, |_| true).unwrap() {
-      TargetResolution::Selected(selected) => selected,
-      other => panic!("expected a selected managed target, got {other:?}"),
-    };
+  let target = link_managed_target(managed_route.target(), plan, &providers, &runtimes).unwrap();
+  let selected = match resolve_managed_target(
+    &target,
+    managed_route.operation(),
+    REQUESTED_MODEL,
+    Endpoint::Responses,
+    None,
+    |_| true,
+  )
+  .unwrap()
+  {
+    TargetResolution::Selected(selected) => selected,
+    other => panic!("expected a selected managed target, got {other:?}"),
+  };
 
   assert_eq!(selected.binding().upstream_id().as_str(), "selected");
   assert_eq!(selected.binding().account_id(), "selected-account");
@@ -240,13 +246,20 @@ accounts = ["codex-account"]
   let providers = link_provider_graph(plan, &accounts, &registry).unwrap();
   let pools = link_account_pools(plan, &providers, &registry).unwrap();
   let runtimes = build_account_pool_runtimes(&pools);
-  let reachable = plan.routes().keys().cloned().collect::<BTreeSet<_>>();
-  let linked_routes = link_routes(plan, &reachable, &providers, &runtimes).unwrap();
-  let (_, linked_route) = linked_routes.routes().next().expect("one linked route");
-  let LinkedRouteKind::Managed(managed_route) = linked_route.kind() else {
+  let (_, route) = plan.routes().iter().next().expect("one route");
+  let tokn_policy::RoutePlan::Managed(managed_route) = route else {
     panic!("expected a managed route");
   };
-  let selected = match resolve_managed_target(managed_route, CODEX_MODEL, Endpoint::Responses, None, |_| true).unwrap()
+  let target = link_managed_target(managed_route.target(), plan, &providers, &runtimes).unwrap();
+  let selected = match resolve_managed_target(
+    &target,
+    managed_route.operation(),
+    CODEX_MODEL,
+    Endpoint::Responses,
+    None,
+    |_| true,
+  )
+  .unwrap()
   {
     TargetResolution::Selected(selected) => selected,
     other => panic!("expected a selected managed target, got {other:?}"),

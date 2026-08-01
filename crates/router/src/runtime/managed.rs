@@ -314,7 +314,8 @@ pub(crate) fn resolve_managed_profile(
 ) -> ManagedProfileResolveResult<TargetResolution<RoutedManagedTarget>> {
   let (site, route) = managed_profile_route(profile)?;
   let resolution = resolve_managed_target(
-    route,
+    route.target(),
+    route.operation(),
     requested_model.as_str(),
     requested_operation,
     session_id,

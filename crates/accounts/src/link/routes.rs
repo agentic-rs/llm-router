@@ -1,22 +1,20 @@
-//! Runtime-linked route targets over configured upstreams and account pools.
+//! Runtime-linked route graph over account-owned target domains.
 //!
 //! Listener/profile reachability belongs to the router. This module accepts
-//! the resulting route-id set and materializes only those routes, keeping
-//! account selection, upstream identity, and model fallback data typed and
-//! immutable. Per-pool cursors, cooldowns, and affinity remain shared through
-//! [`AccountPoolRuntime`].
+//! the resulting route-id set and temporarily materializes the outer route
+//! wrappers. Account selection, upstream identity, and model fallback data are
+//! linked independently by the target module.
 
-use super::{AccountPoolRuntime, AccountPoolRuntimes, ProviderGraph};
-use smol_str::SmolStr;
+use super::{
+  link_managed_target, link_relay_target, AccountPoolRuntimes, LinkedManagedTarget, LinkedRelayTarget, ProviderGraph,
+  TargetLinkError,
+};
 use snafu::Snafu;
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tokn_core::provider::ProviderTarget;
-use tokn_core::upstream_url::{CanonicalHttpOrigin, CleartextHttpPolicy, InvalidUpstreamUrl};
 use tokn_policy::{
-  AccountPoolId, DestinationPolicy, FallbackSelector, GatewayPlan, HeaderPatchSetId, ManagedRetry, ManagedRoute,
-  ModelGroupId, ModelSelector, OperationPolicy, ProviderId, QualificationNamespace, RelayRetry, RelayRoute,
-  RelayTarget, RouteId, RouteKind, RoutePlan, UpstreamId, UpstreamSelector,
+  DestinationPolicy, GatewayPlan, HeaderPatchSetId, ManagedRetry, ManagedRoute, OperationPolicy, ProviderId,
+  RelayRetry, RelayRoute, RouteId, RouteKind, RoutePlan,
 };
 
 /// Runtime materialization of the reachable route subgraph.
@@ -80,16 +78,11 @@ impl LinkedRoute {
   /// do not need to retain the policy graph.
   pub fn destination_policy(&self) -> DestinationPolicy {
     match &self.kind {
-      LinkedRouteKind::Managed(_)
-      | LinkedRouteKind::Relay(LinkedRelayRoute {
-        target: LinkedRelayTarget::Fixed { .. },
-        ..
-      }) => DestinationPolicy::SelectedUpstream,
-      LinkedRouteKind::Relay(LinkedRelayRoute {
-        target: LinkedRelayTarget::FromOrigin { .. },
-        ..
-      })
-      | LinkedRouteKind::Transparent(_) => DestinationPolicy::Original,
+      LinkedRouteKind::Managed(_) => DestinationPolicy::SelectedUpstream,
+      LinkedRouteKind::Relay(route) if !route.target().preserves_original_destination() => {
+        DestinationPolicy::SelectedUpstream
+      }
+      LinkedRouteKind::Relay(_) | LinkedRouteKind::Transparent(_) => DestinationPolicy::Original,
     }
   }
 
@@ -99,45 +92,11 @@ impl LinkedRoute {
   /// to surviving linked candidates rather than the wider base upstream
   /// domain, which keeps startup identity requirements exact.
   pub fn possible_provider_ids(&self) -> Box<[ProviderId]> {
-    let mut providers = BTreeSet::new();
     match &self.kind {
-      LinkedRouteKind::Managed(route) => match route.model() {
-        LinkedModelSelector::Capability | LinkedModelSelector::Qualified { .. } => {
-          providers.extend(
-            route
-              .upstreams()
-              .upstreams()
-              .iter()
-              .map(|upstream| upstream.provider_id().clone()),
-          );
-        }
-        LinkedModelSelector::Fallback(fallback) => {
-          for upstream_id in fallback
-            .groups()
-            .iter()
-            .flat_map(LinkedModelGroup::candidates)
-            .flat_map(|candidate| candidate.upstream_ids())
-          {
-            let upstream = route
-              .upstreams()
-              .upstream(upstream_id)
-              .expect("linked fallback candidate upstream must belong to the managed route domain");
-            providers.insert(upstream.provider_id().clone());
-          }
-        }
-      },
-      LinkedRouteKind::Relay(route) => {
-        providers.extend(
-          route
-            .target()
-            .upstreams()
-            .iter()
-            .map(|upstream| upstream.provider_id().clone()),
-        );
-      }
-      LinkedRouteKind::Transparent(_) => {}
+      LinkedRouteKind::Managed(route) => route.target().possible_provider_ids(),
+      LinkedRouteKind::Relay(route) => route.target().possible_provider_ids(),
+      LinkedRouteKind::Transparent(_) => Box::default(),
     }
-    providers.into_iter().collect()
   }
 }
 
@@ -150,86 +109,30 @@ pub enum LinkedRouteKind {
   Transparent(LinkedTransparentRoute),
 }
 
-/// A configured upstream with its resolved target and provider identity.
-#[derive(Clone, Debug)]
-pub struct LinkedUpstream {
-  id: UpstreamId,
-  provider_id: ProviderId,
-  target: ProviderTarget,
-}
-
-impl LinkedUpstream {
-  pub fn id(&self) -> &UpstreamId {
-    &self.id
-  }
-
-  pub fn provider_id(&self) -> &ProviderId {
-    &self.provider_id
-  }
-
-  pub fn target(&self) -> &ProviderTarget {
-    &self.target
-  }
-}
-
-/// Materialized upstream selector for a managed route.
-#[derive(Clone, Debug)]
-pub enum LinkedUpstreamDomain {
-  Fixed(LinkedUpstream),
-  Any(Box<[LinkedUpstream]>),
-}
-
-impl LinkedUpstreamDomain {
-  pub fn upstreams(&self) -> &[LinkedUpstream] {
-    match self {
-      Self::Fixed(upstream) => std::slice::from_ref(upstream),
-      Self::Any(upstreams) => upstreams,
-    }
-  }
-
-  pub fn upstream(&self, upstream_id: &UpstreamId) -> Option<&LinkedUpstream> {
-    self
-      .upstreams()
-      .binary_search_by(|upstream| upstream.id().cmp(upstream_id))
-      .ok()
-      .map(|index| &self.upstreams()[index])
-  }
-
-  pub fn contains(&self, upstream_id: &UpstreamId) -> bool {
-    self.upstream(upstream_id).is_some()
-  }
-
-  pub fn len(&self) -> usize {
-    self.upstreams().len()
-  }
-
-  pub fn is_empty(&self) -> bool {
-    self.upstreams().is_empty()
-  }
-}
-
 /// Runtime-linked managed route.
 #[derive(Clone, Debug)]
 pub struct LinkedManagedRoute {
-  pool: Arc<AccountPoolRuntime>,
-  upstreams: LinkedUpstreamDomain,
-  model: LinkedModelSelector,
+  target: LinkedManagedTarget,
   operation: OperationPolicy,
   header_patches: Option<HeaderPatchSetId>,
   retry: ManagedRetry,
 }
 
 impl LinkedManagedRoute {
-  pub fn pool(&self) -> &Arc<AccountPoolRuntime> {
-    &self.pool
+  pub fn target(&self) -> &LinkedManagedTarget {
+    &self.target
   }
 
-  pub fn upstreams(&self) -> &LinkedUpstreamDomain {
-    &self.upstreams
+  pub fn pool(&self) -> &Arc<super::AccountPoolRuntime> {
+    self.target.pool()
   }
 
-  pub fn model(&self) -> &LinkedModelSelector {
-    &self.model
+  pub fn upstreams(&self) -> &super::LinkedUpstreamDomain {
+    self.target.upstreams()
+  }
+
+  pub fn model(&self) -> &super::LinkedModelSelector {
+    self.target.model()
   }
 
   pub fn operation(&self) -> OperationPolicy {
@@ -242,88 +145,6 @@ impl LinkedManagedRoute {
 
   pub fn retry(&self) -> &ManagedRetry {
     &self.retry
-  }
-}
-
-/// Request-time model interpretation with all static references resolved.
-#[derive(Clone, Debug)]
-pub enum LinkedModelSelector {
-  Capability,
-  Qualified { namespace: QualificationNamespace },
-  Fallback(LinkedFallbackSelector),
-}
-
-/// Runtime-linked model-group choice.
-#[derive(Clone, Debug)]
-pub enum LinkedFallbackSelector {
-  Fixed(LinkedModelGroup),
-  ByRequested(Box<[LinkedModelGroup]>),
-}
-
-impl LinkedFallbackSelector {
-  /// Resolve the group selected for a request without introducing fuzzy or
-  /// substring matching. The first configured `ByRequested` group wins.
-  pub fn group_for_requested(&self, requested_model: &str) -> Option<&LinkedModelGroup> {
-    match self {
-      Self::Fixed(group) => Some(group),
-      Self::ByRequested(groups) => groups.iter().find(|group| group.matches_requested(requested_model)),
-    }
-  }
-
-  pub fn groups(&self) -> &[LinkedModelGroup] {
-    match self {
-      Self::Fixed(group) => std::slice::from_ref(group),
-      Self::ByRequested(groups) => groups,
-    }
-  }
-}
-
-/// One route-local model group. `request_models` retains every configured
-/// member name, including members whose unusable candidate was pruned, so a
-/// request for that member can still enter the group and use later fallbacks.
-#[derive(Clone, Debug)]
-pub struct LinkedModelGroup {
-  id: ModelGroupId,
-  request_models: BTreeSet<SmolStr>,
-  candidates: Box<[LinkedModelCandidate]>,
-}
-
-impl LinkedModelGroup {
-  pub fn id(&self) -> &ModelGroupId {
-    &self.id
-  }
-
-  pub fn request_models(&self) -> &BTreeSet<SmolStr> {
-    &self.request_models
-  }
-
-  pub fn candidates(&self) -> &[LinkedModelCandidate] {
-    &self.candidates
-  }
-
-  pub fn matches_requested(&self, requested_model: &str) -> bool {
-    self.id.as_str() == requested_model || self.request_models.contains(requested_model)
-  }
-}
-
-/// One materializable fallback attempt and its effective upstream domain.
-#[derive(Clone, Debug)]
-pub struct LinkedModelCandidate {
-  model: SmolStr,
-  upstream_ids: Box<[UpstreamId]>,
-}
-
-impl LinkedModelCandidate {
-  pub fn model(&self) -> &str {
-    self.model.as_str()
-  }
-
-  pub fn upstream_ids(&self) -> &[UpstreamId] {
-    &self.upstream_ids
-  }
-
-  pub fn permits_upstream(&self, upstream_id: &UpstreamId) -> bool {
-    self.upstream_ids.binary_search(upstream_id).is_ok()
   }
 }
 
@@ -349,53 +170,6 @@ impl LinkedRelayRoute {
   }
 }
 
-/// Resolved relay destination selection.
-#[derive(Clone, Debug)]
-pub enum LinkedRelayTarget {
-  Fixed {
-    pool: Arc<AccountPoolRuntime>,
-    upstream: LinkedUpstream,
-  },
-  FromOrigin {
-    pool: Arc<AccountPoolRuntime>,
-    upstreams: Box<[LinkedUpstream]>,
-    origins: BTreeMap<CanonicalHttpOrigin, UpstreamId>,
-  },
-}
-
-impl LinkedRelayTarget {
-  pub fn pool(&self) -> &Arc<AccountPoolRuntime> {
-    match self {
-      Self::Fixed { pool, .. } | Self::FromOrigin { pool, .. } => pool,
-    }
-  }
-
-  pub fn upstreams(&self) -> &[LinkedUpstream] {
-    match self {
-      Self::Fixed { upstream, .. } => std::slice::from_ref(upstream),
-      Self::FromOrigin { upstreams, .. } => upstreams,
-    }
-  }
-
-  pub fn origins(&self) -> Option<&BTreeMap<CanonicalHttpOrigin, UpstreamId>> {
-    match self {
-      Self::Fixed { .. } => None,
-      Self::FromOrigin { origins, .. } => Some(origins),
-    }
-  }
-
-  pub fn upstream_for_origin(&self, origin: &CanonicalHttpOrigin) -> Option<&LinkedUpstream> {
-    let Self::FromOrigin { upstreams, origins, .. } = self else {
-      return None;
-    };
-    let upstream_id = origins.get(origin)?;
-    upstreams
-      .binary_search_by(|upstream| upstream.id().cmp(upstream_id))
-      .ok()
-      .map(|index| &upstreams[index])
-  }
-}
-
 /// Runtime-linked transparent route. It intentionally owns no account or
 /// provider state.
 #[derive(Clone, Debug)]
@@ -415,62 +189,8 @@ pub enum RouteLinkError {
   #[snafu(display("reachable route '{route}' does not exist in the gateway plan"))]
   UnknownRoute { route: RouteId },
 
-  #[snafu(display("route '{route}' references account pool '{pool}' without a linked runtime"))]
-  MissingPoolRuntime { route: RouteId, pool: AccountPoolId },
-
-  #[snafu(display("route '{route}' references unknown upstream '{upstream}'"))]
-  MissingUpstream { route: RouteId, upstream: UpstreamId },
-
-  #[snafu(display("route '{route}' references upstream '{upstream}' without a linked provider target"))]
-  MissingProviderTarget { route: RouteId, upstream: UpstreamId },
-
-  #[snafu(display("route '{route}' has no configured upstream with a binding in account pool '{pool}'"))]
-  NoUsableUpstream { route: RouteId, pool: AccountPoolId },
-
-  #[snafu(display("route '{route}' fixes upstream '{upstream}', but account pool '{pool}' has no binding for it"))]
-  FixedUpstreamUnavailable {
-    route: RouteId,
-    pool: AccountPoolId,
-    upstream: UpstreamId,
-  },
-
-  #[snafu(display("route '{route}' references unknown model group '{group}'"))]
-  MissingModelGroup { route: RouteId, group: ModelGroupId },
-
-  #[snafu(display("route '{route}' model group '{group}' candidate {index} has invalid model '{model}'"))]
-  InvalidModelCandidate {
-    route: RouteId,
-    group: ModelGroupId,
-    index: usize,
-    model: String,
-  },
-
-  #[snafu(display("route '{route}' references model group '{group}', but none of its candidates are materializable"))]
-  NoMaterializableCandidates { route: RouteId, group: ModelGroupId },
-
-  #[snafu(display("route '{route}' has a by-requested fallback selector without any model groups"))]
-  EmptyFallbackSelector { route: RouteId },
-
-  #[snafu(display("route '{route}' upstream '{upstream}' has invalid origin '{origin}': {source}"))]
-  InvalidOrigin {
-    route: RouteId,
-    upstream: UpstreamId,
-    origin: String,
-    source: InvalidUpstreamUrl,
-  },
-
-  #[snafu(display(
-    "route '{route}' maps canonical origin '{origin}' to both upstream '{first_upstream}' and upstream '{second_upstream}'"
-  ))]
-  AmbiguousOrigin {
-    route: RouteId,
-    origin: CanonicalHttpOrigin,
-    first_upstream: UpstreamId,
-    second_upstream: UpstreamId,
-  },
-
-  #[snafu(display("route '{route}' has no origin-bearing upstream with a binding in account pool '{pool}'"))]
-  NoUsableOrigin { route: RouteId, pool: AccountPoolId },
+  #[snafu(display("route '{route}' has an invalid target: {source}"))]
+  Target { route: RouteId, source: TargetLinkError },
 }
 
 pub type RouteLinkResult<T> = std::result::Result<T, RouteLinkError>;
@@ -514,14 +234,13 @@ fn link_managed_route(
   providers: &ProviderGraph,
   pools: &AccountPoolRuntimes,
 ) -> RouteLinkResult<LinkedManagedRoute> {
-  let target = route.target();
-  let pool = require_pool(route_id, target.account_pool(), pools)?;
-  let upstreams = link_upstream_domain(route_id, target.upstream(), &pool, plan, providers)?;
-  let model = link_model_selector(route_id, target.model(), &upstreams, plan)?;
+  let target =
+    link_managed_target(route.target(), plan, providers, pools).map_err(|source| RouteLinkError::Target {
+      route: route_id.clone(),
+      source,
+    })?;
   Ok(LinkedManagedRoute {
-    pool,
-    upstreams,
-    model,
+    target,
     operation: route.operation(),
     header_patches: route.header_patches().cloned(),
     retry: route.retry().clone(),
@@ -535,27 +254,10 @@ fn link_relay_route(
   providers: &ProviderGraph,
   pools: &AccountPoolRuntimes,
 ) -> RouteLinkResult<LinkedRelayRoute> {
-  let target = match route.target() {
-    RelayTarget::FixedUpstream { upstream, account_pool } => {
-      let pool = require_pool(route_id, account_pool, pools)?;
-      let linked_upstream = link_upstream(route_id, upstream, plan, providers)?;
-      if !pool_has_upstream(&pool, upstream) {
-        return Err(RouteLinkError::FixedUpstreamUnavailable {
-          route: route_id.clone(),
-          pool: account_pool.clone(),
-          upstream: upstream.clone(),
-        });
-      }
-      LinkedRelayTarget::Fixed {
-        pool,
-        upstream: linked_upstream,
-      }
-    }
-    RelayTarget::UpstreamFromOrigin { account_pool } => {
-      let pool = require_pool(route_id, account_pool, pools)?;
-      link_origin_relay_target(route_id, pool, plan, providers)?
-    }
-  };
+  let target = link_relay_target(route.target(), plan, providers, pools).map_err(|source| RouteLinkError::Target {
+    route: route_id.clone(),
+    source,
+  })?;
   Ok(LinkedRelayRoute {
     target,
     header_patches: route.header_patches().cloned(),
@@ -563,260 +265,23 @@ fn link_relay_route(
   })
 }
 
-fn require_pool(
-  route_id: &RouteId,
-  pool_id: &AccountPoolId,
-  pools: &AccountPoolRuntimes,
-) -> RouteLinkResult<Arc<AccountPoolRuntime>> {
-  pools
-    .runtime(pool_id)
-    .cloned()
-    .ok_or_else(|| RouteLinkError::MissingPoolRuntime {
-      route: route_id.clone(),
-      pool: pool_id.clone(),
-    })
-}
-
-fn link_upstream_domain(
-  route_id: &RouteId,
-  selector: &UpstreamSelector,
-  pool: &AccountPoolRuntime,
-  plan: &GatewayPlan,
-  providers: &ProviderGraph,
-) -> RouteLinkResult<LinkedUpstreamDomain> {
-  match selector {
-    UpstreamSelector::Fixed(upstream_id) => {
-      let upstream = link_upstream(route_id, upstream_id, plan, providers)?;
-      if !pool_has_upstream(pool, upstream_id) {
-        return Err(RouteLinkError::FixedUpstreamUnavailable {
-          route: route_id.clone(),
-          pool: pool.pool().id().clone(),
-          upstream: upstream_id.clone(),
-        });
-      }
-      Ok(LinkedUpstreamDomain::Fixed(upstream))
-    }
-    UpstreamSelector::Any => {
-      let mut upstreams = Vec::new();
-      for upstream_id in plan.upstreams().keys() {
-        if pool_has_upstream(pool, upstream_id) {
-          upstreams.push(link_upstream(route_id, upstream_id, plan, providers)?);
-        }
-      }
-      if upstreams.is_empty() {
-        return Err(RouteLinkError::NoUsableUpstream {
-          route: route_id.clone(),
-          pool: pool.pool().id().clone(),
-        });
-      }
-      Ok(LinkedUpstreamDomain::Any(upstreams.into_boxed_slice()))
-    }
-  }
-}
-
-fn link_upstream(
-  route_id: &RouteId,
-  upstream_id: &UpstreamId,
-  plan: &GatewayPlan,
-  providers: &ProviderGraph,
-) -> RouteLinkResult<LinkedUpstream> {
-  let upstream = plan
-    .upstream(upstream_id)
-    .ok_or_else(|| RouteLinkError::MissingUpstream {
-      route: route_id.clone(),
-      upstream: upstream_id.clone(),
-    })?;
-  let target = providers
-    .target(upstream_id)
-    .cloned()
-    .ok_or_else(|| RouteLinkError::MissingProviderTarget {
-      route: route_id.clone(),
-      upstream: upstream_id.clone(),
-    })?;
-  Ok(LinkedUpstream {
-    id: upstream_id.clone(),
-    provider_id: upstream.provider().clone(),
-    target,
-  })
-}
-
-fn pool_has_upstream(pool: &AccountPoolRuntime, upstream_id: &UpstreamId) -> bool {
-  pool
-    .pool()
-    .active()
-    .iter()
-    .chain(pool.pool().fallback())
-    .any(|account| account.binding(upstream_id).is_some())
-}
-
-fn link_model_selector(
-  route_id: &RouteId,
-  selector: &ModelSelector,
-  upstreams: &LinkedUpstreamDomain,
-  plan: &GatewayPlan,
-) -> RouteLinkResult<LinkedModelSelector> {
-  match selector {
-    ModelSelector::Capability => Ok(LinkedModelSelector::Capability),
-    ModelSelector::Qualified { namespace } => Ok(LinkedModelSelector::Qualified { namespace: *namespace }),
-    ModelSelector::Fallback(fallback) => {
-      let linked = match fallback {
-        FallbackSelector::Fixed(group_id) => {
-          LinkedFallbackSelector::Fixed(link_model_group(route_id, group_id, upstreams, plan)?)
-        }
-        FallbackSelector::ByRequested(group_ids) => {
-          if group_ids.is_empty() {
-            return Err(RouteLinkError::EmptyFallbackSelector {
-              route: route_id.clone(),
-            });
-          }
-          let groups = group_ids
-            .iter()
-            .map(|group_id| link_model_group(route_id, group_id, upstreams, plan))
-            .collect::<RouteLinkResult<Vec<_>>>()?;
-          LinkedFallbackSelector::ByRequested(groups.into_boxed_slice())
-        }
-      };
-      Ok(LinkedModelSelector::Fallback(linked))
-    }
-  }
-}
-
-fn link_model_group(
-  route_id: &RouteId,
-  group_id: &ModelGroupId,
-  upstreams: &LinkedUpstreamDomain,
-  plan: &GatewayPlan,
-) -> RouteLinkResult<LinkedModelGroup> {
-  let group = plan
-    .model_group(group_id)
-    .ok_or_else(|| RouteLinkError::MissingModelGroup {
-      route: route_id.clone(),
-      group: group_id.clone(),
-    })?;
-  let mut request_models = BTreeSet::new();
-  let mut candidates = Vec::new();
-  for (index, candidate) in group.candidates().iter().enumerate() {
-    let model = candidate.model();
-    if model.is_empty() || model.trim() != model {
-      return Err(RouteLinkError::InvalidModelCandidate {
-        route: route_id.clone(),
-        group: group_id.clone(),
-        index,
-        model: model.to_string(),
-      });
-    }
-    request_models.insert(SmolStr::new(model));
-    let upstream_ids = match candidate.upstream() {
-      Some(upstream_id) => {
-        if plan.upstream(upstream_id).is_none() {
-          return Err(RouteLinkError::MissingUpstream {
-            route: route_id.clone(),
-            upstream: upstream_id.clone(),
-          });
-        }
-        if !upstreams.contains(upstream_id) {
-          continue;
-        }
-        vec![upstream_id.clone()]
-      }
-      None => upstreams
-        .upstreams()
-        .iter()
-        .map(|upstream| upstream.id().clone())
-        .collect(),
-    };
-    if !upstream_ids.is_empty() {
-      candidates.push(LinkedModelCandidate {
-        model: SmolStr::new(model),
-        upstream_ids: upstream_ids.into_boxed_slice(),
-      });
-    }
-  }
-  if candidates.is_empty() {
-    return Err(RouteLinkError::NoMaterializableCandidates {
-      route: route_id.clone(),
-      group: group_id.clone(),
-    });
-  }
-  Ok(LinkedModelGroup {
-    id: group_id.clone(),
-    request_models,
-    candidates: candidates.into_boxed_slice(),
-  })
-}
-
-fn link_origin_relay_target(
-  route_id: &RouteId,
-  pool: Arc<AccountPoolRuntime>,
-  plan: &GatewayPlan,
-  providers: &ProviderGraph,
-) -> RouteLinkResult<LinkedRelayTarget> {
-  let mut upstreams = Vec::new();
-  let mut origins = BTreeMap::new();
-  for (upstream_id, upstream_plan) in plan.upstreams() {
-    if !pool_has_upstream(&pool, upstream_id) {
-      continue;
-    }
-    let upstream = link_upstream(route_id, upstream_id, plan, providers)?;
-    let cleartext = if upstream_plan.allow_insecure_http() {
-      CleartextHttpPolicy::Allow
-    } else {
-      CleartextHttpPolicy::LoopbackOnly
-    };
-    let mut claimed = BTreeSet::new();
-    claimed.insert(upstream.target().base_url().origin());
-    for configured in upstream_plan.origins() {
-      let origin =
-        CanonicalHttpOrigin::parse(configured.as_str(), cleartext).map_err(|source| RouteLinkError::InvalidOrigin {
-          route: route_id.clone(),
-          upstream: upstream_id.clone(),
-          origin: configured.to_string(),
-          source,
-        })?;
-      claimed.insert(origin);
-    }
-    for origin in claimed {
-      match origins.entry(origin.clone()) {
-        Entry::Vacant(entry) => {
-          entry.insert(upstream_id.clone());
-        }
-        Entry::Occupied(entry) if entry.get() == upstream_id => {}
-        Entry::Occupied(entry) => {
-          return Err(RouteLinkError::AmbiguousOrigin {
-            route: route_id.clone(),
-            origin,
-            first_upstream: entry.get().clone(),
-            second_upstream: upstream_id.clone(),
-          });
-        }
-      }
-    }
-    upstreams.push(upstream);
-  }
-  if origins.is_empty() {
-    return Err(RouteLinkError::NoUsableOrigin {
-      route: route_id.clone(),
-      pool: pool.pool().id().clone(),
-    });
-  }
-  Ok(LinkedRelayTarget::FromOrigin {
-    pool,
-    upstreams: upstreams.into_boxed_slice(),
-    origins,
-  })
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph};
+  use crate::link::{
+    build_account_pool_runtimes, link_account_pools, link_provider_graph, LinkedFallbackSelector, LinkedModelCandidate,
+    LinkedModelSelector, TargetLinkError,
+  };
   use crate::registry::Registry;
+  use smol_str::SmolStr;
   use std::time::Duration;
   use tokn_core::account::{AccountConfig, AccountTier};
   use tokn_core::provider::ID_LLAMA_CPP;
+  use tokn_core::upstream_url::{CanonicalHttpOrigin, CleartextHttpPolicy};
   use tokn_policy::{
-    AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ManagedTarget, ModelCandidate, ModelGroupPlan,
-    RelayRetry, RetryPolicyId, UpstreamOrigin, UpstreamPlan,
+    AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, FallbackSelector, ManagedTarget,
+    ModelCandidate, ModelGroupId, ModelGroupPlan, ModelSelector, RelayRetry, RelayTarget, RetryPolicyId, UpstreamId,
+    UpstreamOrigin, UpstreamPlan, UpstreamSelector,
   };
 
   struct Inputs {
@@ -1125,14 +590,20 @@ mod tests {
     .unwrap_err();
     assert!(matches!(
       fixed_error,
-      RouteLinkError::FixedUpstreamUnavailable { route, pool, upstream }
+      RouteLinkError::Target {
+        route,
+        source: TargetLinkError::FixedUpstreamUnavailable { pool, upstream },
+      }
         if route.as_str() == "fixed-dead" && pool.as_str() == "empty" && upstream == dead
     ));
 
     let any_error = link_routes(&gateway, &BTreeSet::from([any_id]), &inputs.providers, &inputs.runtimes).unwrap_err();
     assert!(matches!(
       any_error,
-      RouteLinkError::NoUsableUpstream { route, pool }
+      RouteLinkError::Target {
+        route,
+        source: TargetLinkError::NoUsableUpstream { pool },
+      }
         if route.as_str() == "any-empty" && pool.as_str() == "empty"
     ));
   }
@@ -1250,7 +721,10 @@ mod tests {
     let error = link_routes(&gateway, &BTreeSet::from([route]), &inputs.providers, &inputs.runtimes).unwrap_err();
     assert!(matches!(
       error,
-      RouteLinkError::NoMaterializableCandidates { route, group: error_group }
+      RouteLinkError::Target {
+        route,
+        source: TargetLinkError::NoMaterializableCandidates { group: error_group },
+      }
         if route.as_str() == "fallback-empty" && error_group == group
     ));
   }
@@ -1337,9 +811,12 @@ mod tests {
     .unwrap_err();
     assert!(matches!(
       ambiguity,
-      RouteLinkError::AmbiguousOrigin {
-        first_upstream,
-        second_upstream,
+      RouteLinkError::Target {
+        source: TargetLinkError::AmbiguousOrigin {
+          first_upstream,
+          second_upstream,
+          ..
+        },
         ..
       } if first_upstream.as_str() == "first" && second_upstream.as_str() == "second"
     ));
@@ -1364,7 +841,10 @@ mod tests {
     .unwrap_err();
     assert!(matches!(
       error,
-      RouteLinkError::NoUsableOrigin { route, pool }
+      RouteLinkError::Target {
+        route,
+        source: TargetLinkError::NoUsableOrigin { pool },
+      }
         if route.as_str() == "empty" && pool.as_str() == "empty"
     ));
   }
@@ -1499,7 +979,10 @@ mod tests {
         &missing_pool_inputs.providers,
         &missing_pool_inputs.runtimes,
       ),
-      Err(RouteLinkError::MissingPoolRuntime { pool, .. }) if pool.as_str() == "absent"
+      Err(RouteLinkError::Target {
+        source: TargetLinkError::MissingPoolRuntime { pool },
+        ..
+      }) if pool.as_str() == "absent"
     ));
 
     let missing_upstream_route = route_id("missing-upstream");
@@ -1517,7 +1000,10 @@ mod tests {
         &missing_upstream_inputs.providers,
         &missing_upstream_inputs.runtimes,
       ),
-      Err(RouteLinkError::MissingUpstream { upstream, .. }) if upstream.as_str() == "absent"
+      Err(RouteLinkError::Target {
+        source: TargetLinkError::MissingUpstream { upstream },
+        ..
+      }) if upstream.as_str() == "absent"
     ));
 
     let missing_group_route = route_id("missing-group");
@@ -1545,7 +1031,10 @@ mod tests {
         &missing_group_inputs.providers,
         &missing_group_inputs.runtimes,
       ),
-      Err(RouteLinkError::MissingModelGroup { group, .. }) if group.as_str() == "absent"
+      Err(RouteLinkError::Target {
+        source: TargetLinkError::MissingModelGroup { group },
+        ..
+      }) if group.as_str() == "absent"
     ));
   }
 
@@ -1583,7 +1072,10 @@ mod tests {
     let error = link_routes(&gateway, &BTreeSet::from([route]), &inputs.providers, &inputs.runtimes).unwrap_err();
     assert!(matches!(
       error,
-      RouteLinkError::MissingUpstream { upstream, .. } if upstream.as_str() == "absent"
+      RouteLinkError::Target {
+        source: TargetLinkError::MissingUpstream { upstream },
+        ..
+      } if upstream.as_str() == "absent"
     ));
   }
 
@@ -1620,10 +1112,12 @@ mod tests {
     .unwrap_err();
     assert!(matches!(
       invalid_error,
-      RouteLinkError::InvalidModelCandidate {
-        group,
-        index: 0,
-        model,
+      RouteLinkError::Target {
+        source: TargetLinkError::InvalidModelCandidate {
+          group,
+          index: 0,
+          model,
+        },
         ..
       } if group == invalid_group && model == " bad-model"
     ));
@@ -1655,7 +1149,10 @@ mod tests {
     .unwrap_err();
     assert!(matches!(
       empty_error,
-      RouteLinkError::EmptyFallbackSelector { route } if route.as_str() == "empty-selector"
+      RouteLinkError::Target {
+        route,
+        source: TargetLinkError::EmptyFallbackSelector,
+      } if route.as_str() == "empty-selector"
     ));
   }
 }

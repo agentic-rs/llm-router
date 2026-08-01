@@ -3,6 +3,7 @@ mod provider_graph;
 mod resolve;
 mod routes;
 mod selection;
+mod targets;
 
 pub use pools::{
   link_account_pools, LinkedAccountPool, LinkedAccountPools, LinkedPoolAccount, PoolLinkError, PoolLinkResult,
@@ -17,11 +18,15 @@ pub use resolve::{
   TargetResolveError,
 };
 pub use routes::{
-  link_routes, LinkedFallbackSelector, LinkedManagedRoute, LinkedModelCandidate, LinkedModelGroup, LinkedModelSelector,
-  LinkedRelayRoute, LinkedRelayTarget, LinkedRoute, LinkedRouteKind, LinkedRoutes, LinkedTransparentRoute,
-  LinkedUpstream, LinkedUpstreamDomain, RouteLinkError, RouteLinkResult,
+  link_routes, LinkedManagedRoute, LinkedRelayRoute, LinkedRoute, LinkedRouteKind, LinkedRoutes,
+  LinkedTransparentRoute, RouteLinkError, RouteLinkResult,
 };
 pub use selection::{
   build_account_pool_runtimes, AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, PoolRuntimeError,
   PoolRuntimeResult,
+};
+pub use targets::{
+  link_managed_target, link_relay_target, LinkedFallbackSelector, LinkedManagedTarget, LinkedModelCandidate,
+  LinkedModelGroup, LinkedModelSelector, LinkedRelayTarget, LinkedUpstream, LinkedUpstreamDomain, TargetLinkError,
+  TargetLinkResult,
 };

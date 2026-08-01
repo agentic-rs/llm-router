@@ -3116,6 +3116,7 @@ dependencies = [
  "tokn-core",
  "tokn-headers",
  "tokn-mock-server",
+ "tokn-policy",
  "tokn-router-config",
 ]
 

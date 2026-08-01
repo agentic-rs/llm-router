@@ -160,7 +160,9 @@ mod tests {
   use std::net::{Ipv4Addr, SocketAddr};
   use std::sync::Arc;
   use std::time::Duration;
-  use tokn_accounts::link::{LinkError as ProviderGraphLinkError, LinkedRouteKind, PoolLinkError, RouteLinkError};
+  use tokn_accounts::link::{
+    LinkError as ProviderGraphLinkError, LinkedRouteKind, PoolLinkError, RouteLinkError, TargetLinkError,
+  };
   use tokn_core::provider::ID_LLAMA_CPP;
   use tokn_policy::{
     AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction,
@@ -635,7 +637,10 @@ mod tests {
     assert!(matches!(
       link_gateway_runtime(&route_error, &[], &registry, &names),
       Err(GatewayLinkError::Routes {
-        source: RouteLinkError::MissingPoolRuntime { pool, .. },
+        source: RouteLinkError::Target {
+          source: TargetLinkError::MissingPoolRuntime { pool },
+          ..
+        },
       }) if pool.as_str() == "missing-pool"
     ));
 
