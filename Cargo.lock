@@ -2793,13 +2793,11 @@ dependencies = [
 name = "tokn-convert"
 version = "0.2.1"
 dependencies = [
- "anyhow",
  "bytes",
  "eventsource-stream",
  "futures",
  "futures-util",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "snafu",
@@ -2808,7 +2806,6 @@ dependencies = [
  "tokn-endpoint-core",
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
- "tokn-router-config",
 ]
 
 [[package]]
