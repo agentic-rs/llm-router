@@ -25,6 +25,7 @@ tokn-endpoint-chat-completions.workspace = true
 tokn-endpoint-core.workspace = true
 tokn-endpoint-messages.workspace = true
 tokn-endpoint-responses.workspace = true
+tokn-events.workspace = true
 tokn-headers.workspace = true
 tokn-policy.workspace = true
 tokn-requests.workspace = true

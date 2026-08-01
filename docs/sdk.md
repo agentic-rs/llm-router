@@ -20,6 +20,67 @@ The `tokn-sdk` crate is the stable façade. It provides:
 - a raw JSON request escape hatch;
 - buffered typed responses and live byte streams.
 
+### Lifecycle events
+
+Embedded requests can publish the same comprehensive lifecycle events as the
+listener runtime. The application owns the event hub and its consumers; the
+SDK only retains a clone of the supplied publisher:
+
+```rust
+use tokn_sdk::{events::*, Client};
+
+struct PrintEvents;
+
+impl EventConsumer<GatewayEvent> for PrintEvents {
+  fn name(&self) -> &str {
+    "print-events"
+  }
+
+  fn handle(&mut self, sequence: EventSeq, event: &GatewayEvent) -> ConsumerResult {
+    println!("{sequence}: {event:?}");
+    Ok(())
+  }
+}
+
+let (publisher, hub) = HubBuilder::new()
+  .consumer(PrintEvents)
+  .start()?;
+let client = Client::builder()
+  .event_publisher(publisher)
+  .build()?;
+
+let response = client
+  .generate("smart")
+  .prompt("Explain this function.")
+  .send()
+  .await?;
+
+drop(response);
+drop(client);
+hub.shutdown().await?;
+```
+
+Reliable lifecycle boundaries use the hub's bounded queue and can backpressure
+request execution. High-volume progress observations may be coalesced, while
+request and attempt boundaries remain ordered and reliable. Omitting
+`event_publisher()` disables publication without starting an internal hub.
+
+The lifecycle begins only after the SDK has constructed the managed gateway
+request. Typed request serialization failures and invalid `RequestOptions`
+header names or values are SDK-local errors, so they do not emit
+`Started`/`Finished`. Once managed execution begins, profile, body, selection,
+and upstream-attempt failures are enclosed by those lifecycle boundaries.
+
+The publisher is fixed for the client's lifetime and reused by every successful
+reload. A failed reload leaves both the previous runtime snapshot and the same
+publisher usable. The SDK never closes the hub, including when `Client` is
+dropped. Before calling `hub.shutdown()`, stop starting requests, await all
+buffered calls, and fully drain or drop every raw or semantic stream so each
+stream-owned lifecycle can publish its terminal facts. Friendly semantic
+streams drain their underlying transport through EOF before reporting normal
+completion; a transport error encountered during that drain is surfaced to the
+stream consumer.
+
 Profile selection happens once, when the client is built:
 
 ```rust

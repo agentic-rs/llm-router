@@ -41,16 +41,25 @@ pub enum GenerateEvent {
 }
 
 /// A stream of provider-neutral generation events.
+///
+/// Normal semantic completion is withheld until the underlying transport
+/// reaches EOF. A transport error encountered while draining after a terminal
+/// event is surfaced instead of reporting successful completion. Dropping the
+/// stream early abandons that drain and cancels any attached request lifecycle.
 pub type GenerateStream = BoxStream<'static, Result<GenerateEvent>>;
 
 /// A convenience stream containing only generated text deltas.
+///
+/// It retains the same transport-EOF and early-drop semantics as
+/// [`GenerateStream`].
 pub type TextStream = BoxStream<'static, Result<String>>;
 
 struct EventParseState {
   events: EventStream<crate::ByteStream>,
   accumulator: SseAccumulator,
   pending: VecDeque<Result<GenerateEvent>>,
-  stop_after_pending: bool,
+  terminal: Option<VecDeque<Result<GenerateEvent>>>,
+  finished: bool,
 }
 
 impl EventParseState {
@@ -59,24 +68,39 @@ impl EventParseState {
       events: bytes.eventsource(),
       accumulator: SseAccumulator::new(Endpoint::Responses),
       pending: VecDeque::new(),
-      stop_after_pending: false,
+      terminal: None,
+      finished: false,
     }
   }
 
-  fn enqueue(&mut self, results: Vec<Result<GenerateEvent>>, terminal: bool) {
-    self.stop_after_pending |= terminal;
+  fn enqueue(&mut self, results: Vec<Result<GenerateEvent>>) {
     for result in results {
       let failed = result.is_err();
       self.pending.push_back(result);
       if failed {
-        self.stop_after_pending = true;
+        self.finished = true;
         break;
       }
     }
   }
 
+  fn begin_terminal_drain(&mut self, results: Vec<Result<GenerateEvent>>) {
+    self.terminal = Some(results.into());
+  }
+
+  fn finish_terminal_drain(&mut self) {
+    self
+      .pending
+      .append(self.terminal.as_mut().expect("terminal drain is active"));
+    self.terminal = None;
+    self.finished = true;
+  }
+
   fn fail(&mut self, error: Error) {
-    self.enqueue(vec![Err(error)], true);
+    self.pending.clear();
+    self.terminal = None;
+    self.pending.push_back(Err(error));
+    self.finished = true;
   }
 }
 
@@ -86,20 +110,35 @@ pub(super) fn parse_events(bytes: crate::ByteStream) -> GenerateStream {
       if let Some(result) = state.pending.pop_front() {
         return Some((result, state));
       }
-      if state.stop_after_pending {
+      if state.finished {
         return None;
+      }
+
+      if state.terminal.is_some() {
+        match state.events.next().await {
+          Some(Ok(_)) => continue,
+          Some(Err(error)) => state.fail(Error::GenerateStream {
+            message: error.to_string(),
+          }),
+          None => state.finish_terminal_drain(),
+        }
+        continue;
       }
 
       match state.events.next().await {
         Some(Ok(event)) if event.data.trim().is_empty() => {}
         Some(Ok(event)) if event.data.trim() == "[DONE]" => {
-          state.stop_after_pending = true;
+          state.begin_terminal_drain(Vec::new());
         }
         Some(Ok(event)) => match serde_json::from_str::<Value>(&event.data) {
           Ok(value) => {
             let terminal = is_terminal_value(&value);
             let results = results_from_value(&mut state.accumulator, value);
-            state.enqueue(results, terminal);
+            if terminal {
+              state.begin_terminal_drain(results);
+            } else {
+              state.enqueue(results);
+            }
           }
           Err(source) => state.fail(Error::DeserializeStreamEvent { source }),
         },
@@ -263,9 +302,27 @@ mod tests {
   use super::*;
   use bytes::Bytes;
   use futures_util::stream;
+  use std::collections::VecDeque;
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::sync::Arc;
+  use std::task::Poll;
 
   fn byte_stream(body: String) -> crate::ByteStream {
     Box::pin(stream::once(async move { Ok(Bytes::from(body)) }))
+  }
+
+  fn tracked_byte_stream(chunks: Vec<std::io::Result<Bytes>>) -> (crate::ByteStream, Arc<AtomicBool>) {
+    let reached_eof = Arc::new(AtomicBool::new(false));
+    let eof_observation = Arc::clone(&reached_eof);
+    let mut chunks = VecDeque::from(chunks);
+    let bytes = stream::poll_fn(move |_| match chunks.pop_front() {
+      Some(chunk) => Poll::Ready(Some(chunk)),
+      None => {
+        eof_observation.store(true, Ordering::SeqCst);
+        Poll::Ready(None)
+      }
+    });
+    (Box::pin(bytes), reached_eof)
   }
 
   fn sse(values: impl IntoIterator<Item = Value>) -> String {
@@ -428,7 +485,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn successful_terminal_events_finish_without_polling_later_events() {
+  async fn successful_terminal_events_drain_later_events_without_emitting_them() {
     let body = sse([
       serde_json::json!({
         "type": "response.completed",
@@ -453,6 +510,69 @@ mod tests {
         finish_reason: Some("stop".into())
       }]
     );
+  }
+
+  #[tokio::test]
+  async fn terminal_event_and_done_marker_reach_transport_eof_before_completion() {
+    let terminal = sse([serde_json::json!({
+      "type": "response.completed",
+      "response": {
+        "status": "completed",
+        "output": []
+      }
+    })]);
+    let (bytes, reached_eof) = tracked_byte_stream(vec![
+      Ok(Bytes::from(terminal)),
+      Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+    ]);
+    let mut events = parse_events(bytes);
+
+    assert!(matches!(
+      events.next().await,
+      Some(Ok(GenerateEvent::Completed {
+        finish_reason: Some(reason)
+      })) if reason == "stop"
+    ));
+    assert!(reached_eof.load(Ordering::SeqCst));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn done_marker_without_semantic_terminal_still_drains_to_eof() {
+    let (bytes, reached_eof) = tracked_byte_stream(vec![Ok(Bytes::from_static(b"data: [DONE]\n\n"))]);
+
+    let events = parse_events(bytes)
+      .try_collect::<Vec<_>>()
+      .await
+      .expect("DONE marker should end the semantic stream");
+
+    assert!(events.is_empty());
+    assert!(reached_eof.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn transport_error_while_draining_replaces_normal_completion() {
+    let terminal = sse([serde_json::json!({
+      "type": "response.completed",
+      "response": {
+        "status": "completed",
+        "output": []
+      }
+    })]);
+    let bytes: crate::ByteStream = Box::pin(stream::iter([
+      Ok(Bytes::from(terminal)),
+      Err(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset while draining",
+      )),
+    ]));
+    let mut events = parse_events(bytes);
+
+    assert!(matches!(
+      events.next().await,
+      Some(Err(Error::GenerateStream { message })) if message.contains("connection reset while draining")
+    ));
+    assert!(events.next().await.is_none());
   }
 
   #[tokio::test]

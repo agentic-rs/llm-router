@@ -27,3 +27,7 @@ pub use tokn_endpoint_chat_completions as chat_completions;
 pub use tokn_endpoint_core::Endpoint;
 pub use tokn_endpoint_messages as messages;
 pub use tokn_endpoint_responses as responses;
+pub use tokn_events as events;
+pub use tokn_events::{
+  ConsumerResult, EventConsumer, EventHub, EventSeq, GatewayEvent, HubBuilder, HubStatus, Publisher,
+};
