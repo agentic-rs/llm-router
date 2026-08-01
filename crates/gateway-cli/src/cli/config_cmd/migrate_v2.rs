@@ -367,6 +367,14 @@ mod tests {
     }
   }
 
+  fn apply_args() -> MigrateV2Args {
+    MigrateV2Args {
+      apply: true,
+      yes: true,
+      ..args(V2ActivationArg::Api)
+    }
+  }
+
   fn legacy_config(path: &Path) {
     fs::write(
       path,
@@ -530,5 +538,135 @@ url = "http://user:sentinel-password@proxy.example"
     let diagnostics = std::str::from_utf8(&stderr).unwrap();
     assert!(diagnostics.lines().all(|line| line.starts_with("warning: ")));
     assert!(diagnostics.contains("persistence and logging"));
+  }
+
+  #[test]
+  fn declined_apply_is_read_only_and_does_not_acquire_locks() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    legacy_config(&config_path);
+    let original = fs::read(&config_path).unwrap();
+    let mut args = apply_args();
+    args.yes = false;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut confirmations = 0;
+    let mut decline = |_: &str| {
+      confirmations += 1;
+      Ok(false)
+    };
+
+    execute_with_confirmation(
+      &config_path,
+      &args,
+      Some(&auth_path),
+      &mut stdout,
+      &mut stderr,
+      &mut decline,
+    )
+    .unwrap();
+
+    assert_eq!(confirmations, 1);
+    assert!(stdout.is_empty());
+    assert!(std::str::from_utf8(&stderr).unwrap().contains("no files changed"));
+    assert!(!std::str::from_utf8(&stderr).unwrap().contains("migration-secret"));
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert!(!auth_path.exists());
+    assert!(!backup::legacy_backup_path(&config_path).unwrap().exists());
+    assert!(!directory.path().join(".config.toml.lock").exists());
+    assert!(!directory.path().join(".auth.yaml.lock").exists());
+  }
+
+  #[test]
+  fn apply_installs_credentials_before_activating_exact_v2_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    legacy_config(&config_path);
+    let original = fs::read(&config_path).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut unexpected_confirmation = |_: &str| -> Result<bool> { panic!("--yes must skip confirmation") };
+
+    execute_with_confirmation(
+      &config_path,
+      &apply_args(),
+      Some(&auth_path),
+      &mut stdout,
+      &mut stderr,
+      &mut unexpected_confirmation,
+    )
+    .unwrap();
+
+    assert!(stdout.is_empty());
+    let activated = fs::read_to_string(&config_path).unwrap();
+    let compiled = tokn_config::v2::parse(&activated, &config_path).unwrap();
+    let store = AuthStore::load(Some(&auth_path), None).unwrap();
+    tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), &store.accounts).unwrap();
+    assert_eq!(store.accounts.len(), 1);
+    assert_eq!(store.accounts[0].id, "embedded");
+    assert!(!activated.contains("migration-secret"));
+    let backup_path = backup::legacy_backup_path(&config_path).unwrap();
+    assert_eq!(fs::read(&backup_path).unwrap(), original);
+    let diagnostics = std::str::from_utf8(&stderr).unwrap();
+    assert!(diagnostics.contains("activated version 2 config"));
+    assert!(!diagnostics.contains("migration-secret"));
+  }
+
+  #[test]
+  fn apply_requires_explicit_fragment_flattening_and_retains_fragment_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    legacy_config(&config_path);
+    let fragment_path = tokn_config::paths::agent_config_fragment_path(&config_path, "opencode");
+    fs::create_dir_all(fragment_path.parent().unwrap()).unwrap();
+    let fragment = br#"
+[agents.opencode]
+profile = "opencode"
+
+[profiles.opencode]
+agent_id = "opencode"
+mode = "route"
+"#;
+    fs::write(&fragment_path, fragment).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut unexpected_confirmation = |_: &str| -> Result<bool> { panic!("preflight must not confirm") };
+
+    let error = execute_with_confirmation(
+      &config_path,
+      &apply_args(),
+      Some(&auth_path),
+      &mut stdout,
+      &mut stderr,
+      &mut unexpected_confirmation,
+    )
+    .unwrap_err();
+
+    assert!(
+      error.to_string().contains("--flatten-config-d"),
+      "unexpected error: {error:#}"
+    );
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert!(!backup::legacy_backup_path(&config_path).unwrap().exists());
+    assert!(!auth_path.exists());
+
+    let mut flattened = apply_args();
+    flattened.flatten_config_d = true;
+    execute_with_confirmation(
+      &config_path,
+      &flattened,
+      Some(&auth_path),
+      &mut stdout,
+      &mut stderr,
+      &mut unexpected_confirmation,
+    )
+    .unwrap();
+
+    tokn_config::v2::load(&config_path).unwrap();
+    assert_eq!(fs::read(fragment_path).unwrap(), fragment);
   }
 }
