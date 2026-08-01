@@ -3225,6 +3225,7 @@ dependencies = [
  "tokn-convert",
  "tokn-core",
  "tokn-endpoint-chat-completions",
+ "tokn-endpoint-core",
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
  "tokn-headers",

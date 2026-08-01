@@ -9,8 +9,8 @@ pub mod sse;
 pub mod tools;
 pub mod value;
 
-use crate::provider::Endpoint;
 use serde_json::Value;
+use tokn_endpoint_core::Endpoint;
 
 pub use error::Result;
 

@@ -4,7 +4,7 @@ use super::pipeline::EventTransformer;
 use super::responses_emit::ResponsesEmitter;
 use crate::error::{ConvertError, Result};
 use crate::ir::IrDelta;
-use crate::provider::Endpoint;
+use tokn_endpoint_core::Endpoint;
 
 pub struct EndpointTranslator {
   from: Endpoint,

@@ -14,7 +14,7 @@ use tokn_convert::ir::{
   ContentPart as IrContentPart, IrMessage, IrRequest, Role as IrRole, Sampling, ToolCall as IrToolCall,
 };
 use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary};
-use tokn_core::provider::Endpoint;
+use tokn_endpoint_core::Endpoint;
 use tokn_requests::execution::ManagedAttemptError;
 use tokn_router::runtime::ManagedGatewayError;
 
