@@ -4,6 +4,7 @@ use thiserror::Error;
 use tokn_config::RouteMode;
 
 mod analysis;
+mod resources;
 
 /// Which legacy listener surface should be represented in a v2 plan.
 ///
