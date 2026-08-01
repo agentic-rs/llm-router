@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UsageDetails {
   pub cache_read: Option<u64>,
@@ -35,17 +33,3 @@ pub struct Usage {
   pub usage_type: Option<UsageType>,
   pub details: UsageDetails,
 }
-
-#[derive(Debug, Clone, Default)]
-pub struct HttpSnapshot {
-  pub url: Option<String>,
-  pub method: Option<String>,
-  /// Response status (req side has no status).
-  pub status: Option<u16>,
-  pub req_headers: tokn_headers::HeaderMap,
-  pub req_body: Bytes,
-  pub resp_headers: tokn_headers::HeaderMap,
-  pub resp_body: Bytes,
-}
-
-pub type OutboundSnapshot = HttpSnapshot;
