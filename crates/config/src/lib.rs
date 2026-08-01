@@ -43,6 +43,33 @@ impl<'a> ConfigEditPreimage<'a> {
   }
 }
 
+/// Atomically replace arbitrary config contents when the target still has the
+/// expected exact preimage.
+///
+/// `None` requires the target to remain missing. `Some(bytes)` requires it to
+/// be present with those exact bytes. This function does not parse or validate
+/// either preimage or replacement contents.
+///
+/// A missing target is installed with create-if-absent semantics, so a file
+/// that appears while the replacement is being staged is never overwritten.
+/// For an existing target, portable filesystems do not offer content-based
+/// compare-and-swap; callers must serialize cooperating writers and must not
+/// externally edit the file concurrently with the final check-and-rename
+/// window.
+pub fn replace_contents_if_unchanged(path: &Path, expected: Option<&[u8]>, contents: &[u8]) -> GuardedEditResult<()> {
+  let expected = ConfigEditPreimage::from_expected(expected);
+  let current = read_optional_config_bytes(path)?;
+  if !expected.matches(current.as_deref()) {
+    return Err(GuardedEditError::Changed {
+      path: path.to_path_buf(),
+    });
+  }
+
+  ensure_config_parent(path)?;
+  let staged = stage_atomic_contents(path, contents)?;
+  commit_staged_atomic_write_guarded(path, staged, expected)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
   #[serde(default)]
@@ -1206,6 +1233,10 @@ fn commit_staged_atomic_write_guarded(
 }
 
 fn stage_atomic_write(path: &Path, contents: &str) -> Result<tempfile::NamedTempFile> {
+  stage_atomic_contents(path, contents.as_bytes())
+}
+
+fn stage_atomic_contents(path: &Path, contents: &[u8]) -> Result<tempfile::NamedTempFile> {
   let parent = path
     .parent()
     .filter(|parent| !parent.as_os_str().is_empty())
@@ -1217,12 +1248,9 @@ fn stage_atomic_write(path: &Path, contents: &str) -> Result<tempfile::NamedTemp
     .context(error::WriteSnafu {
       path: path.to_path_buf(),
     })?;
-  staged
-    .as_file_mut()
-    .write_all(contents.as_bytes())
-    .context(error::WriteSnafu {
-      path: staged.path().to_path_buf(),
-    })?;
+  staged.as_file_mut().write_all(contents).context(error::WriteSnafu {
+    path: staged.path().to_path_buf(),
+  })?;
   staged.as_file().sync_all().context(error::WriteSnafu {
     path: staged.path().to_path_buf(),
   })?;
@@ -1877,6 +1905,43 @@ profile = "opencode"
   }
 
   #[test]
+  fn replace_contents_replaces_exact_existing_bytes_without_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let initial = b"\xfflegacy contents\0";
+    let replacement = b"\0generated v2 contents\xfe";
+    std::fs::write(&path, initial).unwrap();
+
+    replace_contents_if_unchanged(&path, Some(initial), replacement).unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+  }
+
+  #[test]
+  fn replace_contents_rejects_changed_bytes_and_preserves_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let current = b"current contents";
+    std::fs::write(&path, current).unwrap();
+
+    let error = replace_contents_if_unchanged(&path, Some(b"stale contents"), b"replacement").unwrap_err();
+
+    assert!(matches!(error, GuardedEditError::Changed { path: changed } if changed == path));
+    assert_eq!(std::fs::read(&path).unwrap(), current);
+  }
+
+  #[test]
+  fn replace_contents_creates_a_missing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested/config.toml");
+    let replacement = b"\xffgenerated contents\0";
+
+    replace_contents_if_unchanged(&path, None, replacement).unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+  }
+
+  #[test]
   fn guarded_edit_rejects_changed_present_contents_before_invoking_edit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -1976,11 +2041,11 @@ profile = "opencode"
   }
 
   #[test]
-  fn guarded_missing_commit_rejects_a_target_created_after_staging() {
+  fn replace_contents_rejects_a_target_created_after_staging() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    let concurrent = b"[server]\nport = 6262\n";
-    let staged = stage_atomic_write(&path, "[server]\nport = 5151\n").unwrap();
+    let concurrent = b"concurrent contents";
+    let staged = stage_atomic_contents(&path, b"replacement contents").unwrap();
     let staged_path = staged.path().to_path_buf();
     std::fs::write(&path, concurrent).unwrap();
 
