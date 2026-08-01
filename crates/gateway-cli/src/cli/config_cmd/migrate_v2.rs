@@ -397,6 +397,15 @@ fn render_behavior_change(change: V2BehaviorChange) -> &'static str {
     V2BehaviorChange::HttpRejectionBehavior => {
       "unmatched paths, methods, and operations use the version 2 rejection response contract"
     }
+    V2BehaviorChange::ProxyRequestModeOverrides => {
+      "legacy request-time proxy mode overrides are not represented; the generated proxy uses one compiled profile"
+    }
+    V2BehaviorChange::ProxyClientAuthentication => {
+      "version 2 authenticates proxy clients before CONNECT routing, including tunnels; use Proxy-Authorization with a local key"
+    }
+    V2BehaviorChange::ProxyCleartextHttpRouting => {
+      "generated proxy HTTP bindings can also route matching absolute-form cleartext requests"
+    }
   }
 }
 
@@ -503,7 +512,7 @@ api_key = "migration-secret"
   }
 
   #[test]
-  fn execution_keeps_streams_empty_until_preflight_succeeds() {
+  fn execution_preflights_proxy_output_and_preserves_default_ca_location() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
     let auth_path = directory.path().join("missing-auth.yaml");
@@ -511,18 +520,69 @@ api_key = "migration-secret"
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let error = execute(
+    execute(
       &config_path,
       &args(V2ActivationArg::Proxy),
       Some(&auth_path),
       &mut stdout,
       &mut stderr,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(format!("{error:#}").contains("does not yet support"));
-    assert!(stdout.is_empty());
-    assert!(stderr.is_empty());
+    let rendered = std::str::from_utf8(&stdout).unwrap();
+    let compiled = tokn_config::v2::parse(rendered, &config_path).unwrap();
+    let tokn_policy::ListenerPlan::ForwardProxy(proxy) = &compiled.gateway().listeners()["proxy"] else {
+      panic!("expected migrated proxy listener")
+    };
+    assert_eq!(
+      proxy.tls().unwrap().ca_dir(),
+      tokn_config::paths::default_ca_dir().unwrap().as_path()
+    );
+    let diagnostics = std::str::from_utf8(&stderr).unwrap();
+    assert!(diagnostics.contains("request-time proxy mode overrides"));
+    assert!(diagnostics.contains("absolute-form cleartext"));
+    assert!(!rendered.contains("migration-secret"));
+  }
+
+  #[test]
+  fn execution_resolves_explicit_relative_ca_at_activation_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("missing-auth.yaml");
+    fs::write(
+      &config_path,
+      r#"
+[[accounts]]
+id = "embedded"
+provider = "openai"
+enabled = true
+api_key = "migration-secret"
+
+[proxy_mode]
+ca_dir = "relative-ca"
+"#,
+    )
+    .unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    execute(
+      &config_path,
+      &args(V2ActivationArg::Proxy),
+      Some(&auth_path),
+      &mut stdout,
+      &mut stderr,
+    )
+    .unwrap();
+
+    let compiled = tokn_config::v2::parse(std::str::from_utf8(&stdout).unwrap(), &config_path).unwrap();
+    let tokn_policy::ListenerPlan::ForwardProxy(proxy) = &compiled.gateway().listeners()["proxy"] else {
+      panic!("expected migrated proxy listener")
+    };
+    assert_eq!(
+      proxy.tls().unwrap().ca_dir(),
+      directory.path().join("relative-ca").as_path()
+    );
   }
 
   #[test]
@@ -662,6 +722,48 @@ url = "http://user:sentinel-password@proxy.example"
     let diagnostics = std::str::from_utf8(&stderr).unwrap();
     assert!(diagnostics.contains("activated version 2 config"));
     assert!(!diagnostics.contains("migration-secret"));
+  }
+
+  #[test]
+  fn apply_activates_linkable_proxy_and_combined_listener_graphs() {
+    for activation in [V2ActivationArg::Proxy, V2ActivationArg::Both] {
+      let directory = tempfile::tempdir().unwrap();
+      let config_path = directory.path().join("config.toml");
+      let auth_path = directory.path().join("auth.yaml");
+      legacy_config(&config_path);
+      let mut migration_args = args(activation);
+      migration_args.apply = true;
+      migration_args.yes = true;
+      let mut stdout = Vec::new();
+      let mut stderr = Vec::new();
+      let mut unexpected_confirmation = |_: &str| -> Result<bool> { panic!("--yes must skip confirmation") };
+
+      execute_with_confirmation(
+        &config_path,
+        &migration_args,
+        Some(&auth_path),
+        &mut stdout,
+        &mut stderr,
+        &mut unexpected_confirmation,
+      )
+      .unwrap();
+
+      let compiled = tokn_config::v2::load(&config_path).unwrap();
+      let store = AuthStore::load(Some(&auth_path), None).unwrap();
+      tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), &store.accounts).unwrap();
+      assert!(matches!(
+        compiled.gateway().listeners()["proxy"],
+        tokn_policy::ListenerPlan::ForwardProxy(_)
+      ));
+      assert_eq!(
+        compiled.gateway().listeners().contains_key("api"),
+        activation == V2ActivationArg::Both
+      );
+      assert!(stdout.is_empty());
+      assert!(std::str::from_utf8(&stderr)
+        .unwrap()
+        .contains("activated version 2 config"));
+    }
   }
 
   #[test]

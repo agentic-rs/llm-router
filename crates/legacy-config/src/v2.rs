@@ -10,10 +10,6 @@ mod resources;
 pub use compose::{plan_v2_migration, V2MigrationPlan};
 
 /// Which legacy listener surface should be represented in a v2 plan.
-///
-/// Only [`Self::Api`] is implemented in the first migration slice. Keeping
-/// unsupported selections representable lets callers report precise errors
-/// instead of silently omitting the forward proxy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum V2ListenerSelection {
   Api,
@@ -63,6 +59,7 @@ impl Default for V2MigrationOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyPolicyLocation {
   Default,
+  Proxy,
   Profile(String),
 }
 
@@ -70,6 +67,7 @@ impl std::fmt::Display for LegacyPolicyLocation {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       Self::Default => formatter.write_str("defaults"),
+      Self::Proxy => formatter.write_str("proxy mode"),
       Self::Profile(name) => write!(formatter, "profile `{name}`"),
     }
   }
@@ -101,6 +99,16 @@ pub enum V2BehaviorChange {
   /// V2 listener rejection uses a different status/body contract from the
   /// legacy Axum router for unmatched paths, methods, and operations.
   HttpRejectionBehavior,
+  /// A v2 proxy profile is fixed by the compiled listener graph. The legacy
+  /// proxy also accepted request-time mode overrides in proxy headers.
+  ProxyRequestModeOverrides,
+  /// V2 authenticates a forward-proxy client before deciding whether a
+  /// CONNECT will be intercepted or tunneled. Legacy API-key enforcement
+  /// applied only after interception and exempted passthrough requests.
+  ProxyClientAuthentication,
+  /// V2 forward-proxy HTTP bindings also match absolute-form cleartext HTTP.
+  /// The legacy proxy routed only requests decoded after HTTPS interception.
+  ProxyCleartextHttpRouting,
 }
 
 /// A non-fatal migration diagnostic that must be shown before applying a
@@ -127,14 +135,16 @@ pub enum V2MigrationError {
   InvalidLegacyProxyUrl,
   #[error("cannot safely render a credential-bearing legacy outbound proxy URL; remove embedded proxy credentials before migration")]
   CredentialedOutboundProxyUnsupported,
-  #[error("v2 migration does not yet support the {selection:?} listener selection")]
-  UnsupportedListenerSelection { selection: V2ListenerSelection },
   #[error("cannot migrate {policy}: legacy route mode {mode:?} has no exact v2 recipe")]
   UnsupportedRouteMode {
     policy: LegacyPolicyLocation,
     mode: RouteMode,
   },
-  #[error("cannot migrate an API gateway without supplied accounts")]
+  #[error(
+    "cannot migrate proxy mode: provider-specific mode overrides for {providers:?} do not have exact v2 recipes"
+  )]
+  UnsupportedProxyProviderModes { providers: Vec<String> },
+  #[error("cannot migrate managed listeners without supplied accounts")]
   NoAccounts,
   #[error("{policy} selects no enabled supplied account")]
   NoEnabledAccountsForPolicy { policy: LegacyPolicyLocation },
@@ -154,6 +164,19 @@ pub enum V2MigrationError {
   UnsupportedApiBindHost { host: String },
   #[error("legacy API bind `{bind}` is non-loopback and requires an explicit v2 public-listener review")]
   UnsupportedRemoteApiBind { bind: SocketAddr },
+  #[error("legacy proxy bind host `{host}` is not an IP address and cannot be represented by a v2 listener")]
+  UnsupportedProxyBindHost { host: String },
+  #[error("legacy proxy bind `{bind}` is non-loopback and requires an explicit v2 public-listener review")]
+  UnsupportedRemoteProxyBind { bind: SocketAddr },
+  #[error("legacy proxy {field} entry `{host}` contains a wildcard that was ineffective in the legacy proxy and cannot be activated safely during migration")]
+  UnsupportedProxyWildcardHost { field: &'static str, host: String },
+  #[error("legacy proxy {field} entry `{host}` is not canonical; the legacy proxy matched it literally, so migration refuses to normalize it into an active v2 rule")]
+  UnsupportedProxyNonCanonicalHost { field: &'static str, host: String },
+  #[error("cannot resolve the legacy default proxy CA directory: {source}")]
+  ResolveDefaultProxyCaDir {
+    #[source]
+    source: tokn_config::Error,
+  },
   #[error("legacy session_ttl_secs=0 with session_tombstone_secs={session_tombstone_secs} has no v2 equivalent")]
   UnsupportedSessionAffinity { session_tombstone_secs: u64 },
   #[error("{policy} uses custom wire identity `{agent_id}`, which the built-in v2 runtime cannot resolve")]

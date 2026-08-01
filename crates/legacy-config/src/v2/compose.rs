@@ -1,23 +1,41 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use tokn_config::v2::{
-  RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawHttpPathPattern, RawListener, RawModelSelector,
-  RawOperationPolicy, RawOutbound, RawProfile, RawQualificationNamespace, RawRequestLimits, RawRoute, RawService,
-  RawUpstreamSelector, SCHEMA_VERSION,
+  RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule, RawHttpPathPattern,
+  RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawProfile, RawQualificationNamespace,
+  RawRequestLimits, RawRoute, RawService, RawUpstreamSelector, SCHEMA_VERSION,
 };
 use tokn_config::{Config, RouteMode};
 use tokn_core::account::AccountConfig;
 
 use super::analysis::{
-  api_bind, base_warnings, effective_policies, profile_path, wire_identity, EffectivePolicy, IdentifierAllocator,
+  api_bind, base_warnings, effective_policies, effective_proxy_policy, profile_path, proxy_bind, wire_identity,
+  EffectivePolicy, IdentifierAllocator,
 };
 use super::resources::{build_upstreams, index_accounts, raw_pool_for_policy};
-use super::{V2ListenerSelection, V2MigrationError, V2MigrationOptions, V2MigrationWarning};
+use super::{
+  LegacyPolicyLocation, V2BehaviorChange, V2ListenerSelection, V2MigrationError, V2MigrationOptions, V2MigrationWarning,
+};
 
 const API_LISTENER_ID: &str = "api";
 const DEFAULT_POLICY_ID: &str = "default";
+const PROXY_LISTENER_ID: &str = "proxy";
+const PROXY_POLICY_ID: &str = "proxy";
 const GENERATED_SOURCE: &str = "migrated-v2.toml";
+// Frozen legacy defaults belong to the migration recipe rather than the v2
+// runtime. Keep this list aligned with the retired proxy's effective set.
+const LEGACY_PROXY_INTERCEPT_HOSTS: &[&str] = &[
+  "api.openai.com",
+  "api.githubcopilot.com",
+  "api.z.ai",
+  "open.bigmodel.cn",
+  "chatgpt.com",
+  "api.deepseek.com",
+  "openrouter.ai",
+  "api.anthropic.com",
+  "opencode.ai",
+];
 const LLM_ENDPOINTS: [(&str, &str, &str); 3] = [
   ("chat-completions", "chat/completions", "chat_completions"),
   ("responses", "responses", "responses"),
@@ -66,11 +84,14 @@ pub fn plan_v2_migration(
   legacy
     .validate()
     .map_err(|source| V2MigrationError::InvalidLegacyConfig { source })?;
-  if options.listener_selection != V2ListenerSelection::Api {
-    return Err(V2MigrationError::UnsupportedListenerSelection {
-      selection: options.listener_selection,
-    });
-  }
+  let include_api = matches!(
+    options.listener_selection,
+    V2ListenerSelection::Api | V2ListenerSelection::ApiAndProxy
+  );
+  let include_proxy = matches!(
+    options.listener_selection,
+    V2ListenerSelection::Proxy | V2ListenerSelection::ApiAndProxy
+  );
   if accounts.is_empty() {
     return Err(V2MigrationError::NoAccounts);
   }
@@ -78,20 +99,42 @@ pub fn plan_v2_migration(
   let account_index = index_accounts(accounts)?;
   let mut warnings = base_warnings(legacy);
   let outbound = migrated_outbound(legacy, &mut warnings)?;
-  let policies = effective_policies(legacy, &mut warnings)?;
+  let proxy_host_rules = include_proxy.then(|| legacy_proxy_host_rules(legacy)).transpose()?;
+  let mut policies = if include_api {
+    effective_policies(legacy, &mut warnings)?
+  } else {
+    Vec::new()
+  };
+  if include_proxy {
+    policies.push(effective_proxy_policy(legacy, &mut warnings)?);
+    warnings.push(V2MigrationWarning::BehaviorChange(
+      V2BehaviorChange::ProxyRequestModeOverrides,
+    ));
+    warnings.push(V2MigrationWarning::BehaviorChange(
+      V2BehaviorChange::ProxyCleartextHttpRouting,
+    ));
+    if legacy.api_key.enabled {
+      warnings.push(V2MigrationWarning::BehaviorChange(
+        V2BehaviorChange::ProxyClientAuthentication,
+      ));
+    }
+  }
   let upstreams = build_upstreams(accounts, &policies, options.allow_insecure_upstreams, &mut warnings)?;
-  let bind = api_bind(legacy)?;
 
   let mut ids = IdentifierAllocator::with_reserved(DEFAULT_POLICY_ID);
+  if include_proxy {
+    ids.reserve(PROXY_POLICY_ID);
+  }
   let mut profiles = BTreeMap::new();
   let mut routes = BTreeMap::new();
   let mut account_pools = BTreeMap::new();
   let mut bindings = Vec::new();
 
   for policy in policies {
-    let resource_id = match policy.legacy_profile.as_deref() {
-      None => DEFAULT_POLICY_ID.to_string(),
-      Some(profile) => {
+    let resource_id = match (&policy.location, policy.legacy_profile.as_deref()) {
+      (LegacyPolicyLocation::Proxy, _) => PROXY_POLICY_ID.to_string(),
+      (LegacyPolicyLocation::Default, None) => DEFAULT_POLICY_ID.to_string(),
+      (LegacyPolicyLocation::Profile(_), Some(profile)) => {
         let allocated = ids.allocate(profile);
         if allocated != profile {
           warnings.push(V2MigrationWarning::ProfileResourceRenamed {
@@ -101,6 +144,7 @@ pub fn plan_v2_migration(
         }
         allocated
       }
+      _ => unreachable!("effective policies retain their legacy location"),
     };
     let model = managed_model_recipe(&policy)?;
     let wire_identity = wire_identity(&policy)?;
@@ -124,25 +168,72 @@ pub fn plan_v2_migration(
     );
     account_pools.insert(resource_id.clone(), pool);
 
-    let path_prefix = match policy.legacy_profile.as_deref() {
-      Some(profile) => profile_path(profile)?,
-      None => "/v1/".to_string(),
-    };
-    for (id_suffix, path_suffix, operation) in LLM_ENDPOINTS {
-      bindings.push(RawBinding {
-        id: format!("{resource_id}-{id_suffix}"),
-        listener: API_LISTENER_ID.to_string(),
-        action: RawBindingAction::Route {
-          profile: resource_id.clone(),
-        },
-        hosts: Vec::new(),
-        paths: vec![RawHttpPathPattern::Exact {
-          path: format!("{path_prefix}{path_suffix}"),
-        }],
-        methods: vec!["POST".to_string()],
-        operations: vec![operation.to_string()],
+    if policy.location == LegacyPolicyLocation::Proxy {
+      let (_, intercept_hosts) = proxy_host_rules.as_ref().expect("proxy selection has host rules");
+      append_proxy_bindings(&mut bindings, &resource_id, intercept_hosts);
+    } else {
+      let path_prefix = match policy.legacy_profile.as_deref() {
+        Some(profile) => profile_path(profile)?,
+        None => "/v1/".to_string(),
+      };
+      append_api_bindings(&mut bindings, &resource_id, &path_prefix);
+    }
+  }
+
+  let mut listeners = BTreeMap::new();
+  let mut connect_rules = Vec::new();
+  if include_api {
+    listeners.insert(
+      API_LISTENER_ID.to_string(),
+      RawListener::LlmApi {
+        bind: api_bind(legacy)?.to_string(),
+        client_auth: migrated_client_auth(legacy),
+        allow_insecure_public: false,
+        default_http_action: RawBindingAction::Reject {},
+      },
+    );
+  }
+  if include_proxy {
+    let (passthrough_hosts, intercept_hosts) = proxy_host_rules.expect("proxy selection has host rules");
+    if !passthrough_hosts.is_empty() {
+      connect_rules.push(RawConnectRule {
+        id: "proxy-passthrough".to_string(),
+        listener: PROXY_LISTENER_ID.to_string(),
+        action: RawConnectAction::Tunnel,
+        hosts: passthrough_hosts,
+        ports: vec![443],
       });
     }
+    if !intercept_hosts.is_empty() {
+      connect_rules.push(RawConnectRule {
+        id: "proxy-intercept".to_string(),
+        listener: PROXY_LISTENER_ID.to_string(),
+        action: RawConnectAction::Intercept,
+        hosts: intercept_hosts,
+        ports: vec![443],
+      });
+    }
+    listeners.insert(
+      PROXY_LISTENER_ID.to_string(),
+      RawListener::ForwardProxy {
+        bind: proxy_bind(legacy)?.to_string(),
+        client_auth: migrated_client_auth(legacy),
+        allow_insecure_public: false,
+        default_http_action: RawBindingAction::Reject {},
+        // Legacy proxy mode tunneled every destination outside its explicit
+        // interception set. Preserve that behavior in migration output even
+        // though new configurations should normally default to reject.
+        default_connect: RawConnectAction::Tunnel,
+        // Retain this even when passthrough rules remove every intercept host:
+        // legacy proxy startup resolved and loaded its CA unconditionally.
+        ca_dir: Some(
+          legacy
+            .proxy_mode
+            .resolved_ca_dir()
+            .map_err(|source| V2MigrationError::ResolveDefaultProxyCaDir { source })?,
+        ),
+      },
+    );
   }
 
   let raw_config = RawConfig {
@@ -151,21 +242,9 @@ pub fn plan_v2_migration(
       outbound,
       request_limits: RawRequestLimits::default(),
     },
-    listeners: BTreeMap::from([(
-      API_LISTENER_ID.to_string(),
-      RawListener::LlmApi {
-        bind: bind.to_string(),
-        client_auth: if legacy.api_key.enabled {
-          RawClientAuth::LocalKeys
-        } else {
-          RawClientAuth::None
-        },
-        allow_insecure_public: false,
-        default_http_action: RawBindingAction::Reject {},
-      },
-    )]),
+    listeners,
     bindings,
-    connect_rules: Vec::new(),
+    connect_rules,
     profiles,
     routes,
     account_pools,
@@ -177,6 +256,91 @@ pub fn plan_v2_migration(
     .map_err(|source| V2MigrationError::InvalidGeneratedConfig { source })?;
 
   Ok(V2MigrationPlan { raw_config, warnings })
+}
+
+fn migrated_client_auth(legacy: &Config) -> RawClientAuth {
+  if legacy.api_key.enabled {
+    RawClientAuth::LocalKeys
+  } else {
+    RawClientAuth::None
+  }
+}
+
+fn append_api_bindings(bindings: &mut Vec<RawBinding>, resource_id: &str, path_prefix: &str) {
+  for (id_suffix, path_suffix, operation) in LLM_ENDPOINTS {
+    bindings.push(RawBinding {
+      id: format!("{resource_id}-{id_suffix}"),
+      listener: API_LISTENER_ID.to_string(),
+      action: RawBindingAction::Route {
+        profile: resource_id.to_string(),
+      },
+      hosts: Vec::new(),
+      paths: vec![RawHttpPathPattern::Exact {
+        path: format!("{path_prefix}{path_suffix}"),
+      }],
+      methods: vec!["POST".to_string()],
+      operations: vec![operation.to_string()],
+    });
+  }
+}
+
+fn append_proxy_bindings(bindings: &mut Vec<RawBinding>, resource_id: &str, intercept_hosts: &[String]) {
+  if intercept_hosts.is_empty() {
+    return;
+  }
+  for (id_suffix, _, operation) in LLM_ENDPOINTS {
+    bindings.push(RawBinding {
+      id: format!("{resource_id}-{id_suffix}"),
+      listener: PROXY_LISTENER_ID.to_string(),
+      action: RawBindingAction::Route {
+        profile: resource_id.to_string(),
+      },
+      hosts: intercept_hosts.to_vec(),
+      paths: Vec::new(),
+      methods: vec!["POST".to_string()],
+      operations: vec![operation.to_string()],
+    });
+  }
+}
+
+fn legacy_proxy_host_rules(legacy: &Config) -> Result<(Vec<String>, Vec<String>), V2MigrationError> {
+  validate_legacy_proxy_hosts("passthrough_hosts", &legacy.proxy_mode.passthrough_hosts)?;
+  validate_legacy_proxy_hosts("intercept_hosts", &legacy.proxy_mode.intercept_hosts)?;
+
+  let passthrough = normalized_hosts(legacy.proxy_mode.passthrough_hosts.iter().map(String::as_str));
+  let intercept = normalized_hosts(
+    LEGACY_PROXY_INTERCEPT_HOSTS
+      .iter()
+      .copied()
+      .chain(legacy.proxy_mode.intercept_hosts.iter().map(String::as_str)),
+  )
+  .into_iter()
+  .filter(|candidate| !passthrough.contains(candidate))
+  .collect();
+  Ok((passthrough.into_iter().collect(), intercept))
+}
+
+fn validate_legacy_proxy_hosts(field: &'static str, hosts: &[String]) -> Result<(), V2MigrationError> {
+  if let Some(host) = hosts.iter().find(|host| host.contains('*')) {
+    return Err(V2MigrationError::UnsupportedProxyWildcardHost {
+      field,
+      host: host.clone(),
+    });
+  }
+  if let Some(host) = hosts
+    .iter()
+    .find(|host| host.as_str() != host.trim() || host.ends_with('.'))
+  {
+    return Err(V2MigrationError::UnsupportedProxyNonCanonicalHost {
+      field,
+      host: host.clone(),
+    });
+  }
+  Ok(())
+}
+
+fn normalized_hosts<'a>(hosts: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
+  hosts.into_iter().map(str::to_ascii_lowercase).collect()
 }
 
 fn migrated_outbound(legacy: &Config, warnings: &mut Vec<V2MigrationWarning>) -> Result<RawOutbound, V2MigrationError> {
@@ -314,22 +478,7 @@ enabled = true
   }
 
   #[test]
-  fn rejects_unsupported_listeners_and_semantically_invalid_output() {
-    let valid_account = account(None);
-    for selection in [V2ListenerSelection::Proxy, V2ListenerSelection::ApiAndProxy] {
-      assert!(matches!(
-        plan_v2_migration(
-          &Config::default(),
-          std::slice::from_ref(&valid_account),
-          V2MigrationOptions {
-            listener_selection: selection,
-            allow_insecure_upstreams: false,
-          }
-        ),
-        Err(V2MigrationError::UnsupportedListenerSelection { selection: found }) if found == selection
-      ));
-    }
-
+  fn rejects_semantically_invalid_output() {
     assert!(matches!(
       plan_v2_migration(
         &Config::default(),
@@ -338,6 +487,185 @@ enabled = true
       ),
       Err(V2MigrationError::InvalidGeneratedConfig { .. })
     ));
+  }
+
+  #[test]
+  fn proxy_selection_preserves_connect_policy_and_uses_its_own_route() {
+    let mut legacy = Config::default();
+    legacy.defaults.mode = RouteMode::Route;
+    legacy.proxy_mode.route_mode = RouteMode::Exact;
+    legacy.proxy_mode.port = 4242;
+    legacy.proxy_mode.ca_dir = Some(Path::new("relative-ca").to_path_buf());
+    legacy.proxy_mode.intercept_hosts = vec!["Custom.Example".into(), "api.example.net".into()];
+    legacy.proxy_mode.passthrough_hosts = vec!["api.openai.com".into(), "safe.example.net".into()];
+
+    let plan = plan_v2_migration(&legacy, &[account(None)], V2MigrationOptions::proxy_only()).unwrap();
+    let raw = plan.raw_config();
+    tokn_config::v2::compile(raw, Path::new("etc/migrated.toml")).unwrap();
+
+    assert_eq!(raw.listeners.len(), 1);
+    let RawListener::ForwardProxy {
+      bind,
+      default_http_action,
+      default_connect,
+      ca_dir,
+      ..
+    } = &raw.listeners[PROXY_LISTENER_ID]
+    else {
+      panic!("expected forward proxy listener")
+    };
+    assert_eq!(bind, "127.0.0.1:4242");
+    assert_eq!(default_http_action, &RawBindingAction::Reject {});
+    assert_eq!(default_connect, &RawConnectAction::Tunnel);
+    assert_eq!(ca_dir.as_deref(), Some(Path::new("relative-ca")));
+
+    assert_eq!(raw.connect_rules.len(), 2);
+    assert_eq!(raw.connect_rules[0].id, "proxy-passthrough");
+    assert_eq!(raw.connect_rules[0].action, RawConnectAction::Tunnel);
+    assert!(raw.connect_rules[0].hosts.contains(&"api.openai.com".into()));
+    assert_eq!(raw.connect_rules[1].id, "proxy-intercept");
+    assert_eq!(raw.connect_rules[1].action, RawConnectAction::Intercept);
+    assert!(!raw.connect_rules[1].hosts.contains(&"api.openai.com".into()));
+    assert!(raw.connect_rules[1].hosts.contains(&"custom.example".into()));
+    assert!(raw.connect_rules[1].hosts.contains(&"api.example.net".into()));
+
+    assert_eq!(raw.profiles.keys().map(String::as_str).collect::<Vec<_>>(), ["proxy"]);
+    assert!(matches!(
+      raw.routes[PROXY_POLICY_ID],
+      RawRoute::Managed {
+        model: RawModelSelector::Qualified {
+          namespace: RawQualificationNamespace::Provider
+        },
+        ..
+      }
+    ));
+    assert_eq!(raw.bindings.len(), 3);
+    assert!(raw.bindings.iter().all(|binding| {
+      binding.listener == PROXY_LISTENER_ID
+        && matches!(&binding.action, RawBindingAction::Route { profile } if profile == PROXY_POLICY_ID)
+    }));
+    assert!(plan.warnings().contains(&V2MigrationWarning::BehaviorChange(
+      V2BehaviorChange::ProxyRequestModeOverrides
+    )));
+    assert!(plan.warnings().contains(&V2MigrationWarning::BehaviorChange(
+      V2BehaviorChange::ProxyCleartextHttpRouting
+    )));
+  }
+
+  #[test]
+  fn both_selection_keeps_api_and_proxy_policies_independent() {
+    let mut legacy = Config::default();
+    legacy.defaults.mode = RouteMode::Route;
+    legacy.proxy_mode.route_mode = RouteMode::Exact;
+    legacy.profiles.insert("proxy".into(), ProfileConfig::default());
+
+    let plan = plan_v2_migration(&legacy, &[account(None)], V2MigrationOptions::api_and_proxy()).unwrap();
+    let raw = plan.raw_config();
+    tokn_config::v2::compile(raw, Path::new("migration.toml")).unwrap();
+
+    assert!(matches!(raw.listeners[API_LISTENER_ID], RawListener::LlmApi { .. }));
+    assert!(matches!(
+      raw.listeners[PROXY_LISTENER_ID],
+      RawListener::ForwardProxy { .. }
+    ));
+    assert!(raw.profiles.contains_key(DEFAULT_POLICY_ID));
+    assert!(raw.profiles.contains_key(PROXY_POLICY_ID));
+    assert!(raw.profiles.contains_key("proxy-2"));
+    assert!(matches!(
+      raw.routes[DEFAULT_POLICY_ID],
+      RawRoute::Managed {
+        model: RawModelSelector::Capability {},
+        ..
+      }
+    ));
+    assert!(matches!(
+      raw.routes[PROXY_POLICY_ID],
+      RawRoute::Managed {
+        model: RawModelSelector::Qualified { .. },
+        ..
+      }
+    ));
+    assert_eq!(raw.bindings.len(), 9);
+  }
+
+  #[test]
+  fn proxy_selection_refuses_dynamic_provider_modes_without_an_exact_recipe() {
+    let mut legacy = Config::default();
+    legacy
+      .proxy_mode
+      .provider_modes
+      .insert("openai".into(), tokn_config::ProxyProviderMode::Passthrough);
+
+    assert!(matches!(
+      plan_v2_migration(&legacy, &[account(None)], V2MigrationOptions::proxy_only()),
+      Err(V2MigrationError::UnsupportedProxyProviderModes { providers }) if providers == ["openai"]
+    ));
+  }
+
+  #[test]
+  fn proxy_selection_refuses_to_activate_legacy_wildcard_hosts() {
+    for field in ["intercept_hosts", "passthrough_hosts"] {
+      let mut legacy = Config::default();
+      match field {
+        "intercept_hosts" => legacy.proxy_mode.intercept_hosts.push("*.example.com".into()),
+        "passthrough_hosts" => legacy.proxy_mode.passthrough_hosts.push("*.example.com".into()),
+        _ => unreachable!(),
+      }
+
+      assert!(matches!(
+        plan_v2_migration(&legacy, &[account(None)], V2MigrationOptions::proxy_only()),
+        Err(V2MigrationError::UnsupportedProxyWildcardHost {
+          field: found,
+          host
+        }) if found == field && host == "*.example.com"
+      ));
+    }
+  }
+
+  #[test]
+  fn proxy_selection_refuses_to_normalize_ineffective_exact_hosts() {
+    for (field, host) in [
+      ("intercept_hosts", " api.example.com"),
+      ("intercept_hosts", "api.example.com "),
+      ("passthrough_hosts", "api.example.com."),
+    ] {
+      let mut legacy = Config::default();
+      match field {
+        "intercept_hosts" => legacy.proxy_mode.intercept_hosts.push(host.into()),
+        "passthrough_hosts" => legacy.proxy_mode.passthrough_hosts.push(host.into()),
+        _ => unreachable!(),
+      }
+
+      assert!(matches!(
+        plan_v2_migration(&legacy, &[account(None)], V2MigrationOptions::proxy_only()),
+        Err(V2MigrationError::UnsupportedProxyNonCanonicalHost {
+          field: found,
+          host: found_host
+        }) if found == field && found_host == host
+      ));
+    }
+  }
+
+  #[test]
+  fn tunnel_only_proxy_retains_the_legacy_ca_startup_precondition() {
+    let mut legacy = Config::default();
+    legacy.proxy_mode.passthrough_hosts = LEGACY_PROXY_INTERCEPT_HOSTS
+      .iter()
+      .map(|host| (*host).to_string())
+      .collect();
+
+    let plan = plan_v2_migration(&legacy, &[account(None)], V2MigrationOptions::proxy_only()).unwrap();
+    let raw = plan.raw_config();
+    let RawListener::ForwardProxy { ca_dir, .. } = &raw.listeners[PROXY_LISTENER_ID] else {
+      panic!("expected forward proxy listener")
+    };
+
+    assert!(ca_dir.is_some());
+    assert!(raw
+      .connect_rules
+      .iter()
+      .all(|rule| rule.action == RawConnectAction::Tunnel));
+    assert!(raw.bindings.is_empty());
   }
 
   #[test]

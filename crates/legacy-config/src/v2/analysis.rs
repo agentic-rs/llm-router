@@ -87,6 +87,37 @@ pub(super) fn effective_policies(
   Ok(policies)
 }
 
+pub(super) fn effective_proxy_policy(
+  legacy: &Config,
+  warnings: &mut Vec<V2MigrationWarning>,
+) -> Result<EffectivePolicy, V2MigrationError> {
+  let mode = legacy.proxy_mode.route_mode;
+  ensure_supported_mode(&LegacyPolicyLocation::Proxy, mode)?;
+  if mode == RouteMode::Route
+    && !warnings.contains(&V2MigrationWarning::BehaviorChange(
+      V2BehaviorChange::ManagedSelectionOrder,
+    ))
+  {
+    warnings.push(V2MigrationWarning::BehaviorChange(
+      V2BehaviorChange::ManagedSelectionOrder,
+    ));
+  }
+  if !legacy.proxy_mode.provider_modes.is_empty() {
+    return Err(V2MigrationError::UnsupportedProxyProviderModes {
+      providers: legacy.proxy_mode.provider_modes.keys().cloned().collect(),
+    });
+  }
+
+  Ok(EffectivePolicy {
+    location: LegacyPolicyLocation::Proxy,
+    legacy_profile: None,
+    mode,
+    agent_id: legacy.defaults.agent_id.clone(),
+    providers: legacy.defaults.providers.clone(),
+    accounts: legacy.defaults.accounts.clone(),
+  })
+}
+
 fn ensure_supported_mode(location: &LegacyPolicyLocation, mode: RouteMode) -> Result<(), V2MigrationError> {
   match mode {
     RouteMode::Route | RouteMode::Exact => Ok(()),
@@ -123,6 +154,21 @@ pub(super) fn api_bind(legacy: &Config) -> Result<SocketAddr, V2MigrationError> 
   Ok(bind)
 }
 
+pub(super) fn proxy_bind(legacy: &Config) -> Result<SocketAddr, V2MigrationError> {
+  let ip = legacy
+    .proxy_mode
+    .host
+    .parse::<IpAddr>()
+    .map_err(|_| V2MigrationError::UnsupportedProxyBindHost {
+      host: legacy.proxy_mode.host.clone(),
+    })?;
+  let bind = SocketAddr::new(ip, legacy.proxy_mode.port);
+  if !ip.is_loopback() {
+    return Err(V2MigrationError::UnsupportedRemoteProxyBind { bind });
+  }
+  Ok(bind)
+}
+
 pub(super) fn profile_path(profile: &str) -> Result<String, V2MigrationError> {
   if matches!(profile, "." | "..") {
     return Err(V2MigrationError::UnsupportedProfilePath {
@@ -154,6 +200,10 @@ impl IdentifierAllocator {
     Self {
       used: BTreeSet::from([reserved.to_string()]),
     }
+  }
+
+  pub(super) fn reserve(&mut self, reserved: &str) {
+    self.used.insert(reserved.to_string());
   }
 
   pub(super) fn allocate(&mut self, source: &str) -> String {
@@ -300,6 +350,18 @@ mod tests {
         }) if profile == "unsupported" && found == mode
       ));
     }
+
+    for mode in [RouteMode::Fuzzy, RouteMode::Switch, RouteMode::Passthrough] {
+      let mut legacy = Config::default();
+      legacy.proxy_mode.route_mode = mode;
+      assert!(matches!(
+        effective_proxy_policy(&legacy, &mut Vec::new()),
+        Err(V2MigrationError::UnsupportedRouteMode {
+          policy: LegacyPolicyLocation::Proxy,
+          mode: found
+        }) if found == mode
+      ));
+    }
   }
 
   #[test]
@@ -319,11 +381,15 @@ mod tests {
   }
 
   #[test]
-  fn accepts_only_explicit_loopback_api_binds() {
+  fn accepts_only_explicit_loopback_listener_binds() {
     let legacy = Config::default();
     assert_eq!(
       api_bind(&legacy).unwrap(),
       SocketAddr::new(IpAddr::from([127, 0, 0, 1]), legacy.server.port)
+    );
+    assert_eq!(
+      proxy_bind(&legacy).unwrap(),
+      SocketAddr::new(IpAddr::from([127, 0, 0, 1]), legacy.proxy_mode.port)
     );
 
     let mut hostname = Config::default();
@@ -338,6 +404,20 @@ mod tests {
     assert!(matches!(
       api_bind(&public),
       Err(V2MigrationError::UnsupportedRemoteApiBind { bind }) if bind.ip().is_unspecified()
+    ));
+
+    let mut proxy_hostname = Config::default();
+    proxy_hostname.proxy_mode.host = "localhost".into();
+    assert!(matches!(
+      proxy_bind(&proxy_hostname),
+      Err(V2MigrationError::UnsupportedProxyBindHost { host }) if host == "localhost"
+    ));
+
+    let mut public_proxy = Config::default();
+    public_proxy.proxy_mode.host = "::".into();
+    assert!(matches!(
+      proxy_bind(&public_proxy),
+      Err(V2MigrationError::UnsupportedRemoteProxyBind { bind }) if bind.ip().is_unspecified()
     ));
   }
 
@@ -354,8 +434,10 @@ mod tests {
     }
 
     let mut ids = IdentifierAllocator::with_reserved("default");
+    ids.reserve("proxy");
     assert_eq!(ids.allocate("Default"), "default-2");
     assert_eq!(ids.allocate("default"), "default-3");
+    assert_eq!(ids.allocate("proxy"), "proxy-2");
     assert_eq!(ids.allocate("Team Blue β"), "team-blue");
     assert_eq!(ids.allocate("β"), "profile");
     assert_eq!(ids.allocate("γ"), "profile-2");
