@@ -491,6 +491,10 @@ mod tests {
   }
 
   fn tls_client_config(ca_cert: &Path) -> Arc<ClientConfig> {
+    tls_client_config_with_sni(ca_cert, true)
+  }
+
+  fn tls_client_config_with_sni(ca_cert: &Path, enable_sni: bool) -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     let mut reader = BufReader::new(std::fs::File::open(ca_cert).unwrap());
     for certificate in rustls_pemfile::certs(&mut reader) {
@@ -502,6 +506,7 @@ mod tests {
       .with_root_certificates(roots)
       .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.enable_sni = enable_sni;
     Arc::new(config)
   }
 
@@ -777,7 +782,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn intercepted_connect_serves_https_with_the_connect_identity() {
+  async fn intercepted_connect_accepts_absent_sni_and_pins_inner_authority() {
     let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let proxy_address = proxy_listener.local_addr().unwrap();
     let (_temp, state, ca_cert) = intercept_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_503)));
@@ -800,12 +805,30 @@ mod tests {
     let server_name = ServerName::try_from("api.example.test").unwrap().to_owned();
     let mut tls = timeout(
       TEST_TIMEOUT,
-      TlsConnector::from(tls_client_config(&ca_cert)).connect(server_name, client),
+      TlsConnector::from(tls_client_config_with_sni(&ca_cert, false)).connect(server_name, client),
     )
     .await
     .unwrap()
     .unwrap();
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
+
+    tls
+      .write_all(b"GET /v1/models HTTP/1.1\r\nHost: other.example.test\r\n\r\n")
+      .await
+      .unwrap();
+    let (head, mut body) = timeout(TEST_TIMEOUT, read_response_head(&mut tls)).await.unwrap();
+    assert!(std::str::from_utf8(&head)
+      .unwrap()
+      .starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    let content_length = response_content_length(&head);
+    timeout(TEST_TIMEOUT, fill_to(&mut tls, &mut body, content_length))
+      .await
+      .unwrap();
+    assert_eq!(body.len(), content_length);
+    assert!(std::str::from_utf8(&body)
+      .unwrap()
+      .contains("\"code\":\"invalid_authority\""));
+
     tls
       .write_all(b"GET /v1/models HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n")
       .await
@@ -834,6 +857,48 @@ mod tests {
       report.session().dispatch().authority().authority().to_string(),
       "api.example.test:443"
     );
+    drop(shutdown_tx);
+  }
+
+  #[tokio::test]
+  async fn intercepted_connect_rejects_sni_that_differs_from_connect_host() {
+    let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let (_temp, state, ca_cert) = intercept_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_505)));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let connection = tokio::spawn(async move {
+      let (stream, _) = proxy_listener.accept().await.unwrap();
+      serve_forward_proxy_connection(stream, state, shutdown_rx).await
+    });
+
+    let mut client = TcpStream::connect(proxy_address).await.unwrap();
+    client
+      .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
+      .await
+      .unwrap();
+    let (head, read_ahead) = timeout(TEST_TIMEOUT, read_response_head(&mut client)).await.unwrap();
+    assert!(std::str::from_utf8(&head).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(read_ahead.is_empty());
+
+    let wrong_name = ServerName::try_from("other.example.test").unwrap().to_owned();
+    assert!(timeout(
+      TEST_TIMEOUT,
+      TlsConnector::from(tls_client_config(&ca_cert)).connect(wrong_name, client),
+    )
+    .await
+    .unwrap()
+    .is_err());
+    let error = timeout(TEST_TIMEOUT, connection)
+      .await
+      .unwrap()
+      .unwrap()
+      .expect_err("mismatched SNI must fail the intercepted CONNECT session");
+    assert!(matches!(
+      error,
+      ConnectionServeError::Connect {
+        source: ConnectRunError::TlsHandshake { .. }
+      }
+    ));
     drop(shutdown_tx);
   }
 
