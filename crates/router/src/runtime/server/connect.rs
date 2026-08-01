@@ -6,6 +6,7 @@
 //! connection task runs the prepared upgrade and reports only post-response
 //! transport failures.
 
+use super::connection::ConnectionMetadata;
 use super::intercept::{prepare_tls_intercept, PreparedTlsIntercept};
 use super::{BoxTunnelIo, ConnectUpgradeUnavailableReason, ListenerServerState, ServerError};
 use crate::runtime::{ConnectDispatch, ConnectDispatchSite};
@@ -27,6 +28,7 @@ pub(super) struct ConnectSession {
   dispatch: ConnectDispatch,
   access: AccessContext,
   request_id: RequestId,
+  connection: ConnectionMetadata,
 }
 
 impl ConnectSession {
@@ -40,6 +42,10 @@ impl ConnectSession {
 
   pub(super) fn request_id(&self) -> &RequestId {
     &self.request_id
+  }
+
+  pub(super) const fn connection(&self) -> ConnectionMetadata {
+    self.connection
   }
 }
 
@@ -182,6 +188,7 @@ pub(super) async fn prepare_connect_upgrade(
   dispatch: ConnectDispatch,
   access: AccessContext,
   request_id: RequestId,
+  connection: ConnectionMetadata,
   request: &mut Request<Body>,
 ) -> Result<ConnectUpgrade, ServerError> {
   if dispatch.action() == ConnectAction::Reject {
@@ -220,6 +227,7 @@ pub(super) async fn prepare_connect_upgrade(
       dispatch,
       access,
       request_id,
+      connection,
     }),
     on_upgrade,
     transport,
