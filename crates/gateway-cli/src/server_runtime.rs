@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::db::archive::{ArchiveEventHandler, ArchiveRuntime};
 use crate::progress::{ArchiveProgressEventHandler, ProgressEventHandler, ProgressLogEventHandler};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
@@ -87,6 +87,9 @@ pub async fn bind_compiled_gateway(
   accounts: &[AccountConfig],
   local_access_db_path: Option<&Path>,
 ) -> Result<BoundGatewayListeners> {
+  if compiled.gateway().listeners().is_empty() {
+    bail!("compiled gateway has no listeners to serve");
+  }
   let runtime = Arc::new(
     link_builtin_gateway_runtime(compiled.gateway(), accounts).context("failed to link compiled gateway runtime")?,
   );
@@ -172,6 +175,15 @@ default_http_action = {{ kind = "reject" }}
     let _parts = build_event_bus(&cfg).expect("event bus should initialize other persistence");
 
     assert!(!sessions_db.exists());
+  }
+
+  #[tokio::test]
+  async fn serving_rejects_a_headless_embedded_config() {
+    let compiled = tokn_config::v2::parse("schema_version = 2\n", Path::new("embedded.toml")).unwrap();
+
+    let error = bind_compiled_gateway(&compiled, &[], None).await.unwrap_err();
+
+    assert_eq!(error.to_string(), "compiled gateway has no listeners to serve");
   }
 
   #[tokio::test]

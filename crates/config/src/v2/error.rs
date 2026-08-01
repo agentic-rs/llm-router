@@ -60,9 +60,6 @@ pub enum CompileError {
     resource: &'static str,
     source: InvalidIdentifier,
   },
-  EmptyRegistry {
-    resource: &'static str,
-  },
   DuplicateId {
     resource: &'static str,
     id: String,
@@ -95,7 +92,6 @@ impl fmt::Display for CompileError {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::InvalidIdentifier { resource, source } => write!(formatter, "invalid {resource}: {source}"),
-      Self::EmptyRegistry { resource } => write!(formatter, "at least one {resource} must be configured"),
       Self::DuplicateId { resource, id } => write!(formatter, "duplicate {resource} id `{id}`"),
       Self::DuplicateBind {
         first_listener,

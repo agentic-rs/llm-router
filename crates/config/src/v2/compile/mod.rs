@@ -13,10 +13,6 @@ pub(super) fn compile_config(raw: &RawConfig, source: &Path) -> Result<CompiledC
 }
 
 fn compile_gateway(raw: &RawConfig, source: &Path) -> Result<GatewayPlan, CompileError> {
-  if raw.listeners.is_empty() {
-    return Err(CompileError::EmptyRegistry { resource: "listener" });
-  }
-
   let resources = resources::compile_resources(raw)?;
   let listeners = listeners::compile_listeners(raw, source, &resources.profiles, &resources.routes)?;
 

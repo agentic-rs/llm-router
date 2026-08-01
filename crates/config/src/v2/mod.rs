@@ -134,6 +134,14 @@ mod tests {
   }
 
   #[test]
+  fn headless_config_compiles_for_embedded_consumers() {
+    let compiled = parse(EMPTY_V2, Path::new("embedded.toml")).unwrap();
+
+    assert!(compiled.gateway().listeners().is_empty());
+    assert!(compiled.gateway().profiles().is_empty());
+  }
+
+  #[test]
   fn missing_file_is_not_replaced_with_defaults() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("missing.toml");

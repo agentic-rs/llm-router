@@ -107,10 +107,6 @@ pub(super) fn compile_listeners(
   profiles: &BTreeMap<ProfileId, ProfilePlan>,
   routes: &BTreeMap<RouteId, RoutePlan>,
 ) -> Result<BTreeMap<ListenerId, ListenerPlan>, CompileError> {
-  if raw.listeners.is_empty() {
-    return Err(CompileError::EmptyRegistry { resource: "listener" });
-  }
-
   let mut drafts = BTreeMap::new();
   let mut binds = Vec::<(SocketAddr, ListenerId)>::new();
   for (raw_id, raw_listener) in &raw.listeners {
