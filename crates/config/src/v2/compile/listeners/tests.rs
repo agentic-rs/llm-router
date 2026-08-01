@@ -8,6 +8,14 @@ fn subdomains_of(value: &str) -> HostPattern {
   HostPattern::subdomains_of(CanonicalHost::parse(value).unwrap()).unwrap()
 }
 
+fn exact_path(value: &str) -> RawHttpPathPattern {
+  RawHttpPathPattern::Exact { path: value.into() }
+}
+
+fn path_prefix(value: &str) -> RawHttpPathPattern {
+  RawHttpPathPattern::Prefix { path: value.into() }
+}
+
 fn parse_config(contents: &str) -> RawConfig {
   toml::from_str(contents).unwrap()
 }
@@ -50,7 +58,7 @@ operations = ["chat_completions"]
 id = "fallback"
 listener = "api"
 action = { kind = "reject" }
-path_prefixes = ["/v1"]
+paths = [{ kind = "prefix", path = "/v1" }]
 "#,
   );
 
@@ -210,7 +218,7 @@ id = "broad"
 listener = "api"
 action = { kind = "reject" }
 hosts = ["*.example.com"]
-path_prefixes = ["/v1"]
+paths = [{ kind = "prefix", path = "/v1" }]
 methods = ["GET", "POST"]
 
 [[bindings]]
@@ -218,13 +226,46 @@ id = "shadowed"
 listener = "api"
 action = { kind = "reject" }
 hosts = ["api.example.com"]
-path_prefixes = ["/v1/chat"]
+paths = [{ kind = "exact", path = "/v1/chat" }]
 methods = ["POST"]
 operations = ["chat_completions"]
 "#,
   );
 
   assert_invalid_message(&raw, "binding `broad` matches all of its requests");
+}
+
+#[test]
+fn earlier_exact_path_does_not_shadow_a_later_prefix() {
+  let raw = parse_config(
+    r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+
+[[bindings]]
+id = "exact"
+listener = "api"
+action = { kind = "reject" }
+paths = [{ kind = "exact", path = "/v1/responses" }]
+
+[[bindings]]
+id = "prefix"
+listener = "api"
+action = { kind = "reject" }
+paths = [{ kind = "prefix", path = "/v1/" }]
+"#,
+  );
+
+  let listeners = compile_config(&raw, Path::new("config.toml")).unwrap();
+  let ListenerPlan::LlmApi(listener) = &listeners["api"] else {
+    panic!("expected LLM API listener");
+  };
+  assert_eq!(listener.http_bindings().len(), 2);
 }
 
 #[test]
@@ -341,7 +382,7 @@ fn rejects_redundant_alternatives_inside_an_http_matcher() {
   for selector in [
     r#"hosts = ["*.example.com", "api.example.com"]"#,
     r#"hosts = ["*.api.example.com", "*.example.com"]"#,
-    r#"path_prefixes = ["/v1/chat", "/v1"]"#,
+    r#"paths = [{ kind = "exact", path = "/v1/chat" }, { kind = "prefix", path = "/v1" }]"#,
   ] {
     let raw = parse_config(&format!(
       r#"
@@ -380,7 +421,7 @@ default_http_action = { kind = "reject" }
 id = "all-paths"
 listener = "api"
 action = { kind = "reject" }
-path_prefixes = ["/"]
+paths = [{ kind = "prefix", path = "/" }]
 "#,
   );
 
@@ -388,41 +429,47 @@ path_prefixes = ["/"]
 }
 
 #[test]
-fn canonicalizes_and_validates_raw_encoded_path_prefixes() {
+fn canonicalizes_and_validates_raw_encoded_path_patterns() {
+  let (patterns, _) = compile_paths(&[path_prefix("/v1/%2fchat"), exact_path("/v2/%2fchat")], "encoded").unwrap();
   assert_eq!(
-    compile_path_prefixes(&["/v1/%2fchat".into()], "encoded")
-      .unwrap()
-      .0
-      .into_iter()
-      .map(|prefix| prefix.to_string())
-      .collect::<Vec<_>>(),
-    vec!["/v1/%2Fchat"]
+    patterns[0],
+    HttpPathPattern::Prefix(HttpPathPrefix::parse("/v1/%2Fchat").unwrap())
+  );
+  assert_eq!(
+    patterns[1],
+    HttpPathPattern::Exact(CanonicalHttpPath::parse("/v2/%2Fchat").unwrap())
   );
 
   for path in ["/café", "/%zz", "/%2", "/v1 path", "/v1[chat]"] {
     assert!(
-      compile_path_prefixes(&[path.into()], "invalid").is_err(),
+      compile_paths(&[exact_path(path)], "invalid").is_err(),
       "{path:?} should be rejected"
     );
   }
 
   assert!(matches!(
-    compile_path_prefixes(&["/v1/%2f".into(), "/v1/%2F".into()], "duplicate"),
+    compile_paths(&[exact_path("/v1/%2f"), exact_path("/v1/%2F")], "duplicate"),
     Err(CompileError::InvalidValue { .. })
   ));
-  assert!(compile_path_prefixes(&["/v1%2Fchat".into(), "/v1/chat".into()], "encoded-slash").is_ok());
+  assert!(compile_paths(&[exact_path("/v1%2Fchat"), exact_path("/v1/chat")], "encoded-slash").is_ok());
+}
+
+#[test]
+fn exact_root_path_is_valid_while_root_prefix_is_not() {
+  assert!(compile_paths(&[exact_path("/")], "root-exact").is_ok());
+  assert!(compile_paths(&[path_prefix("/")], "root-prefix").is_err());
 }
 
 #[test]
 fn rejects_literal_and_percent_encoded_dot_segments() {
   for path in ["/./v1", "/../v1", "/%2e/v1", "/v1/%2E%2e", "/v1/.%2e/chat"] {
     assert!(
-      compile_path_prefixes(&[path.into()], "dot-segment").is_err(),
+      compile_paths(&[exact_path(path)], "dot-segment").is_err(),
       "{path:?} should be rejected"
     );
   }
 
-  assert!(compile_path_prefixes(&["/v1/release..candidate".into()], "ordinary-dots").is_ok());
+  assert!(compile_paths(&[path_prefix("/v1/release..candidate")], "ordinary-dots").is_ok());
 }
 
 #[test]
@@ -775,7 +822,7 @@ default_http_action = { kind = "reject" }
 id = "transparent"
 listener = "api"
 action = { kind = "route", profile = "transparent" }
-path_prefixes = ["/v1"]
+paths = [{ kind = "prefix", path = "/v1" }]
 
 [profiles.transparent]
 route = "transparent"

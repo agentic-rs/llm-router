@@ -619,8 +619,8 @@ mod tests {
   use tokn_core::provider::Endpoint;
   use tokn_policy::{
     CanonicalAuthority, CanonicalHost, CanonicalHttpPath, ConnectMatch, ConnectRulePlan, ForwardProxyListenerPlan,
-    HostPattern, HttpBindingPlan, HttpIngress, HttpMatch, HttpPathPrefix, HttpScheme, IngressAuthority,
-    LlmApiListenerPlan, OperationId, ProfilePlan, RoutePlan, WireIdentity,
+    HostPattern, HttpBindingPlan, HttpIngress, HttpMatch, HttpPathPattern, HttpPathPrefix, HttpScheme,
+    IngressAuthority, LlmApiListenerPlan, OperationId, ProfilePlan, RoutePlan, WireIdentity,
   };
 
   fn listener_id(value: &str) -> ListenerId {
@@ -652,7 +652,7 @@ mod tests {
       binding_id(id),
       HttpMatch::new(
         Box::default(),
-        vec![HttpPathPrefix::parse(prefix).unwrap()].into_boxed_slice(),
+        vec![HttpPathPattern::Prefix(HttpPathPrefix::parse(prefix).unwrap())].into_boxed_slice(),
         Box::default(),
         Box::default(),
       )

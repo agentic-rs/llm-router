@@ -1,11 +1,14 @@
-use crate::v2::{CompileError, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawListener};
+use crate::v2::{
+  CompileError, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawHttpPathPattern, RawListener,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokn_policy::{
-  BindingId, CanonicalHost, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan, DestinationPolicy,
-  ForwardProxyListenerPlan, HostPattern, HttpAction, HttpBindingPlan, HttpMatch, HttpPathPrefix, ListenerId,
-  ListenerPlan, LlmApiListenerPlan, OperationId, ProfileId, ProfilePlan, RouteId, RoutePlan, TlsPlan,
+  BindingId, CanonicalHost, CanonicalHttpPath, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan,
+  DestinationPolicy, ForwardProxyListenerPlan, HostPattern, HttpAction, HttpBindingPlan, HttpMatch, HttpPathPattern,
+  HttpPathPrefix, ListenerId, ListenerPlan, LlmApiListenerPlan, OperationId, ProfileId, ProfilePlan, RouteId,
+  RoutePlan, TlsPlan,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +60,7 @@ fn all_atoms<T>(alternatives: &[T], mut predicate: impl FnMut(Option<&T>) -> boo
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HttpMatchKey {
   hosts: Vec<HostPattern>,
-  path_prefixes: Vec<HttpPathPrefix>,
+  paths: Vec<HttpPathPattern>,
   methods: Vec<String>,
   operations: Vec<String>,
 }
@@ -65,9 +68,7 @@ struct HttpMatchKey {
 impl HttpMatchKey {
   fn subsumes(&self, other: &Self) -> bool {
     dimension_subsumes(&self.hosts, &other.hosts, HostPattern::subsumes)
-      && dimension_subsumes(&self.path_prefixes, &other.path_prefixes, |prefix, path| {
-        prefix.subsumes(path)
-      })
+      && dimension_subsumes(&self.paths, &other.paths, HttpPathPattern::subsumes)
       && dimension_subsumes(&self.methods, &other.methods, PartialEq::eq)
       && dimension_subsumes(&self.operations, &other.operations, PartialEq::eq)
   }
@@ -75,12 +76,12 @@ impl HttpMatchKey {
   fn subsumes_atom(
     &self,
     host: Option<&HostPattern>,
-    path_prefix: Option<&HttpPathPrefix>,
+    path: Option<&HttpPathPattern>,
     method: Option<&String>,
     operation: Option<&String>,
   ) -> bool {
     dimension_subsumes_atom(&self.hosts, host, HostPattern::subsumes)
-      && dimension_subsumes_atom(&self.path_prefixes, path_prefix, |prefix, path| prefix.subsumes(path))
+      && dimension_subsumes_atom(&self.paths, path, HttpPathPattern::subsumes)
       && dimension_subsumes_atom(&self.methods, method, PartialEq::eq)
       && dimension_subsumes_atom(&self.operations, operation, PartialEq::eq)
   }
@@ -88,12 +89,12 @@ impl HttpMatchKey {
 
 fn http_matchers_subsume_union(prior: &[(HttpMatchKey, BindingId)], matcher: &HttpMatchKey) -> bool {
   all_atoms(&matcher.hosts, |host| {
-    all_atoms(&matcher.path_prefixes, |path_prefix| {
+    all_atoms(&matcher.paths, |path| {
       all_atoms(&matcher.methods, |method| {
         all_atoms(&matcher.operations, |operation| {
           prior
             .iter()
-            .any(|(candidate, _)| candidate.subsumes_atom(host, path_prefix, method, operation))
+            .any(|(candidate, _)| candidate.subsumes_atom(host, path, method, operation))
         })
       })
     })
@@ -456,13 +457,13 @@ fn compile_http_action(
 fn compile_http_match(raw: &crate::v2::RawBinding) -> Result<(HttpMatch, HttpMatchKey), CompileError> {
   let hosts_location = format!("bindings.{}.hosts", raw.id);
   let (hosts, mut host_keys) = compile_hosts(&raw.hosts, hosts_location)?;
-  let (path_prefixes, mut path_keys) = compile_path_prefixes(&raw.path_prefixes, &raw.id)?;
+  let (paths, mut path_keys) = compile_paths(&raw.paths, &raw.id)?;
   let (methods, mut method_keys) = compile_methods(&raw.methods, &raw.id)?;
   let (operations, mut operation_keys) = compile_operations(&raw.operations, &raw.id)?;
 
   let matcher = HttpMatch::new(
     hosts.into_boxed_slice(),
-    path_prefixes.into_boxed_slice(),
+    paths.into_boxed_slice(),
     methods.into_iter().map(Into::into).collect(),
     operations.into_boxed_slice(),
   )
@@ -476,7 +477,7 @@ fn compile_http_match(raw: &crate::v2::RawBinding) -> Result<(HttpMatch, HttpMat
     matcher,
     HttpMatchKey {
       hosts: host_keys,
-      path_prefixes: path_keys,
+      paths: path_keys,
       methods: method_keys,
       operations: operation_keys,
     },
@@ -595,28 +596,41 @@ fn invalid_host(location: &str, message: impl Into<String>) -> CompileError {
   invalid_value(location.to_string(), message)
 }
 
-fn compile_path_prefixes(
-  raw_paths: &[String],
+fn compile_paths(
+  raw_paths: &[RawHttpPathPattern],
   binding_id: &str,
-) -> Result<(Vec<HttpPathPrefix>, Vec<HttpPathPrefix>), CompileError> {
-  let location = format!("bindings.{binding_id}.path_prefixes");
+) -> Result<(Vec<HttpPathPattern>, Vec<HttpPathPattern>), CompileError> {
+  let location = format!("bindings.{binding_id}.paths");
   let mut values = Vec::with_capacity(raw_paths.len());
-  let mut claimed = Vec::<(String, HttpPathPrefix)>::new();
-  for raw_path in raw_paths {
-    let path = HttpPathPrefix::parse(raw_path).map_err(|error| invalid_value(location.clone(), error.to_string()))?;
+  let mut claimed = Vec::<(String, HttpPathPattern)>::new();
+  for raw_pattern in raw_paths {
+    let (raw_path, pattern) = match raw_pattern {
+      RawHttpPathPattern::Exact { path } => (
+        path,
+        CanonicalHttpPath::parse(path)
+          .map(HttpPathPattern::Exact)
+          .map_err(|error| invalid_value(location.clone(), error.to_string()))?,
+      ),
+      RawHttpPathPattern::Prefix { path } => (
+        path,
+        HttpPathPrefix::parse(path)
+          .map(HttpPathPattern::Prefix)
+          .map_err(|error| invalid_value(location.clone(), error.to_string()))?,
+      ),
+    };
     for (prior_raw, prior) in &claimed {
-      if prior == &path {
+      if prior == &pattern {
         return Err(duplicate_value(location.clone(), raw_path));
       }
-      if prior.subsumes(&path) {
+      if prior.subsumes(&pattern) {
         return Err(redundant_value(location.clone(), raw_path, prior_raw));
       }
-      if path.subsumes(prior) {
+      if pattern.subsumes(prior) {
         return Err(redundant_value(location.clone(), prior_raw, raw_path));
       }
     }
-    claimed.push((raw_path.clone(), path.clone()));
-    values.push(path);
+    claimed.push((raw_path.clone(), pattern.clone()));
+    values.push(pattern);
   }
   Ok((values.clone(), values))
 }

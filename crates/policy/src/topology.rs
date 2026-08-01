@@ -1,5 +1,5 @@
 use crate::{
-  AccountPoolId, BindingId, CanonicalHost, HttpPathPrefix, ListenerId, ModelGroupId, OperationId, ProfileId,
+  AccountPoolId, BindingId, CanonicalHost, HttpPathPattern, ListenerId, ModelGroupId, OperationId, ProfileId,
   ProfilePlan, ProviderId, RouteId, RoutePlan, UpstreamId,
 };
 use smol_str::SmolStr;
@@ -395,7 +395,7 @@ impl std::error::Error for EmptyHttpMatch {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpMatch {
   hosts: Box<[HostPattern]>,
-  path_prefixes: Box<[HttpPathPrefix]>,
+  paths: Box<[HttpPathPattern]>,
   methods: Box<[SmolStr]>,
   operations: Box<[OperationId]>,
 }
@@ -403,17 +403,17 @@ pub struct HttpMatch {
 impl HttpMatch {
   pub fn new(
     hosts: Box<[HostPattern]>,
-    path_prefixes: Box<[HttpPathPrefix]>,
+    paths: Box<[HttpPathPattern]>,
     methods: Box<[SmolStr]>,
     operations: Box<[OperationId]>,
   ) -> Result<Self, EmptyHttpMatch> {
-    if hosts.is_empty() && path_prefixes.is_empty() && methods.is_empty() && operations.is_empty() {
+    if hosts.is_empty() && paths.is_empty() && methods.is_empty() && operations.is_empty() {
       return Err(EmptyHttpMatch);
     }
 
     Ok(Self {
       hosts,
-      path_prefixes,
+      paths,
       methods,
       operations,
     })
@@ -423,8 +423,8 @@ impl HttpMatch {
     &self.hosts
   }
 
-  pub fn path_prefixes(&self) -> &[HttpPathPrefix] {
-    &self.path_prefixes
+  pub fn paths(&self) -> &[HttpPathPattern] {
+    &self.paths
   }
 
   pub fn methods(&self) -> &[SmolStr] {
@@ -756,7 +756,8 @@ impl ModelGroupPlan {
 mod tests {
   use super::*;
   use crate::{
-    ManagedRetry, ManagedRoute, ManagedTarget, ModelSelector, OperationPolicy, UpstreamSelector, WireIdentity,
+    CanonicalHttpPath, HttpPathPrefix, ManagedRetry, ManagedRoute, ManagedTarget, ModelSelector, OperationPolicy,
+    UpstreamSelector, WireIdentity,
   };
 
   fn id<T>(value: &str) -> T
@@ -861,8 +862,8 @@ mod tests {
     let rule = HttpMatch::new(
       vec![exact_host("api.example.com")].into_boxed_slice(),
       vec![
-        HttpPathPrefix::parse("/v1").unwrap(),
-        HttpPathPrefix::parse("/compatible").unwrap(),
+        HttpPathPattern::Prefix(HttpPathPrefix::parse("/v1").unwrap()),
+        HttpPathPattern::Exact(CanonicalHttpPath::parse("/compatible").unwrap()),
       ]
       .into_boxed_slice(),
       vec![SmolStr::new("POST")].into_boxed_slice(),
@@ -871,7 +872,7 @@ mod tests {
     .unwrap();
 
     assert_eq!(rule.hosts().len(), 1);
-    assert_eq!(rule.path_prefixes().len(), 2);
+    assert_eq!(rule.paths().len(), 2);
     assert_eq!(rule.methods(), &[SmolStr::new("POST")]);
     assert_eq!(rule.operations().len(), 2);
   }

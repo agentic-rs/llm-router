@@ -19,7 +19,7 @@ pub use id::{
   AccountPoolId, BindingId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId, ProfileId,
   ProviderId, RetryPolicyId, RouteId, UpstreamId, WireIdentityId,
 };
-pub use path::{CanonicalHttpPath, HttpPathPrefix, InvalidHttpPath};
+pub use path::{CanonicalHttpPath, HttpPathPattern, HttpPathPrefix, InvalidHttpPath};
 pub use route::{
   CredentialPolicy, DestinationPolicy, FallbackSelector, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget,
   ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, QualificationNamespace, RelayRetry, RelayRoute,

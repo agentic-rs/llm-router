@@ -91,7 +91,7 @@ hosts = ["api.example.com"]
 id = "http-second"
 listener = "proxy"
 action = { kind = "reject" }
-path_prefixes = ["/v1"]
+paths = [{ kind = "prefix", path = "/v1" }]
 
 [[connect_rules]]
 id = "connect-first"
@@ -318,7 +318,7 @@ default_connect = "tunnel"
 id = "reject-health"
 listener = "proxy"
 action = { kind = "reject" }
-path_prefixes = ["/health"]
+paths = [{ kind = "prefix", path = "/health" }]
 
 [[connect_rules]]
 id = "reject-private"

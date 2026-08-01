@@ -17,9 +17,9 @@ pub use compiled::{CompiledConfig, OutboundPlan, RequestLimitsPlan, ServicePlan}
 pub use error::{CompileError, Error, Result};
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
-  RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawOutbound,
-  RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget, RawRequestLimits, RawRoute, RawService,
-  RawUpstream, RawUpstreamSelector, RawWireIdentity,
+  RawFallbackSelector, RawHttpPathPattern, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy,
+  RawOutbound, RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget, RawRequestLimits, RawRoute,
+  RawService, RawUpstream, RawUpstreamSelector, RawWireIdentity,
 };
 pub use raw::{DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, SCHEMA_VERSION};
 

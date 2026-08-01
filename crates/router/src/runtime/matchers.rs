@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 use snafu::Snafu;
 use tokn_core::provider::Endpoint;
 use tokn_policy::{
-  BindingId, CanonicalHttpPath, ConnectMatch, HostPattern, HttpIngress, HttpMatch, HttpPathPrefix, IngressAuthority,
+  BindingId, CanonicalHttpPath, ConnectMatch, HostPattern, HttpIngress, HttpMatch, HttpPathPattern, IngressAuthority,
   IngressAuthoritySource, ListenerId, OperationId,
 };
 
@@ -30,7 +30,7 @@ pub struct HttpRequestFacts<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkedHttpMatcher {
   hosts: Box<[HostPattern]>,
-  path_prefixes: Box<[HttpPathPrefix]>,
+  paths: Box<[HttpPathPattern]>,
   methods: Box<[SmolStr]>,
   operations: Box<[Endpoint]>,
 }
@@ -40,8 +40,8 @@ impl LinkedHttpMatcher {
     &self.hosts
   }
 
-  pub fn path_prefixes(&self) -> &[HttpPathPrefix] {
-    &self.path_prefixes
+  pub fn paths(&self) -> &[HttpPathPattern] {
+    &self.paths
   }
 
   /// Canonical method alternatives in policy order.
@@ -58,7 +58,7 @@ impl LinkedHttpMatcher {
   /// with OR. An empty dimension remains unconstrained.
   pub fn matches(&self, facts: &HttpRequestFacts<'_>) -> bool {
     matches_dimension(&self.hosts, |pattern| pattern.matches(facts.ingress.host()))
-      && matches_dimension(&self.path_prefixes, |prefix| prefix.matches(facts.path))
+      && matches_dimension(&self.paths, |pattern| pattern.matches(facts.path))
       && matches_dimension(&self.methods, |method| method.as_str() == facts.method)
       && matches_dimension(&self.operations, |operation| Some(*operation) == facts.operation)
   }
@@ -101,7 +101,7 @@ pub fn link_http_matcher(
 
   Ok(LinkedHttpMatcher {
     hosts: matcher.hosts().into(),
-    path_prefixes: matcher.path_prefixes().into(),
+    paths: matcher.paths().into(),
     methods: methods.into_boxed_slice(),
     operations: operations.into_boxed_slice(),
   })
@@ -233,7 +233,7 @@ fn is_http_token_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tokn_policy::{CanonicalAuthority, CanonicalHost, HttpScheme};
+  use tokn_policy::{CanonicalAuthority, CanonicalHost, HttpPathPrefix, HttpScheme};
 
   fn listener_id(value: &str) -> ListenerId {
     ListenerId::new(value).unwrap()
@@ -263,6 +263,14 @@ mod tests {
     HttpIngress::direct(HttpScheme::Https, CanonicalAuthority::parse(value).unwrap())
   }
 
+  fn exact_path(value: &str) -> HttpPathPattern {
+    HttpPathPattern::Exact(CanonicalHttpPath::parse(value).unwrap())
+  }
+
+  fn path_prefix(value: &str) -> HttpPathPattern {
+    HttpPathPattern::Prefix(HttpPathPrefix::parse(value).unwrap())
+  }
+
   fn link(matcher: &HttpMatch) -> MatcherLinkResult<LinkedHttpMatcher> {
     link_http_matcher(
       &listener_id("public"),
@@ -276,11 +284,7 @@ mod tests {
   fn http_dimensions_are_anded_and_alternatives_are_ored() {
     let matcher = HttpMatch::new(
       vec![exact_host("other.example.com"), subdomains_of("example.test")].into_boxed_slice(),
-      vec![
-        HttpPathPrefix::parse("/v1/chat").unwrap(),
-        HttpPathPrefix::parse("/v2/chat").unwrap(),
-      ]
-      .into_boxed_slice(),
+      vec![path_prefix("/v1/chat"), path_prefix("/v2/chat")].into_boxed_slice(),
       vec![SmolStr::new("POST"), SmolStr::new("PUT")].into_boxed_slice(),
       vec![operation_id("responses"), operation_id("messages")].into_boxed_slice(),
     )
@@ -370,7 +374,7 @@ mod tests {
   fn canonical_paths_do_not_decode_encoded_slashes() {
     let matcher = HttpMatch::new(
       Box::default(),
-      vec![HttpPathPrefix::parse("/v1%2fchat").unwrap()].into_boxed_slice(),
+      vec![path_prefix("/v1%2fchat")].into_boxed_slice(),
       Box::default(),
       Box::default(),
     )
@@ -391,6 +395,42 @@ mod tests {
       path: &segmented,
       method: "POST",
       operation: None,
+    }));
+  }
+
+  #[test]
+  fn exact_path_method_and_operation_dimensions_must_all_match() {
+    let linked = link(
+      &HttpMatch::new(
+        Box::default(),
+        vec![exact_path("/v1/responses")].into_boxed_slice(),
+        vec![SmolStr::new("POST")].into_boxed_slice(),
+        vec![operation_id("responses")].into_boxed_slice(),
+      )
+      .unwrap(),
+    )
+    .unwrap();
+    let ingress = direct_ingress("api.example.com");
+    let exact = CanonicalHttpPath::parse("/v1/responses").unwrap();
+    let trailing = CanonicalHttpPath::parse("/v1/responses/").unwrap();
+    let nested = CanonicalHttpPath::parse("/v1/extra/responses").unwrap();
+    let facts = HttpRequestFacts {
+      ingress: &ingress,
+      path: &exact,
+      method: "POST",
+      operation: Some(Endpoint::Responses),
+    };
+
+    assert!(linked.matches(&facts));
+    assert!(!linked.matches(&HttpRequestFacts {
+      path: &trailing,
+      ..facts
+    }));
+    assert!(!linked.matches(&HttpRequestFacts { path: &nested, ..facts }));
+    assert!(!linked.matches(&HttpRequestFacts { method: "GET", ..facts }));
+    assert!(!linked.matches(&HttpRequestFacts {
+      operation: Some(Endpoint::Messages),
+      ..facts
     }));
   }
 

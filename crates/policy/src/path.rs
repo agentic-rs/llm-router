@@ -70,6 +70,54 @@ impl fmt::Display for HttpPathPrefix {
   }
 }
 
+/// One canonical raw encoded HTTP path selector.
+///
+/// Exact paths match one path only. Prefixes deliberately retain byte-prefix
+/// semantics for relay and namespace policies that own a path subtree.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HttpPathPattern {
+  Exact(CanonicalHttpPath),
+  Prefix(HttpPathPrefix),
+}
+
+impl HttpPathPattern {
+  pub fn as_str(&self) -> &str {
+    match self {
+      Self::Exact(path) => path.as_str(),
+      Self::Prefix(prefix) => prefix.as_str(),
+    }
+  }
+
+  pub fn matches(&self, path: &CanonicalHttpPath) -> bool {
+    match self {
+      Self::Exact(expected) => expected == path,
+      Self::Prefix(prefix) => prefix.matches(path),
+    }
+  }
+
+  /// Whether every path matched by `other` is also matched by this pattern.
+  pub fn subsumes(&self, other: &Self) -> bool {
+    match (self, other) {
+      (Self::Exact(left), Self::Exact(right)) => left == right,
+      (Self::Exact(_), Self::Prefix(_)) => false,
+      (Self::Prefix(prefix), Self::Exact(path)) => prefix.matches(path),
+      (Self::Prefix(left), Self::Prefix(right)) => left.subsumes(right),
+    }
+  }
+}
+
+impl AsRef<str> for HttpPathPattern {
+  fn as_ref(&self) -> &str {
+    self.as_str()
+  }
+}
+
+impl fmt::Display for HttpPathPattern {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(self.as_str())
+  }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidHttpPath {
   Empty,
@@ -196,6 +244,49 @@ mod tests {
     let narrow = HttpPathPrefix::parse("/v1/chat").unwrap();
     assert!(broad.subsumes(&narrow));
     assert!(!narrow.subsumes(&broad));
+  }
+
+  #[test]
+  fn exact_patterns_do_not_match_extensions_or_trailing_slashes() {
+    let exact = HttpPathPattern::Exact(CanonicalHttpPath::parse("/v1/responses").unwrap());
+
+    assert!(exact.matches(&CanonicalHttpPath::parse("/v1/responses").unwrap()));
+    for path in [
+      "/v1/responses/",
+      "/v1/responses-extra",
+      "/v1/responses/child/responses",
+      "/v1/%72esponses",
+    ] {
+      assert!(
+        !exact.matches(&CanonicalHttpPath::parse(path).unwrap()),
+        "matched {path:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn path_pattern_subsumption_distinguishes_exact_paths_and_prefixes() {
+    let exact = HttpPathPattern::Exact(CanonicalHttpPath::parse("/v1/responses").unwrap());
+    let same = HttpPathPattern::Exact(CanonicalHttpPath::parse("/v1/responses").unwrap());
+    let broad = HttpPathPattern::Prefix(HttpPathPrefix::parse("/v1/").unwrap());
+    let narrow = HttpPathPattern::Prefix(HttpPathPrefix::parse("/v1/responses").unwrap());
+
+    assert!(exact.subsumes(&same));
+    assert!(!exact.subsumes(&broad));
+    assert!(broad.subsumes(&exact));
+    assert!(broad.subsumes(&narrow));
+    assert!(!narrow.subsumes(&broad));
+  }
+
+  #[test]
+  fn exact_patterns_use_canonical_raw_paths_without_decoding_slashes() {
+    let exact = HttpPathPattern::Exact(CanonicalHttpPath::parse("/profiles/a%2fb").unwrap());
+
+    assert!(exact.matches(&CanonicalHttpPath::parse("/profiles/a%2Fb").unwrap()));
+    assert!(!exact.matches(&CanonicalHttpPath::parse("/profiles/a/b").unwrap()));
+    assert!(
+      HttpPathPattern::Exact(CanonicalHttpPath::parse("/").unwrap()).matches(&CanonicalHttpPath::parse("/").unwrap())
+    );
   }
 
   #[test]

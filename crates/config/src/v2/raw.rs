@@ -132,12 +132,20 @@ pub enum RawClientAuth {
   LocalKeys,
 }
 
+/// Whether one canonical raw encoded URI path is matched exactly or by prefix.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RawHttpPathPattern {
+  Exact { path: String },
+  Prefix { path: String },
+}
+
 /// One ordered match rule. Matcher dimensions are combined with AND, while
 /// values inside a dimension are alternatives. Empty-dimension and wildcard
 /// semantics are validated and canonicalized by the compiler. On a forward
 /// proxy, `hosts` matches the immutable ingress authority (the CONNECT target
-/// for intercepted traffic), not an inner Host header. `path_prefixes` are
-/// canonical raw encoded URI paths and are never percent-decoded across `/`.
+/// for intercepted traffic), not an inner Host header. `paths` are canonical
+/// raw encoded URI paths and are never percent-decoded across `/`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawBinding {
@@ -147,7 +155,7 @@ pub struct RawBinding {
   #[serde(default)]
   pub hosts: Vec<String>,
   #[serde(default)]
-  pub path_prefixes: Vec<String>,
+  pub paths: Vec<RawHttpPathPattern>,
   #[serde(default)]
   pub methods: Vec<String>,
   /// Runtime/plugin-owned operation ids. The config compiler validates their
@@ -411,12 +419,14 @@ id = "first"
 listener = "proxy"
 action = { kind = "route", profile = "managed" }
 hosts = ["*.example.com"]
+paths = [{ kind = "exact", path = "/v1/responses" }]
 
 [[bindings]]
 id = "second"
 listener = "proxy"
 action = { kind = "reject" }
 methods = ["POST"]
+paths = [{ kind = "prefix", path = "/v1/" }]
 
 [[connect_rules]]
 id = "intercept"
@@ -442,6 +452,16 @@ model = "gpt-5"
 
     assert_eq!(config.bindings[0].id, "first");
     assert_eq!(config.bindings[1].id, "second");
+    assert_eq!(
+      config.bindings[0].paths,
+      [RawHttpPathPattern::Exact {
+        path: "/v1/responses".into()
+      }]
+    );
+    assert_eq!(
+      config.bindings[1].paths,
+      [RawHttpPathPattern::Prefix { path: "/v1/".into() }]
+    );
     assert_eq!(config.connect_rules[0].id, "intercept");
     assert_eq!(config.connect_rules[1].id, "tunnel");
     assert_eq!(config.model_groups["coding"][0].model, "claude-sonnet-4");
