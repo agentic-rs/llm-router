@@ -2,7 +2,7 @@
 name = "tokn-convert"
 version.workspace = true
 edition.workspace = true
-description = "Request and response conversion pipeline across tokn endpoint formats"
+description = "Cross-endpoint request, response, and SSE conversion for LLM APIs"
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -23,7 +23,4 @@ tokn-endpoint-messages = { workspace = true }
 tokn-endpoint-responses = { workspace = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
 futures = { workspace = true }
-tokn-config = { workspace = true }
-rusqlite = { workspace = true }
