@@ -86,7 +86,8 @@ pub(super) fn started_context(started: &RequestStarted) -> Map<String, Value> {
       insert_literal(&mut context, "request_source", "listener");
       insert_string(&mut context, "listener_id", listener_id);
       insert_literal(&mut context, "ingress", ingress_name(ingress));
-      insert_literal(&mut context, "pipeline_id", ingress_name(ingress));
+      insert_literal(&mut context, "mode", ingress_mode(ingress));
+      insert_literal(&mut context, "pipeline_id", ingress_pipeline(ingress));
       if let IngressKind::InterceptedHttps { parent_connect_id } = ingress {
         insert_string(&mut context, "parent_connect_id", parent_connect_id);
       }
@@ -99,6 +100,7 @@ pub(super) fn started_context(started: &RequestStarted) -> Map<String, Value> {
     }
     RequestSource::Embedded { profile_id } => {
       insert_literal(&mut context, "request_source", "embedded");
+      insert_literal(&mut context, "mode", "embedded");
       insert_literal(&mut context, "pipeline_id", "embedded");
       insert_string(&mut context, "source_profile_id", profile_id);
     }
@@ -262,6 +264,23 @@ fn ingress_name(ingress: &IngressKind) -> &'static str {
     IngressKind::LlmApi => "llm_api",
     IngressKind::ForwardProxy => "forward_proxy",
     IngressKind::InterceptedHttps { .. } => "intercepted_https",
+    _ => "unknown",
+  }
+}
+
+fn ingress_mode(ingress: &IngressKind) -> &'static str {
+  match ingress {
+    IngressKind::LlmApi => "route",
+    IngressKind::ForwardProxy => "forward_proxy",
+    IngressKind::InterceptedHttps { .. } => "intercept",
+    _ => "unknown",
+  }
+}
+
+fn ingress_pipeline(ingress: &IngressKind) -> &'static str {
+  match ingress {
+    IngressKind::LlmApi => "requests",
+    IngressKind::ForwardProxy | IngressKind::InterceptedHttps { .. } => "proxy",
     _ => "unknown",
   }
 }
