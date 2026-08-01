@@ -107,9 +107,6 @@ pub async fn bind_compiled_gateway(
     link_gateway_runtime(compiled.gateway(), accounts, &provider_registry, &runtime_names)
       .context("failed to link compiled gateway runtime")?,
   );
-  let listener_resources = materialize_listeners(runtime.listeners(), local_access_db_path)
-    .context("failed to prepare compiled gateway listener resources")?;
-
   let outbound = compiled.service().outbound().to_http_client_options();
   let request_limits = compiled.service().request_limits();
   let serving_defaults = GatewayServingDefaults::new(RequestBodyLimits::new(
@@ -120,6 +117,8 @@ pub async fn bind_compiled_gateway(
     GatewayServerState::build(runtime, &outbound, serving_defaults)
       .context("failed to prepare compiled gateway serving state")?,
   );
+  let listener_resources = materialize_listeners(serving.runtime().listeners(), local_access_db_path)
+    .context("failed to prepare compiled gateway listener resources")?;
 
   bind_gateway_listeners(serving, listener_resources)
     .await
