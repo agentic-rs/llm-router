@@ -374,7 +374,7 @@ fn resolve_profile(
       Ok(map_managed_resolution(profile, resolution))
     }
     LinkedRouteKind::Relay(route) => {
-      let resolution = resolve_relay_target(route, head.ingress(), session_id, |provider| {
+      let resolution = resolve_relay_target(route.target(), head.ingress(), session_id, |provider| {
         provider_access.allows(provider.as_str())
       });
       map_relay_resolution(site, profile, request_kind, resolution)
