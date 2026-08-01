@@ -19,9 +19,7 @@ pub use viewer::{
 
 use snafu::Snafu;
 pub use tokn_core::db::{DbPaths, HttpSnapshot, MessageRecord, PartRecord};
-#[allow(unused_imports)]
-pub(crate) use tokn_core::db::{Usage, UsageDetails};
-pub use usage::{UsageDb, UsageEventHandler};
+pub use usage::UsageDb;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
