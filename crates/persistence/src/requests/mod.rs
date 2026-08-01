@@ -1,27 +1,13 @@
-//! Requests database — per-day SQLite files, single connection cache.
-//!
-//! This module is the **sole owner** of the day-rotated `Connection`
-//! cache and the `request_id → day` map. Both writer flavours (legacy
-//! lifecycle in [`legacy`] and stage-event in [`stages`]) operate on
-//! `&mut RequestsDb` and use the helpers exposed here.
-//!
-//! Shared helpers (`composite_request_id`, `day_key`, `now_unix`,
-//! `open_day_db`, migration constants) live here so the handler
-//! re-implements them.
+//! Requests database schema, migration, enumeration, and readback helpers for
+//! per-day SQLite files.
 
 use crate::migrate;
 use rusqlite::{params, Connection};
-use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use time::macros::format_description;
 
 use crate::Result;
 
-pub mod stages;
-
-pub use stages::RequestEventHandler;
-
-const CACHE_CAP: usize = 3;
 pub(crate) const BOOTSTRAP: &str = include_str!("../../schemas/snapshot/requests/v0.2.0.sql");
 pub(crate) const MIGRATIONS: &[migrate::Migration] = &[
   migrate::Migration {
@@ -70,103 +56,20 @@ pub fn latest_version() -> u32 {
   migrate::latest_version(MIGRATIONS)
 }
 
-struct RequestMeta {
-  day: String,
-  started_at_ms: i64,
-}
-
-/// Day-rotated SQLite connection pool plus a `request_id → day` map.
-///
-/// Each instance keeps up to [`CACHE_CAP`] day connections open (LRU).
-/// The `request_meta` map lets stage-event UPDATEs route to the day
-/// where the row was originally INSERTed, even if subsequent events
-/// arrive on the next calendar day, and carries the start timestamp
-/// for latency computation.
-pub struct RequestsDb {
-  dir: PathBuf,
-  conns: HashMap<String, Connection>,
-  order: VecDeque<String>,
-  request_meta: HashMap<String, RequestMeta>,
-}
-
-impl RequestsDb {
-  pub fn new(dir: PathBuf) -> Result<Self> {
-    std::fs::create_dir_all(&dir)?;
-    Ok(Self {
-      dir,
-      conns: HashMap::new(),
-      order: VecDeque::new(),
-      request_meta: HashMap::new(),
-    })
+/// Iterate every existing request day file under `dir` without opening it.
+pub fn day_files(dir: &Path) -> Result<Vec<PathBuf>> {
+  let mut out = Vec::new();
+  if !dir.exists() {
+    return Ok(out);
   }
-
-  /// Iterate every existing day file under `dir` (without opening them).
-  pub fn day_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    if !dir.exists() {
-      return Ok(out);
+  for entry in std::fs::read_dir(dir)? {
+    let entry = entry?;
+    let path = entry.path();
+    if path.extension().and_then(|s| s.to_str()) == Some("db") {
+      out.push(path);
     }
-    for entry in std::fs::read_dir(dir)? {
-      let entry = entry?;
-      let path = entry.path();
-      if path.extension().and_then(|s| s.to_str()) == Some("db") {
-        out.push(path);
-      }
-    }
-    Ok(out)
   }
-
-  /// Borrow (or open) the day connection keyed by `ts`. Refreshes LRU.
-  pub(crate) fn conn_for_ts(&mut self, ts: i64) -> Result<&mut Connection> {
-    let key = day_key(ts);
-    self.conn_for_day(&key)
-  }
-
-  /// Borrow (or open) the day connection keyed by `day` (e.g. `"2026-05-19"`).
-  pub(crate) fn conn_for_day(&mut self, key: &str) -> Result<&mut Connection> {
-    if !self.conns.contains_key(key) {
-      if self.order.len() >= CACHE_CAP {
-        if let Some(old) = self.order.pop_front() {
-          self.conns.remove(&old);
-        }
-      }
-      let conn = open_day_db(&self.dir.join(format!("{key}.db")))?;
-      self.conns.insert(key.to_string(), conn);
-    }
-    self.order.retain(|k| k != key);
-    self.order.push_back(key.to_string());
-    Ok(self.conns.get_mut(key).expect("opened requests db"))
-  }
-
-  /// Look up the connection a previously-pinned `request_id` was written to.
-  /// Returns `None` if no INSERT has pinned this id yet.
-  pub(crate) fn conn_for_request(&mut self, request_id: &str) -> Option<&mut Connection> {
-    let key = self.request_meta.get(request_id)?.day.clone();
-    self.conn_for_day(&key).ok()
-  }
-
-  pub(crate) fn pin_request(&mut self, request_id: &str, ts: i64) {
-    let key = day_key(ts);
-    self.request_meta.insert(
-      request_id.to_string(),
-      RequestMeta {
-        day: key,
-        started_at_ms: ts,
-      },
-    );
-  }
-
-  pub(crate) fn latency_since_start(&self, request_id: &str, ts_now: i64) -> i64 {
-    self
-      .request_meta
-      .get(request_id)
-      .map(|m| ts_now - m.started_at_ms)
-      .unwrap_or(0)
-  }
-
-  pub(crate) fn clear_request(&mut self, request_id: &str) {
-    self.request_meta.remove(request_id);
-  }
+  Ok(out)
 }
 
 /// Open a single day file (creating + migrating as needed).
@@ -183,16 +86,6 @@ pub fn open_day_db(path: &Path) -> Result<Connection> {
     MIGRATIONS,
   )?;
   Ok(conn)
-}
-
-/// Compose a row-level `request_id` from the base id and attempt number.
-/// Attempt 0 keeps the bare id; retries append `:N`.
-pub(crate) fn composite_request_id(request_id: &str, attempt: u32) -> String {
-  if attempt == 0 {
-    request_id.to_string()
-  } else {
-    format!("{request_id}:{attempt}")
-  }
 }
 
 /// Convert a unix timestamp to a day key like `"2026-05-19"`.
