@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use thiserror::Error;
 use tokn_config::RouteMode;
 
+mod analysis;
+
 /// Which legacy listener surface should be represented in a v2 plan.
 ///
 /// Only [`Self::Api`] is implemented in the first migration slice. Keeping
