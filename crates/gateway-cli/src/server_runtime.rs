@@ -15,6 +15,7 @@ use tokn_router::runtime::{
   GatewayServerState, GatewayServingDefaults, RequestBodyLimits,
 };
 
+#[allow(dead_code)]
 type EventBusParts = (
   Arc<EventBus>,
   broadcast::Receiver<Arc<tokn_core::event::Event>>,
@@ -23,6 +24,7 @@ type EventBusParts = (
 );
 
 /// Build the event bus and its persistence/progress handlers.
+#[allow(dead_code)]
 pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
   let capacity = cfg.db.write_queue_capacity.max(256);
   let bus = EventBus::new(capacity);
@@ -111,6 +113,7 @@ pub async fn bind_compiled_gateway(
     .context("failed to bind compiled gateway listeners")
 }
 
+#[allow(dead_code)]
 pub fn build_state(
   cfg: &Config,
   accounts: &[AccountConfig],

@@ -1,46 +1,26 @@
-//! `gateway smoke send` — drives the requests pipeline end-to-end.
-//!
-//! Two modes:
-//!
-//! * `--dry-run` builds a [`Profile::without_send`]; the runner halts at
-//!   Send via `PipelineError::stop` after every prior stage's event has
-//!   fired. A bus subscriber captures the per-stage outputs
-//!   (`Resolved` / `BuiltHeaders` / `ConvertedRequest`) and they are
-//!   printed as the dry-run report.
-//! * Default (live) mode builds a [`Profile::full`] with [`DefaultSend`] and
-//!   [`DefaultConvertResponse`] and contacts the upstream provider. The
-//!   response (returned from `run`) is either printed as a buffered JSON
-//!   payload or streamed chunk-by-chunk to stdout (curl `-N` style).
-//!
-//! In both modes every [`StageEvent`] is mirrored to stdout via a separate
-//! subscriber on the requests [`EventBus`], so the user sees the pipeline
-//! progress in real time.
+//! `gateway smoke send` — execute one listener-free managed profile.
 
 use super::OutputFormat;
-use crate::cli::config_cmd::RouteModeArg;
-use crate::config::Config;
 use crate::provider::Endpoint;
-use anyhow::{anyhow, Result};
-use bytes::Bytes;
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use futures_util::StreamExt;
+use http::header::{ACCEPT, CONTENT_TYPE};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tokn_config::RouteMode;
-use tokn_core::event::Event as CoreEvent;
-use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload};
-use tokn_requests::event::{BuiltHeadersSummary, ConvertedRequestSummary, ResolvedSummary};
-use tokn_requests::pipeline::stages::{ConvertedBody, ConvertedResponse};
-use tokn_requests::stages::{
-  DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, DefaultSend, PoolAccountSelector,
-  PoolResolve,
+use tokn_auth::AuthStore;
+use tokn_policy::{ProfileId, RouteKind};
+use tokn_requests::execution::{ManagedClientBody, ManagedClientResponse};
+use tokn_router::runtime::{
+  link_builtin_gateway_runtime_with_profile_roots, EmbeddedProfileRoots, ManagedGatewayError, ManagedGatewayExecutor,
+  ManagedGatewayOutcome, ManagedGatewayRequest, ManagedProfileSite, ManagedSelectionSummary,
 };
-use tokn_requests::{Event, EventBus, EventPayload, PipelineError, PipelineRunner, Profile, RawInbound, StageEvent};
-use tokn_router::api::AppState;
 
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum EndpointArg {
   ChatCompletions,
   Responses,
@@ -48,8 +28,8 @@ pub enum EndpointArg {
 }
 
 impl From<EndpointArg> for Endpoint {
-  fn from(val: EndpointArg) -> Self {
-    match val {
+  fn from(value: EndpointArg) -> Self {
+    match value {
       EndpointArg::ChatCompletions => Endpoint::ChatCompletions,
       EndpointArg::Responses => Endpoint::Responses,
       EndpointArg::Messages => Endpoint::Messages,
@@ -59,844 +39,491 @@ impl From<EndpointArg> for Endpoint {
 
 #[derive(Args, Debug)]
 pub struct SendArgs {
-  /// Route mode (defaults to the serve route-mode from config).
-  #[arg(long, value_enum)]
-  pub route: Option<RouteModeArg>,
-
-  /// Constrain account selection to this provider.
+  /// Managed profile to execute. Profile selection is never request-derived.
   #[arg(long)]
-  pub provider: Option<String>,
+  pub profile: String,
 
-  /// Pick a specific account by id (requires --provider).
-  #[arg(long, requires = "provider")]
-  pub account: Option<String>,
-
-  /// Model to use for the smoke request.
+  /// Model to use. Required unless --body-file contains a string `model` field.
   #[arg(long)]
   pub model: Option<String>,
 
-  /// API endpoint to test.
+  /// Client-facing API operation to test.
   #[arg(long, value_enum, default_value_t = EndpointArg::ChatCompletions)]
   pub endpoint: EndpointArg,
 
-  /// Request streaming SSE response. The response is forwarded chunk-by-
-  /// chunk to stdout as it arrives from upstream.
+  /// Request and forward a live SSE response without buffering it.
   #[arg(long)]
   pub stream: bool,
 
-  /// Build and print outbound headers/body without contacting upstream.
-  /// Equivalent to running the pipeline up to (and including)
-  /// `ConvertRequest` and stopping; nothing is sent.
-  #[arg(long)]
-  pub dry_run: bool,
-
-  /// Output format.
+  /// Output format. JSON is available only for buffered responses.
   #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
   pub format: OutputFormat,
 
-  /// Print outbound and upstream headers verbatim instead of redacting
-  /// sensitive values (authorization, cookies, api keys). Off by default
-  /// because output is often pasted into bug reports — only set when you
-  /// are actively debugging upstream auth and know what you're showing.
+  /// Print response headers verbatim instead of redacting sensitive values.
   #[arg(long)]
   pub no_redact: bool,
 
-  /// Read the raw JSON request body from a file (or `-` for stdin) instead
-  /// of the auto-built body. When set, `message` is optional and `--model`
-  /// defaults to whatever the body declares.
+  /// Read a JSON request body from a file, or `-` for stdin.
   #[arg(long)]
   pub body_file: Option<PathBuf>,
 
-  /// Inject a custom inbound header (`name=value`). Repeatable. Last wins
-  /// per header name. Useful for replaying captured requests that depend on
-  /// `accept`, `originator`, etc.
-  #[arg(long = "header", value_parser = parse_header_kv, num_args = 0..)]
+  /// Add a semantic request header (`name=value` or `name: value`). Repeatable; last wins.
+  #[arg(long = "header", value_parser = parse_header_kv)]
   pub headers: Vec<(String, String)>,
 
-  /// Message to send. Optional when `--body-file` is provided.
+  /// Message to send. Required unless --body-file is used.
   pub message: Option<String>,
 }
 
-fn parse_header_kv(raw: &str) -> std::result::Result<(String, String), String> {
-  let (k, v) = raw
-    .split_once('=')
-    .or_else(|| raw.split_once(':').map(|(a, b)| (a, b.trim_start())))
-    .ok_or_else(|| format!("expected `name=value` or `name: value`, got `{raw}`"))?;
-  let k = k.trim().to_string();
-  let v = v.trim().to_string();
-  if k.is_empty() {
-    return Err("header name must not be empty".into());
-  }
-  Ok((k, v))
+struct ManagedSmokeRuntime {
+  profile: ProfileId,
+  executor: ManagedGatewayExecutor,
 }
 
-pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
-  let (mut cfg, _) = Config::load(cfg_path.as_deref())?;
-  let mut accounts = crate::server_runtime::load_default_accounts()?;
+struct PreparedRequest {
+  body: Value,
+  model: String,
+  stream: bool,
+  headers: HeaderMap,
+  request_id: String,
+}
 
-  let route_mode = args.route.map(RouteMode::from).unwrap_or(cfg.defaults.mode);
-  cfg.defaults.mode = route_mode;
+pub async fn run(config_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
+  let config_path = match config_path {
+    Some(path) => path,
+    None => tokn_config::paths::config_path().context("resolve the default gateway config path")?,
+  };
+  let runtime = load_runtime(&config_path, &args.profile)?;
+  let prepared = prepare_request(&args)?;
 
-  if route_mode == RouteMode::Passthrough {
-    anyhow::bail!("passthrough mode requires the proxy; use a different --route mode");
+  if prepared.stream && args.format == OutputFormat::Json {
+    bail!("streaming smoke requests emit raw SSE; --format json requires a buffered request");
   }
-
-  filter_accounts(&mut accounts, args.provider.as_deref(), args.account.as_deref())?;
-
-  // The legacy AppState still owns the account pool + route resolver + the
-  // legacy `EventBus`. We reuse that same bus for requests events too — the
-  // `build_event_bus` handler list already contains `RequestEventHandler`
-  // (when `cfg.db.enabled`), so emitting `Event::Requests(_)` on it persists
-  // the smoke run into `requests/<YYYY-MM-DD>.db`.
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&cfg)?;
-  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let state = crate::server_runtime::build_state(&cfg, &accounts, events.clone())?;
-  let requests_dir = if cfg.db.enabled {
-    Some(cfg.db.resolve_paths()?.requests_dir)
-  } else {
-    None
-  };
-
-  let custom_body: Option<Value> = match args.body_file.as_deref() {
-    Some(path) => Some(load_body_file(path)?),
-    None => None,
-  };
-
-  let model = match (&args.model, custom_body.as_ref()) {
-    (Some(m), _) => m.clone(),
-    (None, Some(body)) => body
-      .get("model")
-      .and_then(|v| v.as_str())
-      .map(str::to_string)
-      .ok_or_else(|| anyhow!("--body-file does not contain a `model` field; pass --model"))?,
-    (None, None) => pick_default_model(&state, args.provider.as_deref())?,
-  };
-
-  let endpoint: Endpoint = args.endpoint.into();
-
-  if custom_body.is_none() && args.message.is_none() {
-    anyhow::bail!("missing message: pass either a positional message or --body-file");
-  }
-
-  // Build the inbound body we'll feed to requests. We keep the body symmetrical
-  // with the legacy CLI behaviour so existing fixtures still work.
-  let body_value = match custom_body {
-    Some(mut v) => {
-      if let Some(obj) = v.as_object_mut() {
-        if args.model.is_some() {
-          obj.insert("model".into(), Value::String(model.clone()));
-        }
-        if args.stream {
-          obj.insert("stream".into(), Value::Bool(true));
-        }
-      }
-      v
-    }
-    None => build_request_body(endpoint, &model, args.message.as_deref().unwrap_or(""), args.stream),
-  };
-  let body_bytes = Bytes::from(serde_json::to_vec(&body_value)?);
-  let request_id = uuid::Uuid::new_v4().to_string();
-  let mut headers = build_inbound_headers(&args.headers)?;
-  headers.insert("x-request-id", request_id.clone());
-
   if args.no_redact {
-    eprintln!(
-      "warning: --no-redact is set; outbound + upstream headers will be printed verbatim (including authorization, cookies, api keys). Do not paste this output into bug reports."
+    eprintln!("warning: --no-redact prints response headers verbatim; do not paste sensitive output into bug reports");
+  }
+
+  let PreparedRequest {
+    body,
+    model,
+    stream: _,
+    headers,
+    request_id,
+  } = prepared;
+  let request = ManagedGatewayRequest::new(args.endpoint.into(), body).with_headers(headers);
+  let outcome = match runtime.executor.execute(&runtime.profile, request).await {
+    Ok(outcome) => outcome,
+    Err(error) => {
+      print_execution_error(&error, &runtime.profile, args.format)?;
+      return Err(anyhow!(error).context("managed smoke request failed"));
+    }
+  };
+
+  match outcome {
+    ManagedGatewayOutcome::Response {
+      site,
+      selection,
+      response,
+    } => print_response(&site, &selection, &request_id, response, args.format, !args.no_redact).await,
+    ManagedGatewayOutcome::CoolingDown { site, retry_at } => {
+      print_unavailable(
+        &site,
+        &request_id,
+        &model,
+        "cooling_down",
+        Some(retry_after_ms(retry_at)),
+        args.format,
+      )?;
+      bail!("{site} has no selectable account until its cooldown expires")
+    }
+    ManagedGatewayOutcome::NoEligible { site, reason } => {
+      print_unavailable(
+        &site,
+        &request_id,
+        &model,
+        &format!("no_eligible: {reason}"),
+        None,
+        args.format,
+      )?;
+      bail!("{site} has no eligible account: {reason}")
+    }
+  }
+}
+
+fn load_runtime(config_path: &Path, profile: &str) -> Result<ManagedSmokeRuntime> {
+  let profile = ProfileId::new(profile).with_context(|| format!("invalid managed profile id '{profile}'"))?;
+  let compiled = tokn_config::v2::load(config_path)
+    .with_context(|| format!("load compiled gateway config `{}`", config_path.display()))?;
+  let profile_plan = compiled
+    .gateway()
+    .profile(&profile)
+    .with_context(|| format!("compiled config has no profile named '{profile}'"))?;
+  let route = compiled.gateway().route(profile_plan.route()).with_context(|| {
+    format!(
+      "profile '{profile}' references missing route '{}'",
+      profile_plan.route()
+    )
+  })?;
+  if route.kind() != RouteKind::Managed {
+    bail!(
+      "profile '{profile}' uses {} route '{}'; smoke send requires a managed profile",
+      route_kind_name(route.kind()),
+      profile_plan.route()
     );
   }
 
-  if args.format == OutputFormat::Text {
-    println!("provider: {}", args.provider.as_deref().unwrap_or("(any)"));
-    println!("account:  {}", args.account.as_deref().unwrap_or("(any)"));
-    println!("model:    {}", model);
-    println!("endpoint: {}", endpoint);
-    println!("route:    {}", route_mode_name(route_mode));
-    println!("stream:   {}", args.stream);
-    if let Some(body_file) = args.body_file.as_ref() {
-      println!("body:     {}", body_file.display());
-    }
-    println!();
-  }
+  let accounts = AuthStore::load(None, Some(config_path))
+    .context("load gateway credentials")?
+    .accounts;
+  let roots = EmbeddedProfileRoots::one(profile.clone());
+  let linked = link_builtin_gateway_runtime_with_profile_roots(compiled.gateway(), &accounts, &roots)
+    .context("link managed smoke runtime")?;
+  let http_options = compiled.service().outbound().to_http_client_options();
+  let executor =
+    ManagedGatewayExecutor::build(Arc::new(linked), &http_options).context("build managed smoke executor")?;
+  Ok(ManagedSmokeRuntime { profile, executor })
+}
 
-  // ---- Build the requests profile ----
-  // Reuse the shared bus so `RequestEventHandler` persists smoke runs.
-  let bus = events.clone();
-  subscribe_event_printer(&bus);
-  // Capture per-stage outputs so we can render dry-run / failure reports
-  // after `run` returns. The runner no longer carries partial state on
-  // its return value; bus subscribers are the source of truth.
-  let captured = Captured::install(&bus);
-
-  let selector = Arc::new(PoolAccountSelector::new(state.pool.clone(), state.route.clone()));
-  let extract = Arc::new(DefaultExtract);
-  let resolve = Arc::new(PoolResolve::new(selector));
-  let build_headers = Arc::new(DefaultBuildHeaders::with_provider_defaults());
-  let convert_request = Arc::new(DefaultConvertRequest);
-
-  let profile = if args.dry_run {
-    Arc::new(Profile::without_send(
-      "gateway-smoke",
-      extract,
-      resolve,
-      build_headers,
-      convert_request,
-    ))
-  } else {
-    Arc::new(Profile::full(
-      "gateway-smoke",
-      extract,
-      resolve,
-      build_headers,
-      convert_request,
-      Arc::new(DefaultSend::new(state.http.clone())),
-      Arc::new(DefaultConvertResponse::new()),
-    ))
-  };
-  let runner = PipelineRunner::new(profile, bus.clone());
-
-  bus.emit(CoreEvent::Requests(RequestEvent {
-    request_id: request_id.clone().into(),
-    attempt: 0,
-    ts: tokn_core::util::now_unix_ms(),
-    payload: RequestEventPayload::Record(RecordEvent::InboundConnection {
-      user: None,
-      api_key_id: None,
-      local_addr: None,
-      peer_addr: None,
-      mode: "smoke".into(),
-      method: "POST".into(),
-      inbound_method: "POST".into(),
-      url: None,
-    }),
-  }));
-
-  let raw = RawInbound {
-    request_endpoint: endpoint.into(),
+fn prepare_request(args: &SendArgs) -> Result<PreparedRequest> {
+  let custom_body = args.body_file.as_deref().map(load_body_file).transpose()?;
+  let (body, model, stream) = prepare_body(
+    args.endpoint.into(),
+    args.model.as_deref(),
+    custom_body,
+    args.message.as_deref(),
+    args.stream,
+  )?;
+  let (headers, request_id) = build_semantic_headers(&args.headers, stream)?;
+  Ok(PreparedRequest {
+    body,
+    model,
+    stream,
     headers,
-    raw_body: body_bytes.clone(),
-    decoded_body: body_bytes.clone(),
-    body_json: body_value,
-    request_id: Some(request_id.into()),
+    request_id,
+  })
+}
+
+fn prepare_body(
+  endpoint: Endpoint,
+  explicit_model: Option<&str>,
+  custom_body: Option<Value>,
+  message: Option<&str>,
+  force_stream: bool,
+) -> Result<(Value, String, bool)> {
+  let mut body = match custom_body {
+    Some(body) => body,
+    None => {
+      let model = explicit_model.ok_or_else(|| anyhow!("missing model: pass --model or provide it in --body-file"))?;
+      let message = message.ok_or_else(|| anyhow!("missing message: pass a positional message or --body-file"))?;
+      build_request_body(endpoint, model, message, force_stream)
+    }
   };
-
-  let result = match runner.run(raw).await {
-    Ok(converted) if matches!(&converted.body, ConvertedBody::Stream { .. }) => {
-      let snapshot = captured.snapshot();
-      print_live_outcome(converted, &snapshot, None, args.format, !args.no_redact).await?;
-
-      // Streaming final records are emitted by the stream finalizer, so we must
-      // drain the stream before shutting down the event bus.
-      events.shutdown().await;
-      if let Some(archive_runtime) = archive_runtime {
-        archive_runtime.shutdown().await;
-      }
-
-      let persisted = match (requests_dir.as_deref(), snapshot.request_id.as_ref()) {
-        (Some(dir), Some(id)) => match tokn_persistence::read_request_row(dir, id.as_str()) {
-          Ok(row) => row,
-          Err(e) => {
-            eprintln!("warning: failed to read persisted request row: {e}");
-            None
-          }
-        },
-        _ => None,
-      };
-      if matches!(args.format, OutputFormat::Text) {
-        print_persisted_text(persisted.as_ref());
-      }
-      return Ok(());
-    }
-    other => other,
-  };
-
-  // Shut down the legacy event plumbing — requests events are independent.
-  events.shutdown().await;
-  if let Some(archive_runtime) = archive_runtime {
-    archive_runtime.shutdown().await;
+  let object = body
+    .as_object_mut()
+    .ok_or_else(|| anyhow!("smoke request body must be a JSON object"))?;
+  if let Some(model) = explicit_model {
+    object.insert("model".into(), Value::String(model.to_owned()));
   }
+  let body_stream = object
+    .get("stream")
+    .map(|value| {
+      value
+        .as_bool()
+        .ok_or_else(|| anyhow!("request body field `stream` must be a boolean"))
+    })
+    .transpose()?
+    .unwrap_or(false);
+  let stream = force_stream || body_stream;
+  object.insert("stream".into(), Value::Bool(stream));
+  let model = object
+    .get("model")
+    .and_then(Value::as_str)
+    .ok_or_else(|| anyhow!("request body does not contain a string `model` field; pass --model"))?
+    .to_owned();
+  Ok((body, model, stream))
+}
 
-  let snapshot = captured.snapshot();
-  let persisted = match (requests_dir.as_deref(), snapshot.request_id.as_ref()) {
-    (Some(dir), Some(id)) => match tokn_persistence::read_request_row(dir, id.as_str()) {
-      Ok(row) => row,
-      Err(e) => {
-        eprintln!("warning: failed to read persisted request row: {e}");
-        None
-      }
-    },
-    _ => None,
-  };
+fn parse_header_kv(raw: &str) -> std::result::Result<(String, String), String> {
+  let (name, value) = raw
+    .split_once('=')
+    .or_else(|| raw.split_once(':').map(|(name, value)| (name, value.trim_start())))
+    .ok_or_else(|| format!("expected `name=value` or `name: value`, got `{raw}`"))?;
+  let name = name.trim();
+  let value = value.trim();
+  let parsed_name = name
+    .parse::<HeaderName>()
+    .map_err(|error| format!("invalid header name `{name}`: {error}"))?;
+  value
+    .parse::<HeaderValue>()
+    .map_err(|error| format!("invalid value for header `{name}`: {error}"))?;
+  Ok((parsed_name.as_str().to_owned(), value.to_owned()))
+}
 
-  match result {
-    Ok(converted) => {
-      print_live_outcome(converted, &snapshot, persisted.as_ref(), args.format, !args.no_redact).await?;
-    }
-    Err(err) if err.stop && args.dry_run => {
-      print_dry_run_outcome(&snapshot, persisted.as_ref(), args.format, !args.no_redact)?;
-    }
-    Err(err) => {
-      print_failure_outcome(&err, &snapshot, persisted.as_ref(), args.format, !args.no_redact)?;
-      anyhow::bail!("pipeline failed: {}: {}", err.stage, err.message());
-    }
+fn build_semantic_headers(overrides: &[(String, String)], stream: bool) -> Result<(HeaderMap, String)> {
+  let request_id = uuid::Uuid::new_v4().to_string();
+  let mut headers = HeaderMap::new();
+  headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+  headers.insert(
+    ACCEPT,
+    HeaderValue::from_static(if stream {
+      "text/event-stream"
+    } else {
+      "application/json"
+    }),
+  );
+  headers.insert("x-request-id", HeaderValue::from_str(&request_id)?);
+  for (name, value) in overrides {
+    let name = name
+      .parse::<HeaderName>()
+      .with_context(|| format!("invalid header name `{name}`"))?;
+    let value = value
+      .parse::<HeaderValue>()
+      .with_context(|| format!("invalid value for header `{name}`"))?;
+    headers.insert(name, value);
   }
-
-  Ok(())
+  let request_id = headers
+    .get("x-request-id")
+    .and_then(|value| value.to_str().ok())
+    .unwrap_or(&request_id)
+    .to_owned();
+  Ok((headers, request_id))
 }
 
-/// Per-stage outputs captured by a bus subscriber. Cloned out as a
-/// [`CapturedSnapshot`] once `run` returns so we can render reports
-/// without holding the mutex.
-#[derive(Default)]
-struct Captured {
-  inner: Mutex<CapturedSnapshot>,
-}
-
-#[derive(Default, Clone)]
-struct CapturedSnapshot {
-  started_endpoint: Option<String>,
-  resolved: Option<ResolvedSummary>,
-  built_headers: Option<BuiltHeadersSummary>,
-  converted_request: Option<ConvertedRequestSummary>,
-  attempts: Option<u32>,
-  request_id: Option<String>,
-}
-
-impl Captured {
-  fn install(bus: &EventBus) -> Arc<Self> {
-    let cap = Arc::new(Captured::default());
-    let sink = cap.clone();
-    let mut rx = bus.subscribe();
-    tokio::spawn(async move {
-      loop {
-        match rx.recv().await {
-          Ok(arc) => {
-            if let CoreEvent::Requests(event) = &*arc {
-              let mut snap = sink.inner.lock().unwrap();
-              if snap.request_id.is_none() {
-                snap.request_id = Some(event.request_id.to_string());
-              }
-              match &event.payload {
-                EventPayload::Stage(StageEvent::Started { request_endpoint }) => {
-                  snap.started_endpoint = Some(request_endpoint.as_str().to_string())
-                }
-                EventPayload::Stage(StageEvent::Resolve(r)) => snap.resolved = Some(r.clone()),
-                EventPayload::Stage(StageEvent::BuildHeaders(h)) => snap.built_headers = Some(h.clone()),
-                EventPayload::Stage(StageEvent::ConvertRequest(c)) => snap.converted_request = Some(c.clone()),
-                EventPayload::Stage(StageEvent::Completed { attempts, .. }) => snap.attempts = Some(*attempts),
-                _ => {}
-              }
-            }
-          }
-          Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-          Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-        }
-      }
-    });
-    cap
-  }
-
-  fn snapshot(&self) -> CapturedSnapshot {
-    self.inner.lock().unwrap().clone()
-  }
-}
-
-fn subscribe_event_printer(bus: &EventBus) {
-  let mut rx = bus.subscribe();
-  tokio::spawn(async move {
-    loop {
-      match rx.recv().await {
-        Ok(arc) => {
-          if let CoreEvent::Requests(event) = &*arc {
-            print_event(event);
-          }
-        }
-        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-      }
-    }
-  });
-}
-
-fn print_event(event: &Event) {
-  match &event.payload {
-    EventPayload::Stage(StageEvent::Started { request_endpoint }) => {
-      println!("[started]          endpoint={request_endpoint}");
-    }
-    EventPayload::Stage(StageEvent::Extract(e)) => {
-      let cid = e.agent_id.as_ref().map(|c| c.as_str()).unwrap_or("(none)");
-      println!(
-        "[extract]          model={} stream={} agent_id={cid}",
-        e.model, e.stream
-      );
-    }
-    EventPayload::Stage(StageEvent::Resolve(r)) => {
-      let cid = r.agent_id.as_ref().map(|c| c.as_str()).unwrap_or("(none)");
-      let upstream_endpoint = r
-        .upstream_endpoint
-        .map(|endpoint| endpoint.to_string())
-        .unwrap_or_else(|| "auto".to_string());
-      println!(
-        "[resolve]          model={} -> {} account={} provider={} upstream_endpoint={} agent_id={cid}",
-        r.model, r.upstream_model, r.account_id, r.provider_id, upstream_endpoint
-      );
-    }
-    EventPayload::Stage(StageEvent::BuildHeaders(_)) => {
-      println!("[build_headers]    ok");
-    }
-    EventPayload::Stage(StageEvent::ConvertRequest(_)) => {
-      println!("[convert_request]  ok");
-    }
-    EventPayload::Stage(StageEvent::Send(_)) => {
-      println!("[send]             ok");
-    }
-    EventPayload::Stage(StageEvent::ConvertResponse(_)) => {
-      println!("[convert_response] ok");
-    }
-    EventPayload::Stage(StageEvent::Error {
-      stage,
-      message,
-      recoverable,
-      stop,
-    }) => {
-      if *stop {
-        println!("[stop]             stage={stage} message={message}");
-      } else {
-        println!("[error]            stage={stage} recoverable={recoverable} message={message}");
-      }
-    }
-    EventPayload::Stage(StageEvent::Completed { success, attempts }) => {
-      println!("[completed]        success={success} attempts={attempts}");
-    }
-    EventPayload::Record(r) => match r {
-      RecordEvent::InboundConnection {
-        user,
-        api_key_id,
-        local_addr,
-        peer_addr,
-        mode,
-        method,
-        inbound_method,
-        url,
-      } => {
-        println!(
-          "[record:inbound_conn] mode={mode} method={method} inbound_method={inbound_method} user={} api_key_id={} local={} peer={} url={}",
-          user.as_deref().unwrap_or("-"),
-          api_key_id.as_deref().unwrap_or("-"),
-          local_addr.as_deref().unwrap_or("-"),
-          peer_addr.as_deref().unwrap_or("-"),
-          url.as_deref().unwrap_or("-")
-        );
-      }
-      RecordEvent::UpstreamReq {
-        method,
-        url,
-        headers,
-        body,
-      } => {
-        println!(
-          "[record:upstream_req] {method} {url} headers={} body_bytes={}",
-          headers.len(),
-          body.len()
-        );
-      }
-      RecordEvent::UpstreamResp { status, headers } => {
-        println!("[record:upstream_resp] status={status} headers={}", headers.len());
-      }
-      RecordEvent::UpstreamBody { body, error } => {
-        println!(
-          "[record:upstream_body] bytes={} error={}",
-          body.len(),
-          error.as_deref().unwrap_or("-")
-        );
-      }
-      RecordEvent::ConvertedBody { body, error } => {
-        println!(
-          "[record:converted_body] bytes={} error={}",
-          body.len(),
-          error.as_deref().unwrap_or("-")
-        );
-      }
-      RecordEvent::Usage(usage) => {
-        println!(
-          "[record:usage] input={:?} output={:?} total={:?} cache_read={:?} cache_write={:?} reasoning={:?}",
-          usage.input_tokens,
-          usage.output_tokens,
-          usage.total_tokens,
-          usage.details.cache_read,
-          usage.details.cache_write,
-          usage.details.reasoning
-        );
-      }
-    },
-    EventPayload::Custom(c) => {
-      println!("[custom]           kind={}", c.kind);
-    }
-  }
-}
-
-fn print_dry_run_outcome(
-  snap: &CapturedSnapshot,
-  persisted: Option<&serde_json::Map<String, Value>>,
+async fn print_response(
+  site: &ManagedProfileSite,
+  selection: &ManagedSelectionSummary,
+  request_id: &str,
+  response: ManagedClientResponse,
   format: OutputFormat,
   redact: bool,
 ) -> Result<()> {
-  let resolved = snap.resolved.as_ref();
-  let upstream_endpoint = snapshot_endpoint_label(snap);
-  let headers = snap.built_headers.as_ref();
-  let converted = snap.converted_request.as_ref();
-
-  match format {
-    OutputFormat::Json => {
-      let headers_json = headers
-        .map(|h| headers_json_value(&h.headers, redact))
-        .unwrap_or(Value::Null);
-      let body_json = converted.map(|c| (*c.upstream_body).clone()).unwrap_or(Value::Null);
-      let report = serde_json::json!({
-        "dry_run": true,
-        "attempts": snap.attempts.unwrap_or(0),
-        "request_id": snap.request_id.as_deref(),
-        "account": resolved.map(|r| r.account_id.as_str()),
-        "provider": resolved.map(|r| r.provider_id.as_str()),
-        "model": resolved.map(|r| r.model.as_str()),
-        "upstream_model": resolved.map(|r| r.upstream_model.as_str()),
-        "upstream_endpoint": upstream_endpoint,
-        "headers": headers_json,
-        "body": body_json,
-        "content_encoding": converted.and_then(|c| c.content_encoding.as_deref()),
-        "persisted": persisted.map(|m| Value::Object(m.clone())).unwrap_or(Value::Null),
-      });
-      println!("{}", serde_json::to_string_pretty(&report)?);
-    }
-    OutputFormat::Text => {
-      println!();
-      println!("--- outcome ---");
-      if let Some(n) = snap.attempts {
-        println!("attempts: {n}");
-      }
-      if let Some(id) = snap.request_id.as_ref() {
-        println!("request_id: {id}");
-      }
-      if let Some(r) = resolved {
-        println!("account:  {}", r.account_id);
-        println!("provider: {}", r.provider_id);
-        println!("model:    {} -> {}", r.model, r.upstream_model);
-      }
-      if let Some(endpoint) = snapshot_endpoint_label(snap) {
-        println!("upstream: {}", endpoint);
-      }
-      if let Some(h) = headers {
-        println!("headers:");
-        for (name, value) in h.headers.iter() {
-          let v = value.as_str();
-          println!("  {}: {}", name.as_str(), redact_header(name.as_str(), v, redact));
-        }
-      }
-      if let Some(c) = converted {
-        if let Some(enc) = &c.content_encoding {
-          println!("content-encoding: {}", enc);
-        }
-        println!("body:");
-        println!("{}", serde_json::to_string_pretty(&*c.upstream_body)?);
-      }
-      print_persisted_text(persisted);
-    }
-  }
-  Ok(())
-}
-
-/// Render the result of a live (non-dry-run) pipeline run. For buffered
-/// responses we print a JSON report (`OutputFormat::Json`) or a friendly
-/// text preview; for streaming responses we forward the SSE byte chunks
-/// to stdout as they arrive (curl `-N` semantics) and finish with a
-/// concise summary.
-async fn print_live_outcome(
-  converted: ConvertedResponse,
-  snap: &CapturedSnapshot,
-  persisted: Option<&serde_json::Map<String, Value>>,
-  format: OutputFormat,
-  redact: bool,
-) -> Result<()> {
-  let resolved = snap.resolved.as_ref();
-  let upstream_endpoint = snapshot_endpoint_label(snap);
-  let attempts = snap.attempts.unwrap_or(1);
-
-  let ConvertedResponse { status, headers, body } = converted;
+  let (status, headers, body) = response.into_parts();
   match body {
-    ConvertedBody::Buffered { body_json, .. } => match format {
-      OutputFormat::Json => {
-        let report = serde_json::json!({
-          "dry_run": false,
-          "stream": false,
-          "attempts": attempts,
-          "request_id": snap.request_id.as_deref(),
-          "account": resolved.map(|r| r.account_id.as_str()),
-          "provider": resolved.map(|r| r.provider_id.as_str()),
-          "model": resolved.map(|r| r.model.as_str()),
-          "upstream_model": resolved.map(|r| r.upstream_model.as_str()),
-          "upstream_endpoint": upstream_endpoint,
-          "status": status,
-          "headers": headers_json_value(&headers, redact),
-          "body": body_json.as_deref(),
-          "persisted": persisted.map(|m| Value::Object(m.clone())).unwrap_or(Value::Null),
-        });
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    ManagedClientBody::Buffered(body) => {
+      match format {
+        OutputFormat::Json => {
+          let report = serde_json::json!({
+            "success": status.is_success(),
+            "request_id": request_id,
+            "site": site_json(site),
+            "selection": selection_json(selection),
+            "response": {
+              "status": status.as_u16(),
+              "headers": headers_json_value(&headers, redact),
+              "body": buffered_body_json(&body),
+            },
+          });
+          println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Text => {
+          print_selection_text(site, selection, request_id, false);
+          println!("status:    {}", status.as_u16());
+          print_headers_text(&headers, redact, false);
+          println!("body:");
+          println!("{}", buffered_body_text(&body));
+        }
       }
-      OutputFormat::Text => {
-        println!();
-        println!("--- response ---");
-        println!("attempts: {}", attempts);
-        if let Some(id) = snap.request_id.as_ref() {
-          println!("request_id: {id}");
-        }
-        if let Some(r) = resolved {
-          println!("account:  {}", r.account_id);
-          println!("provider: {}", r.provider_id);
-          println!("model:    {} -> {}", r.model, r.upstream_model);
-        }
-        if let Some(endpoint) = snapshot_endpoint_label(snap) {
-          println!("upstream: {}", endpoint);
-        }
-        println!("status:   {}", status);
-        println!("headers:");
-        for (name, value) in headers.iter() {
-          let v = value.as_str();
-          println!("  {}: {}", name.as_str(), redact_header(name.as_str(), v, redact));
-        }
-        println!("body:");
-        println!("{}", serde_json::to_string_pretty(&body_json.as_deref())?);
-        print_persisted_text(persisted);
-      }
-    },
-    ConvertedBody::Stream { mut body } => {
-      // For text format, print a short header banner first so the user sees
-      // metadata before the stream body. For json format we still stream
-      // the raw SSE bytes (already endpoint-translated, if applicable) —
-      // wrapping that in a JSON envelope would require buffering, which
-      // defeats the point of streaming. Tooling that wants structured
-      // output should use `--dry-run` or buffered mode.
-      if matches!(format, OutputFormat::Text) {
-        println!();
-        println!("--- response (stream) ---");
-        println!("attempts: {}", attempts);
-        if let Some(r) = resolved {
-          println!("account:  {}", r.account_id);
-          println!("provider: {}", r.provider_id);
-          println!("model:    {} -> {}", r.model, r.upstream_model);
-        }
-        if let Some(endpoint) = snapshot_endpoint_label(snap) {
-          println!("upstream: {}", endpoint);
-        }
-        println!("status:   {}", status);
-        println!("headers:");
-        for (name, value) in headers.iter() {
-          let v = value.as_str();
-          println!("  {}: {}", name.as_str(), redact_header(name.as_str(), v, redact));
-        }
-        println!("body:");
-      }
-
-      let mut stdout = tokio::io::stdout();
-      let mut total_bytes: usize = 0;
-      while let Some(chunk) = body.next().await {
-        let bytes = chunk.map_err(|e| anyhow!("stream read failed: {e}"))?;
-        total_bytes += bytes.len();
-        stdout
-          .write_all(&bytes)
-          .await
-          .map_err(|e| anyhow!("stdout write failed: {e}"))?;
-        stdout.flush().await.ok();
-      }
-      if matches!(format, OutputFormat::Text) {
-        println!();
-        println!("--- end of stream ({total_bytes} bytes) ---");
-        print_persisted_text(persisted);
+      if status.is_success() {
+        Ok(())
+      } else {
+        bail!("managed upstream returned HTTP {}", status.as_u16())
       }
     }
+    ManagedClientBody::Stream(mut stream) => {
+      if format == OutputFormat::Json {
+        bail!("managed executor returned a stream for JSON output")
+      }
+      print_selection_text(site, selection, request_id, true);
+      eprintln!("status:    {}", status.as_u16());
+      print_headers_text(&headers, redact, true);
+      let mut stdout = tokio::io::stdout();
+      while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read managed SSE response")?;
+        stdout.write_all(&chunk).await.context("write SSE response to stdout")?;
+        stdout.flush().await.context("flush SSE response to stdout")?;
+      }
+      Ok(())
+    }
   }
-  Ok(())
 }
 
-/// Render whatever partial state the pipeline managed to accumulate before
-/// failing. Mirrors `print_dry_run_outcome` shape so the user sees the same
-/// fields whether the run succeeded, was dry-run, or aborted mid-stream.
-fn print_failure_outcome(
-  err: &PipelineError,
-  snap: &CapturedSnapshot,
-  persisted: Option<&serde_json::Map<String, Value>>,
-  format: OutputFormat,
-  redact: bool,
-) -> Result<()> {
-  let resolved = snap.resolved.as_ref();
-  let upstream_endpoint = snapshot_endpoint_label(snap);
-  let headers = snap.built_headers.as_ref();
-  let converted_req = snap.converted_request.as_ref();
+fn print_selection_text(
+  site: &ManagedProfileSite,
+  selection: &ManagedSelectionSummary,
+  request_id: &str,
+  stderr: bool,
+) {
+  let lines = [
+    format!("profile:   {}", site.profile_id()),
+    format!("route:     {}", site.route_id()),
+    format!("request:   {request_id}"),
+    format!("account:   {}", selection.account_id()),
+    format!("provider:  {}", selection.provider_id()),
+    format!("upstream:  {}", selection.upstream_id()),
+    format!(
+      "model:     {} -> {}",
+      selection.requested_model(),
+      selection.upstream_model()
+    ),
+    format!(
+      "operation: {} -> {}",
+      selection.requested_operation(),
+      selection.upstream_operation()
+    ),
+  ];
+  for line in lines {
+    if stderr {
+      eprintln!("{line}");
+    } else {
+      println!("{line}");
+    }
+  }
+}
 
+fn print_execution_error(error: &ManagedGatewayError, profile: &ProfileId, format: OutputFormat) -> Result<()> {
   match format {
     OutputFormat::Json => {
-      let headers_json = headers
-        .map(|h| headers_json_value(&h.headers, redact))
-        .unwrap_or(Value::Null);
-      let body_json = converted_req.map(|c| (*c.upstream_body).clone()).unwrap_or(Value::Null);
       let report = serde_json::json!({
         "success": false,
-        "attempts": snap.attempts.unwrap_or(0),
-        "request_id": snap.request_id.as_deref(),
-        "error": {
-          "stage": err.stage.as_str(),
-          "message": err.message().as_ref(),
-          "recoverable": err.recoverable,
-          "stop": err.stop,
-        },
-        "account": resolved.map(|r| r.account_id.as_str()),
-        "provider": resolved.map(|r| r.provider_id.as_str()),
-        "model": resolved.map(|r| r.model.as_str()),
-        "upstream_model": resolved.map(|r| r.upstream_model.as_str()),
-        "upstream_endpoint": upstream_endpoint,
-        "headers": headers_json,
-        "body": body_json,
-        "content_encoding": converted_req.and_then(|c| c.content_encoding.as_deref()),
-        "persisted": persisted.map(|m| Value::Object(m.clone())).unwrap_or(Value::Null),
+        "profile": profile.as_str(),
+        "site": error.site().map(site_json).unwrap_or(Value::Null),
+        "selection": error.selection().map(selection_json).unwrap_or(Value::Null),
+        "error": error.to_string(),
       });
       println!("{}", serde_json::to_string_pretty(&report)?);
     }
     OutputFormat::Text => {
-      println!();
-      println!("--- failure ---");
-      if let Some(n) = snap.attempts {
-        println!("attempts: {n}");
+      eprintln!("profile: {profile}");
+      if let Some(site) = error.site() {
+        eprintln!("route:   {}", site.route_id());
       }
-      if let Some(id) = snap.request_id.as_ref() {
-        println!("request_id: {id}");
+      if let Some(selection) = error.selection() {
+        eprintln!("account: {}", selection.account_id());
+        eprintln!("upstream: {}", selection.upstream_id());
       }
-      println!("stage:    {}", err.stage);
-      println!("recoverable: {}", err.recoverable);
-      println!("message:  {}", err.message());
-      if let Some(r) = resolved {
-        println!("account:  {}", r.account_id);
-        println!("provider: {}", r.provider_id);
-        println!("model:    {} -> {}", r.model, r.upstream_model);
-      }
-      if let Some(endpoint) = snapshot_endpoint_label(snap) {
-        println!("upstream: {}", endpoint);
-      }
-      if let Some(h) = headers {
-        println!("headers:");
-        for (name, value) in h.headers.iter() {
-          let v = value.as_str();
-          println!("  {}: {}", name.as_str(), redact_header(name.as_str(), v, redact));
-        }
-      }
-      if let Some(c) = converted_req {
-        if let Some(enc) = &c.content_encoding {
-          println!("content-encoding: {}", enc);
-        }
-        println!("body:");
-        println!("{}", serde_json::to_string_pretty(&*c.upstream_body)?);
-      }
-      print_persisted_text(persisted);
     }
   }
   Ok(())
 }
 
-fn snapshot_endpoint_label(snap: &CapturedSnapshot) -> Option<String> {
-  snap
-    .resolved
-    .as_ref()
-    .and_then(|resolved| resolved.upstream_endpoint.map(|endpoint| endpoint.to_string()))
-    .or_else(|| snap.started_endpoint.clone())
-}
-
-/// Print the persisted row in a compact, line-per-column form. BLOB columns
-/// containing structured JSON (headers, body) are pretty-printed beneath
-/// their name; scalar columns appear inline. Null columns are skipped to
-/// keep the output focused on what actually got written.
-fn print_persisted_text(persisted: Option<&serde_json::Map<String, Value>>) {
-  let Some(row) = persisted else {
-    return;
-  };
-  println!();
-  println!("--- persisted row ---");
-  for (k, v) in row.iter() {
-    if v.is_null() {
-      continue;
-    }
-    match v {
-      Value::Object(_) | Value::Array(_) => {
-        println!("{k}:");
-        if let Ok(pretty) = serde_json::to_string_pretty(v) {
-          for line in pretty.lines() {
-            println!("  {line}");
-          }
-        }
-      }
-      Value::String(s) => println!("{k}: {s}"),
-      _ => println!("{k}: {v}"),
-    }
-  }
-}
-
-fn headers_json_value(headers: &tokn_headers::HeaderMap, redact: bool) -> Value {
-  let mut map = serde_json::Map::new();
-  for (name, value) in headers.iter() {
-    let v = value.as_str();
-    let key = name.as_str().to_string();
-    let value = Value::String(redact_header(name.as_str(), v, redact));
-    match map.get_mut(&key) {
-      Some(Value::Array(values)) => values.push(value),
-      Some(_) => unreachable!("header json values are always arrays"),
-      None => {
-        map.insert(key, Value::Array(vec![value]));
-      }
-    }
-  }
-  Value::Object(map)
-}
-
-fn redact_header(name: &str, value: &str, redact: bool) -> String {
-  // Preserve diagnostic sentinels: empty values and the `<missing>`
-  // placeholder emitted by persona builders are not secrets, they are
-  // signals that the upstream stage failed to populate something. Hiding
-  // them defeats the entire point of dumping headers when debugging.
-  if !redact || value.is_empty() || value == "<missing>" {
-    return value.to_string();
-  }
-  match name.to_ascii_lowercase().as_str() {
-    "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key" => "<redacted>".into(),
-    _ => value.to_string(),
-  }
-}
-
-pub(super) fn filter_accounts(
-  accounts: &mut Vec<tokn_core::account::AccountConfig>,
-  provider: Option<&str>,
-  account: Option<&str>,
+fn print_unavailable(
+  site: &ManagedProfileSite,
+  request_id: &str,
+  model: &str,
+  reason: &str,
+  retry_after_ms: Option<u64>,
+  format: OutputFormat,
 ) -> Result<()> {
-  if provider.is_none() && account.is_none() {
-    return Ok(());
-  }
-  let before = accounts.len();
-  accounts.retain(|a| {
-    if let Some(p) = provider {
-      if a.provider != p {
-        return false;
+  match format {
+    OutputFormat::Json => {
+      let report = serde_json::json!({
+        "success": false,
+        "request_id": request_id,
+        "site": site_json(site),
+        "model": model,
+        "error": reason,
+        "retry_after_ms": retry_after_ms,
+      });
+      println!("{}", serde_json::to_string_pretty(&report)?);
+    }
+    OutputFormat::Text => {
+      eprintln!("profile: {}", site.profile_id());
+      eprintln!("route:   {}", site.route_id());
+      eprintln!("model:   {model}");
+      eprintln!("reason:  {reason}");
+      if let Some(retry_after_ms) = retry_after_ms {
+        eprintln!("retry after: {retry_after_ms}ms");
       }
     }
-    if let Some(id) = account {
-      if a.id != id {
-        return false;
-      }
-    }
-    true
-  });
-  if accounts.is_empty() {
-    anyhow::bail!(
-      "no accounts match the requested filters (provider={:?}, account={:?}); had {before} configured",
-      provider,
-      account
-    );
   }
   Ok(())
+}
+
+fn site_json(site: &ManagedProfileSite) -> Value {
+  serde_json::json!({
+    "profile": site.profile_id().as_str(),
+    "route": site.route_id().as_str(),
+  })
+}
+
+fn selection_json(selection: &ManagedSelectionSummary) -> Value {
+  serde_json::json!({
+    "account": selection.account_id(),
+    "provider": selection.provider_id().as_str(),
+    "upstream": selection.upstream_id().as_str(),
+    "requested_model": selection.requested_model(),
+    "upstream_model": selection.upstream_model(),
+    "requested_operation": selection.requested_operation().as_str(),
+    "upstream_operation": selection.upstream_operation().as_str(),
+    "wire_identity": selection.wire_identity().map(|identity| identity.as_str()),
+  })
+}
+
+fn headers_json_value(headers: &HeaderMap, redact: bool) -> Value {
+  let mut output = serde_json::Map::new();
+  for name in headers.keys() {
+    let values = headers
+      .get_all(name)
+      .iter()
+      .map(|value| Value::String(render_header_value(name, value, redact)))
+      .collect();
+    output.insert(name.as_str().to_owned(), Value::Array(values));
+  }
+  Value::Object(output)
+}
+
+fn print_headers_text(headers: &HeaderMap, redact: bool, stderr: bool) {
+  if stderr {
+    eprintln!("headers:");
+  } else {
+    println!("headers:");
+  }
+  for name in headers.keys() {
+    for value in headers.get_all(name) {
+      let value = render_header_value(name, value, redact);
+      if stderr {
+        eprintln!("  {name}: {value}");
+      } else {
+        println!("  {name}: {value}");
+      }
+    }
+  }
+}
+
+fn render_header_value(name: &HeaderName, value: &HeaderValue, redact: bool) -> String {
+  if redact && is_sensitive_header(name.as_str()) {
+    return "<redacted>".to_owned();
+  }
+  value
+    .to_str()
+    .map(str::to_owned)
+    .unwrap_or_else(|_| format!("<non-UTF-8 value: {} bytes>", value.as_bytes().len()))
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+  matches!(
+    name,
+    "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+  )
+}
+
+fn buffered_body_json(body: &[u8]) -> Value {
+  serde_json::from_slice(body).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()))
+}
+
+fn buffered_body_text(body: &[u8]) -> String {
+  match serde_json::from_slice::<Value>(body) {
+    Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+    Err(_) => String::from_utf8_lossy(body).into_owned(),
+  }
+}
+
+fn retry_after_ms(retry_at: Instant) -> u64 {
+  retry_at
+    .saturating_duration_since(Instant::now())
+    .as_millis()
+    .try_into()
+    .unwrap_or(u64::MAX)
 }
 
 fn build_request_body(endpoint: Endpoint, model: &str, message: &str, stream: bool) -> Value {
@@ -909,7 +536,6 @@ fn build_request_body(endpoint: Endpoint, model: &str, message: &str, stream: bo
     Endpoint::Messages => serde_json::json!({
       "model": model,
       "stream": stream,
-      "max_tokens": 32_000,
       "messages": [{"role": "user", "content": message}],
     }),
     Endpoint::Responses => serde_json::json!({
@@ -920,43 +546,24 @@ fn build_request_body(endpoint: Endpoint, model: &str, message: &str, stream: bo
   }
 }
 
-fn build_inbound_headers(overrides: &[(String, String)]) -> Result<tokn_headers::HeaderMap> {
-  use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
-  let mut h = HeaderMap::new();
-  h.insert(
-    HeaderName::new("content-type"),
-    HeaderValue::from_static("application/json"),
-  );
-  h.insert(
-    HeaderName::new("x-request-id"),
-    HeaderValue::from_string(uuid::Uuid::new_v4().to_string()),
-  );
-  for (k, v) in overrides {
-    h.insert(
-      HeaderName::new(k.to_ascii_lowercase()),
-      HeaderValue::from_string(v.clone()),
-    );
-  }
-  Ok(h)
-}
-
-fn load_body_file(path: &std::path::Path) -> Result<Value> {
+fn load_body_file(path: &Path) -> Result<Value> {
   use std::io::Read;
-  let raw = if path == std::path::Path::new("-") {
-    let mut buf = String::new();
+
+  let raw = if path == Path::new("-") {
+    let mut buffer = String::new();
     std::io::stdin()
-      .read_to_string(&mut buf)
-      .map_err(|e| anyhow!("read stdin: {e}"))?;
-    buf
+      .read_to_string(&mut buffer)
+      .context("read smoke request body from stdin")?;
+    buffer
   } else {
-    std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {e}", path.display()))?
+    std::fs::read_to_string(path).with_context(|| format!("read smoke request body `{}`", path.display()))?
   };
-  let body_str = extract_body_section(&raw).unwrap_or_else(|| raw.trim_start());
-  serde_json::from_str(body_str).map_err(|e| anyhow!("parse body file as JSON: {e}"))
+  let body = extract_body_section(&raw).unwrap_or_else(|| raw.trim_start());
+  serde_json::from_str(body).context("parse smoke request body as JSON")
 }
 
 fn extract_body_section(raw: &str) -> Option<&str> {
-  let body_idx = raw
+  let body_index = raw
     .lines()
     .scan(0usize, |offset, line| {
       let start = *offset;
@@ -965,33 +572,14 @@ fn extract_body_section(raw: &str) -> Option<&str> {
     })
     .find_map(|(start, line)| line.trim().eq_ignore_ascii_case("body:").then_some(start + line.len()))?;
 
-  Some(raw[body_idx..].trim_start_matches(['\r', '\n']).trim_start())
+  Some(raw[body_index..].trim_start_matches(['\r', '\n']).trim_start())
 }
 
-fn pick_default_model(state: &AppState, provider_filter: Option<&str>) -> Result<String> {
-  for acct in state.pool.all() {
-    if let Some(p) = provider_filter {
-      if acct.provider.info().id != p {
-        continue;
-      }
-    }
-    if let Some(m) = acct.provider.info().default_models.first() {
-      return Ok(m.id.clone());
-    }
-  }
-  match provider_filter {
-    Some(p) => anyhow::bail!("no models available for provider '{}'; pass --model", p),
-    None => anyhow::bail!("no models available; pass --model explicitly"),
-  }
-}
-
-fn route_mode_name(mode: RouteMode) -> &'static str {
-  match mode {
-    RouteMode::Passthrough => "passthrough",
-    RouteMode::Switch => "switch",
-    RouteMode::Exact => "exact",
-    RouteMode::Route => "route",
-    RouteMode::Fuzzy => "fuzzy",
+fn route_kind_name(kind: RouteKind) -> &'static str {
+  match kind {
+    RouteKind::Managed => "managed",
+    RouteKind::Relay => "relay",
+    RouteKind::Transparent => "transparent",
   }
 }
 
@@ -999,52 +587,130 @@ fn route_mode_name(mode: RouteMode) -> &'static str {
 mod tests {
   use super::*;
   use serde_json::json;
-  use tokn_headers::HeaderMap;
 
   #[test]
-  fn build_request_body_messages_includes_required_max_tokens() {
+  fn build_request_body_messages_leaves_route_defaults_to_managed_execution() {
     let body = build_request_body(Endpoint::Messages, "claude", "hi", false);
-    assert_eq!(body["max_tokens"], 32_000);
+    assert!(body.get("max_tokens").is_none());
     assert_eq!(body["messages"][0]["content"], "hi");
   }
 
   #[test]
-  fn build_request_body_chat_does_not_add_messages_max_tokens() {
-    let body = build_request_body(Endpoint::ChatCompletions, "gpt-4.1", "hi", false);
-    assert!(body.get("max_tokens").is_none());
+  fn prepare_body_requires_an_explicit_model_without_a_body_file() {
+    let error = prepare_body(Endpoint::Responses, None, None, Some("hello"), false).unwrap_err();
+    assert_eq!(
+      error.to_string(),
+      "missing model: pass --model or provide it in --body-file"
+    );
   }
 
   #[test]
-  fn headers_json_value_preserves_multi_values_in_order() {
-    let mut headers = HeaderMap::new();
-    headers.append("set-cookie", "a=1");
-    headers.append("x-test", "first");
-    headers.append("set-cookie", "b=2");
+  fn explicit_flags_override_body_model_and_enable_streaming() {
+    let (body, model, stream) = prepare_body(
+      Endpoint::Responses,
+      Some("provider/replacement"),
+      Some(json!({"model": "provider/original", "input": "hello", "stream": false})),
+      None,
+      true,
+    )
+    .unwrap();
 
-    let json = headers_json_value(&headers, false);
+    assert_eq!(model, "provider/replacement");
+    assert!(stream);
+    assert_eq!(body["model"], "provider/replacement");
+    assert_eq!(body["stream"], true);
+  }
+
+  #[test]
+  fn body_file_stream_must_be_boolean_and_is_normalized_when_absent() {
+    let error = prepare_body(
+      Endpoint::Responses,
+      None,
+      Some(json!({"model": "provider/model", "stream": "yes"})),
+      None,
+      false,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "request body field `stream` must be a boolean");
+
+    let (body, _, stream) = prepare_body(
+      Endpoint::Responses,
+      None,
+      Some(json!({"model": "provider/model", "input": "hello"})),
+      None,
+      false,
+    )
+    .unwrap();
+    assert!(!stream);
+    assert_eq!(body["stream"], false);
+  }
+
+  #[test]
+  fn generated_endpoint_bodies_use_the_requested_client_shape() {
+    let chat = build_request_body(Endpoint::ChatCompletions, "provider/model", "hello", false);
+    assert_eq!(chat["messages"][0]["content"], "hello");
+    assert!(chat.get("input").is_none());
+
+    let responses = build_request_body(Endpoint::Responses, "provider/model", "hello", false);
+    assert_eq!(responses["input"], "hello");
+    assert!(responses.get("messages").is_none());
+  }
+
+  #[test]
+  fn header_parser_rejects_invalid_native_headers() {
+    assert!(parse_header_kv("not a header=value").is_err());
+    assert!(parse_header_kv("x-test=value\nsmuggled").is_err());
     assert_eq!(
-      json,
-      serde_json::json!({
-        "set-cookie": ["a=1", "b=2"],
+      parse_header_kv("X-Session-Id: session").unwrap(),
+      ("x-session-id".to_owned(), "session".to_owned())
+    );
+  }
+
+  #[test]
+  fn semantic_header_overrides_are_last_wins() {
+    let (headers, request_id) = build_semantic_headers(
+      &[
+        ("accept".to_owned(), "application/problem+json".to_owned()),
+        ("x-request-id".to_owned(), "captured-request".to_owned()),
+      ],
+      true,
+    )
+    .unwrap();
+
+    assert_eq!(headers.get(ACCEPT).unwrap(), "application/problem+json");
+    assert_eq!(request_id, "captured-request");
+  }
+
+  #[test]
+  fn headers_json_value_preserves_multi_values_and_redacts_secrets() {
+    let mut headers = HeaderMap::new();
+    headers.append("set-cookie", HeaderValue::from_static("a=1"));
+    headers.append("x-test", HeaderValue::from_static("first"));
+    headers.append("set-cookie", HeaderValue::from_static("b=2"));
+
+    assert_eq!(
+      headers_json_value(&headers, true),
+      json!({
+        "set-cookie": ["<redacted>", "<redacted>"],
         "x-test": ["first"],
       })
     );
   }
 
   #[test]
-  fn extract_body_section_accepts_uppercase_capture_format() {
-    let raw = "HEADERS:\n{\"accept\":\"*/*\"}\n\nBODY:\n{\"model\":\"glm-5.1\"}\n";
+  fn extract_body_section_accepts_capture_format() {
+    let raw = "HEADERS:\n{\"accept\":\"*/*\"}\n\nBODY:\n{\"model\":\"provider/model\"}\n";
     assert_eq!(
       extract_body_section(raw),
-      Some("{\"model\":\"glm-5.1\"}\n".trim_start())
+      Some("{\"model\":\"provider/model\"}\n".trim_start())
     );
   }
 
   #[test]
   fn extract_body_section_returns_none_for_plain_json() {
-    let raw = "{\"model\":\"glm-5.1\"}";
+    let raw = "{\"model\":\"provider/model\"}";
     assert_eq!(extract_body_section(raw), None);
     let parsed: Value = serde_json::from_str(extract_body_section(raw).unwrap_or(raw)).unwrap();
-    assert_eq!(parsed, json!({"model": "glm-5.1"}));
+    assert_eq!(parsed, json!({"model": "provider/model"}));
   }
 }
