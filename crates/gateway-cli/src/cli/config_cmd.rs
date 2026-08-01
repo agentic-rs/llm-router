@@ -19,12 +19,6 @@ pub struct ConfigArgs {
   pub cmd: ConfigCmd,
 }
 
-impl ConfigArgs {
-  pub(super) fn requires_pristine_startup(&self) -> bool {
-    matches!(self.cmd, ConfigCmd::MigrateV2(_))
-  }
-}
-
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
   /// Print the value of a primary-config key (e.g. `copilot.user_agent`)

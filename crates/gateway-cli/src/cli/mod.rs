@@ -104,12 +104,13 @@ impl Cli {
       return smoke::run_cmd(cfg_path, cmd).await.map_err(Error::from);
     }
 
-    // Config migration must observe legacy files exactly as they are. In
-    // particular, do not extract embedded accounts or initialize configured
-    // logging before its read-only planner runs.
-    if matches!(&self.cmd, Cmd::Config(args) if args.requires_pristine_startup()) {
+    // Config commands own their schema-specific loading and mutation. Keep
+    // legacy home migration, partial Config loading, and configured logging
+    // out of every config command. In particular, migrate-v2 must observe
+    // legacy files exactly as they are before its read-only planner runs.
+    if matches!(&self.cmd, Cmd::Config(_)) {
       let Cmd::Config(args) = self.cmd else {
-        unreachable!("the pristine startup predicate only matches config commands")
+        unreachable!("the config predicate only matches config commands")
       };
       return config_cmd::run(cfg_path, args).await.map_err(Error::from);
     }
@@ -148,7 +149,7 @@ impl Cli {
       Cmd::Usage(a) => usage::run(cfg_path, a).await,
       Cmd::Inspect(a) => inspect::run(cfg_path, a).await,
       Cmd::Sessions(c) => sessions::run(c).await,
-      Cmd::Config(a) => config_cmd::run(cfg_path, a).await,
+      Cmd::Config(_) => unreachable!("config commands are dispatched before legacy CLI setup"),
       Cmd::Update(a) => update::run(a).await,
       Cmd::Migration(a) => migration::run(cfg_path, a).await,
       Cmd::Smoke(c) => smoke::run_cmd(cfg_path, c).await,
@@ -176,7 +177,6 @@ fn prepare_legacy_default_config_home(cfg_path: Option<&Path>) -> anyhow::Result
 /// progress at info; the long-running server gets full info logging.
 fn run_mode_for(cmd: &Cmd) -> RunMode {
   use account::AccountCmd;
-  use config_cmd::ConfigCmd::*;
   match cmd {
     Cmd::Inspect(_) => RunMode::ReadOnlyCli,
     Cmd::Update(_) | Cmd::Migration(_) => RunMode::MutatingCli,
@@ -197,10 +197,6 @@ fn run_mode_for(cmd: &Cmd) -> RunMode {
       | AccountCmd::Refresh { .. }
       | AccountCmd::Remove { .. }
       | AccountCmd::Switch(_) => RunMode::MutatingCli,
-    },
-    Cmd::Config(args) => match args.cmd {
-      Set(_) | Unset(_) | Edit | Init(_) => RunMode::MutatingCli,
-      _ => RunMode::ReadOnlyCli,
     },
     _ => RunMode::ReadOnlyCli,
   }

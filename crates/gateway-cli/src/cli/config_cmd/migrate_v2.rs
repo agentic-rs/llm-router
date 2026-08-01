@@ -469,7 +469,6 @@ api_key = "migration-secret"
       let Cmd::Config(config) = cli.cmd else {
         panic!("expected config command")
       };
-      assert!(config.requires_pristine_startup());
       let super::super::ConfigCmd::MigrateV2(ref parsed) = config.cmd else {
         panic!("expected migrate-v2 command")
       };
