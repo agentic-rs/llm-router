@@ -2888,6 +2888,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
+ "console",
  "futures",
  "futures-util",
  "http",
@@ -2909,6 +2910,7 @@ dependencies = [
  "tokn-auth",
  "tokn-catalogue",
  "tokn-core",
+ "tokn-events",
  "tokn-mock-server",
  "tokn-persistence",
  "tokn-policy",
@@ -2967,6 +2969,7 @@ dependencies = [
  "sha2",
  "snafu",
  "time",
+ "tokn-events",
  "tokn-headers",
  "tracing",
  "uuid",
