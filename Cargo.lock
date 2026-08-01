@@ -2673,6 +2673,7 @@ dependencies = [
  "tokn-endpoint-macros",
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
+ "tokn-events",
  "tokn-headers",
  "tokn-policy",
  "tokn-provider-copilot",
@@ -2869,6 +2870,14 @@ dependencies = [
  "serde_json",
  "tokn-endpoint-core",
  "tokn-endpoint-macros",
+]
+
+[[package]]
+name = "tokn-events"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "smol_str",
 ]
 
 [[package]]

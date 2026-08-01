@@ -3,6 +3,7 @@ members = [
   "crates/tokn",
   "crates/mock-server",
   "crates/core",
+  "crates/events",
   "crates/policy",
   "crates/config",
   "crates/legacy-config",
@@ -47,6 +48,7 @@ license = "MIT"
 tokn = { version = "0.2.1", path = "crates/tokn" }
 tokn-mock-server = { version = "0.2.1", path = "crates/mock-server" }
 tokn-core = { version = "0.2.1", path = "crates/core" }
+tokn-events = { version = "0.2.1", path = "crates/events" }
 tokn-policy = { version = "0.2.1", path = "crates/policy" }
 tokn-config = { package = "tokn-router-config", version = "0.2.1", path = "crates/config" }
 tokn-router-legacy-config = { version = "0.2.1", path = "crates/legacy-config" }

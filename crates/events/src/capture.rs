@@ -1,0 +1,252 @@
+use bytes::Bytes;
+use smol_str::SmolStr;
+use std::fmt;
+
+/// One duplicate-preserving captured HTTP field.
+///
+/// Producers must replace credentials and other denied values with
+/// [`CapturedHeaderValue::Redacted`] before publishing the event. Raw header
+/// values are bytes because valid HTTP field values are not necessarily UTF-8.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CapturedHeader {
+  name: SmolStr,
+  value: CapturedHeaderValue,
+}
+
+impl CapturedHeader {
+  pub fn value(name: impl Into<SmolStr>, value: impl Into<Bytes>) -> Self {
+    Self {
+      name: name.into(),
+      value: CapturedHeaderValue::Value(value.into()),
+    }
+  }
+
+  pub fn redacted(name: impl Into<SmolStr>) -> Self {
+    Self {
+      name: name.into(),
+      value: CapturedHeaderValue::Redacted,
+    }
+  }
+
+  pub fn name(&self) -> &str {
+    self.name.as_str()
+  }
+
+  pub fn captured_value(&self) -> &CapturedHeaderValue {
+    &self.value
+  }
+}
+
+impl fmt::Debug for CapturedHeader {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("CapturedHeader")
+      .field("name", &self.name)
+      .field("value", &self.value)
+      .finish()
+  }
+}
+
+/// Captured or deliberately hidden HTTP field value.
+#[derive(Clone, Eq, PartialEq)]
+pub enum CapturedHeaderValue {
+  Value(Bytes),
+  Redacted,
+}
+
+impl CapturedHeaderValue {
+  pub fn as_bytes(&self) -> Option<&[u8]> {
+    match self {
+      Self::Value(value) => Some(value.as_ref()),
+      Self::Redacted => None,
+    }
+  }
+
+  pub const fn is_redacted(&self) -> bool {
+    matches!(self, Self::Redacted)
+  }
+}
+
+impl fmt::Debug for CapturedHeaderValue {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Value(value) => formatter.debug_struct("Value").field("bytes", &value.len()).finish(),
+      Self::Redacted => formatter.write_str("Redacted"),
+    }
+  }
+}
+
+/// Ordered, duplicate-preserving HTTP fields safe to publish to consumers.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct CapturedHeaders(Box<[CapturedHeader]>);
+
+impl CapturedHeaders {
+  pub fn new(fields: impl IntoIterator<Item = CapturedHeader>) -> Self {
+    Self(fields.into_iter().collect())
+  }
+
+  pub fn iter(&self) -> impl ExactSizeIterator<Item = &CapturedHeader> {
+    self.0.iter()
+  }
+
+  pub fn len(&self) -> usize {
+    self.0.len()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.0.is_empty()
+  }
+}
+
+impl fmt::Debug for CapturedHeaders {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("CapturedHeaders")
+      .field("fields", &self.len())
+      .finish()
+  }
+}
+
+impl FromIterator<CapturedHeader> for CapturedHeaders {
+  fn from_iter<T: IntoIterator<Item = CapturedHeader>>(iter: T) -> Self {
+    Self::new(iter)
+  }
+}
+
+/// URI or request-target captured according to the publisher's privacy policy.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CapturedUri {
+  value: SmolStr,
+  redacted: bool,
+}
+
+impl CapturedUri {
+  pub fn exact(value: impl Into<SmolStr>) -> Self {
+    Self {
+      value: value.into(),
+      redacted: false,
+    }
+  }
+
+  pub fn redacted(value: impl Into<SmolStr>) -> Self {
+    Self {
+      value: value.into(),
+      redacted: true,
+    }
+  }
+
+  pub fn as_str(&self) -> &str {
+    self.value.as_str()
+  }
+
+  pub const fn is_redacted(&self) -> bool {
+    self.redacted
+  }
+}
+
+impl fmt::Debug for CapturedUri {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("CapturedUri")
+      .field("bytes", &self.value.len())
+      .field("redacted", &self.redacted)
+      .finish()
+  }
+}
+
+/// Why payload bytes were deliberately omitted from an event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CaptureOmission {
+  Disabled,
+  Sensitive,
+  Unavailable,
+}
+
+/// Bounded payload observation.
+///
+/// `bytes_seen` reports transport progress even when bytes are omitted or a
+/// prefix is retained. Debug output never renders payload contents.
+#[derive(Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BodyCapture {
+  Absent,
+  Omitted { reason: CaptureOmission, bytes_seen: u64 },
+  Complete(Bytes),
+  Truncated { prefix: Bytes, bytes_seen: u64 },
+}
+
+impl BodyCapture {
+  pub fn bytes(&self) -> Option<&[u8]> {
+    match self {
+      Self::Complete(bytes) => Some(bytes.as_ref()),
+      Self::Truncated { prefix, .. } => Some(prefix.as_ref()),
+      Self::Absent | Self::Omitted { .. } => None,
+    }
+  }
+
+  pub fn bytes_seen(&self) -> u64 {
+    match self {
+      Self::Absent => 0,
+      Self::Omitted { bytes_seen, .. } | Self::Truncated { bytes_seen, .. } => *bytes_seen,
+      Self::Complete(bytes) => bytes.len() as u64,
+    }
+  }
+
+  pub const fn is_complete(&self) -> bool {
+    matches!(self, Self::Absent | Self::Complete(_))
+  }
+}
+
+impl fmt::Debug for BodyCapture {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Absent => formatter.write_str("Absent"),
+      Self::Omitted { reason, bytes_seen } => formatter
+        .debug_struct("Omitted")
+        .field("reason", reason)
+        .field("bytes_seen", bytes_seen)
+        .finish(),
+      Self::Complete(bytes) => formatter.debug_struct("Complete").field("bytes", &bytes.len()).finish(),
+      Self::Truncated { prefix, bytes_seen } => formatter
+        .debug_struct("Truncated")
+        .field("prefix_bytes", &prefix.len())
+        .field("bytes_seen", bytes_seen)
+        .finish(),
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn headers_preserve_duplicates_without_debugging_values() {
+    let headers = CapturedHeaders::new([
+      CapturedHeader::value("set-cookie", "secret-cookie"),
+      CapturedHeader::value("set-cookie", "second-cookie"),
+      CapturedHeader::redacted("authorization"),
+    ]);
+
+    assert_eq!(headers.len(), 3);
+    assert_eq!(headers.iter().filter(|field| field.name() == "set-cookie").count(), 2);
+    assert!(headers.iter().last().unwrap().captured_value().is_redacted());
+    let debug = format!("{headers:?}");
+    assert!(!debug.contains("secret-cookie"));
+    assert!(!debug.contains("second-cookie"));
+  }
+
+  #[test]
+  fn body_capture_debug_never_renders_content() {
+    let body = BodyCapture::Truncated {
+      prefix: Bytes::from_static(b"private payload"),
+      bytes_seen: 42,
+    };
+
+    assert_eq!(body.bytes(), Some(b"private payload".as_slice()));
+    assert_eq!(body.bytes_seen(), 42);
+    assert!(!body.is_complete());
+    assert!(!format!("{body:?}").contains("private payload"));
+  }
+}
