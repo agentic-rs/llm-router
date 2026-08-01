@@ -55,8 +55,8 @@ pub enum Error {
   #[snafu(display("could not resolve XDG project dirs"))]
   NoProjectDirs,
 
-  #[snafu(display("[proxy].url is not a valid URL `{url}`: {message}"))]
-  ProxyUrl { url: String, message: String },
+  #[snafu(display("[proxy].url is not a valid URL: {message}"))]
+  ProxyUrl { message: String },
 
   #[snafu(display("[proxy].url has unsupported scheme: {scheme}"))]
   ProxyScheme { scheme: String },

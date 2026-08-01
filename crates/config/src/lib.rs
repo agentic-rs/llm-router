@@ -482,10 +482,7 @@ pub struct ProxyConfig {
 impl ProxyConfig {
   pub fn validate(&self) -> Result<()> {
     if let Some(u) = &self.url {
-      let parsed = reqwest::Url::parse(u).map_err(|e| Error::ProxyUrl {
-        url: u.clone(),
-        message: e.to_string(),
-      })?;
+      let parsed = reqwest::Url::parse(u).map_err(|e| Error::ProxyUrl { message: e.to_string() })?;
       match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
         other => {
@@ -1260,6 +1257,18 @@ fn stage_atomic_contents(path: &Path, contents: &[u8]) -> Result<tempfile::Named
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn invalid_proxy_url_errors_do_not_echo_credentials() {
+    let proxy = ProxyConfig {
+      url: Some("http://user:sentinel-password@[".into()),
+      ..Default::default()
+    };
+
+    let error = proxy.validate().unwrap_err();
+
+    assert!(!error.to_string().contains("sentinel-password"));
+  }
 
   #[test]
   fn default_paths_use_tokn_router_home() {
