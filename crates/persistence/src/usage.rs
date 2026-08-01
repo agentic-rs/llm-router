@@ -1,25 +1,6 @@
 use super::{migrate, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
-use tokn_core::request_event::RequestEndpoint;
-
-pub struct UsageRecord<'a> {
-  pub ts: i64,
-  pub session_id: Option<&'a str>,
-  pub request_id: &'a str,
-  pub project_id: Option<&'a str>,
-  pub ver: Option<&'a str>,
-  pub request_error: Option<&'a str>,
-  pub user: Option<&'a str>,
-  pub endpoint: &'a RequestEndpoint,
-  pub account_id: Option<&'a str>,
-  pub provider_id: Option<&'a str>,
-  pub model: &'a str,
-  pub params_json: Option<&'a str>,
-  pub usage_json: Option<&'a str>,
-  pub ctx_json: Option<&'a str>,
-  pub status: Option<u16>,
-}
 
 const BOOTSTRAP: &str = include_str!("../schemas/snapshot/usage/v0.2.1.sql");
 const MIGRATIONS: &[migrate::Migration] = &[
@@ -79,49 +60,6 @@ impl UsageDb {
       MIGRATIONS,
     )?;
     Ok(Self { conn })
-  }
-
-  pub fn record(&mut self, r: &UsageRecord<'_>) -> Result<()> {
-    self.conn.execute(
-      "INSERT OR REPLACE INTO requests (
-         ts,
-         session_id,
-         request_id,
-         project_id,
-         ver,
-         request_error,
-         user,
-         endpoint,
-         account_id,
-         provider_id,
-         model,
-         params_json,
-         usage_json,
-         ctx_json,
-         status
-       )
-       VALUES (
-         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
-       )",
-      params![
-        r.ts,
-        r.session_id,
-        r.request_id,
-        r.project_id,
-        r.ver,
-        r.request_error,
-        r.user,
-        r.endpoint.as_str(),
-        r.account_id,
-        r.provider_id,
-        r.model,
-        r.params_json,
-        r.usage_json,
-        r.ctx_json,
-        r.status.map(|v| v as i64),
-      ],
-    )?;
-    Ok(())
   }
 
   pub fn summary(&self, since_ts: i64, account: Option<&str>, provider: Option<&str>) -> Result<Vec<RowSummary>> {
@@ -208,40 +146,131 @@ pub struct RowSummary {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tokn_core::provider::Endpoint;
 
   #[test]
-  fn fresh_usage_db_records_correlation_ids() {
+  fn summary_aggregates_usage_and_applies_account_provider_filters() {
     let dir = std::env::temp_dir().join(format!("tokn-router-usage-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("usage.db");
-    let mut db = UsageDb::open(&path).unwrap();
+    let db = UsageDb::open(&path).unwrap();
 
-    db.record(&UsageRecord {
-      ts: 100,
-      session_id: Some("session-1"),
-      request_id: "request-1",
-      project_id: Some("project-1"),
-      ver: Some("v1"),
-      request_error: None,
-      user: Some("client-a"),
-      endpoint: &Endpoint::ChatCompletions.into(),
-      account_id: Some("account"),
-      provider_id: Some("provider"),
-      model: "model",
-      params_json: Some("{\"initiator\":\"user\",\"stream\":false}"),
-      usage_json: Some("{\"input\":1}"),
-      ctx_json: Some("{\"latency_ms\":1}"),
-      status: Some(200),
-    })
-    .unwrap();
+    for row in [
+      SummaryFixture {
+        request_id: "old-request",
+        ts: 99,
+        account: "account-a",
+        provider: "provider-x",
+        model: "model-1",
+        initiator: "user",
+        usage_json: r#"{"input":1000,"output":1000,"cache_read":1000,"reasoning":1000}"#,
+        latency_ms: 1_000,
+      },
+      SummaryFixture {
+        request_id: "request-1",
+        ts: 100,
+        account: "account-a",
+        provider: "provider-x",
+        model: "model-1",
+        initiator: "user",
+        usage_json: r#"{"input":10,"output":4,"cache_read":2,"reasoning":1}"#,
+        latency_ms: 100,
+      },
+      SummaryFixture {
+        request_id: "request-2",
+        ts: 110,
+        account: "account-a",
+        provider: "provider-x",
+        model: "model-1",
+        initiator: "user",
+        usage_json: r#"{"input":5,"output":2,"reasoning":3}"#,
+        latency_ms: 300,
+      },
+      SummaryFixture {
+        request_id: "request-3",
+        ts: 120,
+        account: "account-a",
+        provider: "provider-y",
+        model: "model-1",
+        initiator: "tool",
+        usage_json: r#"{"input":7,"output":1,"cache_read":1}"#,
+        latency_ms: 50,
+      },
+      SummaryFixture {
+        request_id: "request-4",
+        ts: 130,
+        account: "account-b",
+        provider: "provider-x",
+        model: "model-2",
+        initiator: "user",
+        usage_json: r#"{"input":20,"output":10,"cache_read":5,"reasoning":6}"#,
+        latency_ms: 400,
+      },
+    ] {
+      insert_summary_fixture(&db, row);
+    }
 
-    let row: (String, String, String) = db
-      .conn
-      .query_row("SELECT session_id, request_id, project_id FROM requests", [], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-      })
+    let rows = db.summary(100, None, None).unwrap();
+    assert_eq!(rows.len(), 3);
+    let aggregate = find_summary(&rows, "account-a", "provider-x");
+    assert_eq!(aggregate.model, "model-1");
+    assert_eq!(aggregate.initiator.as_deref(), Some("user"));
+    assert_eq!(aggregate.count, 2);
+    assert_eq!(aggregate.input_tokens, 15);
+    assert_eq!(aggregate.output_tokens, 6);
+    assert_eq!(aggregate.cached_tokens, 2);
+    assert_eq!(aggregate.reasoning_tokens, 4);
+    assert_eq!(aggregate.avg_latency_ms, 200.0);
+
+    let account_rows = db.summary(100, Some("account-a"), None).unwrap();
+    assert_eq!(account_rows.len(), 2);
+    assert!(account_rows.iter().all(|row| row.account == "account-a"));
+
+    let provider_rows = db.summary(100, None, Some("provider-x")).unwrap();
+    assert_eq!(provider_rows.len(), 2);
+    assert!(provider_rows.iter().all(|row| row.provider == "provider-x"));
+
+    let combined_rows = db.summary(100, Some("account-a"), Some("provider-x")).unwrap();
+    assert_eq!(combined_rows.len(), 1);
+    assert_eq!(combined_rows[0].count, 2);
+  }
+
+  struct SummaryFixture<'a> {
+    request_id: &'a str,
+    ts: i64,
+    account: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    initiator: &'a str,
+    usage_json: &'a str,
+    latency_ms: u64,
+  }
+
+  fn insert_summary_fixture(db: &UsageDb, fixture: SummaryFixture<'_>) {
+    let params_json = format!(r#"{{"initiator":"{}"}}"#, fixture.initiator);
+    let ctx_json = format!(r#"{{"latency_ms":{}}}"#, fixture.latency_ms);
+    db.conn
+      .execute(
+        "INSERT INTO requests (
+           ts, request_id, account_id, provider_id, model, params_json, usage_json, ctx_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+          fixture.ts,
+          fixture.request_id,
+          fixture.account,
+          fixture.provider,
+          fixture.model,
+          params_json,
+          fixture.usage_json,
+          ctx_json,
+        ],
+      )
       .unwrap();
-    assert_eq!(row, ("session-1".into(), "request-1".into(), "project-1".into()));
+  }
+
+  fn find_summary<'a>(rows: &'a [RowSummary], account: &str, provider: &str) -> &'a RowSummary {
+    rows
+      .iter()
+      .find(|row| row.account == account && row.provider == provider)
+      .unwrap()
   }
 }
