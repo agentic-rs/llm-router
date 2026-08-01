@@ -2,8 +2,6 @@ use crate::config::Config;
 use crate::db::archive::{ArchiveEventHandler, ArchiveRuntime};
 use crate::progress::{ArchiveProgressEventHandler, ProgressEventHandler, ProgressLogEventHandler};
 use anyhow::{Context, Result};
-use axum::Router;
-use std::future::Future;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -98,7 +96,6 @@ pub fn load_access_store(enabled: bool) -> Result<Arc<tokn_access::AccessStore>>
 /// are all prepared before socket acquisition begins. The router's binder
 /// then acquires the complete listener set without starting accept loops and
 /// releases earlier sockets if any later bind fails.
-#[allow(dead_code)] // Wired into command dispatch by the subsequent v2 CLI cutover.
 pub async fn bind_compiled_gateway(
   compiled: &CompiledConfig,
   accounts: &[AccountConfig],
@@ -137,18 +134,6 @@ pub fn build_state(
   tokn_router::api::build_state(cfg, accounts, events)
 }
 
-pub fn build_state_for_route_mode(
-  cfg: &Config,
-  accounts: &[AccountConfig],
-  events: Arc<EventBus>,
-  route_mode: RouteMode,
-) -> Result<tokn_router::api::AppState> {
-  let mut cfg = cfg.clone();
-  cfg.server.route_mode = route_mode;
-  cfg.defaults.mode = route_mode;
-  build_state(&cfg, accounts, events)
-}
-
 pub fn build_proxy_state_for_route_mode(
   cfg: &Config,
   accounts: &[AccountConfig],
@@ -164,16 +149,6 @@ pub fn build_proxy_state_for_route_mode(
 pub fn resolve_bind_addr(host: &str, port: u16, insecure_allow_remote: bool) -> Result<SocketAddr> {
   ensure_bind_host(host, insecure_allow_remote)?;
   Ok(format!("{host}:{port}").parse()?)
-}
-
-pub async fn serve_http<F>(app: Router, addr: SocketAddr, shutdown: F) -> Result<()>
-where
-  F: Future<Output = ()> + Send + 'static,
-{
-  let listener = tokio::net::TcpListener::bind(addr).await?;
-  tracing::info!(%addr, "tokn-router listening");
-  axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
-  Ok(())
 }
 
 pub fn is_loopback(host: &str) -> bool {

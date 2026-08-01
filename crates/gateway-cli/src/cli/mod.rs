@@ -50,8 +50,8 @@ pub enum Cmd {
   ApiKey(api_key::ApiKeyCmd),
   /// Show the Copilot identity headers that will be sent upstream
   Headers(headers::HeadersArgs),
-  /// Run the local OpenAI-compatible server
-  Serve(serve::ServeArgs),
+  /// Run every listener declared by the compiled gateway config
+  Serve,
   /// Run the local MITM forward proxy or print proxy env exports
   Proxy(proxy::ProxyArgs),
   /// Query usage statistics from the local SQLite log
@@ -104,7 +104,7 @@ impl Cli {
       Cmd::Agent(c) => agent::run(cfg_path, c).await,
       Cmd::ApiKey(c) => api_key::run(c).await,
       Cmd::Headers(a) => headers::run(cfg_path, a).await,
-      Cmd::Serve(a) => serve::run(cfg_path, a).await,
+      Cmd::Serve => serve::run(cfg_path).await,
       Cmd::Proxy(a) => proxy::run(cfg_path, a).await,
       Cmd::Usage(a) => usage::run(cfg_path, a).await,
       Cmd::Inspect(a) => inspect::run(cfg_path, a).await,
@@ -139,7 +139,7 @@ fn run_mode_for(cmd: &Cmd) -> RunMode {
   use account::AccountCmd;
   use config_cmd::ConfigCmd::*;
   match cmd {
-    Cmd::Serve(_) | Cmd::Proxy(_) => RunMode::Server,
+    Cmd::Serve | Cmd::Proxy(_) => RunMode::Server,
     Cmd::Inspect(_) => RunMode::ReadOnlyCli,
     Cmd::Update(_) | Cmd::Migration(_) => RunMode::MutatingCli,
     Cmd::Sessions(_) => RunMode::MutatingCli,
