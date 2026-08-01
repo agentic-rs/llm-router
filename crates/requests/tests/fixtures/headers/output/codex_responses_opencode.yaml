@@ -1,9 +1,0 @@
-- Authorization: Bearer atk-codex
-- Accept: application/json
-- Content-Type: application/json
-- OpenAI-Beta: responses=experimental
-- originator: opencode
-- User-Agent: opencode/1.14.28 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13
-- chatgpt-account-id: acct-from-provider
-- session_id: sess-opencode-1
-- X-Session-Affinity: sess-opencode-1
