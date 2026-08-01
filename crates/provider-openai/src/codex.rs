@@ -101,7 +101,9 @@ impl CodexProvider {
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    crate::util::http::send(ctx.http, Method::POST, url.as_str(), headers, Some(body_bytes), what).await
+    ctx
+      .send(Method::POST, url.as_str(), headers, Some(body_bytes), what)
+      .await
   }
 }
 

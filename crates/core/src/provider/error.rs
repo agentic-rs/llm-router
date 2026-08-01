@@ -42,6 +42,9 @@ pub enum Error {
   #[snafu(display("{what}: HTTP request failed: {source}"))]
   Http { what: &'static str, source: reqwest::Error },
 
+  #[snafu(display("outbound request observation failed: {message}"))]
+  RequestObservation { message: String },
+
   #[snafu(display("{what}: upstream returned {status}: {body}"))]
   HttpStatus {
     what: &'static str,

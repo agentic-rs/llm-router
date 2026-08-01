@@ -174,15 +174,9 @@ impl Provider for LlamaCppProvider {
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      url.as_str(),
-      headers,
-      Some(body_bytes),
-      "llama.cpp chat",
-    )
-    .await
+    ctx
+      .send(Method::POST, url.as_str(), headers, Some(body_bytes), "llama.cpp chat")
+      .await
   }
 
   fn on_unauthorized(&self) {
@@ -388,6 +382,7 @@ mod tests {
         client_headers: None,
         vars: TemplateVars::default(),
         wire_identity: Some(tokn_core::AgentId::Opencode),
+        request_observer: None,
       })
       .await
       .unwrap();
@@ -436,6 +431,7 @@ mod tests {
         client_headers: None,
         vars: TemplateVars::default(),
         wire_identity: Some(tokn_core::AgentId::Opencode),
+        request_observer: None,
       })
       .await
       .unwrap();

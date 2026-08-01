@@ -141,9 +141,23 @@ pub async fn send(
   client: &reqwest::Client,
   method: Method,
   url: &str,
+  headers: HeaderMap,
+  body: Option<Bytes>,
+  what: &'static str,
+) -> crate::provider::Result<reqwest::Response> {
+  send_observed(client, method, url, headers, body, what, None).await
+}
+
+/// Send one semantic-header request and optionally expose its final prepared
+/// shape before reqwest starts network I/O.
+pub async fn send_observed(
+  client: &reqwest::Client,
+  method: Method,
+  url: &str,
   mut headers: HeaderMap,
   body: Option<Bytes>,
   what: &'static str,
+  observer: Option<&mut dyn crate::provider::OutboundRequestObserver>,
 ) -> crate::provider::Result<reqwest::Response> {
   // Strip transport-derived headers before handing off to reqwest:
   //   - `Host`     : MUST be derived from `url` (SNI + HTTP Host must agree
@@ -166,7 +180,7 @@ pub async fn send(
       "stripped transport headers before reqwest dispatch"
     );
   }
-  send_native(client, method, url, headers.into(), body, what).await
+  send_native_observed(client, method, url, headers.into(), body, what, observer).await
 }
 
 /// Send one request from a native HTTP header map without a lossy conversion.
@@ -183,8 +197,28 @@ pub async fn send_native(
   body: Option<Bytes>,
   what: &'static str,
 ) -> crate::provider::Result<reqwest::Response> {
-  build_native_request(client, method, url, headers, body, what)
-    .send()
+  send_native_observed(client, method, url, headers, body, what, None).await
+}
+
+/// Send a native-header request while exposing the exact application-visible
+/// request after transport metadata sanitization and before network I/O.
+pub async fn send_native_observed(
+  client: &reqwest::Client,
+  method: Method,
+  url: &str,
+  headers: NativeHeaderMap,
+  body: Option<Bytes>,
+  what: &'static str,
+  observer: Option<&mut dyn crate::provider::OutboundRequestObserver>,
+) -> crate::provider::Result<reqwest::Response> {
+  let request = build_native_request(client, method, url, headers, body, what)
+    .build()
+    .context(crate::provider::error::HttpSnafu { what })?;
+  if let Some(observer) = observer {
+    observer.observe(&request).await?;
+  }
+  client
+    .execute(request)
     .await
     .context(crate::provider::error::HttpSnafu { what })
 }

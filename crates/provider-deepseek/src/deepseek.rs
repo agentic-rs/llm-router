@@ -117,7 +117,9 @@ impl DeepSeekProvider {
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    let resp = crate::util::http::send(ctx.http, Method::POST, url.as_str(), headers, Some(body_bytes), what).await?;
+    let resp = ctx
+      .send(Method::POST, url.as_str(), headers, Some(body_bytes), what)
+      .await?;
     Ok(resp)
   }
 }

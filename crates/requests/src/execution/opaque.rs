@@ -14,6 +14,7 @@ use snafu::Snafu;
 use std::collections::BTreeSet;
 use tokn_accounts::link::SelectionOutcome;
 use tokn_core::provider::Error as ProviderError;
+use tokn_core::provider::OutboundRequestObserver;
 use tokn_core::upstream_url::InvalidRequestUrl;
 use tokn_headers::inbound::build_template_vars;
 use tokn_headers::registry::build_wire_identity_headers;
@@ -181,6 +182,15 @@ impl OpaqueHttpExecutor {
   /// throttling, redirects, and server errors. The caller classifies that
   /// head, settles any selected account, and chooses how to forward the body.
   pub async fn execute(&self, attempt: OpaqueHttpAttempt<'_>) -> Result<reqwest::Response, OpaqueAttemptError> {
+    self.execute_observed(attempt, None).await
+  }
+
+  /// Execute with an optional observer for the final native wire request.
+  pub async fn execute_observed(
+    &self,
+    attempt: OpaqueHttpAttempt<'_>,
+    request_observer: Option<&mut dyn OutboundRequestObserver>,
+  ) -> Result<reqwest::Response, OpaqueAttemptError> {
     let head = attempt.head();
     let target = attempt.target();
     let url = match target {
@@ -196,13 +206,14 @@ impl OpaqueHttpExecutor {
       OpaqueHttpTarget::Transparent(_) => sanitize_forward_headers(attempt.headers()),
     };
 
-    tokn_core::util::http::send_native(
+    tokn_core::util::http::send_native_observed(
       &self.transport_http,
       head.method().clone(),
       url.as_str(),
       headers,
       attempt.body().cloned(),
       "opaque upstream request",
+      request_observer,
     )
     .await
     .map_err(|source| OpaqueAttemptError::Transport { source })
