@@ -2,7 +2,7 @@
 name = "tokn-accounts"
 version.workspace = true
 edition.workspace = true
-description = "Account pooling, affinity, and model route resolution across tokn providers"
+description = "Provider linking, account selection, affinity, and settlement for tokn gateways"
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -11,19 +11,16 @@ license.workspace = true
 [dependencies]
 tokn-core = { workspace = true }
 tokn-auth = { workspace = true }
-tokn-config = { workspace = true }
 tokn-policy = { workspace = true }
 tokn-provider-copilot = { workspace = true }
 tokn-provider-deepseek = { workspace = true }
 tokn-provider-llama-cpp = { workspace = true }
 tokn-provider-openai = { workspace = true }
 tokn-provider-zai = { workspace = true }
-arc-swap = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 snafu = { workspace = true }
 smol_str = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

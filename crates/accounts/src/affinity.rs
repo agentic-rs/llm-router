@@ -1,5 +1,5 @@
-//! Session affinity map used by [`super::AccountPool`] to keep multi-turn
-//! conversations (tool-call follow-ups, OpenAI Responses
+//! Session affinity map used by linked account-pool runtimes to keep
+//! multi-turn conversations (tool-call follow-ups, OpenAI Responses
 //! `previous_response_id`, Anthropic extended-thinking continuations) on the
 //! same selected runtime value.
 //!
@@ -9,12 +9,10 @@
 //!   still retained for debug/observability.
 //! - `Unknown` — first-use; the caller selects a value and records it.
 //!
-//! Entries use a single last-touch timestamp. Legacy configuration supplies an
-//! absolute retention TTL, while v2's [`SessionAffinityPlan`] supplies an
-//! additional retention duration after the live TTL. Separate constructors
-//! make that semantic difference explicit. Once an entry exceeds its computed
-//! retention TTL it is forgotten and a future request with the same id is
-//! treated as a brand new session.
+//! Entries use a single last-touch timestamp. [`SessionAffinityPlan`] supplies
+//! a live TTL plus an additional retention duration for expired bindings. Once
+//! an entry exceeds the combined retention TTL it is forgotten and a future
+//! request with the same id is treated as a brand new session.
 //!
 //! In-memory only — by design. Cross-restart affinity would need durable
 //! state, which we explicitly chose not to keep here.
@@ -79,27 +77,18 @@ pub struct Affinity<V: Clone, C: Clock = SystemClock> {
 }
 
 impl<V: Clone> Affinity<V, SystemClock> {
-  /// Construct affinity using legacy configuration's absolute retention TTL.
-  ///
-  /// `absolute_retention_ttl` is measured from the last touch, just like
-  /// `ttl`. Values shorter than `ttl` are clamped to `ttl`, preserving the
-  /// legacy tombstone behavior.
-  pub fn with_legacy_absolute_retention(ttl: Duration, absolute_retention_ttl: Duration) -> Self {
-    Self::with_clock_and_absolute_retention(ttl, absolute_retention_ttl, SystemClock)
-  }
-
-  /// Construct affinity from v2 policy semantics.
+  /// Construct affinity from compiled policy semantics.
   ///
   /// `expired_retention` is additional time after the live TTL. Saturation
   /// keeps an extreme configuration from wrapping to a shorter retention TTL.
   pub fn from_session_plan(plan: SessionAffinityPlan) -> Self {
     let retained_ttl = plan.ttl().saturating_add(plan.expired_retention());
-    Self::with_clock_and_absolute_retention(plan.ttl(), retained_ttl, SystemClock)
+    Self::with_clock(plan.ttl(), retained_ttl, SystemClock)
   }
 }
 
 impl<V: Clone, C: Clock> Affinity<V, C> {
-  fn with_clock_and_absolute_retention(ttl: C::Duration, retained_ttl: C::Duration, clock: C) -> Self {
+  fn with_clock(ttl: C::Duration, retained_ttl: C::Duration, clock: C) -> Self {
     Self {
       map: RwLock::new(HashMap::new()),
       ttl,
@@ -209,8 +198,7 @@ mod tests {
   }
 
   fn test_affinity(ttl: u64, retained_ttl: u64) -> Affinity<String, FakeClock> {
-    let mut affinity =
-      Affinity::<String, FakeClock>::with_clock_and_absolute_retention(ttl, retained_ttl, FakeClock::new());
+    let mut affinity = Affinity::<String, FakeClock>::with_clock(ttl, retained_ttl, FakeClock::new());
     affinity.gc_every = 4;
     affinity
   }
@@ -282,7 +270,7 @@ mod tests {
 
   #[test]
   fn stores_non_string_values() {
-    let a = Affinity::<u32, FakeClock>::with_clock_and_absolute_retention(ms(40), ms(120), FakeClock::new());
+    let a = Affinity::<u32, FakeClock>::with_clock(ms(40), ms(120), FakeClock::new());
     a.record("k", 42_u32);
     assert_eq!(a.lookup("k"), Lookup::Hit(42));
   }

@@ -2,7 +2,7 @@
 //!
 //! This linker deliberately stops at `(upstream, account)` bindings. Account
 //! pools and routes are separate runtime-linking stages; folding them into this
-//! graph would recreate the legacy inventory's loss of upstream identity.
+//! graph would discard configured upstream identity.
 
 use crate::registry::Registry;
 use smol_str::SmolStr;
