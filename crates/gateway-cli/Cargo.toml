@@ -17,6 +17,7 @@ path = "src/main.rs"
 tokn-accounts = { workspace = true }
 tokn-core = { workspace = true }
 tokn-config = { workspace = true }
+tokn-events = { workspace = true }
 tokn-policy = { workspace = true }
 tokn-router-legacy-config = { workspace = true }
 tokn-agent-migration = { workspace = true }
@@ -30,6 +31,7 @@ tokn-auth = { workspace = true }
 tokn-access = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+console = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
