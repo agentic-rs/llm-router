@@ -15,7 +15,8 @@ pub use capture::{BodyCapture, CaptureOmission, CapturedHeader, CapturedHeaderVa
 pub use id::RequestId;
 pub use runtime::{
   ConsumerFailureKind, ConsumerOperation, ConsumerResult, DeliveryStats, EventConsumer, EventHub, EventSeq, FlushError,
-  HubBuildError, HubBuilder, HubFailure, HubStatus, PublishError, Publisher, ShutdownError, TryPublishError,
+  ForcedShutdown, HubBuildError, HubBuilder, HubFailure, HubStatus, PublishError, Publisher, ShutdownError,
+  TerminalBatch, TerminalContext, TerminalGuard, TerminalRegistrationError, TerminalSubmitError, TryPublishError,
   WaitFailedError,
 };
 pub use traffic::{
