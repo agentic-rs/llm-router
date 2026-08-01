@@ -17,13 +17,16 @@ use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokn_access::AccessContext;
+use tokn_events::RequestId;
 use tokn_policy::ConnectAction;
+use tokn_requests::RequestLifecycle;
 
 /// Authenticated policy decision retained for the complete CONNECT lifetime.
 #[derive(Debug)]
 pub(super) struct ConnectSession {
   dispatch: ConnectDispatch,
   access: AccessContext,
+  request_id: RequestId,
 }
 
 impl ConnectSession {
@@ -33,6 +36,10 @@ impl ConnectSession {
 
   pub(super) fn access(&self) -> &AccessContext {
     &self.access
+  }
+
+  pub(super) fn request_id(&self) -> &RequestId {
+    &self.request_id
   }
 }
 
@@ -44,6 +51,7 @@ pub(super) struct ConnectUpgrade {
   session: Arc<ConnectSession>,
   on_upgrade: OnUpgrade,
   transport: ConnectTransport,
+  lifecycle: Option<RequestLifecycle>,
 }
 
 impl ConnectUpgrade {
@@ -51,8 +59,20 @@ impl ConnectUpgrade {
     &self.session
   }
 
-  pub(super) fn into_parts(self) -> (Arc<ConnectSession>, OnUpgrade, ConnectTransport) {
-    (self.session, self.on_upgrade, self.transport)
+  pub(super) fn attach_lifecycle(&mut self, lifecycle: RequestLifecycle) {
+    assert!(
+      self.lifecycle.replace(lifecycle).is_none(),
+      "CONNECT lifecycle attached twice"
+    );
+  }
+
+  pub(super) fn into_parts(self) -> (Arc<ConnectSession>, OnUpgrade, ConnectTransport, RequestLifecycle) {
+    (
+      self.session,
+      self.on_upgrade,
+      self.transport,
+      self.lifecycle.expect("prepared CONNECT upgrade must own its lifecycle"),
+    )
   }
 }
 
@@ -161,6 +181,7 @@ pub(super) async fn prepare_connect_upgrade(
   state: &ListenerServerState,
   dispatch: ConnectDispatch,
   access: AccessContext,
+  request_id: RequestId,
   request: &mut Request<Body>,
 ) -> Result<ConnectUpgrade, ServerError> {
   if dispatch.action() == ConnectAction::Reject {
@@ -195,8 +216,13 @@ pub(super) async fn prepare_connect_upgrade(
   // failures must remain materializable as an HTTP response.
   let on_upgrade = hyper::upgrade::on(request);
   Ok(ConnectUpgrade {
-    session: Arc::new(ConnectSession { dispatch, access }),
+    session: Arc::new(ConnectSession {
+      dispatch,
+      access,
+      request_id,
+    }),
     on_upgrade,
     transport,
+    lifecycle: None,
   })
 }

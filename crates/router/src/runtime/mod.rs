@@ -63,7 +63,7 @@ pub use server::{
   BoundListener, BoxTunnelIo, BufferedRequestBody, ClientAuthError, ConnectUpgradeUnavailableReason,
   ExpectedRequestTarget, ForwardProxyAdmission, GatewayServeError, GatewayServeResult, GatewayServerState,
   GatewayServerStateError, GatewayServerStateResult, GatewayServingDefaults, ListenerBindError, ListenerBindResult,
-  ListenerServerState, RequestBodyError, RequestBodyLimits, RequestBodyResult, RequestTargetForm, ResponseBridgeError,
-  ResponseBridgeResult, ServerError, TunnelConnectError, TunnelConnectResult, TunnelConnector,
+  ListenerServerState, RequestBodyAdmission, RequestBodyError, RequestBodyLimits, RequestBodyResult, RequestTargetForm,
+  ResponseBridgeError, ResponseBridgeResult, ServerError, TunnelConnectError, TunnelConnectResult, TunnelConnector,
   TunnelConnectorBuildError, TunnelConnectorBuildResult, TunnelIo,
 };

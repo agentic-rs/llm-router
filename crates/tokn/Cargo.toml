@@ -27,5 +27,6 @@ tokn-provider-deepseek = { workspace = true }
 tokn-provider-llama-cpp = { workspace = true }
 tokn-provider-openai = { workspace = true }
 tokn-provider-zai = { workspace = true }
+tokn-requests = { workspace = true }
 tokn-router = { workspace = true }
 tokn-sdk = { workspace = true }
