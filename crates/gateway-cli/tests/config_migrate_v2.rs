@@ -162,7 +162,7 @@ fn empty_modern_auth_is_authoritative_over_embedded_accounts() {
 
   assert!(!output.status.success());
   assert!(stdout(&output).is_empty());
-  assert!(stderr(&output).contains("cannot migrate an API gateway without supplied accounts"));
+  assert!(stderr(&output).contains("cannot migrate managed listeners without supplied accounts"));
   assert!(!stderr(&output).contains("migrated legacy tokn-router config"));
   assert_secret_absent(&output);
   fixture.assert_config_unchanged();
@@ -171,16 +171,35 @@ fn empty_modern_auth_is_authoritative_over_embedded_accounts() {
 }
 
 #[test]
-fn unsupported_proxy_error_does_not_disclose_embedded_credentials() {
-  let fixture = Fixture::new();
+fn proxy_and_combined_dry_runs_emit_linkable_v2_without_side_effects() {
+  for activation in ["proxy", "both"] {
+    let fixture = Fixture::new();
 
-  let output = fixture.run("proxy");
+    let output = fixture.run(activation);
 
-  assert!(!output.status.success());
-  assert!(stdout(&output).is_empty());
-  assert!(stderr(&output).contains("does not yet support the Proxy listener selection"));
-  assert_secret_absent(&output);
-  fixture.assert_config_unchanged();
-  assert!(!fixture.router_home.join("auth.yaml").exists());
-  fixture.assert_no_logging_state();
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let compiled = tokn_config::v2::parse(stdout(&output), &fixture.config_path)
+      .unwrap_or_else(|error| panic!("{activation} output should compile: {error}"));
+    let accounts = vec![toml::from_str::<tokn_core::account::AccountConfig>(
+      r#"
+id = "embedded"
+provider = "openai"
+enabled = true
+api_key = "test-key"
+"#,
+    )
+    .unwrap()];
+    tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), &accounts)
+      .unwrap_or_else(|error| panic!("{activation} output should link: {error}"));
+    assert!(matches!(
+      compiled.gateway().listeners()["proxy"],
+      tokn_policy::ListenerPlan::ForwardProxy(_)
+    ));
+    assert_eq!(compiled.gateway().listeners().contains_key("api"), activation == "both");
+    assert!(stderr(&output).contains("request-time proxy mode overrides"));
+    assert_secret_absent(&output);
+    fixture.assert_config_unchanged();
+    assert!(!fixture.router_home.join("auth.yaml").exists());
+    fixture.assert_no_logging_state();
+  }
 }
