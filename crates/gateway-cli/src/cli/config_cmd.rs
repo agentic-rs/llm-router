@@ -41,7 +41,7 @@ pub enum ConfigCmd {
   Path,
   /// Initialize config with onboarding wizard
   Init(InitArgs),
-  /// Render a validated version 2 config without modifying any files
+  /// Preview or apply a validated version 2 config migration
   #[command(name = "migrate-v2")]
   MigrateV2(MigrateV2Args),
 }
@@ -54,6 +54,15 @@ pub struct MigrateV2Args {
   /// Permit non-loopback cleartext HTTP account upstreams
   #[arg(long)]
   pub allow_insecure_upstreams: bool,
+  /// Back up the legacy config and activate the generated version 2 config
+  #[arg(long)]
+  pub apply: bool,
+  /// Apply without an interactive confirmation
+  #[arg(long, requires = "apply")]
+  pub yes: bool,
+  /// Acknowledge flattening effective config.d fragments into the version 2 root
+  #[arg(long, requires = "apply")]
+  pub flatten_config_d: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
