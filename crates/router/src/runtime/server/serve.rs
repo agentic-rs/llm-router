@@ -9,6 +9,7 @@ use super::connect::{
   connect_upgrade_channel, ConnectRunError, ConnectRunOutcome, ConnectRunReport, ConnectRunResult, ConnectSession,
   ConnectTransport, ConnectUpgrade,
 };
+use super::connection::ConnectionMetadata;
 use super::events::connect_action;
 use super::{BoundGatewayListeners, BoundListener, ListenerServerState};
 use axum::body::Body;
@@ -113,10 +114,15 @@ async fn serve_bound_listener(listener_id: ListenerId, listener: BoundListener, 
       }
       accepted = socket.accept() => match accepted {
         Ok((stream, peer)) => {
+          let local = stream.local_addr().unwrap_or_else(|error| {
+            tracing::warn!(listener = %listener_id, %peer, %error, "failed to inspect accepted connection address");
+            address
+          });
+          let connection = ConnectionMetadata::new(local, peer);
           let state = state.clone();
           let connection_shutdown = shutdown.clone();
           connections.spawn(async move {
-            let result = serve_connection(stream, state, connection_shutdown).await;
+            let result = serve_connection(stream, state, connection, connection_shutdown).await;
             (peer, result)
           });
         }
@@ -156,14 +162,15 @@ async fn serve_bound_listener(listener_id: ListenerId, listener: BoundListener, 
 async fn serve_connection(
   stream: TcpStream,
   state: Arc<ListenerServerState>,
+  connection: ConnectionMetadata,
   shutdown: watch::Receiver<bool>,
 ) -> ConnectionServeResult<ConnectionOutcome> {
   match state.listener().kind() {
     ListenerKind::LlmApi => {
-      serve_llm_api_connection(stream, state, shutdown).await?;
+      serve_llm_api_connection(stream, state, connection, shutdown).await?;
       Ok(ConnectionOutcome::Http)
     }
-    ListenerKind::ForwardProxy => match serve_forward_proxy_connection(stream, state, shutdown).await? {
+    ListenerKind::ForwardProxy => match serve_forward_proxy_connection(stream, state, connection, shutdown).await? {
       Some(report) => Ok(ConnectionOutcome::Connect(report)),
       None => Ok(ConnectionOutcome::Http),
     },
@@ -173,12 +180,13 @@ async fn serve_connection(
 async fn serve_llm_api_connection(
   stream: TcpStream,
   state: Arc<ListenerServerState>,
+  connection: ConnectionMetadata,
   mut shutdown: watch::Receiver<bool>,
 ) -> ConnectionServeResult<()> {
   let service = service_fn(move |request: Request<Incoming>| {
     let state = state.clone();
     async move {
-      let response = handle_llm_api_request(&state, request.map(Body::new)).await;
+      let response = handle_llm_api_request(&state, connection, request.map(Body::new)).await;
       Ok::<_, Infallible>(response)
     }
   });
@@ -195,6 +203,7 @@ async fn serve_llm_api_connection(
 async fn serve_forward_proxy_connection(
   stream: TcpStream,
   state: Arc<ListenerServerState>,
+  connection: ConnectionMetadata,
   mut shutdown: watch::Receiver<bool>,
 ) -> ConnectionServeResult<Option<ConnectRunReport>> {
   let (upgrades, mut upgrade_receiver) = connect_upgrade_channel();
@@ -203,7 +212,7 @@ async fn serve_forward_proxy_connection(
     let state = state.clone();
     let upgrades = upgrades.clone();
     async move {
-      let response = handle_forward_proxy_request(&state, request.map(Body::new), &upgrades).await;
+      let response = handle_forward_proxy_request(&state, connection, request.map(Body::new), &upgrades).await;
       Ok::<_, Infallible>(response)
     }
   });
@@ -456,10 +465,13 @@ mod tests {
   use tokn_access::AccessContext;
   use tokn_accounts::registry::Registry;
   use tokn_core::util::http::HttpClientOptions;
+  use tokn_events::{EventHub, GatewayEvent, HubBuilder};
+  use tokn_persistence::RequestPersistenceConsumer;
   use tokn_policy::{
     ClientAuthPlan, ConnectAction, ForwardProxyListenerPlan, GatewayPlan, HttpAction, ListenerPlan, LlmApiListenerPlan,
     TlsPlan,
   };
+  use tokn_requests::RequestLifecycleEmitter;
 
   const TEST_TIMEOUT: Duration = Duration::from_secs(2);
   const EARLY: &[u8] = b"\x16\x03\x01early";
@@ -470,6 +482,10 @@ mod tests {
 
   fn listener_id() -> ListenerId {
     ListenerId::new("proxy").unwrap()
+  }
+
+  fn connection_metadata(stream: &TcpStream, peer_addr: SocketAddr) -> ConnectionMetadata {
+    ConnectionMetadata::new(stream.local_addr().unwrap(), peer_addr)
   }
 
   fn proxy_plan(bind: SocketAddr) -> GatewayPlan {
@@ -550,6 +566,40 @@ mod tests {
     let ca_cert = resource.kind().proxy_ca().unwrap().cert_path();
     let state = Arc::new(ListenerServerState::new(serving_generation(runtime), resource));
     (temp, state, ca_cert)
+  }
+
+  fn intercept_event_state(
+    bind: SocketAddr,
+  ) -> (
+    tempfile::TempDir,
+    Arc<ListenerServerState>,
+    PathBuf,
+    EventHub<GatewayEvent>,
+    PathBuf,
+  ) {
+    let temp = tempfile::tempdir().unwrap();
+    let requests_dir = temp.path().join("requests");
+    let persistence = RequestPersistenceConsumer::open(&requests_dir, "test-version").unwrap();
+    let (publisher, hub) = HubBuilder::new().consumer(persistence).start().unwrap();
+    let plan = intercept_plan(bind, temp.path().join("ca"));
+    let runtime = linked_runtime(&plan);
+    let resources = materialize_listeners(runtime.listeners(), None).unwrap();
+    let resource = resources.listener(&listener_id()).unwrap().clone();
+    let ca_cert = resource.kind().proxy_ca().unwrap().cert_path();
+    let gateway = Arc::new(
+      GatewayServerState::build_with_events(
+        runtime,
+        &HttpClientOptions {
+          system: false,
+          ..HttpClientOptions::default()
+        },
+        GatewayServingDefaults::new(RequestBodyLimits::new(1024, 1024)),
+        RequestLifecycleEmitter::new(publisher),
+      )
+      .unwrap(),
+    );
+    let state = Arc::new(ListenerServerState::new(gateway, resource));
+    (temp, state, ca_cert, hub, requests_dir)
   }
 
   fn tls_client_config(ca_cert: &Path) -> Arc<ClientConfig> {
@@ -750,8 +800,9 @@ mod tests {
     let state = listener_state(&plan);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connection = tokio::spawn(async move {
-      let (stream, _) = socket.accept().await.unwrap();
-      serve_llm_api_connection(stream, state, shutdown_rx).await
+      let (stream, peer_addr) = socket.accept().await.unwrap();
+      let metadata = connection_metadata(&stream, peer_addr);
+      serve_llm_api_connection(stream, state, metadata, shutdown_rx).await
     });
 
     let mut client = TcpStream::connect(address).await.unwrap();
@@ -786,8 +837,9 @@ mod tests {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let connection = tokio::spawn(async move {
-      let (stream, _) = proxy_listener.accept().await.unwrap();
-      serve_forward_proxy_connection(stream, state, shutdown_rx).await
+      let (stream, peer_addr) = proxy_listener.accept().await.unwrap();
+      let metadata = connection_metadata(&stream, peer_addr);
+      serve_forward_proxy_connection(stream, state, metadata, shutdown_rx).await
     });
     let upstream = tokio::spawn(async move {
       let (mut stream, _) = upstream_listener.accept().await.unwrap();
@@ -808,6 +860,7 @@ mod tests {
     });
 
     let mut client = TcpStream::connect(proxy_address).await.unwrap();
+    let client_addr = client.local_addr().unwrap();
     let mut connect = format!("CONNECT {upstream_address} HTTP/1.1\r\nHost: {upstream_address}\r\n\r\n").into_bytes();
     connect.extend_from_slice(EARLY);
     client.write_all(&connect).await.unwrap();
@@ -860,6 +913,10 @@ mod tests {
     );
     assert_eq!(report.session().dispatch().site().listener_id(), &listener_id());
     assert!(report.session().dispatch().site().rule_id().is_none());
+    assert_eq!(
+      report.session().connection(),
+      ConnectionMetadata::new(proxy_address, client_addr)
+    );
     drop(shutdown_tx);
   }
 
@@ -867,14 +924,17 @@ mod tests {
   async fn intercepted_connect_accepts_absent_sni_and_pins_inner_authority() {
     let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let proxy_address = proxy_listener.local_addr().unwrap();
-    let (_temp, state, ca_cert) = intercept_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_503)));
+    let (_temp, state, ca_cert, hub, requests_dir) =
+      intercept_event_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_503)));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connection = tokio::spawn(async move {
-      let (stream, _) = proxy_listener.accept().await.unwrap();
-      serve_forward_proxy_connection(stream, state, shutdown_rx).await
+      let (stream, peer_addr) = proxy_listener.accept().await.unwrap();
+      let metadata = connection_metadata(&stream, peer_addr);
+      serve_forward_proxy_connection(stream, state, metadata, shutdown_rx).await
     });
 
     let mut client = TcpStream::connect(proxy_address).await.unwrap();
+    let client_addr = client.local_addr().unwrap();
     client
       .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
       .await
@@ -939,6 +999,44 @@ mod tests {
       report.session().dispatch().authority().authority().to_string(),
       "api.example.test:443"
     );
+    assert_eq!(
+      report.session().connection(),
+      ConnectionMetadata::new(proxy_address, client_addr)
+    );
+    let parent_connect_id = report.session().request_id().as_str().to_owned();
+    hub.shutdown().await.unwrap();
+
+    let day_files = tokn_persistence::requests::day_files(&requests_dir).unwrap();
+    assert_eq!(day_files.len(), 1);
+    let database = tokn_persistence::requests::open_day_db(&day_files[0]).unwrap();
+    let mut query = database
+      .prepare("SELECT request_id, ctx_json FROM requests ORDER BY request_id")
+      .unwrap();
+    let contexts = query
+      .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+      .unwrap()
+      .map(|row| {
+        let (request_id, context) = row.unwrap();
+        (request_id, serde_json::from_str::<serde_json::Value>(&context).unwrap())
+      })
+      .collect::<Vec<_>>();
+    let outer = contexts
+      .iter()
+      .find(|(request_id, _)| request_id == &parent_connect_id)
+      .unwrap();
+    assert_eq!(outer.1["ingress"], "forward_proxy");
+    assert_eq!(outer.1["local_addr"], proxy_address.to_string());
+    assert_eq!(outer.1["peer_addr"], client_addr.to_string());
+    let children = contexts
+      .iter()
+      .filter(|(_, context)| context["ingress"] == "intercepted_https")
+      .collect::<Vec<_>>();
+    assert_eq!(children.len(), 2);
+    for (_, context) in children {
+      assert_eq!(context["parent_connect_id"], parent_connect_id);
+      assert_eq!(context["local_addr"], proxy_address.to_string());
+      assert_eq!(context["peer_addr"], client_addr.to_string());
+    }
     drop(shutdown_tx);
   }
 
@@ -949,8 +1047,9 @@ mod tests {
     let (_temp, state, ca_cert) = intercept_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_505)));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connection = tokio::spawn(async move {
-      let (stream, _) = proxy_listener.accept().await.unwrap();
-      serve_forward_proxy_connection(stream, state, shutdown_rx).await
+      let (stream, peer_addr) = proxy_listener.accept().await.unwrap();
+      let metadata = connection_metadata(&stream, peer_addr);
+      serve_forward_proxy_connection(stream, state, metadata, shutdown_rx).await
     });
 
     let mut client = TcpStream::connect(proxy_address).await.unwrap();
@@ -991,8 +1090,9 @@ mod tests {
     let (_temp, state, ca_cert) = intercept_state(SocketAddr::from((Ipv4Addr::LOCALHOST, 42_504)));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connection = tokio::spawn(async move {
-      let (stream, _) = proxy_listener.accept().await.unwrap();
-      serve_forward_proxy_connection(stream, state, shutdown_rx).await
+      let (stream, peer_addr) = proxy_listener.accept().await.unwrap();
+      let metadata = connection_metadata(&stream, peer_addr);
+      serve_forward_proxy_connection(stream, state, metadata, shutdown_rx).await
     });
 
     let mut tls = trusted_tls_client(&ca_cert, "api.example.test");

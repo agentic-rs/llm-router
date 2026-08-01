@@ -9,6 +9,7 @@ mod auth;
 mod bind;
 mod body;
 mod connect;
+mod connection;
 mod error;
 mod events;
 mod http;

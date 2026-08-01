@@ -5,6 +5,7 @@
 //! framed HTTP/1 request because the body may not have been fully consumed.
 
 use super::connect::{prepare_connect_upgrade, ConnectSession, ConnectUpgradeSender};
+use super::connection::ConnectionMetadata;
 use super::events::{
   client_identity, connect_action, connect_policy_selection, downstream_response_head, error_termination,
   request_admitted_connect, request_admitted_http, request_started,
@@ -30,10 +31,18 @@ use tokn_requests::{RequestCompletion, RequestLifecycle, RequestTermination};
 /// authentication can reject the request. Authentication consumes only the
 /// listener credential on success; the admitted request then enters the
 /// shared route/body/resolve/execute pipeline.
-pub(super) async fn handle_llm_api_request(state: &ListenerServerState, mut request: Request<Body>) -> Response {
+pub(super) async fn handle_llm_api_request(
+  state: &ListenerServerState,
+  connection: ConnectionMetadata,
+  mut request: Request<Body>,
+) -> Response {
   let version = request.version();
   let body_present = request_body_present(&request);
-  let started = request_started(listener_source(state, IngressKind::LlmApi), &request, body_present);
+  let started = request_started(
+    listener_source(state, connection, IngressKind::LlmApi),
+    &request,
+    body_present,
+  );
   let mut lifecycle = match begin_lifecycle(state, started).await {
     Ok(lifecycle) => lifecycle,
     Err(error) => return materialize_local_error(state.listener().id(), error, version, body_present),
@@ -90,6 +99,7 @@ pub(super) async fn handle_llm_api_request(state: &ListenerServerState, mut requ
 /// the prepared upgrade to the owning connection before returning 200.
 pub(super) async fn handle_forward_proxy_request(
   state: &ListenerServerState,
+  connection: ConnectionMetadata,
   mut request: Request<Body>,
   upgrades: &ConnectUpgradeSender,
 ) -> Response {
@@ -98,7 +108,7 @@ pub(super) async fn handle_forward_proxy_request(
   let is_connect = request.method() == Method::CONNECT;
   let close_http1 = body_present || is_connect;
   let started = request_started(
-    listener_source(state, IngressKind::ForwardProxy),
+    listener_source(state, connection, IngressKind::ForwardProxy),
     &request,
     body_present,
   );
@@ -207,12 +217,13 @@ pub(super) async fn handle_forward_proxy_request(
       let event_action = connect_action(dispatch.action());
       let event_authority = dispatch.authority().to_string();
       let request_id = lifecycle.request_id().clone();
-      let mut upgrade = match prepare_connect_upgrade(state, dispatch, access, request_id, &mut request).await {
-        Ok(upgrade) => upgrade,
-        Err(error) => {
-          return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
-        }
-      };
+      let mut upgrade =
+        match prepare_connect_upgrade(state, dispatch, access, request_id, connection, &mut request).await {
+          Ok(upgrade) => upgrade,
+          Err(error) => {
+            return complete_http_result(state, lifecycle, Err(error), version, close_http1).await;
+          }
+        };
       let permit = match upgrades.clone().try_reserve_owned() {
         Ok(permit) => permit,
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -263,6 +274,7 @@ pub(super) async fn handle_intercepted_https_request(
   let started = request_started(
     listener_source(
       state,
+      session.connection(),
       IngressKind::InterceptedHttps {
         parent_connect_id: session.request_id().clone(),
       },
@@ -303,12 +315,12 @@ pub(super) async fn handle_intercepted_https_request(
   complete_http_result(state, lifecycle, result, version, close_http1).await
 }
 
-fn listener_source(state: &ListenerServerState, ingress: IngressKind) -> RequestSource {
+fn listener_source(state: &ListenerServerState, connection: ConnectionMetadata, ingress: IngressKind) -> RequestSource {
   RequestSource::Listener {
     listener_id: state.listener().id().as_str().into(),
     ingress,
-    local_addr: None,
-    peer_addr: None,
+    local_addr: Some(connection.local_addr()),
+    peer_addr: Some(connection.peer_addr()),
   }
 }
 
@@ -371,6 +383,12 @@ async fn complete_http_result(
   {
     return materialize_local_error(state.listener().id(), source, version, close_http1);
   }
+  if !lifecycle.is_enabled() {
+    if let Err(error) = lifecycle.finish(termination) {
+      tracing::warn!(error = %error, "disabled request lifecycle could not finish");
+    }
+    return response;
+  }
   observe_downstream_body(
     response,
     lifecycle,
@@ -413,7 +431,7 @@ mod tests {
   use super::*;
   use crate::runtime::{link_gateway_runtime, materialize_listeners, GatewayServerState, GatewayServingDefaults};
   use axum::body::to_bytes;
-  use http::header::{CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, TRANSFER_ENCODING, WWW_AUTHENTICATE};
+  use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, TRANSFER_ENCODING, WWW_AUTHENTICATE};
   use http::{Method, StatusCode};
   use smol_str::SmolStr;
   use std::collections::{BTreeMap, BTreeSet};
@@ -441,6 +459,13 @@ mod tests {
 
   fn listener_id() -> ListenerId {
     ListenerId::new("listener").unwrap()
+  }
+
+  fn connection_metadata() -> ConnectionMetadata {
+    ConnectionMetadata::new(
+      SocketAddr::from((Ipv4Addr::LOCALHOST, 42_510)),
+      SocketAddr::from((Ipv4Addr::LOCALHOST, 52_510)),
+    )
   }
 
   fn local_error(version: Version, body_present: bool) -> Response {
@@ -510,7 +535,9 @@ mod tests {
     )))
   }
 
-  fn managed_event_state() -> (tempfile::TempDir, ListenerServerState, EventHub<GatewayEvent>, PathBuf) {
+  fn managed_event_state(
+    body_limits: super::super::RequestBodyLimits,
+  ) -> (tempfile::TempDir, ListenerServerState, EventHub<GatewayEvent>, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let requests_dir = temp.path().join("requests");
     let persistence = RequestPersistenceConsumer::open(&requests_dir, "test-version").unwrap();
@@ -592,7 +619,7 @@ mod tests {
           system: false,
           ..HttpClientOptions::default()
         },
-        GatewayServingDefaults::new(super::super::RequestBodyLimits::new(1024, 1024)),
+        GatewayServingDefaults::new(body_limits),
         RequestLifecycleEmitter::new(publisher),
       )
       .unwrap(),
@@ -636,6 +663,41 @@ mod tests {
     assert!(!response.headers().contains_key(CONNECTION));
   }
 
+  #[test]
+  fn listener_source_preserves_connection_facts_and_intercept_parent_linkage() {
+    let (_temp, state) = authenticated_state();
+    let connection = connection_metadata();
+    let parent_connect_id = tokn_events::RequestId::new("parent-connect").unwrap();
+
+    for ingress in [IngressKind::LlmApi, IngressKind::ForwardProxy] {
+      assert_eq!(
+        listener_source(&state, connection, ingress.clone()),
+        RequestSource::Listener {
+          listener_id: listener_id().as_str().into(),
+          ingress,
+          local_addr: Some(connection.local_addr()),
+          peer_addr: Some(connection.peer_addr()),
+        }
+      );
+    }
+
+    assert_eq!(
+      listener_source(
+        &state,
+        connection,
+        IngressKind::InterceptedHttps {
+          parent_connect_id: parent_connect_id.clone(),
+        },
+      ),
+      RequestSource::Listener {
+        listener_id: listener_id().as_str().into(),
+        ingress: IngressKind::InterceptedHttps { parent_connect_id },
+        local_addr: Some(connection.local_addr()),
+        peer_addr: Some(connection.peer_addr()),
+      }
+    );
+  }
+
   #[tokio::test]
   async fn direct_auth_rejection_challenges_and_closes_framed_http1() {
     let (_temp, state) = authenticated_state();
@@ -648,7 +710,7 @@ mod tests {
       .body(Body::from("x"))
       .unwrap();
 
-    let response = handle_llm_api_request(&state, request).await;
+    let response = handle_llm_api_request(&state, connection_metadata(), request).await;
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
@@ -656,56 +718,199 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn invalid_managed_json_is_persisted_from_started_through_terminal_response() {
-    let (_temp, state, hub, requests_dir) = managed_event_state();
-    let request = Request::builder()
-      .method(Method::POST)
-      .uri("/v1/responses")
-      .version(Version::HTTP_11)
-      .header(HOST, "client.example")
-      .header(CONTENT_LENGTH, "1")
-      .body(Body::from("{"))
-      .unwrap();
+  async fn managed_body_failures_persist_one_ordinary_request_without_attempt_facts() {
+    #[derive(Clone, Copy)]
+    struct CaptureExpectation {
+      bytes_seen: u64,
+      bytes_captured: u64,
+      limit_bytes: u64,
+    }
 
-    let response = handle_llm_api_request(&state, request).await;
+    struct FailureCase {
+      name: &'static str,
+      body: &'static [u8],
+      content_encoding: Option<&'static str>,
+      body_limits: super::super::RequestBodyLimits,
+      status: StatusCode,
+      response_code: &'static str,
+      request_error: &'static str,
+      body_failure_code: &'static str,
+      persisted_body_bytes: usize,
+      inbound_capture: Option<CaptureExpectation>,
+      decoded_capture: Option<CaptureExpectation>,
+    }
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(response.headers()[CONNECTION], "close");
-    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert!(std::str::from_utf8(&response_body)
-      .unwrap()
-      .contains("invalid_request_body"));
-    hub.shutdown().await.unwrap();
+    const OVERSIZED_BODY: &[u8] = br#"{"model":"fixture","input":"hello"}"#;
+    let cases = [
+      FailureCase {
+        name: "invalid JSON",
+        body: b"{",
+        content_encoding: None,
+        body_limits: super::super::RequestBodyLimits::new(1024, 1024),
+        status: StatusCode::BAD_REQUEST,
+        response_code: "invalid_request_body",
+        request_error: "request_body: the managed request body is not valid JSON",
+        body_failure_code: "invalid_json",
+        persisted_body_bytes: 1,
+        inbound_capture: None,
+        decoded_capture: None,
+      },
+      FailureCase {
+        name: "wire-size limit",
+        body: OVERSIZED_BODY,
+        content_encoding: None,
+        body_limits: super::super::RequestBodyLimits::new(8, 1024),
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        response_code: "request_body_too_large",
+        request_error: "request_body: the request body exceeds the configured wire-size limit",
+        body_failure_code: "wire_body_too_large",
+        persisted_body_bytes: 8,
+        inbound_capture: Some(CaptureExpectation {
+          bytes_seen: OVERSIZED_BODY.len() as u64,
+          bytes_captured: 8,
+          limit_bytes: 8,
+        }),
+        decoded_capture: None,
+      },
+      FailureCase {
+        name: "invalid gzip body",
+        body: b"not-gzip",
+        content_encoding: Some("gzip"),
+        body_limits: super::super::RequestBodyLimits::new(1024, 1024),
+        status: StatusCode::BAD_REQUEST,
+        response_code: "invalid_content_encoding",
+        request_error: "request_body: the gzip request body could not be decoded",
+        body_failure_code: "gzip_decode_failed",
+        persisted_body_bytes: 8,
+        inbound_capture: None,
+        decoded_capture: Some(CaptureExpectation {
+          bytes_seen: 0,
+          bytes_captured: 0,
+          limit_bytes: 0,
+        }),
+      },
+      FailureCase {
+        name: "missing managed model",
+        body: b"{}",
+        content_encoding: None,
+        body_limits: super::super::RequestBodyLimits::new(1024, 1024),
+        status: StatusCode::BAD_REQUEST,
+        response_code: "invalid_model",
+        request_error: "request_body: the managed request model must be a string",
+        body_failure_code: "managed_model_string_required",
+        persisted_body_bytes: 2,
+        inbound_capture: None,
+        decoded_capture: None,
+      },
+    ];
 
-    let day_files = tokn_persistence::requests::day_files(&requests_dir).unwrap();
-    assert_eq!(day_files.len(), 1);
-    let connection = tokn_persistence::requests::open_day_db(&day_files[0]).unwrap();
-    let row = connection
-      .query_row(
-        "SELECT status, request_error, inbound_req_method, inbound_req_url,
-                inbound_req_body, account_id, provider_id, model
-         FROM requests",
-        [],
-        |row| {
-          Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-          ))
-        },
-      )
-      .unwrap();
-    assert_eq!(row.0, 400);
-    assert_eq!(row.1, "request_body: the managed request body is not valid JSON");
-    assert_eq!(row.2, "POST");
-    assert_eq!(row.3, "/v1/responses");
-    assert_eq!(row.4, b"{");
-    assert_eq!((&row.5, &row.6, &row.7), (&None, &None, &None));
+    for case in cases {
+      let (_temp, state, hub, requests_dir) = managed_event_state(case.body_limits);
+      let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/responses")
+        .version(Version::HTTP_11)
+        .header(HOST, "client.example")
+        .header(CONTENT_LENGTH, case.body.len().to_string());
+      if let Some(content_encoding) = case.content_encoding {
+        request = request.header(CONTENT_ENCODING, content_encoding);
+      }
+      let request = request.body(Body::from(case.body)).unwrap();
+
+      let response = handle_llm_api_request(&state, connection_metadata(), request).await;
+
+      assert_eq!(response.status(), case.status, "{}", case.name);
+      assert_eq!(response.headers()[CONNECTION], "close", "{}", case.name);
+      let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+      assert!(
+        std::str::from_utf8(&response_body)
+          .unwrap()
+          .contains(case.response_code),
+        "{}",
+        case.name
+      );
+      hub.shutdown().await.unwrap();
+
+      let day_files = tokn_persistence::requests::day_files(&requests_dir).unwrap();
+      assert_eq!(day_files.len(), 1, "{}", case.name);
+      let connection = tokn_persistence::requests::open_day_db(&day_files[0]).unwrap();
+      let row_count = connection
+        .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+      assert_eq!(row_count, 1, "{}", case.name);
+      let row = connection
+        .query_row(
+          "SELECT status, request_error, inbound_req_method, inbound_req_url,
+                  inbound_req_body, account_id, provider_id, model, ctx_json,
+                  outbound_req_method, outbound_req_url, outbound_resp_status,
+                  inbound_resp_status
+           FROM requests",
+          [],
+          |row| {
+            Ok((
+              row.get::<_, i64>(0)?,
+              row.get::<_, String>(1)?,
+              row.get::<_, String>(2)?,
+              row.get::<_, String>(3)?,
+              row.get::<_, Vec<u8>>(4)?,
+              row.get::<_, Option<String>>(5)?,
+              row.get::<_, Option<String>>(6)?,
+              row.get::<_, Option<String>>(7)?,
+              row.get::<_, String>(8)?,
+              row.get::<_, Option<String>>(9)?,
+              row.get::<_, Option<String>>(10)?,
+              row.get::<_, Option<i64>>(11)?,
+              row.get::<_, Option<i64>>(12)?,
+            ))
+          },
+        )
+        .unwrap();
+      assert_eq!(row.0, i64::from(case.status.as_u16()), "{}", case.name);
+      assert_eq!(row.1, case.request_error, "{}", case.name);
+      assert_eq!(row.2, "POST", "{}", case.name);
+      assert_eq!(row.3, "/v1/responses", "{}", case.name);
+      assert_eq!(row.4, case.body[..case.persisted_body_bytes], "{}", case.name);
+      assert_eq!((&row.5, &row.6, &row.7), (&None, &None, &None), "{}", case.name);
+      assert_eq!((&row.9, &row.10, &row.11), (&None, &None, &None), "{}", case.name);
+      assert_eq!(row.12, Some(i64::from(case.status.as_u16())), "{}", case.name);
+
+      let context: serde_json::Value = serde_json::from_str(&row.8).unwrap();
+      assert_eq!(context["attempt_count"], 0, "{}", case.name);
+      assert_eq!(context["request_phase"], "request_body", "{}", case.name);
+      assert_eq!(context["request_outcome"], "rejected", "{}", case.name);
+      assert_eq!(
+        context["request_body_failure"]["code"], case.body_failure_code,
+        "{}",
+        case.name
+      );
+      assert_eq!(context["request_failure"]["code"], case.response_code, "{}", case.name);
+      assert_eq!(context["local_addr"], connection_metadata().local_addr().to_string());
+      assert_eq!(context["peer_addr"], connection_metadata().peer_addr().to_string());
+
+      for (key, expected) in [
+        ("inbound_request_body_capture", case.inbound_capture),
+        ("decoded_request_body_capture", case.decoded_capture),
+      ] {
+        match expected {
+          Some(expected) => {
+            assert_eq!(context[key]["state"], "truncated", "{}: {key}", case.name);
+            assert_eq!(context[key]["source"], "event", "{}: {key}", case.name);
+            assert_eq!(context[key]["bytes_seen"], expected.bytes_seen, "{}: {key}", case.name);
+            assert_eq!(
+              context[key]["bytes_captured"], expected.bytes_captured,
+              "{}: {key}",
+              case.name
+            );
+            assert_eq!(
+              context[key]["limit_bytes"], expected.limit_bytes,
+              "{}: {key}",
+              case.name
+            );
+          }
+          None => assert!(context.get(key).is_none(), "{}: unexpected {key}", case.name),
+        }
+      }
+    }
   }
 
   #[tokio::test]
@@ -720,7 +925,7 @@ mod tests {
       .body(Body::empty())
       .unwrap();
 
-    let response = handle_forward_proxy_request(&state, request, &upgrades).await;
+    let response = handle_forward_proxy_request(&state, connection_metadata(), request, &upgrades).await;
 
     assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
     assert_eq!(response.headers()[PROXY_AUTHENTICATE], "Bearer");
@@ -751,7 +956,7 @@ mod tests {
 
     for request in requests {
       let (upgrades, mut receiver) = connect_upgrade_channel();
-      let response = handle_forward_proxy_request(&state, request, &upgrades).await;
+      let response = handle_forward_proxy_request(&state, connection_metadata(), request, &upgrades).await;
 
       assert_eq!(response.status(), StatusCode::BAD_REQUEST);
       assert_eq!(response.headers()[CONNECTION], "close");
@@ -768,6 +973,7 @@ mod tests {
     let (upgrades, mut receiver) = connect_upgrade_channel();
     let response = handle_forward_proxy_request(
       &rejected_state,
+      connection_metadata(),
       connect_request(target).body(Body::empty()).unwrap(),
       &upgrades,
     )
@@ -780,6 +986,7 @@ mod tests {
     let (upgrades, mut receiver) = connect_upgrade_channel();
     let response = handle_forward_proxy_request(
       &authenticated_state,
+      connection_metadata(),
       connect_request(target).body(Body::empty()).unwrap(),
       &upgrades,
     )
@@ -797,8 +1004,13 @@ mod tests {
     let (_temp, state) = proxy_state(ClientAuthPlan::None, ConnectAction::Tunnel);
     let (upgrades, mut receiver) = connect_upgrade_channel();
 
-    let response =
-      handle_forward_proxy_request(&state, connect_request(target).body(Body::empty()).unwrap(), &upgrades).await;
+    let response = handle_forward_proxy_request(
+      &state,
+      connection_metadata(),
+      connect_request(target).body(Body::empty()).unwrap(),
+      &upgrades,
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(response.headers()[CONNECTION], "close");
@@ -818,13 +1030,20 @@ mod tests {
     let (_temp, state) = proxy_state(ClientAuthPlan::None, ConnectAction::Tunnel);
     let (upgrades, mut receiver) = connect_upgrade_channel();
 
-    let response = handle_forward_proxy_request(&state, connect_request_with_upgrade_token(target), &upgrades).await;
+    let response = handle_forward_proxy_request(
+      &state,
+      connection_metadata(),
+      connect_request_with_upgrade_token(target),
+      &upgrades,
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.headers().contains_key(CONNECTION));
     let mut upstream = timeout(Duration::from_secs(1), accept).await.unwrap().unwrap();
     let upgrade = receiver.try_recv().unwrap();
     assert_eq!(upgrade.session().access(), &AccessContext::unrestricted());
+    assert_eq!(upgrade.session().connection(), connection_metadata());
     assert_eq!(
       upgrade.session().dispatch().authority().authority().to_string(),
       target.to_string()
@@ -851,8 +1070,13 @@ mod tests {
     let (_temp, state) = proxy_state(ClientAuthPlan::None, ConnectAction::Tunnel);
     let (upgrades, mut receiver) = connect_upgrade_channel();
 
-    let response =
-      handle_forward_proxy_request(&state, connect_request_with_upgrade_token(unavailable), &upgrades).await;
+    let response = handle_forward_proxy_request(
+      &state,
+      connection_metadata(),
+      connect_request_with_upgrade_token(unavailable),
+      &upgrades,
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(response.headers()[CONNECTION], "close");
@@ -864,7 +1088,13 @@ mod tests {
     let (upgrades, receiver) = connect_upgrade_channel();
     drop(receiver);
 
-    let response = handle_forward_proxy_request(&state, connect_request_with_upgrade_token(target), &upgrades).await;
+    let response = handle_forward_proxy_request(
+      &state,
+      connection_metadata(),
+      connect_request_with_upgrade_token(target),
+      &upgrades,
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(response.headers()[CONNECTION], "close");
