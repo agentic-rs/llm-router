@@ -180,7 +180,9 @@ impl AuthStore {
   /// absent. Existing sources are revalidated after staging, but their final
   /// portable rename is not a content-based compare-and-swap. This method
   /// acquires the store's cooperative write lock before revalidating and
-  /// committing changes.
+  /// committing changes. If syncing a source's parent directory fails after
+  /// its atomic install, this method returns an error even though that source
+  /// may already contain the new credentials; reload the store before retrying.
   pub fn save(&mut self) -> Result<()> {
     let lock = AuthStoreLock::acquire(Some(&self.path))?;
     self.save_locked(&lock)
@@ -190,6 +192,8 @@ impl AuthStore {
   ///
   /// The guard must belong to this store's root. Every loaded source is
   /// revalidated after lock acquisition, including when no write is needed.
+  /// If a post-install directory sync fails, the affected source may already
+  /// contain the new credentials and callers must reload before retrying.
   pub fn save_locked(&mut self, lock: &AuthStoreLock) -> Result<()> {
     self.validate_locked(lock)?;
     self.save_with_before_commit(|_| {})
@@ -553,13 +557,24 @@ impl StagedAuthFile {
     let Self { file, contents } = self;
     match file.commit(path, install) {
       Ok(()) => Ok(contents),
-      Err(error) if install == AuthFileInstall::CreateIfAbsent && error.kind() == std::io::ErrorKind::AlreadyExists => {
+      Err(StagedPrivateFileCommitError::Install(error))
+        if install == AuthFileInstall::CreateIfAbsent && error.kind() == std::io::ErrorKind::AlreadyExists =>
+      {
         bail!(
           "{} changed after loading the auth store; retry the command",
           path.display()
         )
       }
-      Err(error) => Err(error).with_context(|| format!("writing {}", path.display())),
+      Err(StagedPrivateFileCommitError::Install(error)) => {
+        Err(error).with_context(|| format!("writing {}", path.display()))
+      }
+      Err(StagedPrivateFileCommitError::SyncParent { parent, source }) => Err(source).with_context(|| {
+        format!(
+          "syncing credential directory {} after committing {}; credentials may already contain the new contents",
+          parent.display(),
+          path.display()
+        )
+      }),
     }
   }
 }
@@ -568,22 +583,43 @@ struct StagedPrivateFile {
   path: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+enum StagedPrivateFileCommitError {
+  Install(std::io::Error),
+  SyncParent { parent: PathBuf, source: std::io::Error },
+}
+
 impl StagedPrivateFile {
-  fn commit(mut self, path: &Path, install: AuthFileInstall) -> std::io::Result<()> {
+  fn commit(self, path: &Path, install: AuthFileInstall) -> std::result::Result<(), StagedPrivateFileCommitError> {
+    self.commit_with_parent_sync(path, install, sync_parent_directory)
+  }
+
+  fn commit_with_parent_sync(
+    mut self,
+    path: &Path,
+    install: AuthFileInstall,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+  ) -> std::result::Result<(), StagedPrivateFileCommitError> {
     let temporary = self.path.as_deref().expect("staged auth file should have a path");
     match install {
       AuthFileInstall::CreateIfAbsent => {
-        fs::hard_link(temporary, path)?;
+        fs::hard_link(temporary, path).map_err(StagedPrivateFileCommitError::Install)?;
         // The target is installed once the link succeeds. Temporary-name
-        // cleanup is best effort and retried by Drop; it must not make the
-        // successful credential write look like a failed save.
+        // cleanup is best effort; it must not make the successful credential
+        // write look like a failed save. Relinquish the Drop retry before the
+        // directory sync so no cleanup mutation can occur after that sync.
+        let temporary = self.path.take().expect("staged auth file should have a path");
         let _ = fs::remove_file(temporary);
-        return Ok(());
       }
-      AuthFileInstall::Replace => fs::rename(temporary, path)?,
+      AuthFileInstall::Replace => {
+        fs::rename(temporary, path).map_err(StagedPrivateFileCommitError::Install)?;
+        self.path = None;
+      }
     }
-    self.path = None;
-    Ok(())
+    sync_parent(path).map_err(|source| StagedPrivateFileCommitError::SyncParent {
+      parent: target_parent(path).to_path_buf(),
+      source,
+    })
   }
 }
 
@@ -593,6 +629,23 @@ impl Drop for StagedPrivateFile {
       let _ = fs::remove_file(path);
     }
   }
+}
+
+fn target_parent(path: &Path) -> &Path {
+  path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+  fs::File::open(target_parent(path))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+  Ok(())
 }
 
 fn stage_auth_file(path: &Path, accounts: &[AccountConfig]) -> Result<StagedAuthFile> {
@@ -729,6 +782,64 @@ mod tests {
     })
     .unwrap();
     fs::write(path, yaml).unwrap();
+  }
+
+  #[test]
+  fn staged_private_files_sync_after_create_or_replace_and_temporary_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let created = dir.path().join("created.yaml");
+    let staged_create = stage_secured_atomic(&created, b"created contents").unwrap();
+    let create_temporary = staged_create.path.as_deref().unwrap().to_path_buf();
+    let create_sync_observed = std::cell::Cell::new(false);
+    staged_create
+      .commit_with_parent_sync(&created, AuthFileInstall::CreateIfAbsent, |sync_target| {
+        assert_eq!(sync_target, created);
+        assert_eq!(fs::read(&created).unwrap(), b"created contents");
+        assert!(!create_temporary.exists());
+        create_sync_observed.set(true);
+        Ok(())
+      })
+      .unwrap();
+    assert!(create_sync_observed.get());
+
+    let replaced = dir.path().join("replaced.yaml");
+    fs::write(&replaced, b"old contents").unwrap();
+    let staged_replace = stage_secured_atomic(&replaced, b"new contents").unwrap();
+    let replace_temporary = staged_replace.path.as_deref().unwrap().to_path_buf();
+    let replace_sync_observed = std::cell::Cell::new(false);
+    staged_replace
+      .commit_with_parent_sync(&replaced, AuthFileInstall::Replace, |sync_target| {
+        assert_eq!(sync_target, replaced);
+        assert_eq!(fs::read(&replaced).unwrap(), b"new contents");
+        assert!(!replace_temporary.exists());
+        replace_sync_observed.set(true);
+        Ok(())
+      })
+      .unwrap();
+    assert!(replace_sync_observed.get());
+  }
+
+  #[test]
+  fn staged_private_file_reports_post_commit_sync_failures_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.yaml");
+    let staged = stage_secured_atomic(&path, b"new credentials").unwrap();
+
+    let error = staged
+      .commit_with_parent_sync(&path, AuthFileInstall::CreateIfAbsent, |_| {
+        Err(std::io::Error::other("injected directory sync failure"))
+      })
+      .unwrap_err();
+
+    assert!(matches!(
+      error,
+      StagedPrivateFileCommitError::SyncParent {
+        parent,
+        source,
+      } if parent == dir.path() && source.to_string() == "injected directory sync failure"
+    ));
+    assert_eq!(fs::read(path).unwrap(), b"new credentials");
   }
 
   #[test]

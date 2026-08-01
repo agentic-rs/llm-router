@@ -123,6 +123,17 @@ pub enum Error {
     source: std::io::Error,
   },
 
+  #[snafu(display(
+    "sync directory `{}` after committing config `{}`; the config may already contain the new contents",
+    parent.display(),
+    path.display()
+  ))]
+  SyncParentAfterCommit {
+    path: PathBuf,
+    parent: PathBuf,
+    source: std::io::Error,
+  },
+
   #[snafu(display("could not resolve XDG project dirs"))]
   NoProjectDirs,
 

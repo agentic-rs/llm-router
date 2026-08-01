@@ -75,6 +75,8 @@ impl ConfigFileLock {
   /// to be present with those exact bytes. The target itself must not be a
   /// symbolic link. That condition is checked before the initial read and
   /// again immediately before the final preimage check and atomic replace.
+  /// Once the replace succeeds, an error syncing the parent directory means
+  /// the target may already contain the new contents.
   pub fn replace_contents_if_unchanged(&self, expected: Option<&[u8]>, contents: &[u8]) -> GuardedEditResult<()> {
     self.validate_identity()?;
     replace_contents_if_unchanged_locked(&self.path, &self.requested_path, expected, contents)
@@ -270,6 +272,9 @@ fn invalid_config_lock_file(path: &Path, lock_path: &Path, reason: &str) -> Erro
 /// editor can still race the final check-and-rename window for an existing
 /// target because portable filesystems do not offer content-based
 /// compare-and-swap.
+///
+/// Once the install or replace succeeds, an error syncing the parent
+/// directory means the target may already contain the new contents.
 pub fn replace_contents_if_unchanged(path: &Path, expected: Option<&[u8]>, contents: &[u8]) -> GuardedEditResult<()> {
   let lock = lock_config_file(path)?;
   lock.replace_contents_if_unchanged(expected, contents)
@@ -1379,11 +1384,12 @@ fn is_proxy_host(s: &str) -> bool {
 fn write_atomic_locked(path: &Path, contents: &str) -> Result<()> {
   let staged = stage_atomic_write(path, contents)?;
   let from = staged.path().to_path_buf();
-  staged.persist(path).map(|_| ()).map_err(|error| Error::Rename {
+  staged.persist(path).map_err(|error| Error::Rename {
     from,
     to: path.to_path_buf(),
     source: error.error,
-  })
+  })?;
+  sync_parent_directory_after_commit(path)
 }
 
 fn write_atomic_guarded_locked(
@@ -1413,7 +1419,7 @@ fn commit_staged_atomic_write_guarded(
   let from = staged.path().to_path_buf();
   match expected {
     ConfigEditPreimage::Missing => match staged.persist_noclobber(path) {
-      Ok(_) => Ok(()),
+      Ok(_) => sync_parent_directory_after_commit(path).map_err(Into::into),
       Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Err(GuardedEditError::Changed {
         path: error_path.to_path_buf(),
       }),
@@ -1431,9 +1437,28 @@ fn commit_staged_atomic_write_guarded(
         to: path.to_path_buf(),
         source: error.error,
       })?;
-      Ok(())
+      sync_parent_directory_after_commit(path).map_err(Into::into)
     }
   }
+}
+
+fn sync_parent_directory_after_commit(path: &Path) -> Result<()> {
+  let parent = config_parent(path);
+  sync_directory(parent).map_err(|source| Error::SyncParentAfterCommit {
+    path: path.to_path_buf(),
+    parent: parent.to_path_buf(),
+    source,
+  })
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+  File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+  Ok(())
 }
 
 fn reject_config_symlink(path: &Path, error_path: &Path) -> Result<()> {
@@ -2145,6 +2170,26 @@ profile = "opencode"
     replace_contents_if_unchanged(&path, Some(initial), replacement).unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), replacement);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn parent_sync_errors_report_that_the_config_may_already_be_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_parent = dir.path().join("missing");
+    let path = missing_parent.join("config.toml");
+
+    let error = sync_parent_directory_after_commit(&path).unwrap_err();
+
+    assert!(matches!(
+      &error,
+      Error::SyncParentAfterCommit {
+        path: failed_path,
+        parent,
+        ..
+      } if failed_path == &path && parent == &missing_parent
+    ));
+    assert!(error.to_string().contains("may already contain the new contents"));
   }
 
   #[test]
