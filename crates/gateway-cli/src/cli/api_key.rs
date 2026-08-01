@@ -75,7 +75,7 @@ fn validate_providers(providers: &[String]) -> Result<()> {
     }
     return Ok(());
   }
-  let registry = tokn_router::accounts::registry::Registry::builtin();
+  let registry = tokn_accounts::registry::Registry::builtin();
   let unknown = providers
     .iter()
     .filter(|provider| registry.resolve(provider).is_none())

@@ -1,6 +1,6 @@
 //! Crate-wide error type.
 //!
-//! Each subsystem owns its own `snafu::Snafu` enum (see `tokn_router::accounts::Error`,
+//! Each subsystem owns its own `snafu::Snafu` enum (see `tokn_accounts::Error`,
 //! `db::Error`, `tokn_catalogue::loader::Error`, `config::Error`,
 //! `provider::Error`, `cli::Error`). Those compose into the top-level
 //! [`Error`] via `#[snafu(source)]`.
@@ -32,7 +32,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[allow(dead_code)]
 pub enum Error {
   #[snafu(display("pool"), context(false))]
-  Pool { source: tokn_router::accounts::Error },
+  Pool { source: tokn_accounts::Error },
 
   #[snafu(display("db"), context(false))]
   Db { source: crate::db::Error },

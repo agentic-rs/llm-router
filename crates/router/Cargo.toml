@@ -12,20 +12,10 @@ license.workspace = true
 tokn-core = { workspace = true }
 tokn-policy = { workspace = true }
 tokn-accounts = { workspace = true }
-tokn-auth = { workspace = true }
 tokn-access = { workspace = true }
-tokn-config = { workspace = true }
-tokn-catalogue = { workspace = true }
-tokn-convert = { workspace = true }
 tokn-headers = { workspace = true }
 tokn-requests = { workspace = true }
-tokn-provider-copilot = { workspace = true }
-tokn-provider-deepseek = { workspace = true }
-tokn-provider-openai = { workspace = true }
-tokn-provider-zai = { workspace = true }
 anyhow = { workspace = true }
-arc-swap = { workspace = true }
-async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
@@ -46,14 +36,12 @@ smol_str = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
-toml = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
 time = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokn-config = { workspace = true }
 tokn-mock-server = { workspace = true }
+toml = { workspace = true }
