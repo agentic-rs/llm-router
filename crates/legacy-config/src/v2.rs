@@ -86,8 +86,7 @@ pub enum V2BehaviorChange {
   /// Legacy request-pipeline retries are not expressible by the current v2
   /// raw managed-route recipe.
   ManagedRetryPolicy,
-  /// Persistence and logging remain process concerns outside the current v2
-  /// service schema.
+  /// Logging remains a process concern outside the current v2 service schema.
   OperationalSettings,
   /// Legacy CORS settings have no current v2 listener representation.
   Cors,

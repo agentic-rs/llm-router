@@ -385,7 +385,7 @@ fn render_behavior_change(change: V2BehaviorChange) -> &'static str {
       "legacy request-pipeline retries are not represented by the generated managed routes"
     }
     V2BehaviorChange::OperationalSettings => {
-      "legacy persistence and logging settings are not represented by the current version 2 service schema"
+      "legacy logging settings are not represented by the current version 2 service schema"
     }
     V2BehaviorChange::Cors => "legacy CORS settings are not represented by the generated version 2 listener",
     V2BehaviorChange::AgentBindings => {
@@ -646,7 +646,8 @@ url = "http://user:sentinel-password@proxy.example"
     assert!(!rendered.contains("migration-secret"));
     let diagnostics = std::str::from_utf8(&stderr).unwrap();
     assert!(diagnostics.lines().all(|line| line.starts_with("warning: ")));
-    assert!(diagnostics.contains("persistence and logging"));
+    assert!(diagnostics.contains("legacy logging settings"));
+    assert!(!diagnostics.contains("legacy persistence"));
   }
 
   #[test]

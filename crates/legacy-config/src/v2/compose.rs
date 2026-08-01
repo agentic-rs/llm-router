@@ -3,8 +3,8 @@ use std::path::Path;
 
 use tokn_config::v2::{
   RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule, RawHttpPathPattern,
-  RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawProfile, RawQualificationNamespace,
-  RawRequestLimits, RawRoute, RawService, RawUpstreamSelector, SCHEMA_VERSION,
+  RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawProfile,
+  RawQualificationNamespace, RawRequestLimits, RawRoute, RawService, RawUpstreamSelector, SCHEMA_VERSION,
 };
 use tokn_config::{Config, RouteMode};
 use tokn_core::account::AccountConfig;
@@ -241,6 +241,18 @@ pub fn plan_v2_migration(
     service: RawService {
       outbound,
       request_limits: RawRequestLimits::default(),
+      persistence: RawPersistence {
+        enabled: legacy.db.enabled,
+        usage_db_path: legacy.db.usage_db_path.clone(),
+        sessions_db_path: legacy.db.sessions_db_path.clone(),
+        requests_dir: legacy.db.requests_dir.clone(),
+        record_sessions: legacy.db.record_sessions,
+        record_request_bodies: legacy.db.record_request_bodies,
+        body_max_bytes: u64::try_from(legacy.db.body_max_bytes).expect("usize always fits u64 on supported targets"),
+        write_queue_capacity: u64::try_from(legacy.db.write_queue_capacity)
+          .expect("usize always fits u64 on supported targets"),
+        archive_extension: legacy.db.archive_extension.clone(),
+      },
     },
     listeners,
     bindings,
@@ -475,6 +487,42 @@ enabled = true
         ..
       }
     ));
+  }
+
+  #[test]
+  fn preserves_legacy_persistence_configuration_exactly() {
+    let mut legacy = Config::default();
+    legacy.db.enabled = false;
+    legacy.db.usage_db_path = Some("state/usage-custom.db".into());
+    legacy.db.sessions_db_path = Some("state/sessions-custom.db".into());
+    legacy.db.requests_dir = Some("state/requests-custom".into());
+    legacy.db.record_sessions = false;
+    legacy.db.record_request_bodies = false;
+    legacy.db.body_max_bytes = 12_345;
+    legacy.db.write_queue_capacity = 678;
+    legacy.db.archive_extension = Some("db.zstd".into());
+
+    let plan = plan_v2_migration(&legacy, &[account(None)], V2MigrationOptions::default()).unwrap();
+    let persistence = &plan.raw_config().service.persistence;
+
+    assert!(!persistence.enabled);
+    assert_eq!(
+      persistence.usage_db_path.as_deref(),
+      Some(Path::new("state/usage-custom.db"))
+    );
+    assert_eq!(
+      persistence.sessions_db_path.as_deref(),
+      Some(Path::new("state/sessions-custom.db"))
+    );
+    assert_eq!(
+      persistence.requests_dir.as_deref(),
+      Some(Path::new("state/requests-custom"))
+    );
+    assert!(!persistence.record_sessions);
+    assert!(!persistence.record_request_bodies);
+    assert_eq!(persistence.body_max_bytes, 12_345);
+    assert_eq!(persistence.write_queue_capacity, 678);
+    assert_eq!(persistence.archive_extension.as_deref(), Some("db.zstd"));
   }
 
   #[test]
