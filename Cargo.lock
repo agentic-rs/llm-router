@@ -2972,7 +2972,6 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
- "console",
  "directories",
  "eventsource-stream",
  "futures",
