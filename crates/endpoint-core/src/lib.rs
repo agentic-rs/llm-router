@@ -16,7 +16,7 @@ pub mod traits;
 #[cfg(debug_assertions)]
 mod extra_keys_impls;
 
-pub use endpoint::Endpoint;
+pub use endpoint::{Endpoint, UnknownEndpoint};
 pub use extras::Extras;
 #[cfg(debug_assertions)]
 pub use extras::{join_path, push_extras, ExtraKeys};
