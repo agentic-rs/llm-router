@@ -1,17 +1,17 @@
 # Embedded SDKs
 
-The SDKs execute requests in-process through the same configuration,
-credentials, account pool, routing, conversion, retry, and provider
-implementations as the gateway. They do not require a gateway process.
+The SDKs execute requests in-process through one managed profile from the
+same version 2 configuration, credentials, account selection, conversion, and
+provider implementations as the gateway. They do not require a listener or a
+gateway process.
 
 ## Rust
 
 The `tokn-sdk` crate is the stable façade. It provides:
 
-- default and explicit `config.toml` / `auth.yaml` loading, including
-  `config.d` and `auth.d`;
+- strict version 2 `config.toml` loading plus `auth.yaml` and `auth.d`;
 - atomic `reload()` of configuration and credentials;
-- default and per-request profile selection;
+- one client-bound managed profile, with `default` used when omitted;
 - a provider-neutral generation builder with friendly text, reasoning, tool
   call, usage, and streaming outputs;
 - owned, serializable requests that can be transformed or bound to a client
@@ -19,6 +19,18 @@ The `tokn-sdk` crate is the stable façade. It provides:
 - typed clients for Responses, Chat Completions, and Messages;
 - a raw JSON request escape hatch;
 - buffered typed responses and live byte streams.
+
+Profile selection happens once, when the client is built:
+
+```rust
+let client = tokn_sdk::Client::builder()
+  .profile("coding")
+  .build()?;
+```
+
+Omit `profile()` to use the conventional `default` profile. Each reload keeps
+that profile and the resolved config/auth paths fixed while atomically
+replacing the linked runtime generation.
 
 The client-bound builder is the shortest path for a one-off request:
 
@@ -92,13 +104,13 @@ rejected while Claude thinking is enabled, as are explicit sampling controls
 on Claude generations that do not accept them.
 
 Unsupported explicit controls fail clearly after routing rather than being
-silently dropped or reinterpreted. Raw endpoint clients remain the escape
-hatch for an exact provider wire shape.
+silently dropped or reinterpreted. Raw endpoint clients accept endpoint-shaped
+request and response types; the managed route still owns upstream translation.
 
-`passthrough` and `switch` profiles preserve the generated Responses payload
-verbatim, so they reject typed `top_k` and reasoning controls that would
-require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
-the provider-neutral control API.
+The embedded SDK accepts managed profiles only. Relay and transparent routes
+belong to listener-backed HTTP/proxy serving and are rejected when the client
+is built. To use multiple profiles in one process, build one client per
+profile; request options cannot override the client-bound profile.
 
 Build a request without a client when it needs to be serialized, transformed,
 queued, or reused:
@@ -121,9 +133,9 @@ let response = request.bind(&client).send().await?;
 ```
 
 The façade deliberately hides router `AppState`, account handles, and request
-pipeline stages. Those remain implementation details and can evolve without
+selection tokens. Those remain implementation details and can evolve without
 breaking SDK consumers. Typed endpoint clients and raw JSON remain available
-when an exact endpoint wire shape is required.
+when direct endpoint request/response types are required.
 
 ## Python
 
@@ -191,7 +203,8 @@ As in Rust, `max_tokens()` aliases `max_output_tokens()`. Reasoning modes,
 summaries, and `top_k` remain provider- and model-dependent; the three examples
 deliberately keep each request to controls its route can represent.
 Unsupported explicit controls fail clearly after routing. Use the raw endpoint
-clients when the application needs to control the exact wire representation.
+clients when the application needs a typed Responses, Chat Completions, or
+Messages request rather than the provider-neutral generation builder.
 
 `GenerateRequest` is owned and independent from a client, so it can be
 serialized, transformed, queued, and later sent or bound:
@@ -287,7 +300,7 @@ breaking out of `for await` also closes them. Buffered calls and stream
 startup accept an `AbortSignal`, which cancels the Rust operation rather than
 only abandoning its JavaScript promise.
 
-The raw endpoint namespaces remain available for exact provider wire shapes:
+The raw endpoint namespaces remain available for typed endpoint shapes:
 
 ```ts
 const response = await client.chat.completions.create(
@@ -296,7 +309,6 @@ const response = await client.chat.completions.create(
     messages: [{ role: "user", content: "Hello" }],
   },
   {
-    profile: "work",
     request_id: crypto.randomUUID(),
   },
 );
