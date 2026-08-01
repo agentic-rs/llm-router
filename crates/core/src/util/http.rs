@@ -143,7 +143,6 @@ pub async fn send(
   url: &str,
   mut headers: HeaderMap,
   body: Option<Bytes>,
-  capture: Option<&crate::provider::OutboundCapture>,
   what: &'static str,
 ) -> crate::provider::Result<reqwest::Response> {
   // Strip transport-derived headers before handing off to reqwest:
@@ -166,17 +165,6 @@ pub async fn send(
       stripped_clen,
       "stripped transport headers before reqwest dispatch"
     );
-  }
-  if let (Some(capture), Some(body)) = (capture, body.as_ref()) {
-    let _ = capture.set(crate::db::OutboundSnapshot {
-      method: Some(method.as_str().to_string()),
-      url: Some(url.to_string()),
-      status: None,
-      req_headers: headers.clone(),
-      req_body: body.clone(),
-      resp_headers: HeaderMap::new(),
-      resp_body: Bytes::new(),
-    });
   }
   send_native(client, method, url, headers.into(), body, what).await
 }

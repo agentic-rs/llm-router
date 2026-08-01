@@ -117,16 +117,7 @@ impl DeepSeekProvider {
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    let resp = crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      url.as_str(),
-      headers,
-      Some(body_bytes),
-      ctx.outbound.as_ref(),
-      what,
-    )
-    .await?;
+    let resp = crate::util::http::send(ctx.http, Method::POST, url.as_str(), headers, Some(body_bytes), what).await?;
     Ok(resp)
   }
 }
@@ -192,8 +183,7 @@ impl Provider for DeepSeekProvider {
       },
     )?;
     let url = self.operation_url(&["models"])?;
-    let resp =
-      crate::util::http::send(http, Method::GET, url.as_str(), headers, None, None, "deepseek /models").await?;
+    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, "deepseek /models").await?;
     crate::util::http::read_json(resp, "deepseek /models").await
   }
 

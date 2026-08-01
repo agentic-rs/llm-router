@@ -329,16 +329,7 @@ impl CopilotProvider {
     )?;
     debug!(%url, "POST upstream");
     let body_bytes = ctx.request_body_bytes();
-    let resp = crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      url.as_str(),
-      h,
-      Some(body_bytes),
-      ctx.outbound.as_ref(),
-      what,
-    )
-    .await?;
+    let resp = crate::util::http::send(ctx.http, Method::POST, url.as_str(), h, Some(body_bytes), what).await?;
     debug!(status = %resp.status(), "upstream returned");
     Ok(resp)
   }
@@ -626,7 +617,6 @@ mod tests {
         initiator: "user",
         inbound_headers: &inbound,
         client_headers: None,
-        outbound: None,
         vars: TemplateVars::default(),
         wire_identity: Some(tokn_core::AgentId::CopilotCli),
       })

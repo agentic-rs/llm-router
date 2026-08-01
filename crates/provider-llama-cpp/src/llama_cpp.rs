@@ -150,16 +150,7 @@ impl Provider for LlamaCppProvider {
     )?;
     let url = self.operation_url(&["models"])?;
     debug!(%url, "GET llama.cpp models");
-    let resp = crate::util::http::send(
-      http,
-      Method::GET,
-      url.as_str(),
-      headers,
-      None,
-      None,
-      "llama.cpp /models",
-    )
-    .await?;
+    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, "llama.cpp /models").await?;
     crate::util::http::read_json(resp, "llama.cpp /models").await
   }
 
@@ -189,7 +180,6 @@ impl Provider for LlamaCppProvider {
       url.as_str(),
       headers,
       Some(body_bytes),
-      ctx.outbound.as_ref(),
       "llama.cpp chat",
     )
     .await
@@ -396,7 +386,6 @@ mod tests {
         initiator: "user",
         inbound_headers: &inbound,
         client_headers: None,
-        outbound: None,
         vars: TemplateVars::default(),
         wire_identity: Some(tokn_core::AgentId::Opencode),
       })
@@ -445,7 +434,6 @@ mod tests {
         initiator: "user",
         inbound_headers: &inbound,
         client_headers: None,
-        outbound: None,
         vars: TemplateVars::default(),
         wire_identity: Some(tokn_core::AgentId::Opencode),
       })

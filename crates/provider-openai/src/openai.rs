@@ -85,16 +85,7 @@ impl OpenAiProvider {
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      url.as_str(),
-      headers,
-      Some(body_bytes),
-      ctx.outbound.as_ref(),
-      what,
-    )
-    .await
+    crate::util::http::send(ctx.http, Method::POST, url.as_str(), headers, Some(body_bytes), what).await
   }
 }
 
@@ -157,7 +148,7 @@ impl Provider for OpenAiProvider {
         wire_identity: Some(&tokn_core::AgentId::Opencode),
       },
     )?;
-    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, None, "openai /models").await?;
+    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, "openai /models").await?;
     crate::util::http::read_json(resp, "openai /models").await
   }
 
@@ -356,7 +347,6 @@ mod tests {
         initiator: "user",
         inbound_headers: &inbound,
         client_headers: None,
-        outbound: None,
         vars: TemplateVars::default(),
         wire_identity: Some(tokn_core::AgentId::Opencode),
       })

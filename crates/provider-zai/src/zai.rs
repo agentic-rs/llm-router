@@ -218,7 +218,6 @@ impl Provider for ZaiProvider {
       url.as_str(),
       self.auth_headers(false)?,
       None,
-      None,
       "zai /models",
     )
     .await?;
@@ -282,7 +281,6 @@ impl Provider for ZaiProvider {
       url.as_str(),
       headers,
       Some(body_bytes),
-      ctx.outbound.as_ref(),
       "zai chat",
     )
     .await?;
@@ -305,9 +303,11 @@ impl Provider for ZaiProvider {
 mod tests {
   use super::*;
   use crate::config::Account as AcctCfg;
-  use crate::provider::{new_outbound_capture, Endpoint, RequestCtx, ZAI_PROVIDERS};
+  use crate::provider::{Endpoint, RequestCtx, ZAI_PROVIDERS};
   use crate::TemplateVars;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+  const MAX_TEST_REQUEST_BYTES: usize = 64 * 1024;
 
   fn acct(provider: &str, key: Option<&str>) -> AcctCfg {
     AcctCfg {
@@ -332,6 +332,51 @@ mod tests {
       refresh_url: None,
       last_refresh: None,
       settings: toml::Table::new(),
+    }
+  }
+
+  async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (Vec<u8>, Vec<u8>) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+      let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buffer))
+        .await
+        .expect("request read timed out")
+        .expect("read request");
+      assert!(read > 0, "client closed before sending the complete request");
+      request.extend_from_slice(&buffer[..read]);
+      assert!(
+        request.len() <= MAX_TEST_REQUEST_BYTES,
+        "request exceeded {MAX_TEST_REQUEST_BYTES}-byte test bound"
+      );
+
+      let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        continue;
+      };
+      let body_start = head_end + 4;
+      let head = std::str::from_utf8(&request[..body_start]).expect("request head is UTF-8");
+      let body_len = head
+        .lines()
+        .find_map(|line| {
+          let (name, value) = line.split_once(':')?;
+          name
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().expect("valid content-length"))
+        })
+        .expect("request has content-length");
+      let request_len = body_start
+        .checked_add(body_len)
+        .expect("request length does not overflow");
+      assert!(
+        request_len <= MAX_TEST_REQUEST_BYTES,
+        "declared request length exceeded test bound"
+      );
+      if request.len() >= request_len {
+        return (
+          request[..body_start].to_vec(),
+          request[body_start..request_len].to_vec(),
+        );
+      }
     }
   }
 
@@ -432,18 +477,18 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn captures_transformed_outbound_body() {
+  async fn sends_the_exact_transformed_body() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
       let (mut stream, _) = listener.accept().await.unwrap();
-      let mut buf = vec![0_u8; 8192];
-      let n = stream.read(&mut buf).await.unwrap();
-      assert!(String::from_utf8_lossy(&buf[..n]).contains("POST /chat/completions"));
+      let (head, body) = read_http_request(&mut stream).await;
+      assert!(String::from_utf8_lossy(&head).starts_with("POST /chat/completions HTTP/1.1\r\n"));
       stream
         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
         .await
         .unwrap();
+      body
     });
 
     let mut cfg = acct("zai-coding-plan", Some("sk-test"));
@@ -457,7 +502,6 @@ mod tests {
       )
       .unwrap();
     let inbound = HeaderMap::new();
-    let capture = new_outbound_capture();
     let ctx = RequestCtx {
       endpoint: Endpoint::ChatCompletions,
       http: &http,
@@ -468,19 +512,17 @@ mod tests {
       initiator: "user",
       inbound_headers: &inbound,
       client_headers: None,
-      outbound: Some(capture.clone()),
       vars: TemplateVars::default(),
       wire_identity: Some(tokn_core::AgentId::Opencode),
     };
     let resp = provider.chat(ctx).await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    server.await.unwrap();
-    let captured = capture.get().expect("captured outbound");
-    let captured_body: Value = serde_json::from_slice(captured.req_body.as_ref()).unwrap();
-    assert_eq!(captured.method.as_deref(), Some("POST"));
+    let outbound_body = server.await.unwrap();
+    assert_eq!(outbound_body, serde_json::to_vec(&body).unwrap());
+    let outbound: Value = serde_json::from_slice(&outbound_body).unwrap();
     assert!(
-      captured_body.get("thinking").is_some(),
-      "body was not transformed: {captured_body}"
+      outbound.get("thinking").is_some(),
+      "body was not transformed: {outbound}"
     );
   }
 

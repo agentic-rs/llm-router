@@ -101,16 +101,7 @@ impl CodexProvider {
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      url.as_str(),
-      headers,
-      Some(body_bytes),
-      ctx.outbound.as_ref(),
-      what,
-    )
-    .await
+    crate::util::http::send(ctx.http, Method::POST, url.as_str(), headers, Some(body_bytes), what).await
   }
 }
 
@@ -232,7 +223,7 @@ impl Provider for CodexProvider {
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
     let url = self.models_url()?;
     let headers = self.models_headers()?;
-    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, None, "codex /models").await?;
+    let resp = crate::util::http::send(http, Method::GET, url.as_str(), headers, None, "codex /models").await?;
     let value: Value = crate::util::http::read_json(resp, "codex /models").await?;
     Ok(normalize_models_response(value))
   }

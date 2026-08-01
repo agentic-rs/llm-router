@@ -47,7 +47,6 @@ pub async fn exchange(
     crate::COPILOT_TOKEN_EXCHANGE_URL,
     h,
     None,
-    None,
     "token exchange",
   )
   .await?;
