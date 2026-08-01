@@ -2,6 +2,10 @@ use super::{migrate, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+mod live;
+
+pub use live::UsagePersistenceConsumer;
+
 const BOOTSTRAP: &str = include_str!("../schemas/snapshot/usage/v0.2.1.sql");
 const MIGRATIONS: &[migrate::Migration] = &[
   migrate::Migration {
@@ -62,9 +66,51 @@ impl UsageDb {
     Ok(Self { conn })
   }
 
+  fn record(&mut self, record: &UsageRecord<'_>) -> Result<()> {
+    self.conn.execute(
+      "INSERT OR REPLACE INTO requests (
+         ts,
+         session_id,
+         request_id,
+         project_id,
+         ver,
+         request_error,
+         user,
+         endpoint,
+         account_id,
+         provider_id,
+         model,
+         params_json,
+         usage_json,
+         ctx_json,
+         status
+       ) VALUES (
+         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+       )",
+      params![
+        record.ts,
+        record.session_id,
+        record.request_id,
+        record.project_id,
+        record.version,
+        record.request_error,
+        record.user,
+        record.endpoint,
+        record.account_id,
+        record.provider_id,
+        record.model,
+        record.params_json,
+        record.usage_json,
+        record.context_json,
+        record.status.map(i64::from),
+      ],
+    )?;
+    Ok(())
+  }
+
   pub fn summary(&self, since_ts: i64, account: Option<&str>, provider: Option<&str>) -> Result<Vec<RowSummary>> {
     let mut sql = String::from(
-      "SELECT account_id, provider_id, model,
+      "SELECT COALESCE(account_id, 'unknown'), COALESCE(provider_id, 'unknown'), model,
               json_extract(params_json, '$.initiator') AS initiator,
               COUNT(*) AS n,
               COALESCE(SUM(COALESCE(json_extract(usage_json, '$.input'), 0)),0),
@@ -79,18 +125,18 @@ impl UsageDb {
     let mut bind_provider = false;
     if account.is_some() {
       bind_account = true;
-      sql.push_str(" AND account_id = ?2");
+      sql.push_str(" AND COALESCE(account_id, 'unknown') = ?2");
     }
     if provider.is_some() {
       bind_provider = true;
       sql.push_str(if bind_account {
-        " AND provider_id = ?3"
+        " AND COALESCE(provider_id, 'unknown') = ?3"
       } else {
-        " AND provider_id = ?2"
+        " AND COALESCE(provider_id, 'unknown') = ?2"
       });
     }
     sql.push_str(
-      " GROUP BY account_id, provider_id, model,
+      " GROUP BY COALESCE(account_id, 'unknown'), COALESCE(provider_id, 'unknown'), model,
                json_extract(params_json, '$.initiator')
         ORDER BY n DESC",
     );
@@ -127,6 +173,24 @@ impl UsageDb {
     };
     Ok(rows)
   }
+}
+
+struct UsageRecord<'a> {
+  ts: i64,
+  session_id: Option<&'a str>,
+  request_id: &'a str,
+  project_id: Option<&'a str>,
+  version: &'a str,
+  request_error: Option<&'a str>,
+  user: Option<&'a str>,
+  endpoint: Option<&'a str>,
+  account_id: Option<&'a str>,
+  provider_id: Option<&'a str>,
+  model: &'a str,
+  params_json: Option<&'a str>,
+  usage_json: Option<&'a str>,
+  context_json: Option<&'a str>,
+  status: Option<u16>,
 }
 
 #[derive(Debug)]
