@@ -1,5 +1,7 @@
 use std::path::Path;
-use tokn_config::v2::{compile, decode, load, parse, CompileError, Error};
+use tokn_config::v2::{
+  compile, decode, load, parse, CompileError, Error, DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES,
+};
 use tokn_policy::{ConnectAction, HttpAction, ListenerPlan, RouteKind};
 
 const MINIMAL_MANAGED: &str = r#"
@@ -38,7 +40,8 @@ fn unwrap_compile_error(error: Error) -> Box<CompileError> {
 
 #[test]
 fn minimal_managed_llm_listener_compiles() {
-  let plan = parse(MINIMAL_MANAGED, Path::new("config.toml")).unwrap();
+  let compiled = parse(MINIMAL_MANAGED, Path::new("config.toml")).unwrap();
+  let plan = compiled.gateway();
 
   let listener = plan.listeners().get("api").unwrap();
   assert!(matches!(listener, ListenerPlan::LlmApi(_)));
@@ -48,6 +51,17 @@ fn minimal_managed_llm_listener_compiles() {
   ));
   assert_eq!(plan.routes().get("default").unwrap().kind(), RouteKind::Managed);
   assert_eq!(plan.account_pools().len(), 1);
+  assert_eq!(compiled.service().outbound().proxy_url(), None);
+  assert!(compiled.service().outbound().no_proxy().is_empty());
+  assert!(!compiled.service().outbound().use_system_proxy());
+  assert_eq!(
+    compiled.service().request_limits().max_wire_bytes(),
+    DEFAULT_MAX_WIRE_BYTES as usize
+  );
+  assert_eq!(
+    compiled.service().request_limits().max_decoded_bytes(),
+    DEFAULT_MAX_DECODED_BYTES as usize
+  );
 }
 
 #[test]
@@ -94,7 +108,8 @@ ports = [443]
   )
   .unwrap();
 
-  let plan = load(&path).unwrap();
+  let compiled = load(&path).unwrap();
+  let plan = compiled.gateway();
   let ListenerPlan::ForwardProxy(proxy) = plan.listeners().get("proxy").unwrap() else {
     panic!("expected a forward proxy listener");
   };
@@ -116,6 +131,94 @@ ports = [443]
 
   let expected_ca_dir = directory.path().join("certificates");
   assert_eq!(proxy.tls().unwrap().ca_dir(), expected_ca_dir.as_path());
+}
+
+#[test]
+fn service_settings_compile_and_normalize_no_proxy_entries() {
+  let config = MINIMAL_MANAGED.replacen(
+    "[listeners.api]",
+    r#"[service.outbound]
+proxy_url = "socks5h://proxy.example:1080"
+no_proxy = [" localhost ", "localhost", "", " 10.0.0.0/8 "]
+
+[service.request_limits]
+max_wire_bytes = 1048576
+max_decoded_bytes = 4194304
+
+[listeners.api]"#,
+    1,
+  );
+
+  let compiled = parse(&config, Path::new("config.toml")).unwrap();
+  let outbound = compiled.service().outbound();
+
+  assert_eq!(outbound.proxy_url(), Some("socks5h://proxy.example:1080"));
+  assert_eq!(outbound.no_proxy(), ["localhost", "10.0.0.0/8"]);
+  assert!(!outbound.use_system_proxy());
+  assert_eq!(compiled.service().request_limits().max_wire_bytes(), 1_048_576);
+  assert_eq!(compiled.service().request_limits().max_decoded_bytes(), 4_194_304);
+}
+
+#[test]
+fn service_accepts_system_proxy_without_explicit_proxy_settings() {
+  let config = MINIMAL_MANAGED.replacen(
+    "[listeners.api]",
+    "[service.outbound]\nuse_system_proxy = true\n\n[listeners.api]",
+    1,
+  );
+
+  let compiled = parse(&config, Path::new("config.toml")).unwrap();
+  let outbound = compiled.service().outbound();
+  let options = outbound.to_http_client_options();
+
+  assert_eq!(outbound.proxy_url(), None);
+  assert!(outbound.no_proxy().is_empty());
+  assert!(outbound.use_system_proxy());
+  assert_eq!(options.url, None);
+  assert!(options.no_proxy.is_empty());
+  assert!(options.system);
+}
+
+#[test]
+fn service_outbound_rejects_unsupported_or_conflicting_proxy_settings() {
+  for (settings, location) in [
+    ("proxy_url = \"ftp://proxy.example\"", "service.outbound.proxy_url"),
+    (
+      "proxy_url = \"http://proxy.example\"\nuse_system_proxy = true",
+      "service.outbound",
+    ),
+    ("no_proxy = [\"localhost\"]", "service.outbound.no_proxy"),
+  ] {
+    let config = MINIMAL_MANAGED.replacen(
+      "[listeners.api]",
+      &format!("[service.outbound]\n{settings}\n\n[listeners.api]"),
+      1,
+    );
+
+    let error = unwrap_compile_error(parse(&config, Path::new("config.toml")).unwrap_err());
+    assert!(matches!(
+      *error,
+      CompileError::InvalidValue { location: actual, .. } if actual == location
+    ));
+  }
+}
+
+#[test]
+fn service_request_limits_reject_zero() {
+  for field in ["max_wire_bytes", "max_decoded_bytes"] {
+    let config = MINIMAL_MANAGED.replacen(
+      "[listeners.api]",
+      &format!("[service.request_limits]\n{field} = 0\n\n[listeners.api]"),
+      1,
+    );
+
+    let error = unwrap_compile_error(parse(&config, Path::new("config.toml")).unwrap_err());
+    assert!(matches!(
+      *error,
+      CompileError::InvalidValue { location, .. }
+        if location == format!("service.request_limits.{field}")
+    ));
+  }
 }
 
 #[test]
@@ -150,6 +253,18 @@ fn parse_rejects_unknown_fields() {
     parse(&config, Path::new("config.toml")),
     Err(Error::Parse { .. })
   ));
+
+  for section in ["service", "service.outbound", "service.request_limits"] {
+    let config = MINIMAL_MANAGED.replacen(
+      "[listeners.api]",
+      &format!("[{section}]\nunknown = true\n\n[listeners.api]"),
+      1,
+    );
+    assert!(matches!(
+      parse(&config, Path::new("config.toml")),
+      Err(Error::Parse { .. })
+    ));
+  }
 }
 
 #[test]
@@ -175,7 +290,7 @@ default_http_action = { kind = "reject" }
 
 #[test]
 fn tunnel_and_reject_only_proxy_needs_no_resource_registries() {
-  let plan = parse(
+  let compiled = parse(
     r#"
 schema_version = 2
 
@@ -201,6 +316,7 @@ hosts = ["*.internal.example"]
     Path::new("config.toml"),
   )
   .unwrap();
+  let plan = compiled.gateway();
 
   assert!(plan.profiles().is_empty());
   assert!(plan.routes().is_empty());

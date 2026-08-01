@@ -80,17 +80,18 @@ upstream = "selected"
     decoy_server.base_url(),
     selected_server.base_url(),
   );
-  let plan = tokn_config::v2::parse(&config, Path::new("managed-execution.toml")).unwrap();
+  let compiled = tokn_config::v2::parse(&config, Path::new("managed-execution.toml")).unwrap();
+  let plan = compiled.gateway();
   let accounts = [
     llama_account("decoy-account", "decoy-key"),
     llama_account("selected-account", "selected-key"),
   ];
   let registry = Registry::builtin();
-  let providers = link_provider_graph(&plan, &accounts, &registry).unwrap();
-  let pools = link_account_pools(&plan, &providers, &registry).unwrap();
+  let providers = link_provider_graph(plan, &accounts, &registry).unwrap();
+  let pools = link_account_pools(plan, &providers, &registry).unwrap();
   let runtimes = build_account_pool_runtimes(&pools);
   let reachable = plan.routes().keys().cloned().collect::<BTreeSet<_>>();
-  let linked_routes = link_routes(&plan, &reachable, &providers, &runtimes).unwrap();
+  let linked_routes = link_routes(plan, &reachable, &providers, &runtimes).unwrap();
   let (_, linked_route) = linked_routes.routes().next().expect("one linked route");
   let LinkedRouteKind::Managed(managed_route) = linked_route.kind() else {
     panic!("expected a managed route");
@@ -228,14 +229,15 @@ accounts = ["codex-account"]
 "#,
     server.base_url(),
   );
-  let plan = tokn_config::v2::parse(&config, Path::new("managed-codex-execution.toml")).unwrap();
+  let compiled = tokn_config::v2::parse(&config, Path::new("managed-codex-execution.toml")).unwrap();
+  let plan = compiled.gateway();
   let accounts = [codex_account("codex-account", "codex-token", "codex-provider-account")];
   let registry = Registry::builtin();
-  let providers = link_provider_graph(&plan, &accounts, &registry).unwrap();
-  let pools = link_account_pools(&plan, &providers, &registry).unwrap();
+  let providers = link_provider_graph(plan, &accounts, &registry).unwrap();
+  let pools = link_account_pools(plan, &providers, &registry).unwrap();
   let runtimes = build_account_pool_runtimes(&pools);
   let reachable = plan.routes().keys().cloned().collect::<BTreeSet<_>>();
-  let linked_routes = link_routes(&plan, &reachable, &providers, &runtimes).unwrap();
+  let linked_routes = link_routes(plan, &reachable, &providers, &runtimes).unwrap();
   let (_, linked_route) = linked_routes.routes().next().expect("one linked route");
   let LinkedRouteKind::Managed(managed_route) = linked_route.kind() else {
     panic!("expected a managed route");

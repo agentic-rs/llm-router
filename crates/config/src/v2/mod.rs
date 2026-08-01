@@ -5,21 +5,23 @@
 //! migration command are complete.
 
 mod compile;
+mod compiled;
 mod error;
 mod raw;
 
 use std::path::Path;
-use tokn_policy::GatewayPlan;
 
 use crate::schema::{ConfigSchema, SchemaMarkerError};
 
+pub use compiled::{CompiledConfig, OutboundPlan, RequestLimitsPlan, ServicePlan};
 pub use error::{CompileError, Error, Result};
-pub use raw::SCHEMA_VERSION;
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
-  RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawPoolStrategy,
-  RawProfile, RawQualificationNamespace, RawRelayTarget, RawRoute, RawUpstream, RawUpstreamSelector, RawWireIdentity,
+  RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawOutbound,
+  RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget, RawRequestLimits, RawRoute, RawService,
+  RawUpstream, RawUpstreamSelector, RawWireIdentity,
 };
+pub use raw::{DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, SCHEMA_VERSION};
 
 /// Decode a version 2 document without compiling references.
 ///
@@ -75,7 +77,7 @@ pub fn load_raw(path: &Path) -> Result<RawConfig> {
 /// within the document are rejected. A separate runtime linker resolves
 /// provider catalogue defaults and runtime/plugin-owned names; it must also
 /// succeed before any listener starts.
-pub fn compile(raw: &RawConfig, source: &Path) -> Result<GatewayPlan> {
+pub fn compile(raw: &RawConfig, source: &Path) -> Result<CompiledConfig> {
   if raw.schema_version != SCHEMA_VERSION {
     return Err(Error::UnsupportedSchemaVersion {
       path: source.to_path_buf(),
@@ -83,14 +85,14 @@ pub fn compile(raw: &RawConfig, source: &Path) -> Result<GatewayPlan> {
     });
   }
 
-  compile::compile_plan(raw, source).map_err(|source_error| Error::Compile {
+  compile::compile_config(raw, source).map_err(|source_error| Error::Compile {
     path: source.to_path_buf(),
     source: Box::new(source_error),
   })
 }
 
 /// Strictly decode and semantically compile a version 2 document.
-pub fn parse(contents: &str, source: &Path) -> Result<GatewayPlan> {
+pub fn parse(contents: &str, source: &Path) -> Result<CompiledConfig> {
   let raw = decode(contents, source)?;
   compile(&raw, source)
 }
@@ -98,7 +100,7 @@ pub fn parse(contents: &str, source: &Path) -> Result<GatewayPlan> {
 /// Read, strictly decode, and semantically compile a version 2 document.
 ///
 /// Unlike the legacy loader, a missing file is always an error.
-pub fn load(path: &Path) -> Result<GatewayPlan> {
+pub fn load(path: &Path) -> Result<CompiledConfig> {
   let raw = load_raw(path)?;
   compile(&raw, path)
 }

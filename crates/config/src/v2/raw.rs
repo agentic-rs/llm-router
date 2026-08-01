@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
+pub const DEFAULT_MAX_WIRE_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_DECODED_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The complete on-disk version 2 configuration.
 ///
@@ -19,6 +21,8 @@ pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
   pub schema_version: u32,
+  #[serde(default)]
+  pub service: RawService,
   #[serde(default)]
   pub listeners: BTreeMap<String, RawListener>,
   /// Bindings are evaluated in source order. A map would silently destroy
@@ -40,6 +44,56 @@ pub struct RawConfig {
   /// Each group value is directly an ordered list of fallback candidates.
   #[serde(default)]
   pub model_groups: BTreeMap<String, Vec<RawModelCandidate>>,
+}
+
+/// Process-wide settings consumed while constructing one serving generation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawService {
+  #[serde(default)]
+  pub outbound: RawOutbound,
+  #[serde(default)]
+  pub request_limits: RawRequestLimits,
+}
+
+/// Shared outbound proxy settings for every client family.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawOutbound {
+  #[serde(default)]
+  pub proxy_url: Option<String>,
+  #[serde(default)]
+  pub no_proxy: Vec<String>,
+  #[serde(default)]
+  pub use_system_proxy: bool,
+}
+
+/// Independent request bounds. Equal conservative defaults cap per-request
+/// memory and prevent compressed input from expanding beyond the same budget.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRequestLimits {
+  #[serde(default = "default_max_wire_bytes")]
+  pub max_wire_bytes: u64,
+  #[serde(default = "default_max_decoded_bytes")]
+  pub max_decoded_bytes: u64,
+}
+
+impl Default for RawRequestLimits {
+  fn default() -> Self {
+    Self {
+      max_wire_bytes: default_max_wire_bytes(),
+      max_decoded_bytes: default_max_decoded_bytes(),
+    }
+  }
+}
+
+const fn default_max_wire_bytes() -> u64 {
+  DEFAULT_MAX_WIRE_BYTES
+}
+
+const fn default_max_decoded_bytes() -> u64 {
+  DEFAULT_MAX_DECODED_BYTES
 }
 
 /// A network ingress and its listener-level fallback behavior.
