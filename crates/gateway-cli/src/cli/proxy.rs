@@ -1,17 +1,22 @@
-use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use tokn_policy::{ForwardProxyListenerPlan, GatewayPlan, ListenerPlan};
 
 const DEFAULT_CLIENT_NO_PROXY: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 #[derive(Args, Debug)]
 pub struct ProxyArgs {
+  /// Compiled forward-proxy listener id. Required when more than one exists.
+  #[arg(long, global = true)]
+  pub listener: Option<String>,
+
   #[command(subcommand)]
   pub cmd: ProxyCmd,
 }
@@ -104,12 +109,13 @@ pub enum Shell {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ProxyArgs) -> Result<()> {
+  let listener = resolve_proxy_listener(cfg_path.as_deref(), args.listener.as_deref())?;
   match args.cmd {
-    ProxyCmd::Env(args) => env(cfg_path, args).await,
-    ProxyCmd::Shell(args) => shell(cfg_path, args).await,
+    ProxyCmd::Env(args) => env(&listener, args).await,
+    ProxyCmd::Shell(args) => shell(&listener, args).await,
     ProxyCmd::Run(args) => {
       agent(
-        cfg_path,
+        &listener,
         args.agent,
         AgentProxyArgs {
           npx: args.npx,
@@ -118,16 +124,16 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ProxyArgs) -> Result<()> {
       )
       .await
     }
-    ProxyCmd::Exec(args) => exec(cfg_path, args).await,
-    ProxyCmd::Codex(args) => agent(cfg_path, AgentKind::Codex, args).await,
-    ProxyCmd::Opencode(args) => agent(cfg_path, AgentKind::Opencode, args).await,
-    ProxyCmd::Pi(args) => agent(cfg_path, AgentKind::Pi, args).await,
-    ProxyCmd::Ca(args) => ca(cfg_path, args).await,
+    ProxyCmd::Exec(args) => exec(&listener, args).await,
+    ProxyCmd::Codex(args) => agent(&listener, AgentKind::Codex, args).await,
+    ProxyCmd::Opencode(args) => agent(&listener, AgentKind::Opencode, args).await,
+    ProxyCmd::Pi(args) => agent(&listener, AgentKind::Pi, args).await,
+    ProxyCmd::Ca(args) => ca(&listener, args).await,
   }
 }
 
-async fn env(cfg_path: Option<PathBuf>, args: EnvArgs) -> Result<()> {
-  let env = resolved_proxy_env(cfg_path.as_deref())?;
+async fn env(listener: &ProxyListenerConfig, args: EnvArgs) -> Result<()> {
+  let env = resolved_proxy_env(listener)?;
   match args.shell {
     Shell::Sh | Shell::Bash | Shell::Zsh => print_sh(&env),
     Shell::Fish => print_fish(&env),
@@ -136,8 +142,8 @@ async fn env(cfg_path: Option<PathBuf>, args: EnvArgs) -> Result<()> {
   Ok(())
 }
 
-async fn shell(cfg_path: Option<PathBuf>, args: ShellArgs) -> Result<()> {
-  let env = resolved_proxy_env(cfg_path.as_deref())?;
+async fn shell(listener: &ProxyListenerConfig, args: ShellArgs) -> Result<()> {
+  let env = resolved_proxy_env(listener)?;
   let shell = detect_shell(args.shell.as_deref())?;
   println!("Entering proxy shell: {}", shell.path.display());
   println!("HTTPS_PROXY={}", env.get("HTTPS_PROXY").unwrap_or(""));
@@ -155,14 +161,14 @@ async fn shell(cfg_path: Option<PathBuf>, args: ShellArgs) -> Result<()> {
   Ok(())
 }
 
-async fn agent(cfg_path: Option<PathBuf>, kind: AgentKind, args: AgentProxyArgs) -> Result<()> {
-  let env = resolved_proxy_env(cfg_path.as_deref())?;
+async fn agent(listener: &ProxyListenerConfig, kind: AgentKind, args: AgentProxyArgs) -> Result<()> {
+  let env = resolved_proxy_env(listener)?;
   let spec = agent_command_spec(kind, args.npx, args.args);
   run_with_proxy_env(kind.name(), &env, spec)
 }
 
-async fn exec(cfg_path: Option<PathBuf>, args: ExecArgs) -> Result<()> {
-  let env = resolved_proxy_env(cfg_path.as_deref())?;
+async fn exec(listener: &ProxyListenerConfig, args: ExecArgs) -> Result<()> {
+  let env = resolved_proxy_env(listener)?;
   let spec = CommandSpec::from_argv(args.command)?;
   run_with_proxy_env("command", &env, spec)
 }
@@ -182,23 +188,27 @@ fn run_with_proxy_env(label: &str, env: &ProxyEnv, spec: CommandSpec) -> Result<
   Ok(())
 }
 
-async fn ca(cfg_path: Option<PathBuf>, args: CaArgs) -> Result<()> {
-  let (cfg, _) = Config::load(cfg_path.as_deref())?;
-  let ca_dir = cfg.proxy_mode.resolved_ca_dir()?;
+async fn ca(listener: &ProxyListenerConfig, args: CaArgs) -> Result<()> {
+  let ca_dir = listener.ca_dir.as_deref().with_context(|| {
+    format!(
+      "forward-proxy listener '{}' has no interception CA; configure ca_dir and at least one intercept action",
+      listener.id
+    )
+  })?;
   match args.cmd {
     CaCmd::Path => {
-      let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, false)?;
+      let ca = tokn_router::runtime::load_or_generate_ca(ca_dir, false)?;
       println!("{}", ca.cert_path().display());
     }
     CaCmd::Show => {
-      let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, false)?;
+      let ca = tokn_router::runtime::load_or_generate_ca(ca_dir, false)?;
       println!("cert: {}", ca.cert_path().display());
       println!("bundle: {}", ca.ensure_bundle()?.display());
       println!("key: {}", ca.key_path().display());
       println!("sha256: {}", ca.fingerprint_sha256());
     }
     CaCmd::Regenerate => {
-      let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, true)?;
+      let ca = tokn_router::runtime::load_or_generate_ca(ca_dir, true)?;
       println!("regenerated CA at {}", ca.cert_path().display());
       println!("sha256: {}", ca.fingerprint_sha256());
     }
@@ -224,27 +234,105 @@ fn print_pwsh(env: &ProxyEnv) {
   }
 }
 
-fn resolved_proxy_env(cfg_path: Option<&Path>) -> Result<ProxyEnv> {
-  let (cfg, _) = Config::load(cfg_path)?;
-  let ca_dir = cfg.proxy_mode.resolved_ca_dir()?;
-  let ca = tokn_router::runtime::load_or_generate_ca(&ca_dir, false)?;
-  let proxy_url = format!("http://{}:{}", cfg.proxy_mode.host, cfg.proxy_mode.port);
-  let cert = ca.cert_path().display().to_string();
-  let bundle = ca.ensure_bundle()?.display().to_string();
-  let no_proxy = client_no_proxy_value(&cfg.proxy.no_proxy);
-  Ok(ProxyEnv {
-    vars: vec![
-      ("HTTPS_PROXY".into(), proxy_url.clone()),
-      ("HTTP_PROXY".into(), proxy_url),
-      ("NO_PROXY".into(), no_proxy),
+fn resolved_proxy_env(listener: &ProxyListenerConfig) -> Result<ProxyEnv> {
+  let proxy_url = format!("http://{}", listener.client_addr);
+  let mut vars = vec![
+    ("HTTPS_PROXY".into(), proxy_url.clone()),
+    ("HTTP_PROXY".into(), proxy_url),
+    ("NO_PROXY".into(), client_no_proxy_value(&listener.no_proxy)),
+  ];
+  if let Some(ca_dir) = &listener.ca_dir {
+    let ca = tokn_router::runtime::load_or_generate_ca(ca_dir, false)?;
+    let cert = ca.cert_path().display().to_string();
+    let bundle = ca.ensure_bundle()?.display().to_string();
+    vars.extend([
       ("SSL_CERT_FILE".into(), bundle.clone()),
       ("NODE_EXTRA_CA_CERTS".into(), cert),
       ("CODEX_CA_CERTIFICATE".into(), bundle.clone()),
       ("REQUESTS_CA_BUNDLE".into(), bundle.clone()),
       ("CURL_CA_BUNDLE".into(), bundle.clone()),
       ("GIT_SSL_CAINFO".into(), bundle),
-    ],
-  })
+    ]);
+  }
+  Ok(ProxyEnv { vars })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProxyListenerConfig {
+  id: String,
+  client_addr: SocketAddr,
+  ca_dir: Option<PathBuf>,
+  no_proxy: Vec<String>,
+}
+
+fn resolve_proxy_listener(config_path: Option<&Path>, requested_listener: Option<&str>) -> Result<ProxyListenerConfig> {
+  let config_path = match config_path {
+    Some(path) => path.to_path_buf(),
+    None => tokn_config::paths::config_path().context("resolve the default gateway config path")?,
+  };
+  let compiled = tokn_config::v2::load(&config_path)
+    .with_context(|| format!("load compiled gateway config `{}`", config_path.display()))?;
+  select_proxy_listener(
+    compiled.gateway(),
+    requested_listener,
+    compiled.service().outbound().no_proxy(),
+  )
+}
+
+fn select_proxy_listener(
+  gateway: &GatewayPlan,
+  requested_listener: Option<&str>,
+  no_proxy: &[String],
+) -> Result<ProxyListenerConfig> {
+  let selected = if let Some(requested) = requested_listener {
+    let (id, listener) = gateway
+      .listeners()
+      .iter()
+      .find(|(id, _)| id.as_str() == requested)
+      .with_context(|| format!("compiled config has no listener named '{requested}'"))?;
+    let ListenerPlan::ForwardProxy(listener) = listener else {
+      anyhow::bail!("listener '{requested}' is not a forward_proxy listener");
+    };
+    (id, listener)
+  } else {
+    let mut candidates = gateway.listeners().iter().filter_map(|(id, listener)| match listener {
+      ListenerPlan::ForwardProxy(listener) => Some((id, listener)),
+      ListenerPlan::LlmApi(_) => None,
+    });
+    let first = candidates
+      .next()
+      .context("compiled config has no forward_proxy listener")?;
+    let remaining = candidates.map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+    if !remaining.is_empty() {
+      let mut ids = vec![first.0.as_str()];
+      ids.extend(remaining);
+      anyhow::bail!(
+        "compiled config has multiple forward_proxy listeners ({}); select one with --listener",
+        ids.join(", ")
+      );
+    }
+    first
+  };
+
+  Ok(proxy_listener_config(selected.0.as_str(), selected.1, no_proxy))
+}
+
+fn proxy_listener_config(id: &str, listener: &ForwardProxyListenerPlan, no_proxy: &[String]) -> ProxyListenerConfig {
+  ProxyListenerConfig {
+    id: id.to_string(),
+    client_addr: client_proxy_addr(listener.bind()),
+    ca_dir: listener.tls().map(|tls| tls.ca_dir().to_path_buf()),
+    no_proxy: no_proxy.to_vec(),
+  }
+}
+
+fn client_proxy_addr(bind: SocketAddr) -> SocketAddr {
+  let ip = match bind.ip() {
+    IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ip => ip,
+  };
+  SocketAddr::new(ip, bind.port())
 }
 
 fn client_no_proxy_value(configured: &[String]) -> String {
@@ -397,6 +485,97 @@ mod tests {
   use crate::cli::{Cli, Cmd};
   use clap::Parser;
 
+  fn compiled(source: &str) -> tokn_config::v2::CompiledConfig {
+    tokn_config::v2::parse(source, Path::new("/tmp/proxy-helper.toml")).unwrap()
+  }
+
+  #[test]
+  fn sole_compiled_proxy_is_selected_and_wildcard_bind_becomes_loopback() {
+    let compiled = compiled(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "0.0.0.0:4142"
+client_auth = "local_keys"
+allow_insecure_public = true
+default_http_action = { kind = "reject" }
+default_connect = "intercept"
+ca_dir = "ca"
+"#,
+    );
+    let selected = select_proxy_listener(compiled.gateway(), None, &["internal.example".into()]).unwrap();
+
+    assert_eq!(selected.id, "proxy");
+    assert_eq!(selected.client_addr, "127.0.0.1:4142".parse().unwrap());
+    assert_eq!(selected.ca_dir, Some(PathBuf::from("/tmp/ca")));
+    assert_eq!(selected.no_proxy, ["internal.example"]);
+  }
+
+  #[test]
+  fn multiple_compiled_proxies_require_an_explicit_listener() {
+    let compiled = compiled(
+      r#"
+schema_version = 2
+
+[listeners.alpha]
+kind = "forward_proxy"
+bind = "127.0.0.1:4142"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+default_connect = "tunnel"
+
+[listeners.beta]
+kind = "forward_proxy"
+bind = "[::]:4242"
+client_auth = "local_keys"
+allow_insecure_public = true
+default_http_action = { kind = "reject" }
+default_connect = "tunnel"
+"#,
+    );
+
+    let error = select_proxy_listener(compiled.gateway(), None, &[]).unwrap_err();
+    assert!(error.to_string().contains("alpha, beta"));
+    let selected = select_proxy_listener(compiled.gateway(), Some("beta"), &[]).unwrap();
+    assert_eq!(selected.client_addr, "[::1]:4242".parse().unwrap());
+    assert!(selected.ca_dir.is_none());
+    let env = resolved_proxy_env(&selected).unwrap();
+    assert_eq!(env.get("HTTPS_PROXY"), Some("http://[::1]:4242"));
+    assert_eq!(env.get("SSL_CERT_FILE"), None);
+  }
+
+  #[test]
+  fn explicit_listener_must_exist_and_be_a_forward_proxy() {
+    let compiled = compiled(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+"#,
+    );
+
+    assert!(select_proxy_listener(compiled.gateway(), Some("missing"), &[])
+      .unwrap_err()
+      .to_string()
+      .contains("no listener named 'missing'"));
+    assert!(select_proxy_listener(compiled.gateway(), Some("api"), &[])
+      .unwrap_err()
+      .to_string()
+      .contains("is not a forward_proxy"));
+  }
+
   #[test]
   fn client_no_proxy_includes_configured_entries() {
     let configured = vec!["internal.local".into(), "10.0.0.0/8".into()];
@@ -522,6 +701,8 @@ mod tests {
     let cli = Cli::try_parse_from([
       "tokn-router",
       "proxy",
+      "--listener",
+      "proxy-b",
       "run",
       "--npx",
       "pi",
@@ -535,6 +716,7 @@ mod tests {
     let Cmd::Proxy(proxy) = cli.cmd else {
       panic!("expected proxy command");
     };
+    assert_eq!(proxy.listener.as_deref(), Some("proxy-b"));
     let ProxyCmd::Run(args) = proxy.cmd else {
       panic!("expected proxy run command");
     };

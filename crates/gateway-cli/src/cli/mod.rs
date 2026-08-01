@@ -82,6 +82,17 @@ impl Cli {
       return serve::run(cfg_path).await.map_err(Error::from);
     }
 
+    // Proxy client helpers derive their endpoint and interception CA directly
+    // from the compiled listener graph. Keep legacy home migration and
+    // partial Config loading out of this path as well.
+    if matches!(&self.cmd, Cmd::Proxy(_)) {
+      logging::init_basic();
+      let Cmd::Proxy(args) = self.cmd else {
+        unreachable!("the proxy predicate only matches proxy commands")
+      };
+      return proxy::run(cfg_path, args).await.map_err(Error::from);
+    }
+
     // Config migration must observe legacy files exactly as they are. In
     // particular, do not extract embedded accounts or initialize configured
     // logging before its read-only planner runs.
@@ -122,7 +133,7 @@ impl Cli {
       Cmd::ApiKey(c) => api_key::run(c).await,
       Cmd::Headers(a) => headers::run(cfg_path, a).await,
       Cmd::Serve => unreachable!("the v2 serve command is dispatched before legacy CLI setup"),
-      Cmd::Proxy(a) => proxy::run(cfg_path, a).await,
+      Cmd::Proxy(_) => unreachable!("proxy helpers are dispatched before legacy CLI setup"),
       Cmd::Usage(a) => usage::run(cfg_path, a).await,
       Cmd::Inspect(a) => inspect::run(cfg_path, a).await,
       Cmd::Sessions(c) => sessions::run(c).await,
@@ -156,7 +167,6 @@ fn run_mode_for(cmd: &Cmd) -> RunMode {
   use account::AccountCmd;
   use config_cmd::ConfigCmd::*;
   match cmd {
-    Cmd::Proxy(_) => RunMode::Server,
     Cmd::Inspect(_) => RunMode::ReadOnlyCli,
     Cmd::Update(_) | Cmd::Migration(_) => RunMode::MutatingCli,
     Cmd::Sessions(_) => RunMode::MutatingCli,

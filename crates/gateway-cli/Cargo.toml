@@ -21,6 +21,7 @@ path = "src/main.rs"
 tokn-accounts = { workspace = true }
 tokn-core = { workspace = true }
 tokn-config = { workspace = true }
+tokn-policy = { workspace = true }
 tokn-router-legacy-config = { workspace = true }
 tokn-agent-migration = { workspace = true }
 tokn-catalogue = { workspace = true }
