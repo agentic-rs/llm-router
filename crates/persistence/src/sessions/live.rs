@@ -500,7 +500,7 @@ impl PendingSession {
         }
       }
       BodyLeg::Downstream => {
-        self.require_http(request_id, "downstream body progress")?;
+        self.allow_downstream_response_boundary(request_id, "downstream body progress")?;
         if self.downstream_body_observed {
           return Err(SessionWriteError::lifecycle(
             request_id,
@@ -533,7 +533,7 @@ impl PendingSession {
         attempt_state.upstream_body_observed = true;
       }
       BodyLeg::Downstream => {
-        self.require_http(request_id, "downstream body completion")?;
+        self.allow_downstream_response_boundary(request_id, "downstream body completion")?;
         if self.downstream_body_observed {
           return Err(SessionWriteError::lifecycle(
             request_id,
@@ -549,7 +549,7 @@ impl PendingSession {
   }
 
   fn observe_downstream_head(&mut self, request_id: &RequestId, response: &HttpResponseHead) -> SessionWriteResult {
-    self.require_http(request_id, "downstream response head")?;
+    self.allow_downstream_response_boundary(request_id, "downstream response head")?;
     if self.downstream_status.is_some() {
       return Err(SessionWriteError::lifecycle(
         request_id,
@@ -557,6 +557,26 @@ impl PendingSession {
       ));
     }
     self.downstream_status = Some(response.status);
+    Ok(())
+  }
+
+  /// Accept a normal HTTP response or the rejection response for a CONNECT
+  /// request that failed before it became ready.
+  ///
+  /// A pre-ready CONNECT remains a CONNECT lifecycle: changing it to `Http`
+  /// would lose the ingress identity and weaken terminal validation. Once the
+  /// tunnel is ready (or closed), HTTP response facts are no longer valid.
+  fn allow_downstream_response_boundary(&mut self, request_id: &RequestId, boundary: &str) -> SessionWriteResult {
+    match self.transport {
+      TransportState::Unknown => self.transport = TransportState::Http,
+      TransportState::Http | TransportState::Connect(ConnectState::Admitted) => {}
+      TransportState::Connect(ConnectState::Ready(_) | ConnectState::Closed(_)) => {
+        return Err(SessionWriteError::lifecycle(
+          request_id,
+          format!("{boundary} followed a CONNECT lifecycle"),
+        ));
+      }
+    }
     Ok(())
   }
 
@@ -1943,6 +1963,118 @@ mod tests {
     assert!(error
       .to_string()
       .contains("CONNECT became ready after a non-CONNECT policy"));
+  }
+
+  #[test]
+  fn admitted_connect_accepts_pre_ready_rejection_response_and_preserves_identity() {
+    let mut harness = Harness::new(
+      "request-connect-pre-ready-rejection",
+      Correlation {
+        session_id: Some("session-connect-pre-ready-rejection".into()),
+        ..Correlation::default()
+      },
+    );
+    harness.admit_connect("example.com:443");
+    harness.emit(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+      status: 400,
+      headers: CapturedHeaders::default(),
+    }));
+    harness.emit(TrafficEventKind::BodyProgress(BodyProgress {
+      leg: BodyLeg::Downstream,
+      bytes_seen: 26,
+      chunks: 1,
+    }));
+    harness.emit(TrafficEventKind::BodyFinished(BodyFinished {
+      leg: BodyLeg::Downstream,
+      capture: BodyCapture::Complete(Bytes::from_static(br#"{"error":"invalid request"}"#)),
+      result: BodyResult::Complete,
+    }));
+
+    let pending = &harness.consumer.pending[&harness.request_id];
+    assert_eq!(pending.transport, TransportState::Connect(ConnectState::Admitted));
+    assert_eq!(pending.downstream_status, Some(400));
+    assert!(pending.downstream_body_progress_observed);
+    assert!(pending.downstream_body_observed);
+
+    harness.finish(RequestOutcome::Rejected, Some(400), 0);
+    assert!(harness.consumer.pending.is_empty());
+    assert_eq!(session_node_count(&harness.consumer), 0);
+  }
+
+  #[test]
+  fn selected_connect_reject_accepts_pre_ready_response() {
+    let mut harness = Harness::new(
+      "request-connect-policy-rejection",
+      Correlation {
+        session_id: Some("session-connect-policy-rejection".into()),
+        ..Correlation::default()
+      },
+    );
+    harness.admit_connect("example.com:443");
+    harness.select_connect(ConnectAction::Reject);
+    harness.emit(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+      status: 403,
+      headers: CapturedHeaders::default(),
+    }));
+    harness.emit(TrafficEventKind::BodyFinished(BodyFinished {
+      leg: BodyLeg::Downstream,
+      capture: BodyCapture::Complete(Bytes::from_static(br#"{"error":"forbidden"}"#)),
+      result: BodyResult::Complete,
+    }));
+
+    assert_eq!(
+      harness.consumer.pending[&harness.request_id].transport,
+      TransportState::Connect(ConnectState::Admitted)
+    );
+    harness.finish(RequestOutcome::Rejected, Some(403), 0);
+    assert!(harness.consumer.pending.is_empty());
+    assert_eq!(session_node_count(&harness.consumer), 0);
+  }
+
+  #[test]
+  fn pre_ready_connect_response_blocks_ready_and_delivered_terminal() {
+    let mut ready = Harness::new(
+      "request-connect-response-before-ready",
+      Correlation {
+        session_id: Some("session-connect-response-before-ready".into()),
+        ..Correlation::default()
+      },
+    );
+    ready.admit_connect("example.com:443");
+    ready.select_connect(ConnectAction::Tunnel);
+    ready.emit(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+      status: 502,
+      headers: CapturedHeaders::default(),
+    }));
+    let error = ready
+      .emit_result(TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "example.com:443".into(),
+      }))
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("CONNECT became ready after an HTTP response boundary"));
+
+    let mut delivered = Harness::new(
+      "request-connect-delivered-before-ready",
+      Correlation {
+        session_id: Some("session-connect-delivered-before-ready".into()),
+        ..Correlation::default()
+      },
+    );
+    delivered.admit_connect("example.com:443");
+    delivered.emit(TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+      status: 400,
+      headers: CapturedHeaders::default(),
+    }));
+    let error = delivered
+      .finish_result(RequestOutcome::Delivered, Some(400), 0)
+      .unwrap_err();
+    assert!(error
+      .to_string()
+      .contains("CONNECT was delivered before it became ready and closed"));
+    assert!(delivered.consumer.pending.contains_key(&delivered.request_id));
   }
 
   #[test]
