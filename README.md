@@ -129,12 +129,13 @@ tokn-gateway api-key list
 tokn-gateway api-key revoke KEY_ID
 ```
 
-Enabling authentication with no active keys fails closed. Gateway credentials
-are removed before managed upstream dispatch. Effective `passthrough` mode is
-the exception: it bypasses API-key authentication and the authentication layer
-does not remove `Authorization` or `x-api-key`. Raw CONNECT tunnels and hosts in
-`proxy_mode.passthrough_hosts` cannot be inspected, so they are also left
-untouched and unauthenticated.
+Enabling authentication with no active keys fails closed. An authenticated
+`llm_api` listener consumes its gateway credential from `Authorization` or
+`x-api-key` before dispatch. A `forward_proxy` listener instead consumes
+`Proxy-Authorization`, preserving origin `Authorization` and `x-api-key`
+headers. Raw CONNECT tunnels selected by an `action = "tunnel"` rule cannot be
+inspected, but the forward-proxy listener still applies its configured client
+authentication before the opaque origin traffic is tunneled.
 
 For authenticated managed requests, persistence records the key name as the
 request `user` and its non-secret key id as `ctx_json.api_key_id` in request and
@@ -353,14 +354,13 @@ tokn-gateway account list [--no-quota]
 tokn-gateway account status [ID]
 tokn-gateway account switch --only ID
 tokn-gateway headers [--account ID]
-tokn-gateway serve [--host HOST] [--port PORT] [--with-proxy] [--no-proxy]
-tokn-gateway proxy start [--host HOST] [--port PORT] [--route-mode MODE] [--passthrough]
-tokn-gateway proxy env [--shell sh|bash|zsh|fish|pwsh]
-tokn-gateway proxy shell [--shell /path/to/shell]
-tokn-gateway proxy codex|opencode|pi [--npx] [ARGS...]
-tokn-gateway proxy run [--npx] codex|opencode|pi [ARGS...]
-tokn-gateway proxy exec COMMAND [ARGS...]
-tokn-gateway proxy ca path|show|regenerate
+tokn-gateway [--config PATH] serve
+tokn-gateway [--config PATH] proxy [--listener ID] env [--shell sh|bash|zsh|fish|pwsh]
+tokn-gateway [--config PATH] proxy [--listener ID] shell [--shell /path/to/shell]
+tokn-gateway [--config PATH] proxy [--listener ID] codex|opencode|pi [--npx] [ARGS...]
+tokn-gateway [--config PATH] proxy [--listener ID] run [--npx] codex|opencode|pi [ARGS...]
+tokn-gateway [--config PATH] proxy [--listener ID] exec COMMAND [ARGS...]
+tokn-gateway [--config PATH] proxy [--listener ID] ca path|show|regenerate
 tokn-gateway usage [--since 24h] [--account ID] [--provider PROVIDER]
 tokn-gateway inspect [--port PORT] [--requests-dir PATH] [--sessions-db PATH]
 tokn-gateway config get|set|unset KEY [--account ID] [--add]
@@ -448,23 +448,72 @@ manually; the link plan prints this reminder.
 
 ## Proxy Mode
 
-The proxy runs a local HTTP CONNECT forward proxy. Requests for recognized LLM
-API hosts are intercepted and routed through the same account pool; unrelated
-hosts are tunneled through untouched.
+A forward proxy is a `kind = "forward_proxy"` listener in a schema-version 2
+config. `tokn-gateway serve` starts every compiled listener, including API and
+forward-proxy listeners; there is no separate `proxy start` command.
+
+Ordered `[[connect_rules]]` decide whether each CONNECT request is intercepted,
+tunneled without inspection, or rejected. An intercepted connection is decoded
+as HTTP and then evaluated by the listener's ordered `[[bindings]]` and
+`default_http_action`, just like other HTTP ingress. The listener's
+`default_connect` handles CONNECT requests that match no rule.
+
+For example, this listener intercepts OpenAI traffic, routes the decoded HTTP
+requests through `profiles.default`, and rejects unmatched CONNECT targets. The
+profile and its route, account pool, and upstreams must also be defined in the
+same v2 config.
+
+```toml
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "127.0.0.1:4142"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "default" }
+default_connect = "reject"
+ca_dir = "ca"
+
+[[connect_rules]]
+id = "intercept-openai"
+listener = "proxy"
+action = "intercept"
+hosts = ["api.openai.com"]
+ports = [443]
+```
+
+Listener addresses and proxy policy come only from the compiled config. To bind
+outside loopback, set `client_auth = "local_keys"` and explicitly acknowledge
+the plaintext listener with `allow_insecure_public = true`.
+
+Start the listeners in one terminal, then configure a client in another:
 
 ```sh
-tokn-gateway proxy start
+tokn-gateway serve
 tokn-gateway proxy ca show
 eval "$(tokn-gateway proxy env)"
 ```
 
-The generated environment includes:
+With one configured forward-proxy listener, helper commands select it
+automatically. With multiple, select one by id:
+
+```sh
+eval "$(tokn-gateway proxy --listener work env)"
+```
+
+The generated environment always includes:
 
 - `HTTPS_PROXY` and `HTTP_PROXY`.
-- `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and
-  `GIT_SSL_CAINFO` pointing at a merged system-root plus tokn CA bundle.
-- `NODE_EXTRA_CA_CERTS` pointing at the tokn CA certificate.
-- `NO_PROXY` for local loopback addresses.
+- `NO_PROXY` for local loopback addresses plus entries from
+  `[service.outbound].no_proxy`.
+
+When the selected listener has a configured `ca_dir`, the environment also
+includes `SSL_CERT_FILE`, `CODEX_CA_CERTIFICATE`,
+`REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` pointing at a
+merged system-root plus tokn CA bundle, and `NODE_EXTRA_CA_CERTS` pointing at
+the tokn CA certificate. Listeners without a `ca_dir` omit the CA variables,
+and `proxy ca` commands reject them. Any listener with an `intercept` action
+must configure `ca_dir`.
 
 Useful wrappers:
 
@@ -473,51 +522,6 @@ tokn-gateway proxy shell
 tokn-gateway proxy codex --help
 tokn-gateway proxy exec curl https://api.openai.com/v1/models
 ```
-
-Proxy config:
-
-```toml
-[proxy_mode]
-host = "127.0.0.1"
-port = 4142
-route_mode = "route"
-
-[proxy_mode.provider_modes]
-# openai = "switch"
-# github-copilot = "passthrough"
-
-# Optional; defaults to ~/.tokn/router/ca
-# ca_dir = "/some/path"
-
-# Extend or trim the interception set.
-# intercept_hosts = ["my-gateway.example.com"]
-# passthrough_hosts = ["api.githubcopilot.com"]
-```
-
-`tokn-gateway serve --with-proxy` runs both the API listener and proxy in one
-process. API routes use `[defaults]` or a named profile; proxy interception uses
-`[proxy_mode].route_mode` unless overridden with `--proxy-route-mode`. With
-`[api_key].enabled = true`, intercepted requests in any managed mode require a
-client key. Passthrough requests and non-intercepted CONNECT tunnels preserve
-the client's credentials and bypass the check.
-
-## LAN Bootstrap
-
-By default, listeners must bind to loopback. To expose a trusted LAN gateway,
-bind explicitly and opt into the risk:
-
-```sh
-tokn-gateway serve --host 0.0.0.0 --with-proxy --insecure-allow-remote
-```
-
-This exposes helper routes on the API listener:
-
-- `/-/lan/bootstrap.json`
-- `/-/lan/ca.crt`
-- `/-/lan/env?shell=sh|bash|zsh|fish|pwsh`
-
-The server prints the CA SHA-256 fingerprint at startup. Verify that fingerprint
-before trusting a CA fetched over the LAN. The private CA key is never served.
 
 ## Development
 
