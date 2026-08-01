@@ -120,6 +120,10 @@ fn parsing_failure_keeps_the_started_row_without_inventing_routing_facts() {
   assert_eq!(persisted.5, b"{");
   assert_eq!(persisted.6, 400);
   let context: Value = serde_json::from_str(&persisted.7).unwrap();
+  assert_eq!(context["mode"], "route");
+  assert_eq!(context["pipeline_id"], "requests");
+  assert!(context.get("selected_action").is_none());
+  assert!(context.get("http_family").is_none());
   assert_eq!(context["attempt_count"], 0);
   assert_eq!(context["request_failure"]["code"], "invalid_request_body");
 
@@ -1074,9 +1078,178 @@ fn authentication_and_v2_routing_keep_legacy_inspector_aliases() {
   assert_eq!(context["client_identity"], "local_key");
   assert_eq!(context["api_key_id"], "key-id");
   assert_eq!(context["ingress"], "llm_api");
-  assert_eq!(context["pipeline_id"], "llm_api");
+  assert_eq!(context["pipeline_id"], "requests");
   assert_eq!(context["http_family"], "relay");
-  assert_eq!(context["mode"], "relay");
+  assert_eq!(context["mode"], "route");
+}
+
+#[test]
+fn ingress_and_http_policy_keep_exact_legacy_context_aliases() {
+  let dir = tempdir();
+  let mut consumer = RequestPersistenceConsumer::open(&dir, "test-version").unwrap();
+  let parent_connect_id = tokn_events::RequestId::new("parent-connect").unwrap();
+  let cases = [
+    (
+      "direct-managed",
+      IngressKind::LlmApi,
+      "llm_api",
+      "route",
+      "requests",
+      HttpFamily::Managed,
+      "managed",
+      None,
+    ),
+    (
+      "forward-relay",
+      IngressKind::ForwardProxy,
+      "forward_proxy",
+      "forward_proxy",
+      "proxy",
+      HttpFamily::Relay,
+      "relay",
+      None,
+    ),
+    (
+      "forward-transparent",
+      IngressKind::ForwardProxy,
+      "forward_proxy",
+      "forward_proxy",
+      "proxy",
+      HttpFamily::Transparent,
+      "transparent",
+      None,
+    ),
+    (
+      "intercepted-managed",
+      IngressKind::InterceptedHttps {
+        parent_connect_id: parent_connect_id.clone(),
+      },
+      "intercepted_https",
+      "intercept",
+      "proxy",
+      HttpFamily::Managed,
+      "managed",
+      Some(parent_connect_id.as_str()),
+    ),
+  ];
+
+  for (request_id, ingress, ingress_name, mode, pipeline_id, family, family_name, parent_id) in cases {
+    emit(
+      &mut consumer,
+      event(
+        request_id,
+        1,
+        0,
+        TrafficEventKind::Started(started_for_ingress(ingress)),
+      ),
+    )
+    .unwrap();
+    emit(
+      &mut consumer,
+      event(
+        request_id,
+        2,
+        1,
+        TrafficEventKind::Admitted(RequestAdmitted::Http {
+          scheme: "https".into(),
+          authority: "gateway.local".into(),
+          path_and_query: CapturedUri::exact("/v1/responses"),
+          operation: Some("responses".into()),
+        }),
+      ),
+    )
+    .unwrap();
+    emit(
+      &mut consumer,
+      event(
+        request_id,
+        3,
+        2,
+        TrafficEventKind::PolicySelected(PolicySelection {
+          binding_id: Some(format!("{request_id}-binding").into()),
+          action: SelectedAction::Http {
+            profile_id: "profile".into(),
+            route_id: "route".into(),
+            family,
+          },
+        }),
+      ),
+    )
+    .unwrap();
+
+    let context = request_context(&dir, request_id);
+    assert_eq!(context["ingress"], ingress_name, "{request_id}");
+    assert_eq!(context["mode"], mode, "{request_id}");
+    assert_eq!(context["pipeline_id"], pipeline_id, "{request_id}");
+    assert_eq!(context["selected_action"], "http", "{request_id}");
+    assert_eq!(context["http_family"], family_name, "{request_id}");
+    match parent_id {
+      Some(parent_id) => assert_eq!(context["parent_connect_id"], parent_id, "{request_id}"),
+      None => assert!(context.get("parent_connect_id").is_none(), "{request_id}"),
+    }
+  }
+}
+
+#[test]
+fn pre_policy_admission_failures_keep_ingress_context_aliases() {
+  let dir = tempdir();
+  let mut consumer = RequestPersistenceConsumer::open(&dir, "test-version").unwrap();
+  let cases = [
+    ("early-direct", IngressKind::LlmApi, "llm_api", "route", "requests"),
+    (
+      "early-forward",
+      IngressKind::ForwardProxy,
+      "forward_proxy",
+      "forward_proxy",
+      "proxy",
+    ),
+    (
+      "early-intercepted",
+      IngressKind::InterceptedHttps {
+        parent_connect_id: tokn_events::RequestId::new("early-parent").unwrap(),
+      },
+      "intercepted_https",
+      "intercept",
+      "proxy",
+    ),
+  ];
+
+  for (request_id, ingress, ingress_name, mode, pipeline_id) in cases {
+    emit(
+      &mut consumer,
+      event(
+        request_id,
+        1,
+        0,
+        TrafficEventKind::Started(started_for_ingress(ingress)),
+      ),
+    )
+    .unwrap();
+    emit(
+      &mut consumer,
+      event(
+        request_id,
+        2,
+        1,
+        TrafficEventKind::Finished(RequestFinished {
+          outcome: RequestOutcome::Rejected,
+          phase: RequestPhase::Admission,
+          downstream_status: Some(400),
+          failure: Some(failure("invalid_request", "request admission failed")),
+          attempt_count: 0,
+        }),
+      ),
+    )
+    .unwrap();
+
+    let context = request_context(&dir, request_id);
+    assert_eq!(context["ingress"], ingress_name, "{request_id}");
+    assert_eq!(context["mode"], mode, "{request_id}");
+    assert_eq!(context["pipeline_id"], pipeline_id, "{request_id}");
+    assert!(context.get("selected_action").is_none(), "{request_id}");
+    assert!(context.get("http_family").is_none(), "{request_id}");
+    assert_eq!(context["request_phase"], "admission", "{request_id}");
+  }
 }
 
 #[test]
@@ -1373,8 +1546,8 @@ fn connect_lifecycle_preserves_proxy_context_and_byte_counts() {
   let context: Value = serde_json::from_str(&context).unwrap();
   assert_eq!(endpoint, "connect");
   assert_eq!(status, 200);
-  assert_eq!(context["pipeline_id"], "forward_proxy");
-  assert_eq!(context["mode"], "tunnel");
+  assert_eq!(context["pipeline_id"], "proxy");
+  assert_eq!(context["mode"], "forward_proxy");
   assert_eq!(context["connect_action"], "tunnel");
   assert_eq!(context["client_to_upstream_bytes"], 111);
   assert_eq!(context["upstream_to_client_bytes"], 222);
@@ -1846,6 +2019,23 @@ fn started() -> RequestStarted {
   }
 }
 
+fn started_for_ingress(ingress: IngressKind) -> RequestStarted {
+  let listener_id = match &ingress {
+    IngressKind::LlmApi => "direct",
+    IngressKind::ForwardProxy => "forward",
+    IngressKind::InterceptedHttps { .. } => "intercepted",
+    _ => "unknown",
+  };
+  let mut started = started();
+  started.source = RequestSource::Listener {
+    listener_id: listener_id.into(),
+    ingress,
+    local_addr: None,
+    peer_addr: None,
+  };
+  started
+}
+
 fn connect_started() -> RequestStarted {
   RequestStarted {
     source: RequestSource::Listener {
@@ -1874,6 +2064,17 @@ fn target(account_id: &str, provider_id: &str, upstream_id: &str) -> TargetSelec
     requested_operation: Some("responses".into()),
     upstream_operation: Some("responses".into()),
   }
+}
+
+fn request_context(dir: &Path, request_id: &str) -> Value {
+  let context = open_day(dir, DAY)
+    .query_row(
+      "SELECT ctx_json FROM requests WHERE request_id = ?1",
+      [request_id],
+      |row| row.get::<_, String>(0),
+    )
+    .unwrap();
+  serde_json::from_str(&context).unwrap()
 }
 
 fn failure(code: &str, message: &str) -> EventFailure {

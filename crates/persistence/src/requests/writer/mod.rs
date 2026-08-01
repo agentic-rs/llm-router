@@ -553,10 +553,12 @@ impl RequestPersistenceConsumer {
     }
     let mut context = state.seed.context.clone();
     insert_optional_string(&mut context, "binding_id", selection.binding_id.as_ref());
+    // `mode` and `pipeline_id` are compatibility aliases for the request source.
+    // Keep policy-specific detail in dedicated fields so early failures and routed
+    // requests project the same ingress vocabulary.
     match &selection.action {
       SelectedAction::Reject => {
         insert_literal(&mut context, "selected_action", "reject");
-        insert_literal(&mut context, "mode", "reject");
       }
       SelectedAction::Http {
         profile_id,
@@ -567,16 +569,13 @@ impl RequestPersistenceConsumer {
         insert_string(&mut context, "profile_id", profile_id);
         insert_string(&mut context, "route_id", route_id);
         insert_literal(&mut context, "http_family", http_family_name(*family));
-        insert_literal(&mut context, "mode", http_family_name(*family));
       }
       SelectedAction::Connect { action } => {
         insert_literal(&mut context, "selected_action", "connect");
         insert_literal(&mut context, "connect_action", connect_action_name(*action));
-        insert_literal(&mut context, "mode", connect_action_name(*action));
       }
       _ => {
         insert_literal(&mut context, "selected_action", "unknown");
-        insert_literal(&mut context, "mode", "unknown");
       }
     }
     let context_json = object_json(&context)?;
