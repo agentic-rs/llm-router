@@ -3,6 +3,7 @@ pub use tokn_catalogue as catalogue;
 pub use tokn_config as config;
 pub use tokn_convert as convert;
 pub use tokn_core as core;
+pub use tokn_events as events;
 pub mod endpoint {
   pub use tokn_endpoint_chat_completions as chat_completions;
   pub use tokn_endpoint_core as core;
