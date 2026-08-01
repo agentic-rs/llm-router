@@ -3,6 +3,7 @@
 //! Binding is a separate phase from serving so startup can acquire every
 //! configured socket before any listener begins accepting connections.
 
+mod adapter;
 mod admission;
 mod auth;
 mod bind;
@@ -13,6 +14,7 @@ mod response;
 mod state;
 mod tunnel;
 
+pub use adapter::handle_llm_api_request;
 pub use admission::{
   admit_forward_proxy_request, admit_intercepted_https_request, admit_llm_api_request, classify_request_kind,
   AdmissionError, AdmittedHttpRequest, AuthorityLocation, ExpectedRequestTarget, ForwardProxyAdmission,
