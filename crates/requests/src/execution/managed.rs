@@ -244,7 +244,6 @@ impl ManagedHttpExecutor {
       initiator: prepared.initiator.as_deref().unwrap_or("user"),
       inbound_headers: attempt.headers(),
       client_headers: Some(prepared.client_headers),
-      outbound: None,
       vars: prepared.vars,
       wire_identity: target.wire_identity().cloned(),
     };

@@ -77,7 +77,6 @@ pub async fn fetch(client: &reqwest::Client, github_token: &str, headers: &Copil
     COPILOT_USER_INFO_URL,
     h,
     None,
-    None,
     "copilot user-info",
   )
   .await?;

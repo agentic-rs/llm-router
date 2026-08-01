@@ -4,7 +4,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use tokn_headers::keys::{AUTHORIZATION, CHATGPT_ACCOUNT_ID, COOKIE, X_API_KEY};
 pub use tokn_headers::TemplateVars;
 use tokn_headers::{AgentId, HeaderMap};
@@ -268,7 +268,6 @@ pub struct RequestCtx<'a> {
   pub initiator: &'a str,
   pub inbound_headers: &'a HeaderMap,
   pub client_headers: Option<HeaderMap>,
-  pub outbound: Option<OutboundCapture>,
   pub vars: TemplateVars,
   /// Explicit client identity to present on the upstream wire. `None` means
   /// provider-required headers only; providers must not invent a persona.
@@ -282,26 +281,6 @@ impl RequestCtx<'_> {
       .cloned()
       .unwrap_or_else(|| Bytes::from(serde_json::to_vec(self.body).unwrap_or_default()))
   }
-
-  pub fn capture_outbound(&self, method: &str, url: &str, headers: &HeaderMap, body: Bytes) {
-    if let Some(slot) = self.outbound.as_ref() {
-      let _ = slot.set(crate::db::OutboundSnapshot {
-        method: Some(method.to_string()),
-        url: Some(url.to_string()),
-        status: None,
-        req_headers: headers.clone(),
-        req_body: body,
-        resp_headers: HeaderMap::new(),
-        resp_body: Bytes::new(),
-      });
-    }
-  }
-}
-
-pub type OutboundCapture = Arc<OnceLock<crate::db::OutboundSnapshot>>;
-
-pub fn new_outbound_capture() -> OutboundCapture {
-  Arc::new(OnceLock::new())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
