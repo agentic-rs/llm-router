@@ -4,6 +4,7 @@ mod execution;
 mod gateway;
 mod intercept_ca;
 mod listeners;
+mod managed;
 mod matchers;
 mod names;
 mod profiles;
@@ -30,6 +31,7 @@ pub use listeners::{
   LinkedConnectRule, LinkedForwardProxyPolicy, LinkedHttpAction, LinkedHttpBinding, LinkedHttpDecision,
   LinkedHttpPolicy, LinkedListener, LinkedListenerKind, LinkedListeners, ListenerLinkError, ListenerLinkResult,
 };
+pub use managed::{ManagedProfileResolveError, ManagedProfileResolveResult, ManagedProfileSite};
 pub use matchers::{
   link_connect_matcher, link_http_matcher, ConnectFactsError, ConnectFactsResult, ConnectRequestFacts,
   HttpRequestFacts, LinkedConnectMatcher, LinkedHttpMatcher, MatcherLinkError, MatcherLinkResult,

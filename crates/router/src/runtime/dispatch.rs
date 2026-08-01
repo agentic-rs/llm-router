@@ -6,7 +6,10 @@
 //! to select an account target without allowing payload facts to change which
 //! listener action matched.
 
-use super::{HttpRequestFacts, LinkedHttpAction, LinkedListener, LinkedProfile, LinkedWireIdentity};
+use super::managed::{resolve_managed_profile, RoutedManagedTarget};
+use super::{
+  HttpRequestFacts, LinkedHttpAction, LinkedListener, LinkedProfile, LinkedWireIdentity, ManagedProfileResolveError,
+};
 use http::{uri::PathAndQuery, Method};
 use smol_str::SmolStr;
 use snafu::Snafu;
@@ -14,10 +17,10 @@ use std::fmt;
 use std::sync::Arc;
 use tokn_access::ProviderAccess;
 use tokn_accounts::link::{
-  resolve_managed_target, resolve_relay_target, LinkedRoute, LinkedRouteKind, PoolRuntimeResult, SelectedManagedTarget,
-  SelectedRelayTarget, SelectionOutcome, SelectionSettlement, TargetResolution, TargetResolveError,
+  resolve_relay_target, LinkedRoute, LinkedRouteKind, PoolRuntimeResult, SelectedRelayTarget, SelectionOutcome,
+  SelectionSettlement, TargetResolution,
 };
-use tokn_core::provider::{Endpoint, ProviderRequestKind};
+use tokn_core::provider::ProviderRequestKind;
 use tokn_core::upstream_url::CanonicalHttpOrigin;
 use tokn_core::AgentId;
 use tokn_policy::{
@@ -235,7 +238,7 @@ impl RoutedHttpDispatch {
 /// Route-family-specific selected HTTP execution target.
 #[derive(Debug)]
 pub(super) enum SelectedHttpTarget {
-  Managed(SelectedManagedHttpTarget),
+  Managed(RoutedManagedTarget),
   Relay(SelectedRelayHttpTarget),
   Transparent(SelectedTransparentHttpTarget),
 }
@@ -261,42 +264,10 @@ impl SelectedHttpTarget {
   /// unchanged without touching pool state.
   pub(super) fn settle(self, outcome: SelectionOutcome) -> PoolRuntimeResult<SelectionSettlement> {
     match self {
-      Self::Managed(selected) => selected.into_target().into_selection_token().settle(outcome),
+      Self::Managed(selected) => selected.settle(outcome),
       Self::Relay(selected) => selected.into_target().into_selection_token().settle(outcome),
       Self::Transparent(_) => Ok(SelectionSettlement::Unchanged),
     }
-  }
-}
-
-/// Managed selection keeps inbound request semantics alongside the outbound
-/// model and operation selected by the accounts resolver.
-#[derive(Debug)]
-pub(super) struct SelectedManagedHttpTarget {
-  requested_model: SmolStr,
-  requested_operation: Endpoint,
-  target: SelectedManagedTarget,
-  wire_identity: Option<AgentId>,
-}
-
-impl SelectedManagedHttpTarget {
-  pub(super) fn requested_model(&self) -> &str {
-    self.requested_model.as_str()
-  }
-
-  pub(super) fn requested_operation(&self) -> Endpoint {
-    self.requested_operation
-  }
-
-  pub(super) fn target(&self) -> &SelectedManagedTarget {
-    &self.target
-  }
-
-  pub(super) fn wire_identity(&self) -> Option<&AgentId> {
-    self.wire_identity.as_ref()
-  }
-
-  fn into_target(self) -> SelectedManagedTarget {
-    self.target
   }
 }
 
@@ -375,7 +346,7 @@ fn resolve_profile(
   provider_access: &ProviderAccess,
 ) -> HttpDispatchResult<TargetResolution<SelectedHttpTarget>> {
   match profile.route().kind() {
-    LinkedRouteKind::Managed(route) => {
+    LinkedRouteKind::Managed(_) => {
       let HttpRequestSemantics::Managed { requested_model } = semantics else {
         return Err(HttpDispatchError::ManagedSemanticsRequired {
           site: site.clone(),
@@ -394,20 +365,18 @@ fn resolve_profile(
           });
         }
       };
-      let resolution = resolve_managed_target(
-        route,
-        requested_model.as_str(),
+      let resolution = resolve_managed_profile(
+        profile,
+        requested_model,
         requested_operation,
         session_id,
-        |provider| provider_access.allows(provider.as_str()),
+        provider_access,
       )
       .map_err(|source| HttpDispatchError::ManagedTarget {
         site: site.clone(),
-        profile: profile.id().clone(),
-        route: profile.route().id().clone(),
         source: Box::new(source),
       })?;
-      map_managed_resolution(site, profile, requested_model, requested_operation, resolution)
+      Ok(map_managed_resolution(profile, resolution))
     }
     LinkedRouteKind::Relay(route) => {
       let resolution = resolve_relay_target(route, head.ingress(), session_id, |provider| {
@@ -424,32 +393,17 @@ fn resolve_profile(
 }
 
 fn map_managed_resolution(
-  site: &HttpDispatchSite,
   profile: &LinkedProfile,
-  requested_model: SmolStr,
-  requested_operation: Endpoint,
-  resolution: TargetResolution<SelectedManagedTarget>,
-) -> HttpDispatchResult<TargetResolution<SelectedHttpTarget>> {
+  resolution: TargetResolution<RoutedManagedTarget>,
+) -> TargetResolution<SelectedHttpTarget> {
   match resolution {
     TargetResolution::Selected(target) => {
-      let wire_identity = resolve_wire_identity(
-        site,
-        profile.id(),
-        profile.route().id(),
-        profile.wire_identity(),
-        target.upstream().provider_id(),
-      )?;
-      Ok(TargetResolution::Selected(SelectedHttpTarget::Managed(
-        SelectedManagedHttpTarget {
-          requested_model,
-          requested_operation,
-          target,
-          wire_identity,
-        },
-      )))
+      debug_assert_eq!(target.site().profile_id(), profile.id());
+      debug_assert_eq!(target.site().route_id(), profile.route().id());
+      TargetResolution::Selected(SelectedHttpTarget::Managed(target))
     }
-    TargetResolution::CoolingDown { retry_at } => Ok(TargetResolution::CoolingDown { retry_at }),
-    TargetResolution::NoEligible { reason } => Ok(TargetResolution::NoEligible { reason }),
+    TargetResolution::CoolingDown { retry_at } => TargetResolution::CoolingDown { retry_at },
+    TargetResolution::NoEligible { reason } => TargetResolution::NoEligible { reason },
   }
 }
 
@@ -461,7 +415,7 @@ fn map_relay_resolution(
 ) -> HttpDispatchResult<TargetResolution<SelectedHttpTarget>> {
   match resolution {
     TargetResolution::Selected(target) => {
-      let wire_identity = resolve_wire_identity(
+      let wire_identity = resolve_relay_wire_identity(
         site,
         profile.id(),
         profile.route().id(),
@@ -481,7 +435,7 @@ fn map_relay_resolution(
   }
 }
 
-fn resolve_wire_identity(
+fn resolve_relay_wire_identity(
   site: &HttpDispatchSite,
   profile: &ProfileId,
   route: &RouteId,
@@ -528,12 +482,10 @@ pub enum HttpDispatchError {
     request_kind: ProviderRequestKind,
   },
 
-  #[snafu(display("{site} failed to resolve managed profile '{profile}' route '{route}': {source}"))]
+  #[snafu(display("{site} failed to resolve {source}"))]
   ManagedTarget {
     site: HttpDispatchSite,
-    profile: ProfileId,
-    route: RouteId,
-    source: Box<TargetResolveError>,
+    source: Box<ManagedProfileResolveError>,
   },
 
   #[snafu(display(
@@ -558,10 +510,10 @@ mod tests {
   use std::net::{Ipv4Addr, SocketAddr};
   use std::path::PathBuf;
   use std::time::Duration;
-  use tokn_accounts::link::{NoEligibleReason, QualificationSyntaxError, RelayDestination};
+  use tokn_accounts::link::{NoEligibleReason, QualificationSyntaxError, RelayDestination, TargetResolveError};
   use tokn_accounts::registry::Registry;
   use tokn_core::account::{AccountConfig, AccountTier};
-  use tokn_core::provider::ID_LLAMA_CPP;
+  use tokn_core::provider::{Endpoint, ID_LLAMA_CPP};
   use tokn_policy::{
     AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, CanonicalAuthority, ClientAuthPlan,
     ConnectAction, FallbackSelector, ForwardProxyListenerPlan, GatewayPlan, HttpAction, HttpBindingPlan, HttpMatch,
@@ -1146,8 +1098,11 @@ mod tests {
     };
     assert!(matches!(
       source.as_ref(),
-      TargetResolveError::MalformedQualification {
-        reason: QualificationSyntaxError::MissingSeparator,
+      ManagedProfileResolveError::MalformedQualification {
+        source: TargetResolveError::MalformedQualification {
+          reason: QualificationSyntaxError::MissingSeparator,
+          ..
+        },
         ..
       }
     ));
@@ -1305,7 +1260,7 @@ mod tests {
       binding_id: Some(binding_id("binding")),
     };
     let provider = provider_id(ID_LLAMA_CPP);
-    let error = resolve_wire_identity(
+    let error = resolve_relay_wire_identity(
       &site,
       &profile_id("profile"),
       &route_id("route"),

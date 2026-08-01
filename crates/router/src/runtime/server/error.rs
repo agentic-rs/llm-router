@@ -8,6 +8,7 @@
 use super::{AdmissionError, ClientAuthError, RequestBodyError, ResponseBridgeError, TunnelConnectError};
 use crate::runtime::{
   ConnectDispatchError, ConnectDispatchSite, HttpDispatchError, HttpDispatchSite, HttpExecutionError,
+  ManagedProfileResolveError,
 };
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -536,9 +537,21 @@ fn target_resolution_descriptor(_source: &TargetResolveError) -> ErrorDescriptor
   )
 }
 
+fn managed_profile_resolution_descriptor(source: &ManagedProfileResolveError) -> ErrorDescriptor {
+  match source {
+    ManagedProfileResolveError::MalformedQualification { source, .. } => target_resolution_descriptor(source),
+    ManagedProfileResolveError::NonManagedRoute { .. }
+    | ManagedProfileResolveError::MissingProviderWireIdentity { .. } => ErrorDescriptor::new(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "internal_error",
+      "the selected route could not be dispatched",
+    ),
+  }
+}
+
 fn dispatch_descriptor(source: &HttpDispatchError) -> ErrorDescriptor {
   match source {
-    HttpDispatchError::ManagedTarget { source, .. } => target_resolution_descriptor(source),
+    HttpDispatchError::ManagedTarget { source, .. } => managed_profile_resolution_descriptor(source),
     HttpDispatchError::ManagedSemanticsRequired { .. }
     | HttpDispatchError::ManagedOperationRequestKindRequired { .. }
     | HttpDispatchError::MissingProviderWireIdentity { .. } => ErrorDescriptor::new(
