@@ -2,10 +2,8 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 pub async fn run(config_path: Option<PathBuf>) -> Result<()> {
-  let config_path = match config_path {
-    Some(path) => path,
-    None => tokn_config::paths::config_path().context("resolve the default gateway config path")?,
-  };
+  let config_path = tokn_config::paths::resolve_config_path(config_path.as_deref())
+    .context("resolve the default gateway config path")?;
   let compiled = tokn_config::v2::load(&config_path)
     .with_context(|| format!("load compiled gateway config `{}`", config_path.display()))?;
   let accounts = crate::server_runtime::load_default_accounts()?;
