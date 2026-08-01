@@ -8,7 +8,3 @@
 pub mod affinity;
 pub mod link;
 pub mod registry;
-
-mod handle;
-
-pub use handle::AccountHandle;
