@@ -160,7 +160,7 @@ impl SelectionToken {
   /// Like [`Self::record_failure`], this deliberately does not commit session
   /// affinity. A later retry may therefore select another eligible binding.
   pub fn record_unauthorized(self) -> PoolRuntimeResult<Instant> {
-    self.binding.handle().invalidate_credentials();
+    self.binding.invalidate_credentials();
     self.pool.record_failure(self.binding.key())
   }
 

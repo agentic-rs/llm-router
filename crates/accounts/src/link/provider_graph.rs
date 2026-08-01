@@ -4,7 +4,7 @@
 //! pools and routes are separate runtime-linking stages; folding them into this
 //! graph would recreate the legacy inventory's loss of upstream identity.
 
-use crate::{registry::Registry, AccountHandle};
+use crate::registry::Registry;
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::collections::BTreeMap;
@@ -57,7 +57,8 @@ impl ProviderBindingKey {
 /// A credential-bearing provider bound to one configured upstream.
 pub struct ProviderBinding {
   key: ProviderBindingKey,
-  handle: Arc<AccountHandle>,
+  account: Arc<AccountConfig>,
+  provider: Arc<dyn Provider>,
   account_order: usize,
 }
 
@@ -74,16 +75,16 @@ impl ProviderBinding {
     self.key.account_id()
   }
 
-  pub fn handle(&self) -> &Arc<AccountHandle> {
-    &self.handle
-  }
-
   pub fn account(&self) -> Arc<AccountConfig> {
-    self.handle.config.load_full()
+    self.account.clone()
   }
 
   pub fn provider(&self) -> &Arc<dyn Provider> {
-    &self.handle.provider
+    &self.provider
+  }
+
+  pub(super) fn invalidate_credentials(&self) {
+    self.provider.on_unauthorized();
   }
 
   /// Zero-based position in the account input supplied to the linker.
@@ -97,7 +98,7 @@ impl std::fmt::Debug for ProviderBinding {
     formatter
       .debug_struct("ProviderBinding")
       .field("key", &self.key)
-      .field("provider", &self.handle.provider.info().id)
+      .field("provider", &self.provider.info().id)
       .field("account_order", &self.account_order)
       .finish()
   }
@@ -324,7 +325,8 @@ pub fn link_provider_graph(
       let key = ProviderBindingKey::new(upstream_id.clone(), &account.config.id);
       let binding = Arc::new(ProviderBinding {
         key: key.clone(),
-        handle: Arc::new(AccountHandle::new(account.config.clone(), provider)),
+        account: account.config.clone(),
+        provider,
         account_order: account.input_order,
       });
       let previous = bindings.insert(key, binding.clone());
@@ -561,7 +563,7 @@ mod tests {
     assert!(primary_target.model_cache().contains("primary-only"));
     assert!(!secondary_target.model_cache().is_warm());
 
-    assert!(!Arc::ptr_eq(second_binding.handle(), other_upstream_binding.handle()));
+    assert!(!Arc::ptr_eq(second_provider, other_upstream_provider));
 
     let linked_first_config = graph.account("first").unwrap().config();
     let bound_first_config = first_binding.account();
