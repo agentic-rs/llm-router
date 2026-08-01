@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const EMBEDDED_SECRET: &str = "migration-secret-must-not-escape";
@@ -43,14 +43,19 @@ api_key = {EMBEDDED_SECRET:?}
   }
 
   fn run(&self, activation: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tokn-gateway"))
+    self.run_with_args(activation, &[])
+  }
+
+  fn run_with_args(&self, activation: &str, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tokn-gateway"));
+    command
       .args(["config", "migrate-v2", "--activate", activation])
+      .args(args)
       .env("HOME", &self.home)
       .env("XDG_CONFIG_HOME", self.home.join(".config"))
       .env("XDG_DATA_HOME", self.home.join(".local/share"))
-      .env("XDG_CACHE_HOME", self.home.join(".cache"))
-      .output()
-      .expect("run the gateway CLI")
+      .env("XDG_CACHE_HOME", self.home.join(".cache"));
+    command.output().expect("run the gateway CLI")
   }
 
   fn assert_config_unchanged(&self) {
@@ -75,6 +80,23 @@ fn assert_secret_absent(output: &Output) {
   assert!(!stderr(output).contains(EMBEDDED_SECRET));
 }
 
+#[cfg(unix)]
+fn assert_private_file(path: &Path) {
+  use std::os::unix::fs::PermissionsExt;
+
+  let metadata = fs::symlink_metadata(path).unwrap();
+  assert!(metadata.is_file(), "{} is not a regular file", path.display());
+  assert_eq!(
+    metadata.permissions().mode() & 0o777,
+    0o600,
+    "{} is not private",
+    path.display()
+  );
+}
+
+#[cfg(not(unix))]
+fn assert_private_file(_path: &Path) {}
+
 #[test]
 fn dry_run_bypasses_legacy_home_and_logging_side_effects() {
   let fixture = Fixture::new();
@@ -90,6 +112,42 @@ fn dry_run_bypasses_legacy_home_and_logging_side_effects() {
   assert!(!stderr(&output).contains("migrated legacy tokn-router config"));
   fixture.assert_config_unchanged();
   assert!(!fixture.router_home.join("auth.yaml").exists());
+  fixture.assert_no_logging_state();
+}
+
+#[test]
+fn apply_activates_v2_with_durable_private_credentials_and_exact_backup() {
+  let fixture = Fixture::new();
+  let auth_path = fixture.router_home.join("auth.yaml");
+  let backup_path = fixture.router_home.join("config.toml.legacy-v1.bak");
+
+  let output = fixture.run_with_args("api", &["--apply", "--yes"]);
+
+  assert!(output.status.success(), "stderr: {}", stderr(&output));
+  assert!(stdout(&output).is_empty());
+  assert_secret_absent(&output);
+  assert!(stderr(&output).contains("auth: install 1 embedded account(s)"));
+  assert!(stderr(&output).contains("activated version 2 config"));
+  assert!(stderr(&output).contains("embedded credentials were installed in modern auth"));
+  assert!(!stderr(&output).contains("migrated legacy tokn-router config"));
+
+  let activated = fs::read_to_string(&fixture.config_path).unwrap();
+  assert!(!activated.contains(EMBEDDED_SECRET));
+  let compiled = tokn_config::v2::parse(&activated, &fixture.config_path).expect("active config should be valid v2");
+  let store = tokn_auth::AuthStore::load(Some(&auth_path), None).expect("modern auth should be durable");
+  assert!(store.has_persisted_sources());
+  let account = store.get("embedded").expect("embedded account should be imported");
+  assert_eq!(account.provider, "openai");
+  assert_eq!(account.api_key.as_ref().unwrap().expose(), EMBEDDED_SECRET);
+  tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), &store.accounts)
+    .expect("active config should link with durable auth");
+
+  let auth_contents = fs::read_to_string(&auth_path).unwrap();
+  assert!(auth_contents.contains(EMBEDDED_SECRET));
+  assert_eq!(fs::read(&backup_path).unwrap(), fixture.config_contents);
+  assert!(fs::read_to_string(&backup_path).unwrap().contains(EMBEDDED_SECRET));
+  assert_private_file(&auth_path);
+  assert_private_file(&backup_path);
   fixture.assert_no_logging_state();
 }
 
