@@ -192,6 +192,21 @@ impl AttemptBodyPlan {
     Ok(())
   }
 
+  /// Close an unfinished upstream body as a deterministic response failure.
+  ///
+  /// Managed adaptation can reject a response before it polls the observed
+  /// body (for example, when a streaming request receives a JSON response).
+  /// That is not caller cancellation: the response was received and the
+  /// gateway rejected it while processing the upstream response.
+  pub(crate) async fn publish_failed_terminal(
+    &self,
+    lifecycle: &mut RequestLifecycle,
+    failure: EventFailure,
+  ) -> Result<(), BoundaryPublishError> {
+    self.observation.finish_adaptation_failure(failure);
+    self.publish_terminal(lifecycle).await
+  }
+
   pub(crate) fn append_terminal(&self, termination: &mut RequestTermination) {
     let Some(events) = self.observation.take_terminal(self.upstream_status) else {
       return;
@@ -199,6 +214,10 @@ impl AttemptBodyPlan {
     for event in events {
       termination.push(event);
     }
+  }
+
+  pub(crate) fn mark_semantically_complete(&self) {
+    self.observation.finish_semantically_complete();
   }
 }
 
@@ -241,6 +260,7 @@ impl UpstreamBodyObservation {
         published_bytes: 0,
         published_chunks: 0,
         result: None,
+        attempt_failure: None,
         usage: TokenUsage {
           kind: usage_kind,
           ..TokenUsage::default()
@@ -263,6 +283,14 @@ impl UpstreamBodyObservation {
 
   fn finish(&self, result: BodyResult) {
     self.lock().finish(result);
+  }
+
+  fn finish_adaptation_failure(&self, failure: EventFailure) {
+    self.lock().finish_adaptation_failure(failure);
+  }
+
+  fn finish_semantically_complete(&self) {
+    self.lock().finish_semantically_complete();
   }
 
   /// Return only newly observed cumulative progress.
@@ -310,6 +338,7 @@ struct UpstreamBodyState {
   published_bytes: u64,
   published_chunks: u64,
   result: Option<BodyResult>,
+  attempt_failure: Option<EventFailure>,
   usage: TokenUsage,
   usage_observed: bool,
   is_sse: bool,
@@ -365,6 +394,37 @@ impl UpstreamBodyState {
     self.result = Some(result);
   }
 
+  fn finish_adaptation_failure(&mut self, failure: EventFailure) {
+    if self.terminalized {
+      return;
+    }
+    // The body result records transfer truth while the attempt result records
+    // whether the gateway accepted the response. Adaptation can fail after a
+    // complete transfer, so keep these terminal dimensions independent. A
+    // body read failure is the more specific attempt failure when both occur.
+    self.attempt_failure = Some(match &self.result {
+      Some(BodyResult::Failed(body_failure)) => body_failure.clone(),
+      _ => failure.clone(),
+    });
+    // Dropping the response owned by a failing adapter runs the observed body
+    // drop hook first. Replace that provisional cancellation because the
+    // coordinator knows the body was abandoned by a deterministic adaptation
+    // failure, not by its caller. A body that already reached EOF or reported
+    // its own read failure retains that more precise transfer result.
+    if self.result.is_none() || matches!(self.result.as_ref(), Some(BodyResult::Cancelled)) {
+      self.result = Some(BodyResult::Failed(failure));
+    }
+  }
+
+  fn finish_semantically_complete(&mut self) {
+    if self.terminalized {
+      return;
+    }
+    if self.result.is_none() || matches!(self.result.as_ref(), Some(BodyResult::Cancelled)) {
+      self.result = Some(BodyResult::Complete);
+    }
+  }
+
   fn observe_sse_line(&mut self, line: &[u8]) {
     let Some(payload) = line.strip_prefix(b"data:") else {
       return;
@@ -399,16 +459,14 @@ impl UpstreamBodyState {
         bytes_seen: self.bytes_seen,
       }
     };
-    let failure = match &result {
-      BodyResult::Failed(failure) => Some(failure.clone()),
-      BodyResult::Complete | BodyResult::Cancelled => None,
-      _ => None,
-    };
-    let outcome = match result {
-      BodyResult::Complete => AttemptOutcome::Response,
-      BodyResult::Failed(_) => AttemptOutcome::Failed,
-      BodyResult::Cancelled => AttemptOutcome::Cancelled,
-      _ => AttemptOutcome::Failed,
+    let (outcome, failure) = match &self.attempt_failure {
+      Some(failure) => (AttemptOutcome::Failed, Some(failure.clone())),
+      None => match &result {
+        BodyResult::Complete => (AttemptOutcome::Response, None),
+        BodyResult::Failed(failure) => (AttemptOutcome::Failed, Some(failure.clone())),
+        BodyResult::Cancelled => (AttemptOutcome::Cancelled, None),
+        _ => (AttemptOutcome::Failed, None),
+      },
     };
     let mut events = vec![RequestTerminalEvent::BodyFinished(BodyFinished {
       leg: BodyLeg::Upstream { attempt: self.attempt },
@@ -663,6 +721,90 @@ mod tests {
       }))
     ));
     assert!(observation.take_terminal(200).is_none());
+  }
+
+  #[test]
+  fn semantic_completion_closes_a_pending_upstream_body_as_complete() {
+    let observation = UpstreamBodyObservation::new(AttemptNo::FIRST, 64, None, true);
+    let body = ObservedUpstreamBody::new(TestBody::new([TestFrame::Pending]), observation.clone());
+
+    drop(body);
+    observation.finish_semantically_complete();
+
+    let events = observation.take_terminal(200).unwrap();
+    assert!(matches!(
+      &events[0],
+      RequestTerminalEvent::BodyFinished(BodyFinished {
+        result: BodyResult::Complete,
+        ..
+      })
+    ));
+    assert!(matches!(
+      events.last(),
+      Some(RequestTerminalEvent::AttemptFinished(AttemptFinished {
+        outcome: AttemptOutcome::Response,
+        upstream_status: Some(200),
+        ..
+      }))
+    ));
+  }
+
+  #[test]
+  fn adaptation_failure_after_body_eof_keeps_transfer_complete_but_fails_the_attempt() {
+    let observation = UpstreamBodyObservation::new(AttemptNo::FIRST, 64, None, false);
+    observation.finish(BodyResult::Complete);
+    observation.finish_adaptation_failure(EventFailure {
+      code: "invalid_upstream_response".into(),
+      message: "the upstream response could not be processed".into(),
+    });
+
+    let events = observation.take_terminal(200).unwrap();
+    assert!(matches!(
+      &events[0],
+      RequestTerminalEvent::BodyFinished(BodyFinished {
+        result: BodyResult::Complete,
+        ..
+      })
+    ));
+    assert!(matches!(
+      events.last(),
+      Some(RequestTerminalEvent::AttemptFinished(AttemptFinished {
+        outcome: AttemptOutcome::Failed,
+        failure: Some(failure),
+        ..
+      })) if failure.code == "invalid_upstream_response"
+    ));
+  }
+
+  #[test]
+  fn body_read_failure_remains_the_most_specific_attempt_failure() {
+    let observation = UpstreamBodyObservation::new(AttemptNo::FIRST, 64, None, false);
+    let body_failure = EventFailure {
+      code: UPSTREAM_BODY_FAILURE_CODE.into(),
+      message: UPSTREAM_BODY_FAILURE_MESSAGE.into(),
+    };
+    observation.finish(BodyResult::Failed(body_failure));
+    observation.finish_adaptation_failure(EventFailure {
+      code: "invalid_upstream_response".into(),
+      message: "the upstream response could not be processed".into(),
+    });
+
+    let events = observation.take_terminal(200).unwrap();
+    assert!(matches!(
+      &events[0],
+      RequestTerminalEvent::BodyFinished(BodyFinished {
+        result: BodyResult::Failed(failure),
+        ..
+      }) if failure.code == UPSTREAM_BODY_FAILURE_CODE
+    ));
+    assert!(matches!(
+      events.last(),
+      Some(RequestTerminalEvent::AttemptFinished(AttemptFinished {
+        outcome: AttemptOutcome::Failed,
+        failure: Some(failure),
+        ..
+      })) if failure.code == UPSTREAM_BODY_FAILURE_CODE
+    ));
   }
 
   #[tokio::test]
