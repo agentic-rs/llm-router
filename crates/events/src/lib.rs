@@ -7,11 +7,17 @@
 
 mod capture;
 mod id;
+mod runtime;
 mod traffic;
 mod usage;
 
 pub use capture::{BodyCapture, CaptureOmission, CapturedHeader, CapturedHeaderValue, CapturedHeaders, CapturedUri};
 pub use id::RequestId;
+pub use runtime::{
+  ConsumerFailureKind, ConsumerOperation, ConsumerResult, DeliveryStats, EventConsumer, EventHub, EventSeq, FlushError,
+  HubBuildError, HubBuilder, HubFailure, HubStatus, PublishError, Publisher, ShutdownError, TryPublishError,
+  WaitFailedError,
+};
 pub use traffic::{
   BodyFinished, BodyLeg, BodyOutcome, BodyProgress, BodyResult, ClientIdentity, ConnectAction, ConnectClosed,
   ConnectReady, Correlation, EventFailure, GatewayEvent, HttpFamily, HttpRequestSnapshot, HttpResponseHead,
