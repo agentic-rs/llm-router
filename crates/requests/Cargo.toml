@@ -11,6 +11,7 @@ license.workspace = true
 [dependencies]
 tokn-accounts = { workspace = true }
 tokn-core = { workspace = true }
+tokn-events = { workspace = true }
 tokn-headers = { workspace = true }
 tokn-convert = { workspace = true }
 bytes = { workspace = true }
@@ -19,6 +20,8 @@ http = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

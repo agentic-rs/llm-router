@@ -3107,14 +3107,17 @@ dependencies = [
  "reqwest",
  "serde_json",
  "snafu",
+ "thiserror",
  "tokio",
  "tokn-accounts",
  "tokn-convert",
  "tokn-core",
+ "tokn-events",
  "tokn-headers",
  "tokn-mock-server",
  "tokn-policy",
  "tokn-router-config",
+ "uuid",
 ]
 
 [[package]]
