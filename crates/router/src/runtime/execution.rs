@@ -79,7 +79,7 @@ impl HttpExecutionCoordinator {
   }
 
   /// Execute one routed request while publishing the complete one-attempt
-  /// lifecycle. Live raw response-body ownership is returned to the server
+  /// lifecycle. Live pre-adaptation response-body ownership is returned to the server
   /// adapter without buffering.
   pub(crate) async fn execute_observed(
     &self,
@@ -432,7 +432,8 @@ pub enum HttpExecutionOutcome {
     site: HttpDispatchSite,
     response: ManagedClientResponse,
   },
-  /// Untouched relay or transparent response with its live native body.
+  /// Unadapted relay or transparent response with content codings retained and
+  /// its live native body.
   Opaque {
     site: HttpDispatchSite,
     response: reqwest::Response,

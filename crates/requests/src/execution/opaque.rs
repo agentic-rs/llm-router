@@ -175,8 +175,9 @@ impl OpaqueHttpExecutor {
     &self.transport_http
   }
 
-  /// Send one relay or transparent request and return the untouched live
-  /// response after its final head arrives.
+  /// Send one relay or transparent request and return the unadapted live
+  /// application response, with automatic content decoding disabled, after its
+  /// final head arrives.
   ///
   /// Any received HTTP status is `Ok`, including authentication errors,
   /// throttling, redirects, and server errors. The caller classifies that
@@ -185,7 +186,8 @@ impl OpaqueHttpExecutor {
     self.execute_observed(attempt, None).await
   }
 
-  /// Execute with an optional observer for the final native wire request.
+  /// Execute with an optional observer for the final sanitized native-header
+  /// reqwest request immediately before dispatch.
   pub async fn execute_observed(
     &self,
     attempt: OpaqueHttpAttempt<'_>,

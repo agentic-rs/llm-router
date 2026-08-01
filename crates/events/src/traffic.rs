@@ -15,7 +15,8 @@ pub enum GatewayEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrafficEvent {
   pub request_id: RequestId,
-  /// Monotonic sequence across the complete logical request, starting at one.
+  /// Contiguous, strictly increasing sequence across the complete logical
+  /// request, starting at one.
   pub sequence: u64,
   pub at_unix_ms: i64,
   /// Monotonic elapsed time since [`TrafficEventKind::Started`].
@@ -81,7 +82,8 @@ pub struct Correlation {
   pub turn_id: Option<SmolStr>,
 }
 
-/// Raw request facts captured before admission, authentication, or body parsing.
+/// Ingress application-boundary request-head facts captured before admission,
+/// authentication, or body parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestStarted {
   pub source: RequestSource,
@@ -154,7 +156,14 @@ pub enum ConnectAction {
   Reject,
 }
 
-/// Wire and semantic body facts, including failures before target selection.
+/// Ingress representation and decoded body facts, including failures before
+/// target selection.
+///
+/// For listener traffic, `wire` is the content-coded payload representation
+/// yielded by the HTTP body API before gateway content decoding; HTTP transfer
+/// framing is not included. Embedded producers without an ingress
+/// representation use [`BodyCapture::Absent`] and may report serialized
+/// logical JSON in `decoded`.
 ///
 /// Producers emit this boundary once after body admission, whether admission
 /// succeeds or fails. `decoded` is present only for bytes that represent the
@@ -226,14 +235,24 @@ pub struct AttemptStarted {
   pub target: TargetSelection,
 }
 
-/// Wire-truth request for one selected upstream attempt.
+/// Final application-visible request snapshot for one selected upstream
+/// attempt.
+///
+/// This is captured from the built `reqwest::Request` immediately before
+/// dispatch. Managed attempts contain the provider-prepared request; opaque
+/// attempts contain the sanitized and authorized native-header request.
+/// Protocol framing and transport-derived metadata are outside this boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptHttpRequest {
   pub attempt: AttemptNo,
   pub request: HttpRequestSnapshot,
 }
 
-/// Response metadata observed for one selected upstream attempt.
+/// Application-visible response metadata for one selected upstream attempt.
+///
+/// Managed attempts observe the `reqwest` response head after automatic
+/// content-decoding header adjustments. Opaque attempts observe the `reqwest`
+/// response head with automatic content decoding disabled.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptHttpResponseHead {
   pub attempt: AttemptNo,
@@ -250,7 +269,8 @@ pub struct AttemptUsage {
   pub usage: TokenUsage,
 }
 
-/// One fully prepared HTTP request at a transport boundary.
+/// Method, URI, headers, and available body bytes of a built HTTP-client
+/// request at the application dispatch boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpRequestSnapshot {
   pub method: SmolStr,
@@ -259,10 +279,12 @@ pub struct HttpRequestSnapshot {
   pub body: BodyCapture,
 }
 
-/// Response metadata observed before polling its body.
+/// HTTP status and headers observed at an application boundary before body
+/// polling.
 ///
-/// This is wire truth. Matching status values later carried by terminal
-/// summaries are fallbacks for paths where no response head was observed.
+/// This is not a capture of network bytes or HTTP framing. Matching status
+/// values later carried by terminal summaries are fallbacks for paths where no
+/// response head was observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpResponseHead {
   pub status: u16,
@@ -272,11 +294,16 @@ pub struct HttpResponseHead {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BodyLeg {
+  /// Upstream body bytes yielded by the HTTP client before gateway response
+  /// adaptation. Managed attempts expose decoded bytes; opaque attempts expose
+  /// content-coded bytes with HTTP transfer framing removed.
   Upstream { attempt: AttemptNo },
+  /// Downstream application bytes handed to the server or embedded caller.
   Downstream,
 }
 
-/// Monotonic body-transfer update used by library observers and CLI progress.
+/// Cumulative application-body transfer update used by library observers and
+/// CLI progress.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BodyProgress {
   pub leg: BodyLeg,
@@ -284,7 +311,7 @@ pub struct BodyProgress {
   pub chunks: u64,
 }
 
-/// Final bounded body observation for one side of the gateway.
+/// Final bounded application-body observation for one gateway leg.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BodyFinished {
   pub leg: BodyLeg,
@@ -332,12 +359,14 @@ pub struct RetryDecision {
   pub reason: EventFailure,
 }
 
-/// Exactly one transport-closing observation for every [`AttemptStarted`].
+/// Exactly one attempt-closing observation for every [`AttemptStarted`].
 ///
-/// Request snapshots, response heads, and upstream body facts must precede
-/// this event. A sparse [`AttemptUsage`] update may follow it when a provider
-/// exposes final usage only during terminal reduction, but it must still
-/// precede the request-wide `Finished` event.
+/// Any [`AttemptHttpRequest`], [`AttemptHttpResponseHead`], or upstream
+/// [`BodyProgress`] and [`BodyFinished`] observations for this attempt must
+/// precede this event. A sparse [`AttemptUsage`] update is the only
+/// attempt-scoped observation that may follow it, when a provider exposes final
+/// usage only during terminal reduction, and it must still precede the
+/// request-wide `Finished` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptFinished {
   pub attempt: AttemptNo,
@@ -381,6 +410,10 @@ pub enum RequestOutcome {
 }
 
 /// Exactly one terminal event for every started request or CONNECT exchange.
+///
+/// Every opened [`AttemptStarted`] must be closed by exactly one
+/// [`AttemptFinished`] before this event. `attempt_count` must equal the number
+/// of [`AttemptStarted`] observations in this logical request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestFinished {
   pub outcome: RequestOutcome,
