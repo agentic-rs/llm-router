@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
 use super::super::database::open_readonly;
+use super::super::days::request_day_from_timestamp;
 use super::super::effective_limit;
 use super::super::schema::{read_schema_version, SESSION_MESSAGE_TREE_SCHEMA_VERSION, SESSION_TREE_SCHEMA_VERSION};
 use super::super::value::sqlite_status;
@@ -255,7 +256,7 @@ fn session_summary_from_db_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
     first_ts: row.get(2)?,
     last_ts,
     request_count: nonnegative_count(row.get(4)?),
-    last_request_day: crate::requests::day_key(last_ts),
+    last_request_day: request_day_from_timestamp(last_ts),
     last_request_id: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
     endpoint: row.get(6)?,
     status: sqlite_status(row.get(7)?),
