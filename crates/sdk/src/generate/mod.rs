@@ -675,7 +675,7 @@ impl Client {
   pub async fn send(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateResponse> {
     let request = request.borrow();
     let body = request.responses_body(false)?;
-    let response = self
+    let execution = self
       .execute_generation(
         Endpoint::Responses,
         body,
@@ -683,8 +683,10 @@ impl Client {
         request.generation_options(),
       )
       .await
-      .map_err(map_generation_error)?
-      .into_buffered()?;
+      .map_err(map_generation_error)?;
+    let (response, semantic_completion) = execution.into_parts();
+    drop(semantic_completion);
+    let response = response.into_buffered()?;
     ensure_success(response.status, &response.data)?;
     let raw = serde_json::from_slice(&response.data).map_err(|source| Error::DeserializeResponse { source })?;
     Ok(GenerateResponse::from_raw(response.status, response.headers, raw))
@@ -694,7 +696,7 @@ impl Client {
   pub async fn stream(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateStream> {
     let request = request.borrow();
     let body = request.responses_body(true)?;
-    let response = self
+    let execution = self
       .execute_generation(
         Endpoint::Responses,
         body,
@@ -703,8 +705,12 @@ impl Client {
       )
       .await
       .map_err(map_generation_error)?;
+    let (response, semantic_completion) = execution.into_parts();
     ensure_raw_success(&response)?;
-    Ok(stream::parse_events(response.into_stream()?.into_stream()))
+    Ok(stream::parse_events_with_completion(
+      response.into_stream()?.into_stream(),
+      semantic_completion,
+    ))
   }
 
   /// Stream only generated text deltas.

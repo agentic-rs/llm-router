@@ -12,7 +12,7 @@ use tokn_policy::{ProfileId, RouteKind};
 use tokn_requests::RequestLifecycleEmitter;
 use tokn_router::runtime::{
   link_builtin_gateway_runtime_with_profile_roots, EmbeddedProfileRoots, ManagedGatewayExecutor, ManagedGatewayOutcome,
-  ManagedGatewayRequest,
+  ManagedGatewayRequest, ManagedSemanticCompletion,
 };
 
 use crate::endpoint::{ChatCompletions, Messages, Responses};
@@ -129,6 +129,17 @@ struct Snapshot {
   gateway: ManagedGatewayExecutor,
 }
 
+pub(crate) struct ControlledRawResponse {
+  response: RawResponse,
+  semantic_completion: Option<ManagedSemanticCompletion>,
+}
+
+impl ControlledRawResponse {
+  pub(crate) fn into_parts(self) -> (RawResponse, Option<ManagedSemanticCompletion>) {
+    (self.response, self.semantic_completion)
+  }
+}
+
 /// In-process client bound to one profile and one optional event publisher.
 ///
 /// Runtime snapshots are replaced atomically, while the lifecycle emitter is
@@ -222,6 +233,7 @@ impl Client {
     self
       .execute_with_generation_options(endpoint, body, options, None)
       .await
+      .map(|response| response.response)
   }
 
   pub(crate) async fn execute_generation(
@@ -230,7 +242,7 @@ impl Client {
     body: Value,
     options: RequestOptions,
     generation_options: GenerationOptions,
-  ) -> Result<RawResponse> {
+  ) -> Result<ControlledRawResponse> {
     let generation_options = (!generation_options.is_empty()).then_some(generation_options);
     self
       .execute_with_generation_options(endpoint, body, options, generation_options)
@@ -243,7 +255,7 @@ impl Client {
     body: Value,
     options: RequestOptions,
     generation_options: Option<GenerationOptions>,
-  ) -> Result<RawResponse> {
+  ) -> Result<ControlledRawResponse> {
     let snapshot = self.snapshot.load_full();
     let headers = request_headers(&options)?;
     let mut request = ManagedGatewayRequest::new(endpoint, body).with_headers(headers);
@@ -254,15 +266,19 @@ impl Client {
       request = request.with_generation_options(generation_options);
     }
 
-    let outcome = snapshot
+    let execution = snapshot
       .gateway
-      .execute(&self.source.profile, request)
+      .execute_controlled(&self.source.profile, request)
       .await
       .map_err(|source| Error::ManagedRequest {
         source: Box::new(source),
       })?;
+    let (outcome, semantic_completion) = execution.into_parts();
     match outcome {
-      ManagedGatewayOutcome::Response { response, .. } => Ok(response.into()),
+      ManagedGatewayOutcome::Response { response, .. } => Ok(ControlledRawResponse {
+        response: response.into(),
+        semantic_completion,
+      }),
       ManagedGatewayOutcome::CoolingDown { retry_at, .. } => Err(Error::CoolingDown {
         profile: self.source.profile.to_string(),
         retry_at,
