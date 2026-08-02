@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokn_config::GuardedEditError;
+use tokn_config::{FileIdentity, GuardedEditError};
 
 const LEGACY_BACKUP_SUFFIX: &str = ".legacy-v1.bak";
 
@@ -47,15 +47,18 @@ pub(super) fn ensure_legacy_backup(config_path: &Path, legacy_contents: &[u8]) -
 }
 
 fn validate_existing_backup(path: &Path, expected: &[u8]) -> Result<bool> {
-  let linked_before = match inspect_backup_path(path)? {
-    Some(metadata) => metadata,
-    None => return Ok(false),
-  };
+  if inspect_backup_path(path)?.is_none() {
+    return Ok(false);
+  }
   let mut file = fs::File::open(path).with_context(|| format!("open legacy config backup `{}`", path.display()))?;
   let opened = file
     .metadata()
     .with_context(|| format!("inspect opened legacy config backup `{}`", path.display()))?;
-  if !metadata_is_same_file(&opened, &linked_before) {
+  let opened_identity = FileIdentity::from_file(&file)
+    .with_context(|| format!("inspect opened legacy config backup `{}`", path.display()))?;
+  let linked_identity =
+    FileIdentity::from_path(path).with_context(|| format!("inspect legacy config backup `{}`", path.display()))?;
+  if opened_identity != linked_identity {
     bail!(
       "legacy config backup `{}` changed while it was being opened; retry the migration",
       path.display()
@@ -68,13 +71,15 @@ fn validate_existing_backup(path: &Path, expected: &[u8]) -> Result<bool> {
   file
     .read_to_end(&mut actual)
     .with_context(|| format!("read legacy config backup `{}`", path.display()))?;
-  let Some(linked_after) = inspect_backup_path(path)? else {
+  if inspect_backup_path(path)?.is_none() {
     bail!(
       "legacy config backup `{}` disappeared while it was being read; retry the migration",
       path.display()
     );
-  };
-  if !metadata_is_same_file(&opened, &linked_after) {
+  }
+  let linked_identity =
+    FileIdentity::from_path(path).with_context(|| format!("inspect legacy config backup `{}`", path.display()))?;
+  if opened_identity != linked_identity {
     bail!(
       "legacy config backup `{}` changed while it was being read; retry the migration",
       path.display()
@@ -139,27 +144,6 @@ fn require_single_link(path: &Path, metadata: &fs::Metadata) -> Result<()> {
 #[cfg(not(unix))]
 fn require_single_link(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
   Ok(())
-}
-
-#[cfg(unix)]
-fn metadata_is_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-  use std::os::unix::fs::MetadataExt;
-
-  left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn metadata_is_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-  use std::os::windows::fs::MetadataExt;
-
-  let left_identity = (left.volume_serial_number(), left.file_index());
-  let right_identity = (right.volume_serial_number(), right.file_index());
-  left_identity.0.is_none() || left_identity.1.is_none() || left_identity == right_identity
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_is_same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-  true
 }
 
 #[cfg(test)]

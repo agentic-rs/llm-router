@@ -1,5 +1,5 @@
-use super::{Config, ConfigFileLock, ConfigSources, Error, Result};
-use std::fs::{File, Metadata};
+use super::{Config, ConfigFileLock, ConfigSources, Error, FileIdentity, Result};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -255,12 +255,16 @@ struct DiscoveredFragments {
   paths: Vec<PathBuf>,
 }
 
+struct SourceMetadata {
+  identity: FileIdentity,
+}
+
 pub(super) fn load_fragment_paths(fragment_dir: &Path) -> Result<Vec<PathBuf>> {
   Ok(discover_fragment_paths(fragment_dir)?.paths)
 }
 
 fn discover_fragment_paths(fragment_dir: &Path) -> Result<DiscoveredFragments> {
-  let directory_metadata = match std::fs::symlink_metadata(fragment_dir) {
+  let directory_identity = match std::fs::symlink_metadata(fragment_dir) {
     Ok(metadata) if metadata.file_type().is_symlink() => {
       return Err(Error::ConfigSourceSymlink {
         path: fragment_dir.to_path_buf(),
@@ -272,7 +276,10 @@ fn discover_fragment_paths(fragment_dir: &Path) -> Result<DiscoveredFragments> {
         expected: "a directory",
       });
     }
-    Ok(metadata) => metadata,
+    Ok(_) => FileIdentity::from_path(fragment_dir).map_err(|source| Error::Read {
+      path: fragment_dir.to_path_buf(),
+      source,
+    })?,
     Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
       return Ok(DiscoveredFragments {
         directory_exists: false,
@@ -313,7 +320,7 @@ fn discover_fragment_paths(fragment_dir: &Path) -> Result<DiscoveredFragments> {
       Err(source) => return Err(Error::Read { path, source }),
     }
   }
-  validate_directory_identity(fragment_dir, &directory_metadata)?;
+  validate_directory_identity(fragment_dir, &directory_identity)?;
   fragments.sort();
   Ok(DiscoveredFragments {
     directory_exists: true,
@@ -323,19 +330,19 @@ fn discover_fragment_paths(fragment_dir: &Path) -> Result<DiscoveredFragments> {
 
 fn read_optional_source(path: &Path) -> Result<Option<Vec<u8>>> {
   match source_metadata(path)? {
-    Some(metadata) => read_opened_source(path, &metadata).map(Some),
+    Some(source) => read_opened_source(path, source.identity).map(Some),
     None => Ok(None),
   }
 }
 
 fn read_source(path: &Path) -> Result<Vec<u8>> {
-  let metadata = source_metadata(path)?.ok_or_else(|| Error::ConfigSourceChanged {
+  let source = source_metadata(path)?.ok_or_else(|| Error::ConfigSourceChanged {
     path: path.to_path_buf(),
   })?;
-  read_opened_source(path, &metadata)
+  read_opened_source(path, source.identity)
 }
 
-fn source_metadata(path: &Path) -> Result<Option<Metadata>> {
+fn source_metadata(path: &Path) -> Result<Option<SourceMetadata>> {
   match std::fs::symlink_metadata(path) {
     Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::ConfigSourceSymlink {
       path: path.to_path_buf(),
@@ -344,7 +351,12 @@ fn source_metadata(path: &Path) -> Result<Option<Metadata>> {
       path: path.to_path_buf(),
       expected: "a regular file",
     }),
-    Ok(metadata) => Ok(Some(metadata)),
+    Ok(_) => Ok(Some(SourceMetadata {
+      identity: FileIdentity::from_path(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+      })?,
+    })),
     Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
     Err(source) => Err(Error::Read {
       path: path.to_path_buf(),
@@ -353,30 +365,32 @@ fn source_metadata(path: &Path) -> Result<Option<Metadata>> {
   }
 }
 
-fn read_opened_source(path: &Path, initial: &Metadata) -> Result<Vec<u8>> {
+fn read_opened_source(path: &Path, initial: FileIdentity) -> Result<Vec<u8>> {
   let mut file = File::open(path).map_err(|source| Error::Read {
     path: path.to_path_buf(),
     source,
   })?;
-  validate_file_identity(path, &file, initial)?;
+  validate_file_identity(path, &file, &initial)?;
   let mut contents = Vec::new();
   file.read_to_end(&mut contents).map_err(|source| Error::Read {
     path: path.to_path_buf(),
     source,
   })?;
-  validate_file_identity(path, &file, initial)?;
+  validate_file_identity(path, &file, &initial)?;
   Ok(contents)
 }
 
-fn validate_file_identity(path: &Path, file: &File, initial: &Metadata) -> Result<()> {
-  let opened = file.metadata().map_err(|source| Error::Read {
+fn validate_file_identity(path: &Path, file: &File, initial: &FileIdentity) -> Result<()> {
+  let opened = FileIdentity::from_file(file).map_err(|source| Error::Read {
     path: path.to_path_buf(),
     source,
   })?;
-  let linked = source_metadata(path)?.ok_or_else(|| Error::ConfigSourceChanged {
-    path: path.to_path_buf(),
-  })?;
-  if !super::metadata_is_same_file(initial, &opened) || !super::metadata_is_same_file(&opened, &linked) {
+  let linked = source_metadata(path)?
+    .ok_or_else(|| Error::ConfigSourceChanged {
+      path: path.to_path_buf(),
+    })?
+    .identity;
+  if initial != &opened || opened != linked {
     return Err(Error::ConfigSourceChanged {
       path: path.to_path_buf(),
     });
@@ -384,8 +398,8 @@ fn validate_file_identity(path: &Path, file: &File, initial: &Metadata) -> Resul
   Ok(())
 }
 
-fn validate_directory_identity(path: &Path, initial: &Metadata) -> Result<()> {
-  let current = match std::fs::symlink_metadata(path) {
+fn validate_directory_identity(path: &Path, initial: &FileIdentity) -> Result<()> {
+  match std::fs::symlink_metadata(path) {
     Ok(metadata) if metadata.file_type().is_symlink() => {
       return Err(Error::ConfigSourceSymlink {
         path: path.to_path_buf(),
@@ -397,7 +411,7 @@ fn validate_directory_identity(path: &Path, initial: &Metadata) -> Result<()> {
         expected: "a directory",
       });
     }
-    Ok(metadata) => metadata,
+    Ok(_) => {}
     Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
       return Err(Error::ConfigSourceChanged {
         path: path.to_path_buf(),
@@ -410,7 +424,11 @@ fn validate_directory_identity(path: &Path, initial: &Metadata) -> Result<()> {
       });
     }
   };
-  if !super::metadata_is_same_file(initial, &current) {
+  let current = FileIdentity::from_path(path).map_err(|source| Error::Read {
+    path: path.to_path_buf(),
+    source,
+  })?;
+  if initial != &current {
     return Err(Error::ConfigSourceChanged {
       path: path.to_path_buf(),
     });

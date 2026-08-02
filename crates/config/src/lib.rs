@@ -1,10 +1,12 @@
 pub mod error;
+mod file_identity;
 pub mod paths;
 mod schema;
 mod snapshot;
 pub mod v2;
 
 pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
+pub use file_identity::FileIdentity;
 pub use snapshot::{ConfigFileSnapshot, ConfigSourcesSnapshot, StableLoadedConfig};
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
 pub use tokn_core::AgentId;
@@ -187,12 +189,7 @@ fn reject_config_lock_symlink(path: &Path, lock_path: &Path) -> Result<()> {
 }
 
 fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Result<()> {
-  let opened = file.metadata().map_err(|source| Error::ConfigLock {
-    path: path.to_path_buf(),
-    lock_path: lock_path.to_path_buf(),
-    source,
-  })?;
-  let linked = match std::fs::symlink_metadata(lock_path) {
+  match std::fs::symlink_metadata(lock_path) {
     Ok(metadata) if metadata.file_type().is_symlink() => {
       return Err(Error::ConfigLockSymlink {
         path: path.to_path_buf(),
@@ -202,7 +199,7 @@ fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Resu
     Ok(metadata) if !metadata.is_file() => {
       return Err(invalid_config_lock_file(path, lock_path, "must be a regular file"));
     }
-    Ok(metadata) => metadata,
+    Ok(_) => {}
     Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
       return Err(Error::ConfigLockChanged {
         path: path.to_path_buf(),
@@ -218,7 +215,17 @@ fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Resu
     }
   };
 
-  if !metadata_is_same_file(&opened, &linked) {
+  let opened_identity = FileIdentity::from_file(file).map_err(|source| Error::ConfigLock {
+    path: path.to_path_buf(),
+    lock_path: lock_path.to_path_buf(),
+    source,
+  })?;
+  let linked_identity = FileIdentity::from_path(lock_path).map_err(|source| Error::ConfigLock {
+    path: path.to_path_buf(),
+    lock_path: lock_path.to_path_buf(),
+    source,
+  })?;
+  if opened_identity != linked_identity {
     return Err(Error::ConfigLockChanged {
       path: path.to_path_buf(),
       lock_path: lock_path.to_path_buf(),
@@ -226,25 +233,6 @@ fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Resu
   }
 
   Ok(())
-}
-
-#[cfg(unix)]
-fn metadata_is_same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-  use std::os::unix::fs::MetadataExt;
-  left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn metadata_is_same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-  use std::os::windows::fs::MetadataExt;
-  let left_identity = (left.volume_serial_number(), left.file_index());
-  let right_identity = (right.volume_serial_number(), right.file_index());
-  left_identity.0.is_none() || left_identity.1.is_none() || left_identity == right_identity
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_is_same_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
-  true
 }
 
 fn invalid_config_lock_file(path: &Path, lock_path: &Path, reason: &str) -> Error {

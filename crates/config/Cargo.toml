@@ -17,6 +17,7 @@ tokn-headers = { workspace = true }
 tokn-policy = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+same-file = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
