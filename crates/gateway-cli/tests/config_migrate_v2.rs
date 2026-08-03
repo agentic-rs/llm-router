@@ -54,6 +54,7 @@ api_key = {EMBEDDED_SECRET:?}
       .args(["config", "migrate-v2", "--activate", activation])
       .args(args)
       .env("HOME", &self.home)
+      .env("TOKN_ROUTER_HOME", &self.router_home)
       .env("XDG_CONFIG_HOME", self.home.join(".config"))
       .env("XDG_DATA_HOME", self.home.join(".local/share"))
       .env("XDG_CACHE_HOME", self.home.join(".cache"));
