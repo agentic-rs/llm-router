@@ -305,29 +305,37 @@ default_http_action = {{ kind = "reject" }}
   }
 
   fn compile_persistence(root: &Path, enabled: bool, record_sessions: bool) -> CompiledConfig {
-    let usage_db = root.join("usage.db");
-    let sessions_db = root.join("sessions.db");
-    let requests_dir = root.join("requests");
+    let usage_db = toml::Value::String(root.join("usage.db").to_string_lossy().into_owned());
+    let sessions_db = toml::Value::String(root.join("sessions.db").to_string_lossy().into_owned());
+    let requests_dir = toml::Value::String(root.join("requests").to_string_lossy().into_owned());
     let config = format!(
       r#"
 schema_version = 2
 
 [service.persistence]
 enabled = {enabled}
-usage_db_path = "{}"
-sessions_db_path = "{}"
-requests_dir = "{}"
+usage_db_path = {usage_db}
+sessions_db_path = {sessions_db}
+requests_dir = {requests_dir}
 record_sessions = {record_sessions}
 record_request_bodies = false
 body_max_bytes = 37
 write_queue_capacity = 257
 archive_extension = "zstd"
 "#,
-      usage_db.display(),
-      sessions_db.display(),
-      requests_dir.display(),
     );
     tokn_config::v2::parse(&config, Path::new("persistence.toml")).unwrap()
+  }
+
+  #[test]
+  fn persistence_fixture_quotes_windows_paths_as_toml_strings() {
+    let root = Path::new(r"C:\Users\runner\AppData\Local\Temp");
+    let compiled = compile_persistence(root, true, false);
+    let paths = compiled.service().persistence().resolve_paths().unwrap();
+
+    assert_eq!(paths.usage_db, root.join("usage.db"));
+    assert_eq!(paths.sessions_db, root.join("sessions.db"));
+    assert_eq!(paths.requests_dir, root.join("requests"));
   }
 
   fn test_event() -> GatewayEvent {
