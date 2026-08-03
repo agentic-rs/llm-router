@@ -2309,6 +2309,7 @@ mod tests {
       .start()
       .unwrap();
     let terminal = publisher.begin_guarded(1, |_| TerminalBatch::one(99)).await.unwrap();
+    assert_eq!(publisher.flush().await.unwrap().delivered, 1);
     let shutdown = tokio::spawn(hub.shutdown());
     for _ in 0..100 {
       if matches!(publisher.status(), HubStatus::Closing) {
