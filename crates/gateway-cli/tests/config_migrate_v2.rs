@@ -49,6 +49,8 @@ api_key = {EMBEDDED_SECRET:?}
   fn run_with_args(&self, activation: &str, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tokn-gateway"));
     command
+      .arg("--config")
+      .arg(&self.config_path)
       .args(["config", "migrate-v2", "--activate", activation])
       .args(args)
       .env("HOME", &self.home)
