@@ -79,4 +79,58 @@ mod tests {
       FileIdentity::from_path(&second).unwrap()
     );
   }
+
+  #[test]
+  fn missing_paths_preserve_the_io_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.toml");
+
+    let error = FileIdentity::from_path(&missing).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+  }
+
+  #[test]
+  fn hard_links_share_one_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.toml");
+    let alias = directory.path().join("alias.toml");
+    std::fs::write(&first, "schema_version = 2\n").unwrap();
+    std::fs::hard_link(&first, &alias).unwrap();
+
+    assert_eq!(
+      FileIdentity::from_path(&first).unwrap(),
+      FileIdentity::from_path(&alias).unwrap()
+    );
+  }
+
+  #[test]
+  fn cloned_open_handles_share_one_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "schema_version = 2\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let cloned = file.try_clone().unwrap();
+
+    assert_eq!(
+      FileIdentity::from_file(&file).unwrap(),
+      FileIdentity::from_file(&cloned).unwrap()
+    );
+  }
+
+  #[test]
+  fn open_handle_keeps_its_identity_after_path_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let archived = directory.path().join("config.toml.old");
+    std::fs::write(&path, "first").unwrap();
+    let file = File::open(&path).unwrap();
+    let opened = FileIdentity::from_file(&file).unwrap();
+
+    std::fs::rename(&path, &archived).unwrap();
+    std::fs::write(&path, "replacement").unwrap();
+
+    assert_eq!(opened, FileIdentity::from_path(&archived).unwrap());
+    assert_ne!(opened, FileIdentity::from_path(&path).unwrap());
+  }
 }

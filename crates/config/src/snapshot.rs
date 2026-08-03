@@ -668,6 +668,70 @@ mod tests {
     assert!(matches!(error, Error::ConfigLockChanged { path, .. } if path == root));
   }
 
+  #[test]
+  fn file_snapshot_rejects_a_directory_as_the_root_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("config.toml");
+    std::fs::create_dir(&root).unwrap();
+
+    let error = ConfigFileSnapshot::capture(&root).unwrap_err();
+
+    assert!(matches!(
+      error,
+      Error::InvalidConfigSourceType { path, expected: "a regular file" } if path == root
+    ));
+  }
+
+  #[test]
+  fn stable_load_rejects_a_file_as_the_fragment_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("config.toml");
+    let fragment_dir = crate::paths::config_fragment_dir(&root);
+    std::fs::write(&root, ROOT_CONTENTS).unwrap();
+    std::fs::write(&fragment_dir, "not a directory").unwrap();
+
+    let error = Config::load_stable(Some(&root)).unwrap_err();
+
+    assert!(matches!(
+      error,
+      Error::InvalidConfigSourceType { path, expected: "a directory" } if path == fragment_dir
+    ));
+  }
+
+  #[test]
+  fn stable_load_ignores_a_directory_with_a_toml_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("config.toml");
+    let fragment_dir = crate::paths::config_fragment_dir(&root);
+    std::fs::write(&root, ROOT_CONTENTS).unwrap();
+    std::fs::create_dir_all(fragment_dir.join("ignored.toml")).unwrap();
+
+    let loaded = Config::load_stable(Some(&root)).unwrap();
+
+    assert!(loaded.snapshot.fragments().is_empty());
+    loaded.snapshot.validate().unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn stable_load_ignores_a_non_toml_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("config.toml");
+    let fragment_dir = crate::paths::config_fragment_dir(&root);
+    let target = dir.path().join("outside.toml");
+    std::fs::write(&root, ROOT_CONTENTS).unwrap();
+    std::fs::write(&target, "not valid toml = [").unwrap();
+    std::fs::create_dir(&fragment_dir).unwrap();
+    symlink(&target, fragment_dir.join("ignored.txt")).unwrap();
+
+    let loaded = Config::load_stable(Some(&root)).unwrap();
+
+    assert!(loaded.snapshot.fragments().is_empty());
+    loaded.snapshot.validate().unwrap();
+  }
+
   #[cfg(unix)]
   #[test]
   fn stable_load_rejects_a_root_symlink_without_parsing_its_target() {

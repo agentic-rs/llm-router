@@ -2212,6 +2212,54 @@ profile = "opencode"
     assert!(matches!(error, Error::ConfigLocked { path: locked, .. } if locked == alias));
   }
 
+  #[test]
+  fn config_file_lock_rejects_a_preexisting_lock_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let lock_path = config_lock_path(&canonical_config_path(&path).unwrap()).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
+
+    let error = lock_config_file(&path).unwrap_err();
+
+    assert!(matches!(
+      error,
+      Error::ConfigLock {
+        path: rejected,
+        lock_path: rejected_lock,
+        source,
+      } if rejected == path
+        && rejected_lock == lock_path
+        && source.kind() == std::io::ErrorKind::InvalidInput
+    ));
+  }
+
+  #[test]
+  fn config_file_lock_preserves_a_preexisting_regular_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let lock_path = config_lock_path(&canonical_config_path(&path).unwrap()).unwrap();
+    std::fs::write(&lock_path, "existing lock marker").unwrap();
+
+    let lock = lock_config_file(&path).unwrap();
+    drop(lock);
+
+    assert_eq!(std::fs::read_to_string(lock_path).unwrap(), "existing lock marker");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn config_file_lock_creates_a_private_lock_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let lock = lock_config_file(&path).unwrap();
+
+    let mode = std::fs::metadata(&lock.lock_path).unwrap().permissions().mode() & 0o777;
+
+    assert_eq!(mode, 0o600);
+  }
+
   #[cfg(unix)]
   #[test]
   fn config_file_lock_rejects_a_preexisting_lock_symlink() {
