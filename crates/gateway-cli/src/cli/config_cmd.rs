@@ -1,6 +1,8 @@
 //! `tokn-router config` subcommand — git-style key/value access. Comment-
 //! preserving edits via `toml_edit`.
 
+use self::v2_io::V2ConfigFile;
+use crate::cli::command_config::CommandConfig;
 use crate::config::{paths, Config};
 use crate::util::http::build_client;
 use anyhow::{anyhow, bail, Context, Result};
@@ -200,8 +202,7 @@ fn render_item(item: &Item) -> String {
 fn cmd_set(path: &std::path::Path, args: SetArgs) -> Result<()> {
   let segments = key_segments(args.account.as_deref(), &args.key);
   ensure_root_key_is_not_fragment_managed(path, &segments)?;
-  #[allow(clippy::result_large_err)]
-  Config::edit_in_place(path, |doc| {
+  edit_command_config(path, |doc| {
     if args.add {
       append_array(doc, &segments, &args.value)?;
     } else {
@@ -213,6 +214,29 @@ fn cmd_set(path: &std::path::Path, args: SetArgs) -> Result<()> {
   })?;
   tracing::info!(key = %args.key, account = ?args.account, add = args.add, "config set");
   println!("set {}", args.key);
+  Ok(())
+}
+
+/// Apply a comment-preserving edit through the validator for the active
+/// schema. Version 2 uses an exact file snapshot so a concurrent writer can
+/// never be overwritten between validation and replacement.
+fn edit_command_config<F>(path: &std::path::Path, edit: F) -> Result<()>
+where
+  F: FnOnce(&mut DocumentMut) -> Result<()>,
+{
+  let command_config = CommandConfig::load(Some(path))?;
+  if command_config.is_v2() {
+    let file = V2ConfigFile::read(path)?;
+    let source = std::str::from_utf8(file.contents())
+      .with_context(|| format!("read version 2 config `{}` as UTF-8", path.display()))?;
+    let mut document: DocumentMut = source.parse().context("parse version 2 config as editable TOML")?;
+    edit(&mut document)?;
+    file.replace_contents(document.to_string().as_bytes())?;
+    return Ok(());
+  }
+
+  #[allow(clippy::result_large_err)]
+  Config::edit_in_place(path, |document| edit(document).map_err(Into::into))?;
   Ok(())
 }
 
@@ -268,10 +292,9 @@ fn append_array(doc: &mut DocumentMut, segments: &[String], raw: &str) -> Result
 fn cmd_unset(path: &std::path::Path, args: UnsetArgs) -> Result<()> {
   let segments = key_segments(args.account.as_deref(), &args.key);
   ensure_root_key_is_not_fragment_managed(path, &segments)?;
-  #[allow(clippy::result_large_err)]
-  Config::edit_in_place(path, |doc| {
+  edit_command_config(path, |doc| {
     if !remove(doc, &segments) {
-      return Err(anyhow::anyhow!("key not found: {}", args.key).into());
+      bail!("key not found: {}", args.key);
     }
     Ok(())
   })?;
@@ -283,28 +306,36 @@ fn cmd_unset(path: &std::path::Path, args: UnsetArgs) -> Result<()> {
 // --- list / edit / path ------------------------------------------------
 
 fn cmd_list(path: &std::path::Path) -> Result<()> {
-  let (cfg, _) = Config::load(Some(path))?;
-  let s = toml::to_string_pretty(&cfg)?;
+  let command_config = CommandConfig::load(Some(path))?;
+  let s = if command_config.is_v2() {
+    toml::to_string_pretty(&tokn_config::v2::load_raw(path)?)?
+  } else {
+    let (cfg, _) = Config::load(Some(path))?;
+    toml::to_string_pretty(&cfg)?
+  };
   print!("{s}");
   Ok(())
 }
 
 fn cmd_edit(path: &std::path::Path) -> Result<()> {
-  let fragment_dir = paths::config_fragment_dir(path);
-  if fragment_dir.is_dir() {
-    let has_fragments = std::fs::read_dir(&fragment_dir)
-      .ok()
-      .into_iter()
-      .flatten()
-      .filter_map(Result::ok)
-      .map(|entry| entry.path())
-      .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
-    if has_fragments {
-      eprintln!(
-        "note: linked-agent state is managed separately under {}; this editor changes only {}",
-        fragment_dir.display(),
-        path.display()
-      );
+  let command_config = CommandConfig::load(Some(path))?;
+  if !command_config.is_v2() {
+    let fragment_dir = paths::config_fragment_dir(path);
+    if fragment_dir.is_dir() {
+      let has_fragments = std::fs::read_dir(&fragment_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
+      if has_fragments {
+        eprintln!(
+          "note: linked-agent state is managed separately under {}; this editor changes only {}",
+          fragment_dir.display(),
+          path.display()
+        );
+      }
     }
   }
   if let Some(parent) = path.parent() {
@@ -314,7 +345,7 @@ fn cmd_edit(path: &std::path::Path) -> Result<()> {
   // Validate
   let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
   let _: DocumentMut = raw.parse().context("edited file is not valid TOML")?;
-  let (_cfg, _) = Config::load(Some(path)).context("validation failed after edit")?;
+  CommandConfig::load(Some(path)).context("validation failed after edit")?;
   println!("ok");
   Ok(())
 }
@@ -613,6 +644,9 @@ fn ensure_root_key_is_not_fragment_managed(path: &std::path::Path, segments: &[S
   if section != "agents" && section != "profiles" {
     return Ok(());
   }
+  if CommandConfig::load(Some(path))?.is_v2() {
+    return Ok(());
+  }
   let loaded = Config::load_with_sources(Some(path))?;
   for fragment_path in &loaded.sources.fragments {
     let fragment = load_doc(fragment_path)?;
@@ -865,6 +899,77 @@ agent_id = "opencode"
     assert!(
       ensure_root_key_is_not_fragment_managed(&root, &["profiles".into(), "other".into(), "mode".into()],).is_ok()
     );
+  }
+
+  #[test]
+  fn v2_set_and_unset_preserve_comments_and_validate_the_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "# operator note\nschema_version = 2\n").unwrap();
+
+    cmd_set(
+      &path,
+      SetArgs {
+        key: "service.persistence.enabled".into(),
+        value: "false".into(),
+        add: false,
+        account: None,
+      },
+    )
+    .unwrap();
+
+    let after_set = std::fs::read_to_string(&path).unwrap();
+    assert!(after_set.contains("# operator note"));
+    assert!(after_set.contains("enabled = false"));
+    tokn_config::v2::parse(&after_set, &path).unwrap();
+
+    cmd_unset(
+      &path,
+      UnsetArgs {
+        key: "service.persistence.enabled".into(),
+        account: None,
+      },
+    )
+    .unwrap();
+
+    let after_unset = std::fs::read_to_string(&path).unwrap();
+    assert!(after_unset.contains("# operator note"));
+    assert!(!after_unset.contains("enabled = false"));
+    tokn_config::v2::parse(&after_unset, &path).unwrap();
+  }
+
+  #[test]
+  fn invalid_v2_set_does_not_replace_the_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let original = "# unchanged\nschema_version = 2\n";
+    std::fs::write(&path, original).unwrap();
+
+    let error = cmd_set(
+      &path,
+      SetArgs {
+        key: "schema_version".into(),
+        value: "3".into(),
+        add: false,
+        account: None,
+      },
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("unsupported schema version"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+  }
+
+  #[test]
+  fn legacy_fragments_do_not_shadow_v2_root_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("config.toml");
+    std::fs::write(&root, "schema_version = 2\n").unwrap();
+    let fragment = paths::agent_config_fragment_path(&root, "opencode");
+    std::fs::create_dir_all(fragment.parent().unwrap()).unwrap();
+    std::fs::write(&fragment, "[profiles.opencode]\nagent_id = \"opencode\"\n").unwrap();
+
+    ensure_root_key_is_not_fragment_managed(&root, &["profiles".into(), "opencode".into(), "mode".into()]).unwrap();
   }
 
   #[test]

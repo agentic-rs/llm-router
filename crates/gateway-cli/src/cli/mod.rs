@@ -2,12 +2,13 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::config::{Config, LogTarget};
+use crate::config::LogTarget;
 use crate::logging::{self, RunMode};
 
 mod account;
 mod agent;
 mod api_key;
+mod command_config;
 mod config_cmd;
 mod error;
 mod headers;
@@ -116,7 +117,8 @@ impl Cli {
     }
 
     let is_inspect = matches!(&self.cmd, Cmd::Inspect(_));
-    if !is_inspect {
+    let versioned_schema = command_config::CommandConfig::uses_versioned_schema(cfg_path.as_deref());
+    if !is_inspect && matches!(versioned_schema, Ok(false)) {
       prepare_legacy_default_config_home(cfg_path.as_deref())?;
     }
 
@@ -125,15 +127,27 @@ impl Cli {
     // config loading fails we fall back to a stderr-only emergency
     // subscriber so the resulting error still gets logged sanely.
     let mode = run_mode_for(&self.cmd);
-    let _guard = match Config::load(cfg_path.as_deref()) {
-      Ok((cfg, _)) => {
-        let mut logging_cfg = cfg.logging.clone();
-        if is_inspect {
-          logging_cfg.target = LogTarget::Stderr;
+    let _guard = match versioned_schema {
+      Ok(false) => match command_config::CommandConfig::load(cfg_path.as_deref()) {
+        Ok(command_config) => {
+          let mut logging_cfg = command_config
+            .legacy_logging()
+            .expect("an unversioned command config contains legacy logging")
+            .clone();
+          if is_inspect {
+            logging_cfg.target = LogTarget::Stderr;
+          }
+          Some(logging::init(&logging_cfg, mode))
         }
-        Some(logging::init(&logging_cfg, mode))
-      }
-      Err(_) => {
+        Err(_) => {
+          logging::init_basic();
+          None
+        }
+      },
+      Ok(true) | Err(_) => {
+        // Logging is not part of the v2 service schema yet. Invalid configs
+        // are also left to the owning command so config-independent commands
+        // remain usable for recovery.
         logging::init_basic();
         None
       }

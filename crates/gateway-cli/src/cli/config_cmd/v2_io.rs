@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use tokn_config::ConfigFileSnapshot;

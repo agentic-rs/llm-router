@@ -1,4 +1,3 @@
-use crate::config::Config;
 use anyhow::{anyhow, Result};
 use clap::Args;
 use std::path::PathBuf;
@@ -12,8 +11,8 @@ pub struct HeadersArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: HeadersArgs) -> Result<()> {
-  let (_cfg, path) = Config::load(cfg_path.as_deref())?;
-  let store = AuthStore::load(None, Some(&path))?;
+  let config = super::command_config::CommandConfig::load(cfg_path.as_deref())?;
+  let store = AuthStore::load(None, Some(config.path()))?;
   let headers = match args.account {
     None => tokn_provider_copilot::config::CopilotHeaders::default(),
     Some(id) => {
