@@ -1,5 +1,13 @@
 use super::*;
 
+fn exact_host(value: &str) -> HostPattern {
+  HostPattern::exact(CanonicalHost::parse(value).unwrap())
+}
+
+fn subdomains_of(value: &str) -> HostPattern {
+  HostPattern::subdomains_of(CanonicalHost::parse(value).unwrap()).unwrap()
+}
+
 fn parse_config(contents: &str) -> RawConfig {
   toml::from_str(contents).unwrap()
 }
@@ -53,7 +61,7 @@ path_prefixes = ["/v1"]
   assert_eq!(listener.http_bindings()[0].id().as_str(), "specific");
   assert_eq!(listener.http_bindings()[1].id().as_str(), "fallback");
   let matcher = listener.http_bindings()[0].matcher();
-  assert_eq!(matcher.hosts(), &[HostPattern::exact("api.example.com")]);
+  assert_eq!(matcher.hosts(), &[exact_host("api.example.com")]);
   assert_eq!(matcher.methods()[0].as_str(), "POST");
   assert_eq!(matcher.operations()[0].as_str(), "chat_completions");
 }
@@ -62,25 +70,13 @@ path_prefixes = ["/v1"]
 fn host_patterns_are_strict_and_canonical() {
   assert_eq!(
     compile_host("*.API.Example.COM", "hosts").unwrap(),
-    (
-      HostPattern::subdomains_of("api.example.com"),
-      CanonicalHost::SubdomainsOf("api.example.com".into())
-    )
+    subdomains_of("api.example.com")
   );
   assert_eq!(
     compile_host("[2001:0db8::1]", "hosts").unwrap(),
-    (
-      HostPattern::exact("2001:db8::1"),
-      CanonicalHost::Exact("2001:db8::1".into())
-    )
+    exact_host("2001:db8::1")
   );
-  assert_eq!(
-    compile_host("127.0.0.1", "hosts").unwrap(),
-    (
-      HostPattern::exact("127.0.0.1"),
-      CanonicalHost::Exact("127.0.0.1".into())
-    )
-  );
+  assert_eq!(compile_host("127.0.0.1", "hosts").unwrap(), exact_host("127.0.0.1"));
 
   for invalid in [
     "*",

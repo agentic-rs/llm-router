@@ -1,11 +1,11 @@
 use crate::v2::{CompileError, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawListener};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokn_policy::{
-  BindingId, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan, DestinationPolicy, ForwardProxyListenerPlan,
-  HostPattern, HttpAction, HttpBindingPlan, HttpMatch, ListenerId, ListenerPlan, LlmApiListenerPlan, OperationId,
-  ProfileId, ProfilePlan, RouteId, RoutePlan, TlsPlan,
+  BindingId, CanonicalHost, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan, DestinationPolicy,
+  ForwardProxyListenerPlan, HostPattern, HttpAction, HttpBindingPlan, HttpMatch, ListenerId, ListenerPlan,
+  LlmApiListenerPlan, OperationId, ProfileId, ProfilePlan, RouteId, RoutePlan, TlsPlan,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,29 +29,6 @@ struct HttpActionContext<'a> {
   reference_field: &'static str,
   location: String,
   listener_flavor: ListenerFlavor,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum CanonicalHost {
-  Exact(String),
-  SubdomainsOf(String),
-}
-
-impl CanonicalHost {
-  fn subsumes(&self, other: &Self) -> bool {
-    match (self, other) {
-      (Self::Exact(left), Self::Exact(right)) => left == right,
-      (Self::SubdomainsOf(suffix), Self::Exact(host)) => is_strict_subdomain(host, suffix),
-      (Self::SubdomainsOf(left), Self::SubdomainsOf(right)) => left == right || is_strict_subdomain(right, left),
-      (Self::Exact(_), Self::SubdomainsOf(_)) => false,
-    }
-  }
-}
-
-fn is_strict_subdomain(host: &str, suffix: &str) -> bool {
-  host
-    .strip_suffix(suffix)
-    .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
 }
 
 fn dimension_subsumes<T>(covering: &[T], covered: &[T], subsumes: impl Fn(&T, &T) -> bool) -> bool {
@@ -79,7 +56,7 @@ fn all_atoms<T>(alternatives: &[T], mut predicate: impl FnMut(Option<&T>) -> boo
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HttpMatchKey {
-  hosts: Vec<CanonicalHost>,
+  hosts: Vec<HostPattern>,
   path_prefixes: Vec<String>,
   methods: Vec<String>,
   operations: Vec<String>,
@@ -87,7 +64,7 @@ struct HttpMatchKey {
 
 impl HttpMatchKey {
   fn subsumes(&self, other: &Self) -> bool {
-    dimension_subsumes(&self.hosts, &other.hosts, CanonicalHost::subsumes)
+    dimension_subsumes(&self.hosts, &other.hosts, HostPattern::subsumes)
       && dimension_subsumes(&self.path_prefixes, &other.path_prefixes, |prefix, path| {
         path.starts_with(prefix)
       })
@@ -97,12 +74,12 @@ impl HttpMatchKey {
 
   fn subsumes_atom(
     &self,
-    host: Option<&CanonicalHost>,
+    host: Option<&HostPattern>,
     path_prefix: Option<&String>,
     method: Option<&String>,
     operation: Option<&String>,
   ) -> bool {
-    dimension_subsumes_atom(&self.hosts, host, CanonicalHost::subsumes)
+    dimension_subsumes_atom(&self.hosts, host, HostPattern::subsumes)
       && dimension_subsumes_atom(&self.path_prefixes, path_prefix, |prefix, path| {
         path.starts_with(prefix)
       })
@@ -510,18 +487,18 @@ fn compile_http_match(raw: &crate::v2::RawBinding) -> Result<(HttpMatch, HttpMat
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConnectMatchKey {
-  hosts: Vec<CanonicalHost>,
+  hosts: Vec<HostPattern>,
   ports: Vec<u16>,
 }
 
 impl ConnectMatchKey {
   fn subsumes(&self, other: &Self) -> bool {
-    dimension_subsumes(&self.hosts, &other.hosts, CanonicalHost::subsumes)
+    dimension_subsumes(&self.hosts, &other.hosts, HostPattern::subsumes)
       && dimension_subsumes(&self.ports, &other.ports, PartialEq::eq)
   }
 
-  fn subsumes_atom(&self, host: Option<&CanonicalHost>, port: Option<&u16>) -> bool {
-    dimension_subsumes_atom(&self.hosts, host, CanonicalHost::subsumes)
+  fn subsumes_atom(&self, host: Option<&HostPattern>, port: Option<&u16>) -> bool {
+    dimension_subsumes_atom(&self.hosts, host, HostPattern::subsumes)
       && dimension_subsumes_atom(&self.ports, port, PartialEq::eq)
   }
 }
@@ -569,41 +546,31 @@ fn compile_connect_match(raw: &crate::v2::RawConnectRule) -> Result<(ConnectMatc
   ))
 }
 
-fn compile_hosts(
-  raw_hosts: &[String],
-  location: String,
-) -> Result<(Vec<HostPattern>, Vec<CanonicalHost>), CompileError> {
+fn compile_hosts(raw_hosts: &[String], location: String) -> Result<(Vec<HostPattern>, Vec<HostPattern>), CompileError> {
   let mut patterns = Vec::with_capacity(raw_hosts.len());
   let mut keys = Vec::with_capacity(raw_hosts.len());
-  let mut claimed = Vec::<(String, CanonicalHost)>::new();
+  let mut claimed = Vec::<(String, HostPattern)>::new();
   for raw_host in raw_hosts {
-    let (pattern, key) = compile_host(raw_host, &location)?;
+    let pattern = compile_host(raw_host, &location)?;
     for (prior_raw, prior) in &claimed {
-      if prior == &key {
+      if prior == &pattern {
         return Err(duplicate_value(location.clone(), raw_host));
       }
-      if prior.subsumes(&key) {
+      if prior.subsumes(&pattern) {
         return Err(redundant_value(location.clone(), raw_host, prior_raw));
       }
-      if key.subsumes(prior) {
+      if pattern.subsumes(prior) {
         return Err(redundant_value(location.clone(), prior_raw, raw_host));
       }
     }
-    claimed.push((raw_host.clone(), key.clone()));
-    patterns.push(pattern);
-    keys.push(key);
+    claimed.push((raw_host.clone(), pattern.clone()));
+    patterns.push(pattern.clone());
+    keys.push(pattern);
   }
   Ok((patterns, keys))
 }
 
-fn compile_host(raw: &str, location: &str) -> Result<(HostPattern, CanonicalHost), CompileError> {
-  if raw.is_empty() || raw.trim() != raw {
-    return Err(invalid_value(
-      location.to_string(),
-      "hosts must be non-empty and have no surrounding whitespace",
-    ));
-  }
-
+fn compile_host(raw: &str, location: &str) -> Result<HostPattern, CompileError> {
   if let Some(raw_suffix) = raw.strip_prefix("*.") {
     if raw_suffix.contains('*') {
       return Err(invalid_host(
@@ -611,21 +578,8 @@ fn compile_host(raw: &str, location: &str) -> Result<(HostPattern, CanonicalHost
         "wildcard is only allowed once as the `*.` prefix",
       ));
     }
-    if let Some(address) = whatwg_ipv4_address(raw_suffix) {
-      return Err(invalid_host(
-        location,
-        format!("wildcard suffix resolves to IPv4 address `{address}`; use it as an exact host instead"),
-      ));
-    }
-    let suffix = canonical_dns_name(raw_suffix, location)?;
-    if suffix.parse::<IpAddr>().is_ok() {
-      return Err(invalid_host(
-        location,
-        "wildcard suffix must be a DNS name, not an IP address",
-      ));
-    }
-    let key = CanonicalHost::SubdomainsOf(suffix.clone());
-    return Ok((HostPattern::subdomains_of(suffix), key));
+    let suffix = CanonicalHost::parse(raw_suffix).map_err(|error| invalid_host(location, error.to_string()))?;
+    return HostPattern::subdomains_of(suffix).map_err(|error| invalid_host(location, error.to_string()));
   }
   if raw.contains('*') {
     return Err(invalid_host(
@@ -634,66 +588,9 @@ fn compile_host(raw: &str, location: &str) -> Result<(HostPattern, CanonicalHost
     ));
   }
 
-  let canonical = if let Some(inner) = raw.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
-    inner
-      .parse::<Ipv6Addr>()
-      .map(|address| address.to_string())
-      .map_err(|_| invalid_host(location, "brackets may only contain an IPv6 address"))?
-  } else if raw.contains('[') || raw.contains(']') {
-    return Err(invalid_host(location, "malformed bracketed IPv6 address"));
-  } else if let Ok(address) = raw.parse::<IpAddr>() {
-    address.to_string()
-  } else {
-    if let Some(address) = whatwg_ipv4_address(raw) {
-      return Err(invalid_host(
-        location,
-        format!("noncanonical IPv4 address; use `{address}`"),
-      ));
-    }
-    if raw.contains(':') {
-      return Err(invalid_host(location, "host selectors must not include a port"));
-    }
-    canonical_dns_name(raw, location)?
-  };
-  let key = CanonicalHost::Exact(canonical.clone());
-  Ok((HostPattern::exact(canonical), key))
-}
-
-fn whatwg_ipv4_address(raw: &str) -> Option<String> {
-  let url = reqwest::Url::parse(&format!("http://{raw}/")).ok()?;
-  url
-    .host_str()?
-    .parse::<std::net::Ipv4Addr>()
-    .ok()
-    .map(|address| address.to_string())
-}
-
-fn canonical_dns_name(raw: &str, location: &str) -> Result<String, CompileError> {
-  if !raw.is_ascii() {
-    return Err(invalid_host(location, "DNS names must contain ASCII characters only"));
-  }
-  if raw.ends_with('.') {
-    return Err(invalid_host(location, "trailing dots are not allowed"));
-  }
-  if raw.len() > 253 {
-    return Err(invalid_host(location, "DNS name exceeds 253 bytes"));
-  }
-  if raw.is_empty() {
-    return Err(invalid_host(location, "DNS name must not be empty"));
-  }
-  for label in raw.split('.') {
-    let valid_length = !label.is_empty() && label.len() <= 63;
-    let valid_edges = label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
-      && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric);
-    let valid_characters = label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    if !(valid_length && valid_edges && valid_characters) {
-      return Err(invalid_host(
-        location,
-        "DNS labels must be 1-63 ASCII letters, digits, or interior hyphens",
-      ));
-    }
-  }
-  Ok(raw.to_ascii_lowercase())
+  CanonicalHost::parse(raw)
+    .map(HostPattern::exact)
+    .map_err(|error| invalid_host(location, error.to_string()))
 }
 
 fn invalid_host(location: &str, message: impl Into<String>) -> CompileError {

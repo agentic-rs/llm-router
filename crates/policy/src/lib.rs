@@ -5,10 +5,15 @@
 //! runtime crates consume them without depending on TOML shape or compatibility
 //! aliases.
 
+mod authority;
 mod id;
 mod route;
 mod topology;
 
+pub use authority::{
+  AuthorityMismatch, CanonicalAuthority, CanonicalHost, IngressAuthority, IngressAuthoritySource, InvalidAuthority,
+  InvalidHost, ResolvedAuthority,
+};
 pub use id::{
   AccountPoolId, BindingId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId, ProfileId,
   ProviderId, RetryPolicyId, RouteId, UpstreamId, WireIdentityId,
@@ -21,6 +26,6 @@ pub use route::{
 pub use topology::{
   AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
   ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, HttpAction,
-  HttpBindingPlan, HttpMatch, ListenerKind, ListenerPlan, LlmApiListenerPlan, ModelCandidate, ModelGroupPlan,
-  SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
+  HttpBindingPlan, HttpMatch, InvalidSubdomainSuffix, ListenerKind, ListenerPlan, LlmApiListenerPlan, ModelCandidate,
+  ModelGroupPlan, SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
 };

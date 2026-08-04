@@ -3,9 +3,9 @@ use crate::v2::{
   RawOperationPolicy, RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget, RawRoute, RawUpstream,
   RawUpstreamSelector, RawWireIdentity,
 };
-use reqwest::Url;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_policy::{
   AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, FallbackSelector, ManagedRetry,
   ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan, ModelSelector, OperationPolicy, ProfileId,
@@ -66,7 +66,7 @@ fn compile_account_pools(
         raw_pool.session_expired_retention_secs,
         MAX_SESSION_DURATION_SECS,
       )?;
-      let accounts = compile_account_filter(raw_pool.accounts.as_deref(), raw_id)?
+      let accounts = compile_account_filter(raw_pool.accounts.as_deref(), format!("account_pools.{raw_id}.accounts"))?
         .map(|accounts| accounts.into_iter().map(Into::into).collect());
       let providers = compile_provider_filter(raw_pool.providers.as_deref(), raw_id)?;
 
@@ -111,12 +111,12 @@ fn validate_duration(pool_id: &str, field: &str, seconds: u64, maximum: u64) -> 
 
 fn compile_account_filter(
   raw_values: Option<&[String]>,
-  pool_id: &str,
+  location: String,
 ) -> Result<Option<BTreeSet<String>>, CompileError> {
   let Some(raw_values) = raw_values else {
     return Ok(None);
   };
-  validate_selector_shape(raw_values, format!("account_pools.{pool_id}.accounts"))?;
+  validate_selector_shape(raw_values, location.clone())?;
   if raw_values == ["*"] {
     return Ok(None);
   }
@@ -125,12 +125,12 @@ fn compile_account_filter(
   for value in raw_values {
     if value.trim().is_empty() || value.trim() != value {
       return Err(invalid_value(
-        format!("account_pools.{pool_id}.accounts"),
+        location.clone(),
         "account ids must be non-empty and have no surrounding whitespace",
       ));
     }
     if !values.insert(value.clone()) {
-      return Err(duplicate_value(format!("account_pools.{pool_id}.accounts"), value));
+      return Err(duplicate_value(location.clone(), value));
     }
   }
   Ok(Some(values))
@@ -179,6 +179,9 @@ fn compile_upstreams(
   for (raw_id, raw_upstream) in raw_upstreams {
     let id = parse_id::<UpstreamId>("upstream id", raw_id)?;
     let provider = parse_id::<ProviderId>("upstream provider", &raw_upstream.provider)?;
+    let eligible_accounts =
+      compile_account_filter(raw_upstream.accounts.as_deref(), format!("upstreams.{raw_id}.accounts"))?
+        .map(|accounts| accounts.into_iter().map(Into::into).collect());
     let (base_url, base_origin) = raw_upstream
       .base_url
       .as_deref()
@@ -211,7 +214,8 @@ fn compile_upstreams(
       base_url.map(Into::into),
       origins.into_boxed_slice(),
       raw_upstream.allow_insecure_http,
-    );
+    )
+    .with_eligible_accounts(eligible_accounts);
     plans.insert(id, plan);
   }
 
@@ -240,192 +244,24 @@ fn canonical_base_url(
   location: String,
   allow_insecure_http: bool,
 ) -> Result<(String, String), CompileError> {
-  let parsed = parse_http_url(value, &location, allow_insecure_http)?;
-  if parsed.query().is_some() || parsed.fragment().is_some() {
-    return Err(invalid_value(location, "base URL must not contain a query or fragment"));
-  }
-
-  let origin = parsed.origin().ascii_serialization();
-  let mut base_url = parsed.to_string();
-  if !base_url.ends_with('/') {
-    base_url.push('/');
-  }
-  Ok((base_url, origin))
+  let parsed = CanonicalUpstreamUrl::parse(value, cleartext_policy(allow_insecure_http))
+    .map_err(|error| invalid_value(location, error.to_string()))?;
+  let origin = parsed.origin().to_string();
+  Ok((parsed.to_string(), origin))
 }
 
 fn canonical_origin(value: &str, location: String, allow_insecure_http: bool) -> Result<String, CompileError> {
-  let parsed = parse_http_url(value, &location, allow_insecure_http)?;
-  if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
-    return Err(invalid_value(location, "expected only scheme, host, and optional port"));
-  }
-  Ok(parsed.origin().ascii_serialization())
+  CanonicalHttpOrigin::parse(value, cleartext_policy(allow_insecure_http))
+    .map(|origin| origin.to_string())
+    .map_err(|error| invalid_value(location, error.to_string()))
 }
 
-fn parse_http_url(value: &str, location: &str, allow_insecure_http: bool) -> Result<Url, CompileError> {
-  let raw_host = validate_raw_http_url(value, location)?;
-  let parsed =
-    Url::parse(value).map_err(|error| invalid_value(location.to_string(), format!("invalid URL: {error}")))?;
-  if !matches!(parsed.scheme(), "http" | "https") {
-    return Err(invalid_value(location.to_string(), "scheme must be http or https"));
+fn cleartext_policy(allow_insecure_http: bool) -> CleartextHttpPolicy {
+  if allow_insecure_http {
+    CleartextHttpPolicy::Allow
+  } else {
+    CleartextHttpPolicy::LoopbackOnly
   }
-  if parsed.host().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must contain a host and must not contain credentials",
-    ));
-  }
-  if parsed.port() == Some(0) {
-    return Err(invalid_value(location.to_string(), "port zero is not allowed"));
-  }
-  let host = parsed.host_str().expect("host presence was checked");
-  if host.trim_end_matches('.').len() != host.len() {
-    return Err(invalid_value(
-      location.to_string(),
-      "DNS hosts must not have a trailing dot",
-    ));
-  }
-  reject_noncanonical_ipv4_host(raw_host, host, location)?;
-  if parsed.scheme() == "http" && !allow_insecure_http && !is_literal_loopback(host) {
-    return Err(invalid_value(
-      location.to_string(),
-      "non-loopback HTTP can expose account credentials; use HTTPS or set allow_insecure_http = true",
-    ));
-  }
-  Ok(parsed)
-}
-
-fn validate_raw_http_url<'a>(value: &'a str, location: &str) -> Result<&'a str, CompileError> {
-  if !value.is_ascii() {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must be ASCII; use an ASCII domain and percent-encoded path",
-    ));
-  }
-  if value
-    .bytes()
-    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-    || value.contains('\\')
-  {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must not contain whitespace, control characters, or backslashes",
-    ));
-  }
-
-  let remainder = value
-    .strip_prefix("https://")
-    .or_else(|| value.strip_prefix("http://"))
-    .ok_or_else(|| {
-      invalid_value(
-        location.to_string(),
-        "scheme must use canonical `https://` or `http://` syntax",
-      )
-    })?;
-  let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-  let authority = &remainder[..authority_end];
-  if authority.is_empty() || authority.contains('@') || authority.contains('%') {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL must contain a plain host authority without credentials or escapes",
-    ));
-  }
-  let raw_host = raw_authority_host(authority).ok_or_else(|| {
-    invalid_value(
-      location.to_string(),
-      "URL authority must contain a valid host and optional port",
-    )
-  })?;
-  if raw_host.ends_with('.') {
-    return Err(invalid_value(
-      location.to_string(),
-      "DNS hosts must not have a trailing dot",
-    ));
-  }
-
-  let raw_path_and_suffix = &remainder[authority_end..];
-  let raw_path = raw_path_and_suffix
-    .split(['?', '#'])
-    .next()
-    .unwrap_or(raw_path_and_suffix);
-  if raw_path.split('/').any(is_raw_dot_segment) {
-    return Err(invalid_value(
-      location.to_string(),
-      "URL path must not contain literal or percent-encoded `.` or `..` segments",
-    ));
-  }
-
-  Ok(raw_host)
-}
-
-fn raw_authority_host(authority: &str) -> Option<&str> {
-  if let Some(bracketed) = authority.strip_prefix('[') {
-    let closing = bracketed.find(']')?;
-    let host = &bracketed[..closing];
-    let suffix = &bracketed[closing + 1..];
-    if !suffix.is_empty()
-      && !suffix
-        .strip_prefix(':')
-        .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-      return None;
-    }
-    return (!host.is_empty()).then_some(host);
-  }
-
-  let host = match authority.rsplit_once(':') {
-    Some((host, port)) if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) => host,
-    Some(_) => return None,
-    None => authority,
-  };
-  (!host.is_empty() && !host.contains(':')).then_some(host)
-}
-
-fn is_raw_dot_segment(segment: &str) -> bool {
-  let bytes = segment.as_bytes();
-  let mut dots = 0;
-  let mut index = 0;
-  while index < bytes.len() {
-    if bytes[index] == b'.' {
-      dots += 1;
-      index += 1;
-    } else if bytes
-      .get(index..index + 3)
-      .is_some_and(|encoded| encoded[0] == b'%' && encoded[1] == b'2' && encoded[2].eq_ignore_ascii_case(&b'e'))
-    {
-      dots += 1;
-      index += 3;
-    } else {
-      return false;
-    }
-  }
-  matches!(dots, 1 | 2)
-}
-
-fn reject_noncanonical_ipv4_host(raw_host: &str, parsed_host: &str, location: &str) -> Result<(), CompileError> {
-  let parsed_host = parsed_host
-    .strip_prefix('[')
-    .and_then(|value| value.strip_suffix(']'))
-    .unwrap_or(parsed_host);
-  let Ok(parsed_address) = parsed_host.parse::<std::net::Ipv4Addr>() else {
-    return Ok(());
-  };
-  if raw_host.parse::<std::net::Ipv4Addr>().ok() != Some(parsed_address) {
-    return Err(invalid_value(
-      location.to_string(),
-      format!("IPv4 host must use canonical dotted-decimal form `{parsed_address}`"),
-    ));
-  }
-  Ok(())
-}
-
-fn is_literal_loopback(host: &str) -> bool {
-  let host = host
-    .strip_prefix('[')
-    .and_then(|value| value.strip_suffix(']'))
-    .unwrap_or(host);
-  host
-    .parse::<std::net::IpAddr>()
-    .is_ok_and(|address| address.is_loopback())
 }
 
 fn compile_model_groups(

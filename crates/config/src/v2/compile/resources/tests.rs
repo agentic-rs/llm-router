@@ -301,6 +301,7 @@ fn managed_any_requires_a_compatible_configured_upstream() {
     "default".into(),
     RawUpstream {
       provider: "openai".into(),
+      accounts: None,
       base_url: None,
       origins: Vec::new(),
       allow_insecure_http: false,
@@ -311,6 +312,33 @@ fn managed_any_requires_a_compatible_configured_upstream() {
     compile_resources(&config),
     Err(CompileError::InvalidValue { location, .. }) if location == "routes.default.upstream"
   ));
+}
+
+#[test]
+fn upstream_account_filters_prevent_implicit_credential_cartesian_products() {
+  let mut config = base_config("");
+  config.upstreams.get_mut("default").unwrap().accounts = Some(vec!["work".into()]);
+  let compiled = compile_resources(&config).unwrap();
+  let upstream = &compiled.upstreams[&UpstreamId::new("default").unwrap()];
+  assert!(upstream.permits_account("work"));
+  assert!(!upstream.permits_account("personal"));
+
+  config.upstreams.get_mut("default").unwrap().accounts = Some(vec!["*".into()]);
+  assert!(
+    compile_resources(&config).unwrap().upstreams[&UpstreamId::new("default").unwrap()].permits_account("personal")
+  );
+
+  for invalid in [
+    Vec::new(),
+    vec!["*".into(), "work".into()],
+    vec!["work".into(), "work".into()],
+  ] {
+    config.upstreams.get_mut("default").unwrap().accounts = Some(invalid);
+    assert!(matches!(
+      compile_resources(&config),
+      Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.default.accounts"
+    ));
+  }
 }
 
 #[test]
@@ -355,6 +383,8 @@ fn upstream_urls_reject_port_zero_and_normalize_base_prefixes() {
     "https://api.example.com/a/../v1",
     "https://api.example.com/%2E%2e/v1",
     "https://127.1/v1",
+    "https://example.0x10/v1",
+    "https://example.123/v1",
   ] {
     config.upstreams.get_mut("default").unwrap().base_url = Some(invalid.into());
     assert!(matches!(

@@ -4,6 +4,8 @@ use reqwest::Method;
 use serde_json::Value;
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
+use tokn_core::provider::ProviderTarget;
+use tokn_core::upstream_url::CleartextHttpPolicy;
 use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
@@ -13,12 +15,12 @@ use crate::{
   ID_LLAMA_CPP,
 };
 
-pub const DEFAULT_BASE_URL: &str = "http://localhost:8080/v1";
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 
 pub struct LlamaCppProvider {
   pub id: String,
   api_key: Option<Secret<String>>,
-  base_url: String,
+  target: ProviderTarget,
   info: ProviderInfo,
 }
 
@@ -43,18 +45,30 @@ impl LlamaCppProvider {
   }
 
   pub fn from_account(a: Arc<AccountConfig>) -> Result<Self> {
+    let base_url = a.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+    let target = ProviderTarget::parse(base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: a.id.clone(),
+        source,
+      }
+    })?;
+    Self::from_account_at(a, target)
+  }
+
+  pub fn from_account_at(a: Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
     Self::validate_account(&a)?;
     let api_key = a.api_key.clone();
-    let base_url = a.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    let upstream_url = target.base_url().to_string();
+    let model_cache = target.model_cache().clone();
     Ok(Self {
       id: format!("{}:{}", a.provider, a.id),
       api_key: api_key.clone(),
-      base_url: base_url.clone(),
+      target,
       info: ProviderInfo {
         id: ID_LLAMA_CPP.to_string(),
         aliases: &[ID_LLAMA_CPP],
         display_name: "llama.cpp",
-        upstream_url: base_url,
+        upstream_url,
         auth_kind: if api_key.is_some() {
           AuthKind::StaticApiKey
         } else {
@@ -62,13 +76,13 @@ impl LlamaCppProvider {
         },
         default_models: crate::catalogue::default_models_for(ID_LLAMA_CPP),
         default_endpoints: crate::DEFAULT_ENDPOINTS,
-        model_cache: Arc::new(tokn_core::provider::ModelCache::default()),
+        model_cache,
       },
     })
   }
 
-  fn url(&self, path: &str) -> String {
-    format!("{}{}", self.base_url.trim_end_matches('/'), path)
+  fn operation_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+    Ok(self.target.base_url().operation_url(segments.iter().copied())?)
   }
 }
 
@@ -134,15 +148,24 @@ impl Provider for LlamaCppProvider {
         agent_id: &tokn_core::AgentId::Opencode,
       },
     )?;
-    let url = self.url("/models");
+    let url = self.operation_url(&["models"])?;
     debug!(%url, "GET llama.cpp models");
-    let resp = crate::util::http::send(http, Method::GET, &url, headers, None, None, "llama.cpp /models").await?;
+    let resp = crate::util::http::send(
+      http,
+      Method::GET,
+      url.as_str(),
+      headers,
+      None,
+      None,
+      "llama.cpp /models",
+    )
+    .await?;
     crate::util::http::read_json(resp, "llama.cpp /models").await
   }
 
   #[instrument(name = "llama_cpp_chat", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    let url = self.url("/chat/completions");
+    let url = self.operation_url(&["chat", "completions"])?;
     debug!(%url, "POST llama.cpp chat");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -163,7 +186,7 @@ impl Provider for LlamaCppProvider {
     crate::util::http::send(
       ctx.http,
       Method::POST,
-      &url,
+      url.as_str(),
       headers,
       Some(body_bytes),
       ctx.outbound.as_ref(),
@@ -228,9 +251,39 @@ mod tests {
   fn constructs_without_api_key() {
     let provider = LlamaCppProvider::from_account(Arc::new(acct(None))).unwrap();
     assert_eq!(provider.info().id, ID_LLAMA_CPP);
-    assert_eq!(provider.info().upstream_url, DEFAULT_BASE_URL);
+    assert_eq!(provider.info().upstream_url, format!("{DEFAULT_BASE_URL}/"));
     assert_eq!(provider.info().auth_kind, AuthKind::None);
     assert!(provider.supports("local-model", Endpoint::ChatCompletions));
+  }
+
+  #[test]
+  fn target_overrides_legacy_account_url_and_owns_the_model_cache() {
+    let mut account = acct(None);
+    account.base_url = Some("https://ignored.example/v1".into());
+    let target = ProviderTarget::parse("https://selected.example/api/v1", CleartextHttpPolicy::Allow).unwrap();
+    let expected_cache = target.model_cache().clone();
+
+    let provider = LlamaCppProvider::from_account_at(Arc::new(account), target).unwrap();
+
+    assert_eq!(provider.info().upstream_url, "https://selected.example/api/v1/");
+    assert_eq!(
+      provider.operation_url(&["models"]).unwrap().as_str(),
+      "https://selected.example/api/v1/models"
+    );
+    assert!(Arc::ptr_eq(&provider.info().model_cache, &expected_cache));
+  }
+
+  #[test]
+  fn legacy_constructor_reports_invalid_account_url() {
+    let mut account = acct(None);
+    account.base_url = Some("not a URL".into());
+
+    let error = LlamaCppProvider::from_account(Arc::new(account)).err().unwrap();
+
+    assert!(matches!(
+      error,
+      error::Error::InvalidUpstreamUrl { ref account, .. } if account == "test"
+    ));
   }
 
   #[test]

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
 
 /// The complete on-disk version 2 configuration.
 ///
@@ -266,6 +266,11 @@ const fn default_session_ttl_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct RawUpstream {
   pub provider: String,
+  /// Accounts permitted to send credentials to this endpoint. Omitted or
+  /// `["*"]` means every matching-provider account; explicit ids prevent a
+  /// linker from creating an unsafe account-by-upstream Cartesian product.
+  #[serde(default)]
+  pub accounts: Option<Vec<String>>,
   #[serde(default)]
   pub base_url: Option<String>,
   #[serde(default)]

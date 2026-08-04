@@ -11,6 +11,8 @@ mod raw;
 use std::path::Path;
 use tokn_policy::GatewayPlan;
 
+use crate::schema::{ConfigSchema, SchemaMarkerError};
+
 pub use error::{CompileError, Error, Result};
 pub use raw::SCHEMA_VERSION;
 pub use raw::{
@@ -28,23 +30,27 @@ pub fn decode(contents: &str, source: &Path) -> Result<RawConfig> {
     path: source.to_path_buf(),
     source: source_error,
   })?;
-  let version = document
-    .get("schema_version")
-    .ok_or_else(|| Error::MissingSchemaVersion {
-      path: source.to_path_buf(),
-    })?
-    .as_integer()
-    .ok_or_else(|| Error::InvalidSchemaVersion {
-      path: source.to_path_buf(),
-    })?;
-  if version != i64::from(SCHEMA_VERSION) {
-    return Err(Error::UnsupportedSchemaVersion {
-      path: source.to_path_buf(),
-      found: version,
-    });
+  match crate::schema::detect_toml(&document) {
+    Ok(ConfigSchema::V2) => {}
+    Ok(ConfigSchema::LegacyUnversioned) => {
+      return Err(Error::MissingSchemaVersion {
+        path: source.to_path_buf(),
+      });
+    }
+    Err(SchemaMarkerError::NonInteger) => {
+      return Err(Error::InvalidSchemaVersion {
+        path: source.to_path_buf(),
+      });
+    }
+    Err(SchemaMarkerError::Unsupported(found)) => {
+      return Err(Error::UnsupportedSchemaVersion {
+        path: source.to_path_buf(),
+        found,
+      });
+    }
   }
 
-  toml::from_str(contents).map_err(|source_error| Error::Parse {
+  document.try_into().map_err(|source_error| Error::Parse {
     path: source.to_path_buf(),
     source: source_error,
   })

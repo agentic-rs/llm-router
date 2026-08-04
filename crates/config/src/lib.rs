@@ -1,5 +1,6 @@
 pub mod error;
 pub mod paths;
+mod schema;
 pub mod v2;
 
 pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
@@ -12,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokn_core::provider::ID_GITHUB_COPILOT;
+
+use crate::schema::{ConfigSchema, SchemaMarkerError};
 
 pub const DEFAULT_PORT: u16 = 4141;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -777,7 +780,9 @@ impl Config {
     let mut doc: toml_edit::DocumentMut = raw.parse().context(error::ParseEditSnafu {
       path: path.to_path_buf(),
     })?;
+    require_legacy_edit_schema(&doc, path)?;
     f(&mut doc)?;
+    require_legacy_edit_schema(&doc, path)?;
     let serialised = doc.to_string();
     let cfg: Config = toml::from_str(&serialised).context(error::EditValidateSnafu)?;
     cfg.proxy.validate().map_err(|e| Error::EditValidateSection {
@@ -839,7 +844,11 @@ fn load_primary_config(path: &Path) -> Result<Config> {
   let raw = std::fs::read_to_string(path).context(error::ReadSnafu {
     path: path.to_path_buf(),
   })?;
-  let raw_cfg: ConfigRaw = toml::from_str(&raw).context(error::ParseSnafu {
+  let document: toml::Value = toml::from_str(&raw).context(error::ParseSnafu {
+    path: path.to_path_buf(),
+  })?;
+  require_legacy_schema(schema::detect_toml(&document), path)?;
+  let raw_cfg: ConfigRaw = document.try_into().context(error::ParseSnafu {
     path: path.to_path_buf(),
   })?;
   if raw_cfg.copilot.is_some() {
@@ -849,6 +858,26 @@ fn load_primary_config(path: &Path) -> Result<Config> {
   }
   raw_cfg.config.validate()?;
   Ok(raw_cfg.config)
+}
+
+fn require_legacy_edit_schema(document: &toml_edit::DocumentMut, path: &Path) -> Result<()> {
+  require_legacy_schema(schema::detect_edit(document), path)
+}
+
+fn require_legacy_schema(schema: std::result::Result<ConfigSchema, SchemaMarkerError>, path: &Path) -> Result<()> {
+  match schema {
+    Ok(ConfigSchema::LegacyUnversioned) => Ok(()),
+    Ok(ConfigSchema::V2) => Err(Error::V2ConfigRequiresV2Loader {
+      path: path.to_path_buf(),
+    }),
+    Err(SchemaMarkerError::NonInteger) => Err(Error::InvalidSchemaVersion {
+      path: path.to_path_buf(),
+    }),
+    Err(SchemaMarkerError::Unsupported(found)) => Err(Error::UnsupportedSchemaVersion {
+      path: path.to_path_buf(),
+      found,
+    }),
+  }
 }
 
 fn load_fragment_paths(fragment_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1217,6 +1246,80 @@ mod tests {
     assert_eq!(paths::default_requests_dir().unwrap(), home.join("requests"));
     assert_eq!(paths::default_logs_dir().unwrap(), home.join("logs"));
     assert_eq!(paths::default_ca_dir().unwrap(), home.join("ca"));
+  }
+
+  #[test]
+  fn legacy_loader_rejects_v2_before_overlapping_profiles_can_default() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+      &path,
+      r#"
+schema_version = 2
+
+[profiles.default]
+route = "managed"
+wire_identity = "managed"
+"#,
+    )
+    .unwrap();
+
+    let error = Config::load(Some(&path)).unwrap_err();
+    assert!(matches!(error, Error::V2ConfigRequiresV2Loader { path: rejected } if rejected == path));
+  }
+
+  #[test]
+  fn legacy_loader_rejects_invalid_and_unsupported_schema_markers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+
+    std::fs::write(&path, "schema_version = \"2\"\n").unwrap();
+    assert!(matches!(
+      Config::load(Some(&path)),
+      Err(Error::InvalidSchemaVersion { path: rejected }) if rejected == path
+    ));
+
+    std::fs::write(&path, "schema_version = 3\n").unwrap();
+    assert!(matches!(
+      Config::load(Some(&path)),
+      Err(Error::UnsupportedSchemaVersion { path: rejected, found: 3 }) if rejected == path
+    ));
+  }
+
+  #[test]
+  fn legacy_editor_does_not_invoke_edits_for_v2_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let contents = "schema_version = 2\n";
+    std::fs::write(&path, contents).unwrap();
+    let invoked = std::cell::Cell::new(false);
+
+    let error = Config::edit_in_place_with_contents(&path, |_| {
+      invoked.set(true);
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, Error::V2ConfigRequiresV2Loader { path: rejected } if rejected == path));
+    assert!(!invoked.get());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+  }
+
+  #[test]
+  fn legacy_editor_cannot_turn_an_unversioned_file_into_v2() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let contents = "[server]\nport = 4141\n";
+    std::fs::write(&path, contents).unwrap();
+
+    let error = Config::edit_in_place_with_contents(&path, |document| {
+      document["schema_version"] = toml_edit::value(2);
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, Error::V2ConfigRequiresV2Loader { path: rejected } if rejected == path));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
   }
 
   #[test]
