@@ -1,4 +1,4 @@
-use super::{MigrateV2Args, V2ActivationArg};
+use super::MigrateV2Args;
 use anyhow::{bail, Context, Result};
 use inquire::Confirm;
 use std::io::Write;
@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use tokn_auth::{AuthSource, AuthStore};
 use tokn_config::StableLoadedConfig;
 use tokn_core::account::AccountConfig;
-use tokn_router_legacy_config::v2::{
-  plan_v2_migration, V2BehaviorChange, V2ListenerSelection, V2MigrationOptions, V2MigrationWarning,
-};
+use tokn_router_legacy_config::v2::{plan_v2_migration, V2BehaviorChange, V2MigrationOptions, V2MigrationWarning};
 
 mod apply;
 mod backup;
@@ -338,16 +336,6 @@ impl AuthPreimage {
   }
 }
 
-impl V2ActivationArg {
-  fn listener_selection(self) -> V2ListenerSelection {
-    match self {
-      Self::Api => V2ListenerSelection::Api,
-      Self::Proxy => V2ListenerSelection::Proxy,
-      Self::Both => V2ListenerSelection::ApiAndProxy,
-    }
-  }
-}
-
 fn render_warning(warning: &V2MigrationWarning) -> String {
   match warning {
     V2MigrationWarning::BehaviorChange(change) => render_behavior_change(*change).to_string(),
@@ -412,9 +400,11 @@ fn render_behavior_change(change: V2BehaviorChange) -> &'static str {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::cli::config_cmd::V2ActivationArg;
   use crate::cli::{Cli, Cmd};
   use clap::Parser;
   use std::fs;
+  use tokn_router_legacy_config::v2::V2ListenerSelection;
 
   fn args(activate: V2ActivationArg) -> MigrateV2Args {
     MigrateV2Args {

@@ -142,7 +142,10 @@ requests_dir = "v2-requests"
     let v2 = CommandConfig::load(Some(&v2_path)).unwrap();
     assert!(v2.is_v2());
     assert_eq!(v2.path(), v2_path);
-    assert_eq!(v2.outbound_http_options().url.as_deref(), Some("http://127.0.0.1:8181/"));
+    assert_eq!(
+      v2.outbound_http_options().url.as_deref(),
+      Some("http://127.0.0.1:8181/")
+    );
     assert_eq!(v2.outbound_http_options().no_proxy, ["v2.example"]);
     assert_eq!(v2.persistence_paths().unwrap().usage_db, PathBuf::from("v2-usage.db"));
   }

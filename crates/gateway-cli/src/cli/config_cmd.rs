@@ -11,6 +11,8 @@ use inquire::{Confirm, Select, Text};
 use std::path::PathBuf;
 use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
+use tokn_core::account::AccountConfig;
+use tokn_router_legacy_config::v2::{plan_v2_migration, V2ListenerSelection, V2MigrationOptions};
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value as EditValue};
 
 mod migrate_v2;
@@ -69,6 +71,16 @@ pub enum V2ActivationArg {
   Both,
 }
 
+impl V2ActivationArg {
+  fn listener_selection(self) -> V2ListenerSelection {
+    match self {
+      Self::Api => V2ListenerSelection::Api,
+      Self::Proxy => V2ListenerSelection::Proxy,
+      Self::Both => V2ListenerSelection::ApiAndProxy,
+    }
+  }
+}
+
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum RouteModeArg {
   Passthrough,
@@ -95,6 +107,12 @@ pub struct InitArgs {
   /// Non-interactive mode.
   #[arg(long)]
   pub yes: bool,
+  /// Listener surface for a newly-created version 2 config.
+  #[arg(long, value_enum, default_value = "api")]
+  pub activate: V2ActivationArg,
+  /// Permit non-loopback cleartext HTTP account upstreams in a new config.
+  #[arg(long)]
+  pub allow_insecure_upstreams: bool,
   /// Runtime route mode override.
   #[arg(long, value_enum)]
   pub route_mode: Option<RouteModeArg>,
@@ -375,38 +393,100 @@ struct AccountSpec {
 }
 
 async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
+  if path.exists() {
+    let command_config = CommandConfig::load(Some(path))?;
+    if command_config.is_v2() {
+      return cmd_init_existing_v2(command_config, args).await;
+    }
+    return cmd_init_legacy(path, args).await;
+  }
+
+  cmd_init_new_v2(path, args).await
+}
+
+async fn cmd_init_legacy(path: &std::path::Path, args: InitArgs) -> Result<()> {
   // `config init` owns the primary config file. Do not flatten managed agent
   // overlays from `config.d` back into it when refreshing runtime settings.
   let (mut cfg, _) = Config::load_primary(Some(path))?;
   println!("Config path: {}", path.display());
 
   apply_runtime_overrides(&mut cfg, &args);
+  if !args.yes {
+    interactive_runtime_prompts(&mut cfg)?;
+  }
 
+  let mut store = AuthStore::load(None, Some(path))?;
+  let client = build_client(&cfg.proxy)?;
+  let upserted = collect_init_accounts(&mut store, &client, &args).await?;
+
+  cfg.save(path)?;
+  store.save()?;
+  println!("Initialized config and upserted {upserted} account(s).");
+  if !args.yes {
+    println!("Next: tokn-router serve");
+  }
+  Ok(())
+}
+
+async fn cmd_init_existing_v2(command_config: CommandConfig, args: InitArgs) -> Result<()> {
+  if has_v2_graph_overrides(&args) {
+    bail!(
+      "listener and route overrides cannot be applied to an existing version 2 graph; use `config set` or `config edit`"
+    );
+  }
+
+  println!("Config path: {}", command_config.path().display());
+  let mut store = AuthStore::load(None, Some(command_config.path()))?;
+  let client = tokn_core::util::http::build_client(&command_config.outbound_http_options())?;
+  let upserted = collect_init_accounts(&mut store, &client, &args).await?;
+  store.save()?;
+  println!("Version 2 config unchanged; upserted {upserted} account(s).");
+  Ok(())
+}
+
+async fn cmd_init_new_v2(path: &std::path::Path, args: InitArgs) -> Result<()> {
+  let mut legacy_recipe = Config::default();
+  apply_runtime_overrides(&mut legacy_recipe, &args);
+  if !args.yes {
+    interactive_v2_runtime_prompts(&mut legacy_recipe, args.activate)?;
+  }
+  validate_v2_init_modes(&legacy_recipe, args.activate)?;
+
+  println!("Config path: {}", path.display());
+  let mut store = AuthStore::load(None, Some(path))?;
+  let client = build_client(&legacy_recipe.proxy)?;
+  let upserted = collect_init_accounts(&mut store, &client, &args).await?;
+  let rendered = render_initial_v2_config(path, &legacy_recipe, &store.accounts, &args)?;
+
+  // Credentials become durable first. If config creation then loses a race,
+  // the additional credentials remain valid standalone state and no config is
+  // overwritten.
+  store.save()?;
+  tokn_config::replace_contents_if_unchanged(path, None, rendered.as_bytes())
+    .with_context(|| format!("create version 2 config `{}`", path.display()))?;
+  println!("Initialized version 2 config and upserted {upserted} account(s).");
+  println!("Next: tokn-router serve");
+  Ok(())
+}
+
+async fn collect_init_accounts(store: &mut AuthStore, client: &reqwest::Client, args: &InitArgs) -> Result<usize> {
   if args.yes {
     if args.accounts.is_empty() {
       bail!("--yes requires at least one --account spec");
     }
-    let mut store = AuthStore::load(None, Some(path))?;
-    let client = build_client(&cfg.proxy)?;
     for raw in &args.accounts {
       let spec = parse_account_spec(raw)?;
       let source = account_source_from_spec(&spec, false)?;
       let account =
-        crate::cli::onboarding::resolve_account(&client, &spec.provider, Some(spec.id.clone()), source).await?;
+        crate::cli::onboarding::resolve_account(client, &spec.provider, Some(spec.id.clone()), source).await?;
       store.upsert_in_main(account)?;
     }
-    cfg.save(path)?;
-    store.save()?;
-    println!("Initialized config and upserted {} account(s).", args.accounts.len());
-    return Ok(());
+    return Ok(args.accounts.len());
   }
 
-  interactive_runtime_prompts(&mut cfg)?;
-  let mut store = AuthStore::load(None, Some(path))?;
-  let client = build_client(&cfg.proxy)?;
   let mut upserted = 0usize;
   loop {
-    let account = crate::cli::onboarding::interactive_add_account(&client, None, None).await?;
+    let account = crate::cli::onboarding::interactive_add_account(client, None, None).await?;
     store.upsert_in_main(account)?;
     upserted += 1;
     let more = Confirm::new("Add another account?")
@@ -417,12 +497,7 @@ async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
       break;
     }
   }
-
-  cfg.save(path)?;
-  store.save()?;
-  println!("Initialized config and upserted {upserted} account(s).");
-  println!("Next: tokn-router serve");
-  Ok(())
+  Ok(upserted)
 }
 
 fn apply_runtime_overrides(cfg: &mut Config, args: &InitArgs) {
@@ -446,80 +521,148 @@ fn apply_runtime_overrides(cfg: &mut Config, args: &InitArgs) {
   }
 }
 
-fn interactive_runtime_prompts(cfg: &mut Config) -> Result<()> {
-  let route_options = vec!["route", "passthrough", "switch", "exact", "fuzzy"];
-  let default_idx = match cfg.defaults.mode {
-    RouteMode::Route => 0,
-    RouteMode::Passthrough => 1,
-    RouteMode::Switch => 2,
-    RouteMode::Exact => 3,
-    RouteMode::Fuzzy => 4,
-  };
-  let selected = Select::new("Route mode:", route_options.clone())
-    .with_starting_cursor(default_idx)
-    .prompt()
-    .context("route mode selection cancelled")?;
-  cfg.defaults.mode = match selected {
-    "route" => RouteMode::Route,
-    "passthrough" => RouteMode::Passthrough,
-    "switch" => RouteMode::Switch,
-    "exact" => RouteMode::Exact,
-    "fuzzy" => RouteMode::Fuzzy,
-    _ => RouteMode::Route,
-  };
+fn has_v2_graph_overrides(args: &InitArgs) -> bool {
+  args.activate != V2ActivationArg::Api
+    || args.allow_insecure_upstreams
+    || args.route_mode.is_some()
+    || args.host.is_some()
+    || args.port.is_some()
+    || args.proxy_host.is_some()
+    || args.proxy_port.is_some()
+    || args.proxy_route_mode.is_some()
+}
 
-  let proxy_default_idx = match cfg.proxy_mode.route_mode {
-    RouteMode::Route => 0,
-    RouteMode::Passthrough => 1,
-    RouteMode::Switch => 2,
-    RouteMode::Exact => 3,
-    RouteMode::Fuzzy => 4,
-  };
-  let proxy_selected = Select::new("Proxy route mode:", route_options)
-    .with_starting_cursor(proxy_default_idx)
-    .prompt()
-    .context("proxy route mode selection cancelled")?;
-  cfg.proxy_mode.route_mode = match proxy_selected {
-    "route" => RouteMode::Route,
-    "passthrough" => RouteMode::Passthrough,
-    "switch" => RouteMode::Switch,
-    "exact" => RouteMode::Exact,
-    "fuzzy" => RouteMode::Fuzzy,
-    _ => RouteMode::Route,
-  };
-
-  if Confirm::new("Set serve host/port?")
-    .with_default(false)
-    .prompt()
-    .context("serve host/port prompt cancelled")?
+fn validate_v2_init_modes(cfg: &Config, activation: V2ActivationArg) -> Result<()> {
+  if matches!(activation, V2ActivationArg::Api | V2ActivationArg::Both)
+    && !matches!(cfg.defaults.mode, RouteMode::Route | RouteMode::Exact)
   {
-    let host = Text::new("Serve host:")
-      .with_initial_value(&cfg.server.host)
-      .prompt()
-      .context("serve host prompt cancelled")?;
-    let port = Text::new("Serve port:")
-      .with_initial_value(&cfg.server.port.to_string())
-      .prompt()
-      .context("serve port prompt cancelled")?;
-    cfg.server.host = host;
-    cfg.server.port = port.parse().context("serve port must be a valid u16")?;
+    bail!(
+      "version 2 API initialization supports route or exact mode, not {}",
+      route_mode_name(cfg.defaults.mode)
+    );
   }
+  if matches!(activation, V2ActivationArg::Proxy | V2ActivationArg::Both)
+    && !matches!(cfg.proxy_mode.route_mode, RouteMode::Route | RouteMode::Exact)
+  {
+    bail!(
+      "version 2 proxy initialization supports route or exact mode, not {}",
+      route_mode_name(cfg.proxy_mode.route_mode)
+    );
+  }
+  Ok(())
+}
 
-  if Confirm::new("Set proxy host/port?")
+fn render_initial_v2_config(
+  path: &std::path::Path,
+  legacy_recipe: &Config,
+  accounts: &[AccountConfig],
+  args: &InitArgs,
+) -> Result<String> {
+  let plan = plan_v2_migration(
+    legacy_recipe,
+    accounts,
+    V2MigrationOptions {
+      listener_selection: args.activate.listener_selection(),
+      allow_insecure_upstreams: args.allow_insecure_upstreams,
+    },
+  )
+  .context("build initial version 2 config")?;
+  let rendered = toml::to_string_pretty(plan.raw_config()).context("render initial version 2 config")?;
+  let compiled = tokn_config::v2::parse(&rendered, path).context("validate initial version 2 config")?;
+  tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), accounts)
+    .context("link initial version 2 runtime")?;
+  Ok(rendered)
+}
+
+fn interactive_runtime_prompts(cfg: &mut Config) -> Result<()> {
+  let options = ["route", "passthrough", "switch", "exact", "fuzzy"];
+  cfg.defaults.mode = prompt_route_mode("Route mode:", cfg.defaults.mode, &options)?;
+  cfg.proxy_mode.route_mode = prompt_route_mode("Proxy route mode:", cfg.proxy_mode.route_mode, &options)?;
+  prompt_bind(
+    "Set serve host/port?",
+    "Serve",
+    &mut cfg.server.host,
+    &mut cfg.server.port,
+  )?;
+  prompt_bind(
+    "Set proxy host/port?",
+    "Proxy",
+    &mut cfg.proxy_mode.host,
+    &mut cfg.proxy_mode.port,
+  )?;
+  Ok(())
+}
+
+fn interactive_v2_runtime_prompts(cfg: &mut Config, activation: V2ActivationArg) -> Result<()> {
+  let options = ["route", "exact"];
+  if matches!(activation, V2ActivationArg::Api | V2ActivationArg::Both) {
+    cfg.defaults.mode = prompt_route_mode("API route mode:", cfg.defaults.mode, &options)?;
+    prompt_bind("Set API host/port?", "API", &mut cfg.server.host, &mut cfg.server.port)?;
+  }
+  if matches!(activation, V2ActivationArg::Proxy | V2ActivationArg::Both) {
+    cfg.proxy_mode.route_mode = prompt_route_mode("Proxy route mode:", cfg.proxy_mode.route_mode, &options)?;
+    prompt_bind(
+      "Set proxy host/port?",
+      "Proxy",
+      &mut cfg.proxy_mode.host,
+      &mut cfg.proxy_mode.port,
+    )?;
+  }
+  Ok(())
+}
+
+fn prompt_route_mode(prompt: &str, current: RouteMode, options: &[&str]) -> Result<RouteMode> {
+  let default_index = options
+    .iter()
+    .position(|candidate| *candidate == route_mode_name(current))
+    .unwrap_or(0);
+  let selected = Select::new(prompt, options.to_vec())
+    .with_starting_cursor(default_index)
+    .prompt()
+    .with_context(|| {
+      format!(
+        "{} selection cancelled",
+        prompt.trim_end_matches(':').to_ascii_lowercase()
+      )
+    })?;
+  match selected {
+    "route" => Ok(RouteMode::Route),
+    "passthrough" => Ok(RouteMode::Passthrough),
+    "switch" => Ok(RouteMode::Switch),
+    "exact" => Ok(RouteMode::Exact),
+    "fuzzy" => Ok(RouteMode::Fuzzy),
+    _ => bail!("unknown route mode `{selected}`"),
+  }
+}
+
+fn route_mode_name(mode: RouteMode) -> &'static str {
+  match mode {
+    RouteMode::Route => "route",
+    RouteMode::Passthrough => "passthrough",
+    RouteMode::Switch => "switch",
+    RouteMode::Exact => "exact",
+    RouteMode::Fuzzy => "fuzzy",
+  }
+}
+
+fn prompt_bind(prompt: &str, label: &str, host: &mut String, port: &mut u16) -> Result<()> {
+  if Confirm::new(prompt)
     .with_default(false)
     .prompt()
-    .context("proxy host/port prompt cancelled")?
+    .with_context(|| format!("{} host/port prompt cancelled", label.to_ascii_lowercase()))?
   {
-    let host = Text::new("Proxy host:")
-      .with_initial_value(&cfg.proxy_mode.host)
+    let selected_host = Text::new(&format!("{label} host:"))
+      .with_initial_value(host)
       .prompt()
-      .context("proxy host prompt cancelled")?;
-    let port = Text::new("Proxy port:")
-      .with_initial_value(&cfg.proxy_mode.port.to_string())
+      .with_context(|| format!("{} host prompt cancelled", label.to_ascii_lowercase()))?;
+    let selected_port = Text::new(&format!("{label} port:"))
+      .with_initial_value(&port.to_string())
       .prompt()
-      .context("proxy port prompt cancelled")?;
-    cfg.proxy_mode.host = host;
-    cfg.proxy_mode.port = port.parse().context("proxy port must be a valid u16")?;
+      .with_context(|| format!("{} port prompt cancelled", label.to_ascii_lowercase()))?;
+    *host = selected_host;
+    *port = selected_port
+      .parse()
+      .with_context(|| format!("{} port must be a valid u16", label.to_ascii_lowercase()))?;
   }
   Ok(())
 }
@@ -841,6 +984,21 @@ fn load_doc(path: &std::path::Path) -> Result<DocumentMut> {
 mod tests {
   use super::*;
 
+  fn init_args(activation: V2ActivationArg) -> InitArgs {
+    InitArgs {
+      yes: true,
+      activate: activation,
+      allow_insecure_upstreams: false,
+      route_mode: None,
+      host: None,
+      port: None,
+      proxy_host: None,
+      proxy_port: None,
+      proxy_route_mode: None,
+      accounts: Vec::new(),
+    }
+  }
+
   fn doc(s: &str) -> DocumentMut {
     s.parse().unwrap()
   }
@@ -970,6 +1128,52 @@ agent_id = "opencode"
     std::fs::write(&fragment, "[profiles.opencode]\nagent_id = \"opencode\"\n").unwrap();
 
     ensure_root_key_is_not_fragment_managed(&root, &["profiles".into(), "opencode".into(), "mode".into()]).unwrap();
+  }
+
+  #[test]
+  fn new_init_renders_a_linkable_v2_graph_without_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let account: AccountConfig = toml::from_str(
+      r#"
+id = "work"
+provider = "openai"
+api_key = "must-not-be-rendered"
+"#,
+    )
+    .unwrap();
+    let args = init_args(V2ActivationArg::Both);
+
+    let rendered = render_initial_v2_config(&path, &Config::default(), &[account], &args).unwrap();
+    let raw = tokn_config::v2::decode(&rendered, &path).unwrap();
+
+    assert_eq!(raw.schema_version, 2);
+    assert!(raw.listeners.contains_key("api"));
+    assert!(raw.listeners.contains_key("proxy"));
+    assert!(!rendered.contains("must-not-be-rendered"));
+  }
+
+  #[test]
+  fn new_v2_init_rejects_modes_without_an_exact_recipe() {
+    let mut config = Config::default();
+    config.defaults.mode = RouteMode::Switch;
+
+    let error = validate_v2_init_modes(&config, V2ActivationArg::Api)
+      .unwrap_err()
+      .to_string();
+
+    assert!(error.contains("supports route or exact mode"));
+    assert!(error.contains("switch"));
+  }
+
+  #[test]
+  fn existing_v2_init_accepts_account_only_options() {
+    let mut args = init_args(V2ActivationArg::Api);
+    args.accounts.push("id=work,provider=openai,from=env".into());
+    assert!(!has_v2_graph_overrides(&args));
+
+    args.port = Some(8181);
+    assert!(has_v2_graph_overrides(&args));
   }
 
   #[test]
