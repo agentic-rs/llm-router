@@ -3278,6 +3278,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "reqwest",
+ "same-file",
  "serde",
  "serde_json",
  "snafu",

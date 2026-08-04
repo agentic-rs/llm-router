@@ -1,0 +1,82 @@
+//! Stable identity checks for files and directories used by guarded config IO.
+
+use std::fs::File;
+use std::io;
+use std::path::Path;
+
+/// A stable identity for one opened filesystem object.
+///
+/// Unix uses the device/inode pair and Windows uses the stable Win32 handle
+/// information exposed by `same-file`. Keeping this behind one type avoids
+/// relying on unstable Windows methods from `std::os::windows::fs::MetadataExt`.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Eq, PartialEq)]
+pub struct FileIdentity(same_file::Handle);
+
+/// Fallback identity for targets where the standard library does not expose
+/// a portable file identity primitive. The existing guarded IO behavior on
+/// those targets is preserved.
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Eq, PartialEq)]
+pub struct FileIdentity;
+
+impl FileIdentity {
+  /// Open a path and capture its filesystem identity.
+  pub fn from_path(path: &Path) -> io::Result<Self> {
+    #[cfg(any(unix, windows))]
+    {
+      same_file::Handle::from_path(path).map(Self)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+      let _ = path;
+      Ok(Self)
+    }
+  }
+
+  /// Capture the filesystem identity of an already opened file without
+  /// changing ownership of the caller's handle.
+  pub fn from_file(file: &File) -> io::Result<Self> {
+    #[cfg(any(unix, windows))]
+    {
+      same_file::Handle::from_file(file.try_clone()?).map(Self)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+      let _ = file;
+      Ok(Self)
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::FileIdentity;
+  use std::fs::File;
+
+  #[test]
+  fn path_and_open_handle_have_the_same_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "schema_version = 2\n").unwrap();
+
+    let path_identity = FileIdentity::from_path(&path).unwrap();
+    let file = File::open(&path).unwrap();
+
+    assert_eq!(path_identity, FileIdentity::from_file(&file).unwrap());
+  }
+
+  #[test]
+  fn distinct_paths_have_distinct_identities() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.toml");
+    let second = directory.path().join("second.toml");
+    std::fs::write(&first, "first").unwrap();
+    std::fs::write(&second, "second").unwrap();
+
+    assert_ne!(
+      FileIdentity::from_path(&first).unwrap(),
+      FileIdentity::from_path(&second).unwrap()
+    );
+  }
+}

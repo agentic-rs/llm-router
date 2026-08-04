@@ -1,9 +1,11 @@
 pub mod error;
+mod file_identity;
 pub mod paths;
 mod schema;
 pub mod v2;
 
 pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
+pub use file_identity::FileIdentity;
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
 pub use tokn_core::AgentId;
 
@@ -176,12 +178,7 @@ fn reject_config_lock_symlink(path: &Path, lock_path: &Path) -> Result<()> {
 }
 
 fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Result<()> {
-  let opened = file.metadata().map_err(|source| Error::ConfigLock {
-    path: path.to_path_buf(),
-    lock_path: lock_path.to_path_buf(),
-    source,
-  })?;
-  let linked = match std::fs::symlink_metadata(lock_path) {
+  match std::fs::symlink_metadata(lock_path) {
     Ok(metadata) if metadata.file_type().is_symlink() => {
       return Err(Error::ConfigLockSymlink {
         path: path.to_path_buf(),
@@ -191,7 +188,7 @@ fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Resu
     Ok(metadata) if !metadata.is_file() => {
       return Err(invalid_config_lock_file(path, lock_path, "must be a regular file"));
     }
-    Ok(metadata) => metadata,
+    Ok(_) => {}
     Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
       return Err(Error::ConfigLockChanged {
         path: path.to_path_buf(),
@@ -207,28 +204,21 @@ fn validate_open_config_lock(path: &Path, lock_path: &Path, file: &File) -> Resu
     }
   };
 
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::MetadataExt;
-    if opened.dev() != linked.dev() || opened.ino() != linked.ino() {
-      return Err(Error::ConfigLockChanged {
-        path: path.to_path_buf(),
-        lock_path: lock_path.to_path_buf(),
-      });
-    }
-  }
-
-  #[cfg(windows)]
-  {
-    use std::os::windows::fs::MetadataExt;
-    let opened_identity = (opened.volume_serial_number(), opened.file_index());
-    let linked_identity = (linked.volume_serial_number(), linked.file_index());
-    if opened_identity.0.is_some() && opened_identity.1.is_some() && opened_identity != linked_identity {
-      return Err(Error::ConfigLockChanged {
-        path: path.to_path_buf(),
-        lock_path: lock_path.to_path_buf(),
-      });
-    }
+  let opened_identity = FileIdentity::from_file(file).map_err(|source| Error::ConfigLock {
+    path: path.to_path_buf(),
+    lock_path: lock_path.to_path_buf(),
+    source,
+  })?;
+  let linked_identity = FileIdentity::from_path(lock_path).map_err(|source| Error::ConfigLock {
+    path: path.to_path_buf(),
+    lock_path: lock_path.to_path_buf(),
+    source,
+  })?;
+  if opened_identity != linked_identity {
+    return Err(Error::ConfigLockChanged {
+      path: path.to_path_buf(),
+      lock_path: lock_path.to_path_buf(),
+    });
   }
 
   Ok(())
