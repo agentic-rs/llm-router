@@ -39,7 +39,8 @@ fn create(store: &AccessStore, args: CreateArgs) -> Result<()> {
   println!("providers: {}", created.providers.display());
   println!("key: {}", created.token);
   println!("Store this key now; it will not be shown again.");
-  println!("Enable enforcement with `[api_key].enabled = true` in config.toml.");
+  println!("For v2, enable enforcement with `client_auth = \"local_keys\"` on the intended listeners.");
+  println!("For legacy config, use `[api_key].enabled = true`.");
   Ok(())
 }
 

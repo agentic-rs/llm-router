@@ -373,7 +373,10 @@ pub fn import_accounts(request: ImportRequest) -> Result<ImportReport> {
 
 fn import_accounts_with_gateway_auth_path(request: ImportRequest, gateway_auth_path: PathBuf) -> Result<ImportReport> {
   let adapter = adapter_for(&request.agent).ok_or_else(|| anyhow!("unsupported agent {}", request.agent))?;
-  let gateway_config_path = Config::load(request.gateway_config_path.as_deref())?.1;
+  // Import changes only the credential store. Resolve the config path for
+  // layout/diagnostics without decoding a routing schema, so imports remain
+  // usable after the v2 graph is activated.
+  let gateway_config_path = tokn_config::paths::resolve_config_path(request.gateway_config_path.as_deref())?;
   let home = resolve_home(request.agent_home)?;
   let timestamp = timestamp()?;
   let imported_accounts = adapter.discover_accounts(&home, &timestamp)?;
@@ -5262,7 +5265,7 @@ providers = ["anthropic"]
   }
 
   #[test]
-  fn agent_import_only_disables_root_accounts_and_leaves_agent_shards_untouched() {
+  fn agent_import_with_v2_config_only_disables_root_accounts_and_leaves_agent_shards_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let agent_home = dir.path().join("home");
     let gateway_config_path = dir.path().join("gateway/config.toml");
@@ -5270,7 +5273,7 @@ providers = ["anthropic"]
     let agent_auth_path = agent_home.join(".local/share/opencode/auth.json");
     std::fs::create_dir_all(gateway_config_path.parent().unwrap()).unwrap();
     std::fs::create_dir_all(agent_auth_path.parent().unwrap()).unwrap();
-    std::fs::write(&gateway_config_path, "[server]\nport = 4141\n").unwrap();
+    std::fs::write(&gateway_config_path, "schema_version = 2\n").unwrap();
 
     let mut store = AuthStore::load(Some(&gateway_auth_path), None).unwrap();
     store

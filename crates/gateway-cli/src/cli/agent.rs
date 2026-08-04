@@ -105,6 +105,14 @@ pub struct AgentUnlinkArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, cmd: AgentCmd) -> Result<()> {
+  if super::command_config::CommandConfig::uses_versioned_schema(cfg_path.as_deref())?
+    && requires_legacy_profile_projection(&cmd)
+  {
+    bail!(
+      "this agent command still depends on the legacy profile projection and cannot safely modify or assess a version 2 routing graph; retained config.d state is inactive under v2, while `agent import` and `agent unlink` remain available"
+    );
+  }
+
   match cmd {
     AgentCmd::List => list(cfg_path),
     AgentCmd::Show(args) => show(cfg_path, args),
@@ -113,6 +121,13 @@ pub async fn run(cfg_path: Option<PathBuf>, cmd: AgentCmd) -> Result<()> {
     AgentCmd::Sync(args) => sync(cfg_path, args),
     AgentCmd::Unlink(args) => unlink_cmd(args),
   }
+}
+
+fn requires_legacy_profile_projection(command: &AgentCmd) -> bool {
+  matches!(
+    command,
+    AgentCmd::List | AgentCmd::Show(_) | AgentCmd::Link(_) | AgentCmd::Sync(_)
+  )
 }
 
 fn list(cfg_path: Option<PathBuf>) -> Result<()> {
@@ -546,6 +561,32 @@ mod tests {
   fn use_main_accounts_only_requests_a_source_when_present() {
     assert_eq!(requested_account_source(false), None);
     assert_eq!(requested_account_source(true), Some(AgentAccountSource::Main));
+  }
+
+  #[test]
+  fn v2_boundary_keeps_graph_independent_agent_commands_available() {
+    let target = || AgentTargetArgs {
+      agent: AgentId::Opencode,
+    };
+    assert!(!requires_legacy_profile_projection(&AgentCmd::Import(
+      AgentImportArgs {
+        target: target(),
+        yes: true,
+      }
+    )));
+    assert!(!requires_legacy_profile_projection(&AgentCmd::Unlink(
+      AgentUnlinkArgs {
+        target: target(),
+        backup_id: None,
+        legacy_root: None,
+        yes: true,
+      }
+    )));
+    assert!(requires_legacy_profile_projection(&AgentCmd::List));
+    assert!(requires_legacy_profile_projection(&AgentCmd::Show(target())));
+    assert!(requires_legacy_profile_projection(&AgentCmd::Link(link_args(
+      Vec::new()
+    ))));
   }
 
   #[test]
