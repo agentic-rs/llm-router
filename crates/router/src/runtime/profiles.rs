@@ -685,6 +685,36 @@ mod tests {
   }
 
   #[test]
+  fn embedded_roots_report_empty_state_and_missing_routes() {
+    let empty = EmbeddedProfileRoots::default();
+    assert!(empty.is_empty());
+
+    let profile = profile_id("embedded");
+    let route = route_id("missing-route");
+    let plan = gateway(
+      BTreeMap::new(),
+      BTreeMap::from([(profile.clone(), ProfilePlan::new(route.clone(), WireIdentity::None))]),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+    );
+    let roots = EmbeddedProfileRoots::one(profile.clone());
+    assert!(!roots.is_empty());
+    assert_eq!(roots.profile_ids(), &BTreeSet::from([profile.clone()]));
+
+    let mut reachable = ProfileReachability::default();
+    assert!(matches!(
+      include_embedded_profile_roots(&plan, &roots, &mut reachable),
+      Err(ProfileLinkError::UnknownEmbeddedRoute {
+        profile: error_profile,
+        route: error_route,
+      }) if error_profile == profile && error_route == route
+    ));
+    assert!(reachable.is_empty());
+  }
+
+  #[test]
   fn unreachable_named_identity_is_not_resolved() {
     let route = route_id("transparent");
     let reachable_profile = profile_id("reachable");
