@@ -15,5 +15,10 @@
   "devDependencies": {
     "typescript": "^5.9.3",
     "vite": "^7.1.12"
+  },
+  "pnpm": {
+    "overrides": {
+      "postcss": ">=8.5.18"
+    }
   }
 }
