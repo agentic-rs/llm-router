@@ -279,4 +279,19 @@ mod tests {
       format!("load compiled gateway config `{}`", config_path.display())
     );
   }
+
+  #[tokio::test]
+  async fn live_model_fetch_preserves_invalid_config_context() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("invalid.toml");
+    std::fs::write(&config_path, "schema_version = [").unwrap();
+
+    let error = fetch_live_models(Some(&config_path), "openai").await.unwrap_err();
+
+    assert_eq!(
+      error.to_string(),
+      format!("load compiled gateway config `{}`", config_path.display())
+    );
+    assert!(format!("{error:#}").contains("parse v2 config"), "{error:#}");
+  }
 }
