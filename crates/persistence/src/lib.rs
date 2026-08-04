@@ -7,8 +7,7 @@ pub mod usage;
 pub mod viewer;
 
 pub use access::{AccessDb, ApiKeyRecord, ApiKeySummaryRecord, NewApiKeyRecord};
-pub use requests::{read_request_row, RequestEventHandler};
-pub use sessions::SessionEventHandler;
+pub use requests::{RequestPersistenceConsumer, RequestPersistenceOptions};
 pub use viewer::{
   get_request, get_request_llm_message, get_request_llm_summary, get_request_llm_tool_definition, get_session,
   get_session_from_db, get_session_node_from_db, get_session_usage, is_valid_request_day, list_latest_requests,
@@ -19,35 +18,9 @@ pub use viewer::{
   SessionPartOmissionReason, SessionRequestUsage, SessionSummary, SessionUsage, StoredSessionDetail,
 };
 
-use bytes::Bytes;
+pub use sessions::{MessageRecord, PartRecord, SessionPersistenceConsumer};
 use snafu::Snafu;
-pub use tokn_core::db::{DbPaths, HttpSnapshot, MessageRecord, PartRecord};
-#[allow(unused_imports)]
-pub(crate) use tokn_core::db::{Usage, UsageDetails};
-pub use usage::{UsageDb, UsageEventHandler};
-
-/// Serialise an HTTP header map to JSON bytes, redacting values whose name
-/// is sensitive (`authorization`, `proxy-authorization`, `cookie`, anything
-/// containing `api-key`). Public so both inbound (server::forward) and
-/// outbound (db::requests) capture paths share the same redaction policy.
-pub fn headers_json(headers: &tokn_headers::HeaderMap) -> Bytes {
-  use serde_json::{Map, Value};
-  let mut out = Map::new();
-  for (name, value) in headers {
-    let key = name.as_str().to_ascii_lowercase();
-    let value = if is_sensitive_header(&key) {
-      "<redacted>".to_string()
-    } else {
-      value.as_str().to_string()
-    };
-    out.insert(key, Value::String(value));
-  }
-  serde_json::to_vec(&Value::Object(out)).unwrap_or_default().into()
-}
-
-pub fn is_sensitive_header(name: &str) -> bool {
-  matches!(name, "authorization" | "proxy-authorization" | "cookie") || name.contains("api-key")
-}
+pub use usage::{UsageDb, UsagePersistenceConsumer};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -73,9 +46,6 @@ pub enum Error {
 
   #[snafu(display("session message tree is invalid at {message_id}"))]
   InvalidMessageTree { message_id: String },
-
-  #[snafu(display("db writer channel closed"))]
-  ChannelClosed,
 }
 
 impl From<std::io::Error> for Error {

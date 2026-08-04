@@ -11,8 +11,8 @@
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokn_convert::provider::Endpoint;
 use tokn_convert::sse::{EndpointTranslator, EventTransformer, SseEvent};
+use tokn_endpoint_core::Endpoint;
 
 const CASES_DIR: &str = "tests/golden/chat_to_responses";
 

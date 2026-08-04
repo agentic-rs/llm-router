@@ -5,8 +5,8 @@ use tempfile::TempDir;
 use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 use tokn_sdk::chat_completions::{ChatRequest, ChatResponse};
 use tokn_sdk::{
-  Client, Error, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary, RequestOptions, Tool,
-  ToolCall, ToolChoice,
+  Client, Endpoint, Error, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary, RequestOptions,
+  Tool, ToolCall, ToolChoice,
 };
 
 struct Fixture {
@@ -25,26 +25,42 @@ impl Fixture {
   }
 
   fn with_account(base_url: &str, provider: &str, credentials: &str) -> Self {
-    Self::with_account_and_mode(base_url, provider, credentials, "exact")
-  }
-
-  fn with_account_and_mode(base_url: &str, provider: &str, credentials: &str, mode: &str) -> Self {
     let root = tempfile::tempdir().expect("create SDK fixture directory");
     let config_path = root.path().join("config.toml");
     let auth_path = root.path().join("auth.yaml");
-    let default_provider = matches!(mode, "passthrough" | "switch")
-      .then(|| format!("default_provider_id = \"{provider}\"\n"))
-      .unwrap_or_default();
     fs::write(
       &config_path,
-      format!("[defaults]\nmode = \"{mode}\"\n{default_provider}"),
+      format!(
+        r#"schema_version = 2
+
+[profiles.default]
+route = "managed"
+
+[profiles.alternate]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "default"
+upstream = {{ kind = "fixed", upstream = "local" }}
+model = {{ kind = "qualified", namespace = "provider" }}
+operation = "translate_compatible"
+
+[account_pools.default]
+active_accounts = ["*"]
+providers = ["{provider}"]
+
+[upstreams.local]
+provider = "{provider}"
+base_url = "{base_url}"
+accounts = ["local"]
+"#,
+      ),
     )
     .expect("write SDK config");
     fs::write(
       &auth_path,
-      format!(
-        "version: 1\naccounts:\n  - id: local\n    provider: {provider}\n    base_url: {base_url}\n{credentials}"
-      ),
+      format!("version: 1\naccounts:\n  - id: local\n    provider: {provider}\n{credentials}"),
     )
     .expect("write SDK credentials");
     Self {
@@ -93,6 +109,8 @@ async fn typed_request_uses_configured_provider_and_returns_typed_response() {
   assert_eq!(response.data.id.as_deref(), Some("chatcmpl-mock"));
   let captured = mock.last_request().expect("upstream request captured");
   assert_eq!(captured.path, "/chat/completions");
+  assert_eq!(captured.header("x-session-affinity"), Some("session-1"));
+  assert_eq!(captured.header("x-sdk-test"), None);
   let outbound: serde_json::Value = serde_json::from_slice(&captured.body).expect("parse upstream body");
   assert_eq!(outbound["model"], "mock-model");
   assert_eq!(outbound["stream"], false);
@@ -227,53 +245,6 @@ async fn detached_generation_request_round_trips_transforms_and_uses_mock_provid
     .get("stream")
     .and_then(serde_json::Value::as_bool)
     .unwrap_or(false));
-
-  mock.shutdown().await;
-}
-
-#[tokio::test]
-async fn typed_generation_controls_reject_verbatim_profile_modes() {
-  for mode in ["passthrough", "switch"] {
-    let fixture = Fixture::with_account_and_mode("http://127.0.0.1:1", "llama-cpp", "", mode);
-    let client = fixture.client();
-
-    let error = client
-      .generate("llama-cpp/mock-model")
-      .prompt("do not silently drop controls")
-      .top_k(40)
-      .send()
-      .await
-      .expect_err("verbatim mode should reject typed generation controls");
-
-    assert!(
-      matches!(error, Error::InvalidGenerateRequest { message } if message.contains(mode)),
-      "unexpected error for {mode}"
-    );
-  }
-}
-
-#[tokio::test]
-async fn max_tokens_is_already_wire_native_in_verbatim_profile_modes() {
-  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
-
-  for mode in ["passthrough", "switch"] {
-    let fixture = Fixture::with_account_and_mode(mock.base_url(), "openai", "    api_key: test-key\n", mode);
-    let client = fixture.client();
-
-    let response = client
-      .generate("gpt-5")
-      .prompt("preserve this native Responses limit")
-      .max_tokens(64)
-      .send()
-      .await
-      .expect("wire-native output limit should not require lowering");
-
-    assert_eq!(response.text, "mock response");
-    let captured = mock.last_request().expect("upstream request captured");
-    assert_eq!(captured.path, "/responses");
-    let outbound: serde_json::Value = serde_json::from_slice(&captured.body).expect("parse upstream body");
-    assert_eq!(outbound["max_output_tokens"], 64);
-  }
 
   mock.shutdown().await;
 }
@@ -624,26 +595,53 @@ async fn raw_request_and_client_lifecycle_use_explicit_paths() {
 
   assert_eq!(client.config_path(), fixture.config_path);
   assert_eq!(client.auth_path(), fixture.auth_path);
+  assert_eq!(client.profile(), "default");
   client.reload().expect("reload SDK client");
   let _ = client.responses();
   let _ = client.messages();
 
   let options = RequestOptions::default()
-    .with_profile("default")
     .with_request_id("sdk-raw")
     .with_session_id("session-raw")
     .with_project_id("/tmp/sdk-project")
-    .with_initiator("sdk-test")
+    .with_initiator("agent")
     .with_header("x-sdk-test", "raw");
-  let error = client
+  let response = client
     .execute(
-      tokn_core::provider::Endpoint::ChatCompletions,
+      Endpoint::ChatCompletions,
       serde_json::to_value(chat_request()).expect("serialize chat request"),
       options,
     )
     .await
-    .expect_err("unknown request profile should fail");
-  assert!(matches!(error, Error::UnknownProfile { profile } if profile == "default"));
+    .expect("execute raw request through the bound default profile");
+  assert_eq!(response.status, 200);
+  let captured = mock.last_request().expect("upstream request captured");
+  assert_eq!(captured.path, "/chat/completions");
+  assert_eq!(captured.header("x-session-affinity"), Some("session-raw"));
+  assert_eq!(captured.header("x-sdk-test"), None);
+
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_reload_keeps_the_previous_runtime_snapshot() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let client = fixture.client();
+  fs::write(
+    &fixture.config_path,
+    "schema_version = 2\n[profiles.default]\nroute = \"missing\"\n",
+  )
+  .expect("replace config with an invalid generation");
+
+  assert!(matches!(client.reload(), Err(Error::LoadConfig { .. })));
+  let response = client
+    .chat_completions()
+    .create(&chat_request())
+    .await
+    .expect("previous runtime remains usable after failed reload");
+  assert_eq!(response.status, 200);
+  assert_eq!(mock.requests().len(), 1);
 
   mock.shutdown().await;
 }
@@ -673,7 +671,7 @@ async fn streaming_request_remains_a_live_byte_stream() {
 }
 
 #[test]
-fn invalid_default_profile_is_rejected_during_construction() {
+fn missing_builder_bound_profile_is_rejected_during_construction() {
   let fixture = Fixture::new("http://127.0.0.1:1");
   let error = Client::builder()
     .config_path(&fixture.config_path)
@@ -684,6 +682,102 @@ fn invalid_default_profile_is_rejected_during_construction() {
     .expect("unknown profile should fail");
 
   assert!(matches!(error, Error::UnknownProfile { profile } if profile == "missing"));
+}
+
+#[tokio::test]
+async fn explicit_alternate_profile_executes_the_same_managed_route() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let client = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path)
+    .profile("alternate")
+    .build()
+    .expect("build alternate-profile SDK client");
+
+  assert_eq!(client.profile(), "alternate");
+  let response = client
+    .chat_completions()
+    .create(&chat_request())
+    .await
+    .expect("execute through alternate profile");
+  assert_eq!(response.status, 200);
+  let captured = mock.last_request().expect("upstream request captured");
+  let outbound: serde_json::Value = serde_json::from_slice(&captured.body).expect("parse upstream body");
+  assert_eq!(outbound["model"], "mock-model");
+
+  mock.shutdown().await;
+}
+
+#[test]
+fn legacy_config_is_rejected_instead_of_implicitly_migrated() {
+  let fixture = Fixture::new("http://127.0.0.1:1");
+  fs::write(&fixture.config_path, "[defaults]\nmode = \"exact\"\n").expect("replace fixture with legacy config");
+
+  let error = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path)
+    .build()
+    .err()
+    .expect("legacy config should fail strict v2 loading");
+
+  assert!(matches!(error, Error::LoadConfig { .. }));
+}
+
+#[test]
+fn non_managed_profile_is_rejected_during_construction() {
+  let fixture = Fixture::new("http://127.0.0.1:1");
+  fs::write(
+    &fixture.config_path,
+    r#"schema_version = 2
+
+[profiles.default]
+route = "relay"
+
+[routes.relay]
+kind = "relay"
+target = { kind = "fixed_upstream", upstream = "local", account_pool = "default" }
+
+[account_pools.default]
+active_accounts = ["*"]
+providers = ["llama-cpp"]
+
+[upstreams.local]
+provider = "llama-cpp"
+base_url = "http://127.0.0.1:1"
+accounts = ["local"]
+"#,
+  )
+  .expect("write relay config");
+
+  let error = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path)
+    .build()
+    .err()
+    .expect("relay profile should fail embedded SDK construction");
+
+  assert!(matches!(
+    error,
+    Error::NonManagedProfile { profile, route, .. } if profile == "default" && route == "relay"
+  ));
+}
+
+#[tokio::test]
+async fn invalid_request_header_is_rejected_before_transport() {
+  let fixture = Fixture::new("http://127.0.0.1:1");
+  let client = fixture.client();
+
+  let error = client
+    .execute(
+      Endpoint::ChatCompletions,
+      serde_json::to_value(chat_request()).expect("serialize chat request"),
+      RequestOptions::default().with_header("invalid header", "value"),
+    )
+    .await
+    .expect_err("invalid header name should fail locally");
+
+  assert!(matches!(error, Error::InvalidHeaderName { name, .. } if name == "invalid header"));
 }
 
 #[test]

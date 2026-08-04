@@ -13,7 +13,7 @@ test("the packaged native addon exposes the supported ABI", () => {
   if (process.env["TOKN_NATIVE_SMOKE"] !== "1") {
     return;
   }
-  assert.equal(getNativeBinding().nativeAbiVersion(), 1);
+  assert.equal(getNativeBinding().nativeAbiVersion(), 2);
 });
 
 test("native configuration failures retain their public error type", async () => {
@@ -124,7 +124,32 @@ test("the native client loads configured credentials and completes a provider re
   const fixtureRoot = await mkdtemp(join(tmpdir(), "tokn-typescript-"));
   const configPath = join(fixtureRoot, "config.toml");
   const authPath = join(fixtureRoot, "auth.yaml");
-  await writeFile(configPath, '[defaults]\nmode = "exact"\n');
+  await writeFile(
+    configPath,
+    [
+      "schema_version = 2",
+      "",
+      "[profiles.native]",
+      'route = "managed"',
+      "",
+      "[routes.managed]",
+      'kind = "managed"',
+      'account_pool = "default"',
+      'upstream = { kind = "fixed", upstream = "local" }',
+      'model = { kind = "qualified", namespace = "provider" }',
+      'operation = "translate_compatible"',
+      "",
+      "[account_pools.default]",
+      'active_accounts = ["*"]',
+      'providers = ["llama-cpp"]',
+      "",
+      "[upstreams.local]",
+      'provider = "llama-cpp"',
+      `base_url = "http://127.0.0.1:${address.port}"`,
+      'accounts = ["local-llama"]',
+      "",
+    ].join("\n"),
+  );
   await writeFile(
     authPath,
     [
@@ -132,7 +157,6 @@ test("the native client loads configured credentials and completes a provider re
       "accounts:",
       "  - id: local-llama",
       "    provider: llama-cpp",
-      `    base_url: http://127.0.0.1:${address.port}`,
       "",
     ].join("\n"),
   );
@@ -142,7 +166,9 @@ test("the native client loads configured credentials and completes a provider re
     client = await Client.create({
       config_path: configPath,
       auth_path: authPath,
+      profile: "native",
     });
+    assert.equal(client.profile, "native");
     const response = await client
       .generate("llama-cpp/mock-model")
       .prompt("Exercise the native TypeScript binding.")

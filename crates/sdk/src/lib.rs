@@ -1,8 +1,9 @@
 //! Embedded SDK for routing LLM requests through configured providers.
 //!
-//! [`Client`] loads the same configuration and credential files as the
-//! `tokn-gateway` runtime, then executes requests in-process through the shared
-//! account pool, routing, conversion, retry, and provider implementations.
+//! A [`Client`] binds one managed profile from the strict version 2 gateway
+//! configuration, then executes requests in-process through the same linked
+//! account selection, conversion, and provider implementation used by serving.
+//! Build separate clients when an application needs separate profiles.
 
 mod client;
 mod endpoint;
@@ -22,7 +23,11 @@ pub use response::{BufferedResponse, ByteStream, RawResponse, ResponseBody, Stre
 pub use tokn_core::generation::{
   GenerationOptions, GenerationOptionsError, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary,
 };
-pub use tokn_core::provider::Endpoint;
 pub use tokn_endpoint_chat_completions as chat_completions;
+pub use tokn_endpoint_core::Endpoint;
 pub use tokn_endpoint_messages as messages;
 pub use tokn_endpoint_responses as responses;
+pub use tokn_events as events;
+pub use tokn_events::{
+  ConsumerResult, EventConsumer, EventHub, EventSeq, GatewayEvent, HubBuilder, HubStatus, Publisher,
+};

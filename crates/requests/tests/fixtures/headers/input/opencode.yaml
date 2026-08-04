@@ -1,6 +1,0 @@
-- accept: application/json
-- x-initiator: user
-- x-session-id: sess-opencode-1
-- x-interaction-id: int-opencode-1
-- x-request-id: req-opencode-1
-- x-opencode-project: /tmp/opencode-project

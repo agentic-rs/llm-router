@@ -84,6 +84,11 @@ impl NativeClient {
     self.state.client.auth_path().to_string_lossy().into_owned()
   }
 
+  #[napi(getter)]
+  pub fn profile(&self) -> String {
+    self.state.client.profile().to_string()
+  }
+
   #[napi]
   pub fn reload(&self, env: Env, cancellation: &NativeCancellation) -> Result<AsyncBlock<()>> {
     let cancellation = cancellation.inner.clone();
@@ -331,7 +336,7 @@ pub fn create_client(env: Env, options_json: String) -> Result<AsyncBlock<Native
 
 #[napi]
 pub fn native_abi_version() -> u32 {
-  1
+  2
 }
 
 fn parse_endpoint(endpoint: &str) -> Result<Endpoint> {

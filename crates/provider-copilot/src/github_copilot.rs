@@ -8,17 +8,18 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use reqwest::Method;
 use serde_json::Value;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokn_core::account::AccountConfig;
-use tokn_core::pipeline::InputTransformer;
+use tokn_core::provider::{InputTransformer, ProviderTarget};
+use tokn_core::upstream_url::CleartextHttpPolicy;
 use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
 use tracing::{debug, instrument};
 
 use crate::{
-  error, AuthKind, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx,
-  Result, ID_GITHUB_COPILOT,
+  error, AuthKind, CredentialPatchCtx, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo,
+  ProviderRequestKind, RequestCtx, Result, ID_GITHUB_COPILOT,
 };
 
 #[allow(dead_code)]
@@ -37,25 +38,8 @@ pub struct CopilotProvider {
   pub headers: CopilotHeaders,
   refresh_lock: AsyncMutex<()>,
   cache: RwLock<ApiToken>,
+  target: ProviderTarget,
   info: ProviderInfo,
-}
-
-fn copilot_info() -> &'static ProviderInfo {
-  static CELL: OnceLock<ProviderInfo> = OnceLock::new();
-  CELL.get_or_init(|| ProviderInfo {
-    id: ID_GITHUB_COPILOT.to_string(),
-    aliases: &[ID_GITHUB_COPILOT],
-    display_name: "GitHub Copilot",
-    upstream_url: COPILOT_API.to_string(),
-    auth_kind: AuthKind::OAuthDeviceFlow,
-    // Copilot's `/models` upstream is the source of truth for model
-    // *identity*; the catalogue below provides metadata overlay for the
-    // ids that models.dev tracks. Unknown ids still pass through
-    // `/v1/models` — they just lack the `x_tokn_router` enrichment block.
-    default_models: crate::catalogue::default_models_for(ID_GITHUB_COPILOT),
-    default_endpoints: crate::DEFAULT_ENDPOINTS,
-    model_cache: std::sync::Arc::new(tokn_core::provider::ModelCache::default()),
-  })
 }
 
 impl CopilotProvider {
@@ -71,8 +55,26 @@ impl CopilotProvider {
 
   pub fn from_account(a: Arc<AccountConfig>) -> Result<Self> {
     Self::validate_account(&a)?;
+    let base_url = a.base_url.as_deref().unwrap_or(COPILOT_API);
+    let target = ProviderTarget::parse(base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: a.id.clone(),
+        source,
+      }
+    })?;
+    Self::from_validated_account_at(a, target)
+  }
+
+  pub fn from_account_at(a: Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
+    Self::validate_account(&a)?;
+    Self::from_validated_account_at(a, target)
+  }
+
+  fn from_validated_account_at(a: Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
     let gh = a.refresh_token.clone().expect("validated refresh_token");
     let headers = headers_from_settings(&a)?;
+    let upstream_url = target.base_url().to_string();
+    let model_cache = target.model_cache().clone();
     Ok(Self {
       id: format!("github-copilot:{}", a.id),
       refresh_token: gh,
@@ -82,7 +84,21 @@ impl CopilotProvider {
         token: a.access_token.clone(),
         expires_at: a.access_token_expires_at,
       }),
-      info: copilot_info().clone(),
+      target,
+      info: ProviderInfo {
+        id: ID_GITHUB_COPILOT.to_string(),
+        aliases: &[ID_GITHUB_COPILOT],
+        display_name: "GitHub Copilot",
+        upstream_url,
+        auth_kind: AuthKind::OAuthDeviceFlow,
+        // Copilot's `/models` upstream is the source of truth for model
+        // *identity*; the catalogue below provides metadata overlay for the
+        // ids that models.dev tracks. Unknown ids still pass through
+        // `/v1/models` — they just lack the `x_tokn_router` enrichment block.
+        default_models: crate::catalogue::default_models_for(ID_GITHUB_COPILOT),
+        default_endpoints: crate::DEFAULT_ENDPOINTS,
+        model_cache,
+      },
     })
   }
 
@@ -183,12 +199,28 @@ impl Provider for CopilotProvider {
     crate::DESCRIPTOR.model_endpoint_rules
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     let token = ctx.bearer_token.ok_or_else(|| error::Error::Profiles {
-      message: "missing copilot bearer token for header patch".to_string(),
+      message: "missing copilot bearer token for credential injection".to_string(),
     })?;
     headers.insert(&AUTHORIZATION, HeaderValue::from_string(format!("Bearer {token}")));
     Ok(())
+  }
+
+  async fn authorize_request(
+    &self,
+    http: &reqwest::Client,
+    headers: &mut HeaderMap,
+    request_kind: ProviderRequestKind,
+  ) -> Result<()> {
+    let token = self.ensure_api_token(http).await?;
+    self.replace_credentials(
+      headers,
+      &CredentialPatchCtx {
+        request_kind,
+        bearer_token: Some(token.expose()),
+      },
+    )
   }
 
   fn normalize_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
@@ -213,43 +245,23 @@ impl Provider for CopilotProvider {
 
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
     let token = self.ensure_api_token(http).await?;
-    models::list(http, token.expose(), &self.headers).await
+    models::list(http, self.target.base_url(), token.expose(), &self.headers).await
   }
 
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/chat/completions", "chat").await
+    self.upstream_post(ctx, &["chat", "completions"], "chat").await
   }
 
   async fn responses(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/responses", "responses").await
+    self.upstream_post(ctx, &["responses"], "responses").await
   }
 
   async fn messages(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, "/v1/messages", "messages").await
+    self.upstream_post(ctx, &["v1", "messages"], "messages").await
   }
 
   fn on_unauthorized(&self) {
     self.invalidate_api_token();
-  }
-
-  fn needs_refresh(&self, cfg: &AccountConfig) -> bool {
-    const SKEW_SECS: i64 = 300;
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    cfg
-      .access_token_expires_at
-      .map(|exp| exp - SKEW_SECS <= now)
-      .unwrap_or(true)
-      || cfg.access_token.is_none()
-  }
-
-  async fn refresh(&self, cfg: &AccountConfig, http: &reqwest::Client) -> Result<AccountConfig> {
-    let token = self.ensure_api_token(http).await?;
-    let (_, expires_at) = self.snapshot();
-    let mut next = cfg.clone();
-    next.access_token = Some(token);
-    next.access_token_expires_at = expires_at;
-    next.last_refresh = Some(time::OffsetDateTime::now_utc().unix_timestamp());
-    Ok(next)
   }
 }
 
@@ -278,12 +290,19 @@ impl CopilotProvider {
     fields(
       account = %self.id,
       what,
-      path,
+      path = tracing::field::Empty,
       stream = ctx.stream,
       initiator = tracing::field::Empty,
     ),
   )]
-  async fn upstream_post(&self, ctx: RequestCtx<'_>, path: &str, what: &'static str) -> Result<reqwest::Response> {
+  async fn upstream_post(
+    &self,
+    ctx: RequestCtx<'_>,
+    path_segments: &[&str],
+    what: &'static str,
+  ) -> Result<reqwest::Response> {
+    let url = self.target.base_url().operation_url(path_segments.iter().copied())?;
+    tracing::Span::current().record("path", url.path());
     let token = self.ensure_api_token(ctx.http).await?;
     let initiator = match ctx.endpoint {
       // For /v1/responses the inbound body uses `input`, not `messages`,
@@ -293,9 +312,7 @@ impl CopilotProvider {
       _ => self.resolve_initiator(ctx.body, ctx.inbound_headers, ctx.initiator),
     };
     tracing::Span::current().record("initiator", initiator.as_str());
-    let mut h = ctx.client_headers.clone().unwrap_or_else(|| {
-      headers::copilot_request_headers(token.expose(), &self.headers, ctx.stream, &initiator).unwrap_or_default()
-    });
+    let mut h = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
       &mut h,
       &HeaderPatchCtx {
@@ -307,22 +324,12 @@ impl CopilotProvider {
         initiator: &initiator,
         inbound_headers: ctx.inbound_headers,
         vars: &ctx.vars,
-        agent_id: &ctx.agent_id,
+        wire_identity: ctx.wire_identity.as_ref(),
       },
     )?;
-    let url = format!("{COPILOT_API}{path}");
     debug!(%url, "POST upstream");
     let body_bytes = ctx.request_body_bytes();
-    let resp = crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      &url,
-      h,
-      Some(body_bytes),
-      ctx.outbound.as_ref(),
-      what,
-    )
-    .await?;
+    let resp = ctx.send(Method::POST, url.as_str(), h, Some(body_bytes), what).await?;
     debug!(status = %resp.status(), "upstream returned");
     Ok(resp)
   }
@@ -357,6 +364,7 @@ mod tests {
   use super::*;
   use crate::TemplateVars;
   use tokn_core::account::AccountTier;
+  use tokn_mock_server::{MockAuthConfig, MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 
   fn acct(refresh: Option<&str>) -> AccountConfig {
     AccountConfig {
@@ -388,6 +396,13 @@ mod tests {
     CopilotProvider::from_account(Arc::new(acct(Some("gh-test-fixture")))).unwrap()
   }
 
+  fn acct_with_cached_api_token() -> AccountConfig {
+    let mut account = acct(Some("gh-test-fixture"));
+    account.access_token = Some(Secret::new("api-tok-fixture".into()));
+    account.access_token_expires_at = Some(time::OffsetDateTime::now_utc().unix_timestamp() + 3_600);
+    account
+  }
+
   fn patch_ctx(
     endpoint: Endpoint,
     stream: bool,
@@ -403,7 +418,7 @@ mod tests {
       initiator,
       inbound_headers: Box::leak(Box::new(HeaderMap::new())),
       vars: Box::leak(Box::new(TemplateVars::default())),
-      agent_id: Box::leak(Box::new(tokn_core::AgentId::CopilotCli)),
+      wire_identity: Some(Box::leak(Box::new(tokn_core::AgentId::CopilotCli))),
     }
   }
 
@@ -478,9 +493,145 @@ mod tests {
       initiator: "user",
       inbound_headers: &HeaderMap::new(),
       vars: &TemplateVars::default(),
-      agent_id: &tokn_core::AgentId::CopilotCli,
+      wire_identity: Some(&tokn_core::AgentId::CopilotCli),
     };
     let err = p.patch_headers(&mut h, &ctx).unwrap_err();
     assert!(err.to_string().contains("copilot bearer token"), "{err}");
+  }
+
+  #[tokio::test]
+  async fn copilot_authorize_request_uses_cached_token_without_normalizing_headers() {
+    let provider = CopilotProvider::from_account(Arc::new(acct_with_cached_api_token())).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("accept", "application/x-client-choice");
+    headers.insert("x-client-header", "preserved");
+    headers.insert("x-api-key", "client-api-key");
+    headers.insert("chatgpt-account-id", "client-account");
+    headers.insert("cookie", "session=client");
+
+    provider
+      .authorize_request(&reqwest::Client::new(), &mut headers, ProviderRequestKind::Opaque)
+      .await
+      .unwrap();
+
+    assert_eq!(headers.get("authorization").unwrap().as_str(), "Bearer api-tok-fixture");
+    assert_eq!(headers.get("accept").unwrap().as_str(), "application/x-client-choice");
+    assert_eq!(headers.get("x-client-header").unwrap().as_str(), "preserved");
+    assert!(headers.get("x-api-key").is_none());
+    assert!(headers.get("chatgpt-account-id").is_none());
+    assert!(headers.get("cookie").is_none());
+    assert!(headers.get("content-type").is_none());
+    assert!(headers.get("x-initiator").is_none());
+  }
+
+  #[test]
+  fn explicit_target_owns_destination_and_model_cache() {
+    let mut account = acct(Some("gh-test-fixture"));
+    account.base_url = Some("https://ignored.example/copilot".into());
+    let target = ProviderTarget::parse(
+      "https://gateway.example/copilot/data-plane",
+      CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+    let target_cache = target.model_cache().clone();
+
+    let provider = CopilotProvider::from_account_at(Arc::new(account), target).unwrap();
+
+    assert_eq!(
+      provider
+        .target
+        .base_url()
+        .operation_url(["chat", "completions"])
+        .unwrap()
+        .as_str(),
+      "https://gateway.example/copilot/data-plane/chat/completions"
+    );
+    assert_eq!(
+      provider.info().upstream_url,
+      "https://gateway.example/copilot/data-plane/"
+    );
+    assert!(Arc::ptr_eq(&provider.info().model_cache, &target_cache));
+  }
+
+  #[test]
+  fn legacy_constructor_reports_invalid_account_url() {
+    let mut account = acct(Some("gh-test-fixture"));
+    account.base_url = Some("not a URL".into());
+
+    let error = CopilotProvider::from_account(Arc::new(account)).err().unwrap();
+
+    assert!(matches!(
+      error,
+      error::Error::InvalidUpstreamUrl { ref account, .. } if account == "test"
+    ));
+  }
+
+  #[tokio::test]
+  async fn explicit_target_serves_models_and_operations() {
+    let config = MockLlmConfig::default()
+      .with_auth(MockAuthConfig::bearer(["api-tok-fixture"]))
+      .with_route(MockRoute::new(
+        MockEndpoint::Custom {
+          method: reqwest::Method::GET,
+          path: "/copilot/models".into(),
+        },
+        MockResponse::json(serde_json::json!({
+          "object": "list",
+          "data": [{"id": "mock-model", "object": "model"}]
+        })),
+      ))
+      .with_route(MockRoute::new(
+        MockEndpoint::Custom {
+          method: reqwest::Method::POST,
+          path: "/copilot/chat/completions".into(),
+        },
+        MockResponse::json(serde_json::json!({"id": "chatcmpl-mock"})),
+      ));
+    let server = MockLlmServer::start(config).await;
+    let target = ProviderTarget::parse(
+      &format!("{}/copilot", server.base_url()),
+      CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+    let mut account = acct_with_cached_api_token();
+    account.base_url = Some("https://ignored.example/copilot".into());
+    let provider = CopilotProvider::from_account_at(Arc::new(account), target).unwrap();
+    let http = reqwest::Client::new();
+
+    let models = provider.list_models(&http).await.unwrap();
+    assert_eq!(models["data"][0]["id"], "mock-model");
+
+    let body = serde_json::json!({
+      "model": "mock-model",
+      "messages": [{"role": "user", "content": "hi"}]
+    });
+    let inbound = HeaderMap::new();
+    let response = provider
+      .chat(RequestCtx {
+        endpoint: Endpoint::ChatCompletions,
+        http: &http,
+        body: &body,
+        body_bytes: None,
+        content_encoding: None,
+        stream: false,
+        initiator: "user",
+        inbound_headers: &inbound,
+        client_headers: None,
+        vars: TemplateVars::default(),
+        wire_identity: Some(tokn_core::AgentId::CopilotCli),
+        request_observer: None,
+      })
+      .await
+      .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, reqwest::Method::GET);
+    assert_eq!(requests[0].path, "/copilot/models");
+    assert_eq!(requests[0].header("authorization"), Some("Bearer api-tok-fixture"));
+    assert_eq!(requests[1].method, reqwest::Method::POST);
+    assert_eq!(requests[1].path, "/copilot/chat/completions");
+    assert_eq!(requests[1].header("authorization"), Some("Bearer api-tok-fixture"));
   }
 }

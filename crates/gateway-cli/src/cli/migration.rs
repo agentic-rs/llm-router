@@ -4,8 +4,7 @@
 //! snapshots, then print current/latest versions and aggregate row counts.
 //! `--commit` applies pending migrations; `--rollback` restores backups.
 
-use crate::config::Config;
-use crate::db::{migrate, requests, requests::RequestsDb, sessions::SessionsDb, usage::UsageDb};
+use crate::db::{migrate, requests, sessions::SessionsDb, usage::UsageDb};
 use anyhow::Result;
 use clap::Args;
 use rusqlite::Connection;
@@ -24,8 +23,8 @@ pub struct MigrationArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: MigrationArgs) -> Result<()> {
-  let (cfg, _) = Config::load(cfg_path.as_deref())?;
-  let paths = cfg.db.resolve_paths()?;
+  let config = super::command_config::CommandConfig::load(cfg_path.as_deref())?;
+  let paths = config.persistence_paths()?;
   let usage_db = paths.usage_db;
   let sessions_db = paths.sessions_db;
   let requests_dir = paths.requests_dir;
@@ -33,7 +32,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: MigrationArgs) -> Result<()> {
   if args.rollback {
     rollback_one("usage", &usage_db)?;
     rollback_one("sessions", &sessions_db)?;
-    for path in RequestsDb::day_files(&requests_dir)? {
+    for path in requests::day_files(&requests_dir)? {
       rollback_one("requests", &path)?;
     }
     return Ok(());
@@ -43,7 +42,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: MigrationArgs) -> Result<()> {
     println!("migration dry-run (use --commit to apply migrations, or --rollback to restore .bak files)");
     print_status("usage", &usage_db, crate::db::usage::latest_version())?;
     print_status("sessions", &sessions_db, crate::db::sessions::latest_version())?;
-    for path in RequestsDb::day_files(&requests_dir)? {
+    for path in requests::day_files(&requests_dir)? {
       print_status("requests", &path, crate::db::requests::latest_version())?;
     }
     return Ok(());
@@ -51,7 +50,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: MigrationArgs) -> Result<()> {
 
   apply_one("usage", &usage_db, |p| UsageDb::open(p).map(|_| ()))?;
   apply_one("sessions", &sessions_db, |p| SessionsDb::open(p).map(|_| ()))?;
-  for path in RequestsDb::day_files(&requests_dir)? {
+  for path in requests::day_files(&requests_dir)? {
     apply_one("requests", &path, |p| requests::open_day_db(p).map(|_| ()))?;
   }
   Ok(())

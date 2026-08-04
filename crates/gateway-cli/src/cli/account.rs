@@ -1,7 +1,6 @@
 use crate::cli::import::ImportArgs;
 use crate::cli::login::LoginArgs;
-use crate::config::{Account, AccountState, AccountTier, Config};
-use crate::util::http::build_client;
+use crate::config::{Account, AccountState, AccountTier};
 use crate::util::secret::Secret;
 use crate::util::timefmt::{relative_from_now, relative_from_now_ms};
 use anyhow::{anyhow, bail, Result};
@@ -10,6 +9,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokn_auth::AuthStore;
+use tokn_core::util::http::{build_client, HttpClientOptions};
+
+use super::command_config::CommandConfig;
 
 #[derive(Subcommand, Debug)]
 pub enum AccountCmd {
@@ -90,10 +92,10 @@ pub struct SwitchArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
+  let config = CommandConfig::load(cfg_path.as_deref())?;
+  let mut store = AuthStore::load(None, Some(config.path()))?;
   match cmd {
-    AccountCmd::List(args) => list(&cfg, &mut store, args).await?,
+    AccountCmd::List(args) => list(&config.outbound_http_options(), &mut store, args).await?,
     AccountCmd::Remove { id } => {
       let removed = store.remove(&id).ok_or_else(|| anyhow!("no account with id '{id}'"))?;
       store.save()?;
@@ -101,11 +103,11 @@ pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
       println!("Removed '{id}'");
     }
     AccountCmd::Show { id } => show(&store, &id)?,
-    AccountCmd::Add(args) => add(cfg_path, args).await?,
-    AccountCmd::Login(args) => crate::cli::login::run(cfg_path, args).await?,
-    AccountCmd::Import(args) => crate::cli::import::run(cfg_path, args).await?,
-    AccountCmd::Refresh { id } => refresh(&cfg, &mut store, &id).await?,
-    AccountCmd::Status { id } => status(&cfg, &mut store, id).await?,
+    AccountCmd::Add(args) => add(&config, args).await?,
+    AccountCmd::Login(args) => crate::cli::login::run(&config, args).await?,
+    AccountCmd::Import(args) => crate::cli::import::run(&config, args).await?,
+    AccountCmd::Refresh { id } => refresh(&config.outbound_http_options(), &mut store, &id).await?,
+    AccountCmd::Status { id } => status(&config.outbound_http_options(), &mut store, id).await?,
     AccountCmd::Switch(args) => switch(&mut store, args)?,
   }
   Ok(())
@@ -115,7 +117,7 @@ pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
 // list
 // ---------------------------------------------------------------------------
 
-async fn list(cfg: &Config, store: &mut AuthStore, args: ListArgs) -> Result<()> {
+async fn list(http_options: &HttpClientOptions, store: &mut AuthStore, args: ListArgs) -> Result<()> {
   if store.accounts.is_empty() {
     println!("(no accounts)");
     return Ok(());
@@ -126,7 +128,7 @@ async fn list(cfg: &Config, store: &mut AuthStore, args: ListArgs) -> Result<()>
   let quotas: Vec<QuotaResult> = if args.no_quota {
     store.accounts.iter().map(|_| QuotaResult::Skipped).collect()
   } else {
-    let http = build_client(&cfg.proxy)?;
+    let http = build_client(http_options)?;
     let timeout = Duration::from_secs(args.timeout.max(1));
     let futs = store
       .accounts
@@ -437,10 +439,9 @@ fn state_label(s: AccountState) -> &'static str {
 // add (interactive wizard)
 // ---------------------------------------------------------------------------
 
-async fn add(cfg_path: Option<PathBuf>, args: AddArgs) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
-  let client = build_client(&cfg.proxy)?;
+async fn add(config: &CommandConfig, args: AddArgs) -> Result<()> {
+  let mut store = AuthStore::load(None, Some(config.path()))?;
+  let client = build_client(&config.outbound_http_options())?;
   let account = crate::cli::onboarding::interactive_add_account(&client, args.provider, args.id).await?;
   let id = account.id.clone();
   let provider = account.provider.clone();
@@ -455,7 +456,7 @@ async fn add(cfg_path: Option<PathBuf>, args: AddArgs) -> Result<()> {
 // refresh (force token re-exchange for github-copilot)
 // ---------------------------------------------------------------------------
 
-async fn refresh(cfg: &Config, store: &mut AuthStore, id: &str) -> Result<()> {
+async fn refresh(http_options: &HttpClientOptions, store: &mut AuthStore, id: &str) -> Result<()> {
   let account = store
     .get(id)
     .ok_or_else(|| anyhow!("no account with id '{id}'"))?
@@ -464,7 +465,7 @@ async fn refresh(cfg: &Config, store: &mut AuthStore, id: &str) -> Result<()> {
   let Some(provider_auth) = crate::auth_registry::provider_auth_for(&account.provider) else {
     bail!("unknown provider '{}'", account.provider);
   };
-  let http = build_client(&cfg.proxy)?;
+  let http = build_client(http_options)?;
   match provider_auth
     .refresh_credential(&http, &account)
     .await
@@ -508,13 +509,13 @@ async fn refresh(cfg: &Config, store: &mut AuthStore, id: &str) -> Result<()> {
 // status (gh-auth-style one-line per account)
 // ---------------------------------------------------------------------------
 
-async fn status(cfg: &Config, store: &mut AuthStore, id: Option<String>) -> Result<()> {
+async fn status(http_options: &HttpClientOptions, store: &mut AuthStore, id: Option<String>) -> Result<()> {
   if store.accounts.is_empty() {
     println!("(no accounts) — run `tokn-router account add` to add one");
     return Ok(());
   }
   let timeout = Duration::from_secs(5);
-  let http = build_client(&cfg.proxy)?;
+  let http = build_client(http_options)?;
   let futs = store
     .accounts
     .iter()

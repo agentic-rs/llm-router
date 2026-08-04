@@ -8,3 +8,5 @@ __pycache__/
 /bindings/typescript/_native.cjs
 /bindings/typescript/_native.d.ts
 /bindings/typescript/tokn_sdk.*.node
+/bindings/python/python/tokn/_native*.so
+/bindings/python/python/tokn/_native*.pyd

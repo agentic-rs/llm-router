@@ -25,3 +25,6 @@ time = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokn-mock-server = { workspace = true }

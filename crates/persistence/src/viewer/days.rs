@@ -91,6 +91,19 @@ pub(super) fn request_day_files(requests_dir: &Path) -> Result<Vec<DayFile>> {
   Ok(files)
 }
 
+/// Convert a Unix timestamp in seconds or milliseconds to a UTC request day.
+pub(super) fn request_day_from_timestamp(timestamp: i64) -> String {
+  let timestamp_seconds = if timestamp > 10_000_000_000 {
+    timestamp / 1_000
+  } else {
+    timestamp
+  };
+  time::OffsetDateTime::from_unix_timestamp(timestamp_seconds)
+    .ok()
+    .and_then(|datetime| datetime.date().format(format_description!("[year]-[month]-[day]")).ok())
+    .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
 fn probe_request_day_state_best_effort(day_file: &DayFile) -> RequestDayState {
   let result = (|| -> Result<RequestDayState> {
     let Some(conn) = open_readonly_with_timeout(&day_file.path, DAY_PROBE_BUSY_TIMEOUT)? else {
@@ -129,4 +142,17 @@ fn day_has_requests(conn: &Connection) -> Result<bool> {
   };
   let has_requests = conn.query_row(sql, [], |row| row.get::<_, i64>(0))?;
   Ok(has_requests != 0)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::request_day_from_timestamp;
+
+  #[test]
+  fn request_day_conversion_accepts_seconds_and_milliseconds() {
+    assert_eq!(request_day_from_timestamp(0), "1970-01-01");
+    assert_eq!(request_day_from_timestamp(1_767_225_600), "2026-01-01");
+    assert_eq!(request_day_from_timestamp(1_767_225_600_000), "2026-01-01");
+    assert_eq!(request_day_from_timestamp(i64::MAX), "1970-01-01");
+  }
 }

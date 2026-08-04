@@ -56,6 +56,8 @@ class NativeClient:
 
   def auth_path(self) -> str: ...
 
+  def profile(self) -> str: ...
+
   async def request(
     self,
     endpoint: str,

@@ -1,67 +1,56 @@
-//! TTY progress display for in-flight requests.
-//!
-//! Implements [`EventHandler`] driving an [`indicatif::MultiProgress`].
-//! One bar per request_id; updated on lifecycle events; finalised on
-//! `RequestCompleted` and persisted in the scrollback. A persistent
-//! footer bar (last line of the MultiProgress) shows live session
-//! counters.
-//!
-//! Only registered when stdout is a TTY (see `server_runtime.rs`).
+//! Shared terminal progress surface and request lifecycle display.
 
-use crate::db::archive::{ArchiveEvent, ArchiveEventHandler};
-use console::style;
+use console::{style, StyledObject};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use time::{macros::format_description, OffsetDateTime};
-use tokn_core::db::Usage;
-use tokn_core::event::{Event, EventHandler};
-use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
+use tokn_events::{
+  AttemptFinished, AttemptNo, AttemptStarted, BodyLeg, BodyOutcome, BodyResult, ConsumerResult, EventConsumer,
+  EventSeq, GatewayEvent, RequestAdmitted, RequestFinished, RequestOutcome, RequestStarted, TokenUsage, TrafficEvent,
+  TrafficEventKind,
+};
+use tokn_persistence::archive::{ArchiveEvent, ArchiveEventHandler};
 
-/// Process-wide [`MultiProgress`] shared between [`ProgressEventHandler`]
-/// and the tracing log writer (so log lines suspend the bars during
-/// emission instead of garbling them).
 static MULTI: OnceLock<MultiProgress> = OnceLock::new();
-const USAGE_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
-/// Returns the shared [`MultiProgress`]. Lazily initialized on first call;
-/// safe to call from any context (logging init or event handler).
+/// Returns the process-wide progress surface shared by interactive commands
+/// and the tracing writer.
 pub fn multi() -> &'static MultiProgress {
   MULTI.get_or_init(|| MultiProgress::with_draw_target(ProgressDrawTarget::stdout()))
 }
 
+#[derive(Debug)]
 struct RequestState {
-  started: Instant,
   provider: String,
   model: String,
   account: String,
   endpoint: String,
-  attempt: u32,
+  attempt: Option<AttemptNo>,
   sent_bytes: u64,
   recv_bytes: u64,
-  usage: Usage,
+  usage: TokenUsage,
   final_status: Option<u16>,
   error: Option<String>,
+  elapsed_ms: u64,
 }
 
 impl RequestState {
-  fn new(endpoint: String) -> Self {
+  fn new(started: &RequestStarted, elapsed_ms: u64) -> Self {
     Self {
-      started: Instant::now(),
       provider: String::new(),
       model: String::new(),
       account: String::new(),
-      endpoint,
-      attempt: 0,
+      endpoint: initial_endpoint(started),
+      attempt: None,
       sent_bytes: 0,
       recv_bytes: 0,
-      usage: Usage::default(),
+      usage: TokenUsage::default(),
       final_status: None,
       error: None,
+      elapsed_ms,
     }
   }
 
@@ -70,17 +59,19 @@ impl RequestState {
   }
 
   fn render_in_flight(&self, request_id: &str) -> String {
-    let elapsed = self.started.elapsed().as_secs_f64();
-    let speed_kbs = if elapsed > 0.05 {
-      (self.recv_bytes as f64) / 1024.0 / elapsed
+    let elapsed = self.elapsed_ms as f64 / 1_000.0;
+    let speed_kbs = if self.elapsed_ms > 50 {
+      self.recv_bytes as f64 / 1024.0 / elapsed
     } else {
       0.0
     };
-    let attempt_part = if self.attempt > 0 {
-      format!(" {}", style(format!("a={}", self.attempt)).yellow())
-    } else {
-      String::new()
-    };
+    let attempt_part = self
+      .attempt
+      .map(AttemptNo::get)
+      .and_then(|attempt| attempt.checked_sub(1))
+      .filter(|retry| *retry > 0)
+      .map(|retry| format!(" {}", style(format!("a={retry}")).yellow()))
+      .unwrap_or_default();
     format!(
       "[{}] {} {} {}{} {} sent={:.1}kB recv={:.1}kB {:.1}kB/s elapsed={:.1}s",
       style(Self::id_short(request_id)).dim(),
@@ -89,54 +80,27 @@ impl RequestState {
       style(truncate(&self.account, 16)).magenta(),
       attempt_part,
       style(&self.endpoint).dim(),
-      (self.sent_bytes as f64) / 1024.0,
-      (self.recv_bytes as f64) / 1024.0,
+      self.sent_bytes as f64 / 1024.0,
+      self.recv_bytes as f64 / 1024.0,
       speed_kbs,
       elapsed,
     )
   }
 
-  fn merge_usage(&mut self, usage: &Usage) {
-    if usage.input_tokens.is_some() {
-      self.usage.input_tokens = usage.input_tokens;
-    }
-    if usage.output_tokens.is_some() {
-      self.usage.output_tokens = usage.output_tokens;
-    }
-    if usage.total_tokens.is_some() {
-      self.usage.total_tokens = usage.total_tokens;
-    }
-    if usage.details.cache_read.is_some() {
-      self.usage.details.cache_read = usage.details.cache_read;
-    }
-    if usage.details.cache_write.is_some() {
-      self.usage.details.cache_write = usage.details.cache_write;
-    }
-    if usage.details.reasoning.is_some() {
-      self.usage.details.reasoning = usage.details.reasoning;
-    }
-  }
-
-  fn render_completed(
-    &self,
-    request_id: &str,
-    success: bool,
-    total_attempts: u32,
-    final_status: Option<u16>,
-    total_latency_ms: u64,
-    error: Option<&str>,
-  ) -> String {
+  fn render_completed(&self, request_id: &str, finished: &RequestFinished) -> String {
     let id_short = Self::id_short(request_id);
-    let latency_s = (total_latency_ms as f64) / 1000.0;
-    let attempts_part = if total_attempts > 1 {
-      format!(" attempts={total_attempts}")
+    let latency_s = self.elapsed_ms as f64 / 1_000.0;
+    let attempts_part = if finished.attempt_count > 1 {
+      format!(" attempts={}", finished.attempt_count)
     } else {
       String::new()
     };
-    if success {
-      let status_part = final_status
-        .map(|status| format!(" {}", style_status(status)))
-        .unwrap_or_default();
+    let status_part = self
+      .final_status
+      .map(|status| format!(" {}", style_status(status)))
+      .unwrap_or_default();
+
+    if matches!(finished.outcome, RequestOutcome::Delivered) {
       format!(
         "[{}] {}{} {} {} {} {} sent={:.1}kB recv={:.1}kB{} latency={:.1}s{}",
         style(&id_short).dim(),
@@ -146,18 +110,14 @@ impl RequestState {
         style(truncate(&self.model, 28)).cyan(),
         style(truncate(&self.account, 16)).magenta(),
         style(&self.endpoint).dim(),
-        (self.sent_bytes as f64) / 1024.0,
-        (self.recv_bytes as f64) / 1024.0,
+        self.sent_bytes as f64 / 1024.0,
+        self.recv_bytes as f64 / 1024.0,
         format_usage(&self.usage),
         latency_s,
         attempts_part,
       )
     } else {
-      let err = error.unwrap_or("failed");
-      let status_part = match final_status {
-        Some(s) => format!(" {}", style_status(s)),
-        None => String::new(),
-      };
+      let error = self.error.as_deref().unwrap_or("failed");
       format!(
         "[{}] {}{} {} {} {} {} sent={:.1}kB recv={:.1}kB latency={:.1}s{} error={}",
         style(&id_short).dim(),
@@ -167,18 +127,16 @@ impl RequestState {
         style(truncate(&self.model, 28)).cyan(),
         style(truncate(&self.account, 16)).magenta(),
         style(&self.endpoint).dim(),
-        (self.sent_bytes as f64) / 1024.0,
-        (self.recv_bytes as f64) / 1024.0,
+        self.sent_bytes as f64 / 1024.0,
+        self.recv_bytes as f64 / 1024.0,
         latency_s,
         attempts_part,
-        style(truncate(err, 80)).red(),
+        style(truncate(error, 80)).red(),
       )
     }
   }
 
   fn render_interrupted(&self, request_id: &str) -> String {
-    let id_short = Self::id_short(request_id);
-    let elapsed = self.started.elapsed().as_secs_f64();
     let model_part = if self.model.is_empty() {
       String::new()
     } else {
@@ -191,22 +149,144 @@ impl RequestState {
     };
     format!(
       "[{}] {}{}{} sent={:.1}kB recv={:.1}kB elapsed={:.1}s",
-      style(&id_short).dim(),
+      style(Self::id_short(request_id)).dim(),
       style("⚠ interrupted").yellow().bold(),
       model_part,
       account_part,
-      (self.sent_bytes as f64) / 1024.0,
-      (self.recv_bytes as f64) / 1024.0,
-      elapsed,
+      self.sent_bytes as f64 / 1024.0,
+      self.recv_bytes as f64 / 1024.0,
+      self.elapsed_ms as f64 / 1_000.0,
     )
   }
 
-  fn render_waiting_for_usage(&self, request_id: &str) -> String {
-    format!(
-      "{} {}",
-      self.render_in_flight(request_id),
-      style("waiting for usage...").yellow()
-    )
+  fn observe(&mut self, event: &TrafficEvent) {
+    self.elapsed_ms = event.elapsed_ms;
+    match &event.kind {
+      TrafficEventKind::Admitted(admitted) => self.observe_admitted(admitted),
+      TrafficEventKind::RequestBody(body) => {
+        if let Some(model) = &body.requested_model {
+          self.model = model.to_string();
+        }
+        if let BodyOutcome::Rejected(failure) = &body.outcome {
+          self.error = Some(failure.message.to_string());
+        }
+      }
+      TrafficEventKind::AttemptStarted(started) => self.begin_attempt(started),
+      TrafficEventKind::AttemptRequest(request) if self.is_current_attempt(request.attempt) => {
+        self.sent_bytes = request.request.body.bytes_seen();
+      }
+      TrafficEventKind::AttemptResponseHead(response) if self.is_current_attempt(response.attempt) => {
+        self.final_status = Some(response.response.status);
+      }
+      TrafficEventKind::BodyProgress(progress) => {
+        if matches!(progress.leg, BodyLeg::Downstream) {
+          self.recv_bytes = progress.bytes_seen;
+        }
+      }
+      TrafficEventKind::BodyFinished(body) => {
+        match body.leg {
+          BodyLeg::Downstream => self.recv_bytes = self.recv_bytes.max(body.capture.bytes_seen()),
+          BodyLeg::Upstream { attempt } if !self.is_current_attempt(attempt) => return,
+          BodyLeg::Upstream { .. } => {}
+          _ => {}
+        }
+        self.observe_body_result(&body.result);
+      }
+      TrafficEventKind::DownstreamResponseHead(response) => {
+        self.final_status = Some(response.status);
+      }
+      TrafficEventKind::AttemptUsage(usage) if self.is_current_attempt(usage.attempt) => {
+        self.usage.merge_from(&usage.usage);
+      }
+      TrafficEventKind::AttemptFinished(finished) if self.is_current_attempt(finished.attempt) => {
+        self.observe_attempt_finished(finished);
+      }
+      TrafficEventKind::ConnectReady(ready) => {
+        self.endpoint = format!("CONNECT {}", ready.authority);
+      }
+      TrafficEventKind::ConnectClosed(closed) => {
+        if let Some(bytes) = closed.client_to_upstream_bytes {
+          self.sent_bytes = bytes;
+        }
+        if let Some(bytes) = closed.upstream_to_client_bytes {
+          self.recv_bytes = bytes;
+        }
+        self.observe_body_result(&closed.result);
+      }
+      _ => {}
+    }
+  }
+
+  fn observe_admitted(&mut self, admitted: &RequestAdmitted) {
+    match admitted {
+      RequestAdmitted::Http {
+        path_and_query,
+        operation,
+        ..
+      } => {
+        self.endpoint = operation
+          .as_deref()
+          .filter(|operation| !operation.trim().is_empty())
+          .unwrap_or_else(|| path_and_query.as_str())
+          .to_string();
+      }
+      RequestAdmitted::Connect { authority } => {
+        self.endpoint = format!("CONNECT {authority}");
+      }
+      _ => {}
+    }
+  }
+
+  fn begin_attempt(&mut self, started: &AttemptStarted) {
+    if self.attempt.is_some_and(|attempt| attempt > started.attempt) {
+      return;
+    }
+    self.attempt = Some(started.attempt);
+    self.provider = started.target.provider_id.as_deref().unwrap_or_default().to_string();
+    self.account = started.target.account_id.as_deref().unwrap_or_default().to_string();
+    if let Some(model) = &started.target.requested_model {
+      self.model = model.to_string();
+    } else if self.model.is_empty() {
+      if let Some(model) = &started.target.upstream_model {
+        self.model = model.to_string();
+      }
+    }
+    if let Some(operation) = &started.target.requested_operation {
+      self.endpoint = operation.to_string();
+    } else if self.endpoint.is_empty() {
+      if let Some(operation) = &started.target.upstream_operation {
+        self.endpoint = operation.to_string();
+      }
+    }
+    self.sent_bytes = 0;
+    self.recv_bytes = 0;
+    self.usage = TokenUsage::default();
+    self.final_status = None;
+    self.error = None;
+  }
+
+  fn observe_attempt_finished(&mut self, finished: &AttemptFinished) {
+    if let Some(status) = finished.upstream_status {
+      self.final_status = Some(status);
+    }
+    if let Some(failure) = &finished.failure {
+      self.error = Some(failure.message.to_string());
+    } else if let Some(retry) = &finished.retry {
+      self.error = Some(retry.reason.message.to_string());
+    }
+  }
+
+  fn observe_body_result(&mut self, result: &BodyResult) {
+    match result {
+      BodyResult::Complete => {}
+      BodyResult::Failed(failure) => self.error = Some(failure.message.to_string()),
+      BodyResult::Cancelled => self.error = Some("cancelled".to_string()),
+      _ => {}
+    }
+  }
+
+  fn is_current_attempt(&self, attempt: AttemptNo) -> bool {
+    self.attempt == Some(attempt)
   }
 }
 
@@ -215,184 +295,117 @@ struct BarState {
   request: RequestState,
 }
 
-struct PendingCompletion {
-  bar: ProgressBar,
-  request: RequestState,
-  success: bool,
-  attempts: u32,
-  done: bool,
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-  if s.len() <= max {
-    s
-  } else {
-    &s[..max]
-  }
-}
-
-fn file_label(path: &Path) -> String {
-  path
-    .file_name()
-    .and_then(|v| v.to_str())
-    .unwrap_or_else(|| path.to_str().unwrap_or("unknown"))
-    .to_string()
-}
-
-fn style_status(status: u16) -> console::StyledObject<u16> {
-  match status {
-    200..=299 => style(status).green(),
-    300..=399 => style(status).cyan(),
-    400..=499 => style(status).yellow(),
-    500..=599 => style(status).red(),
-    _ => style(status),
-  }
-}
-
-/// Format a [`Usage`] for the success line: ` in=N out=M cache=K reason=R`,
-/// omitting any field whose value is None or 0. Returns an empty string if no
-/// fields are set; otherwise the result starts with a leading space.
-fn format_usage(u: &Usage) -> String {
-  let mut parts = Vec::with_capacity(4);
-  if let Some(v) = u.input_tokens {
-    if v > 0 {
-      parts.push(format!("in={v}"));
-    }
-  }
-  if let Some(v) = u.output_tokens {
-    if v > 0 {
-      parts.push(format!("out={v}"));
-    }
-  }
-  if let Some(v) = u.total_tokens {
-    if v > 0 {
-      parts.push(format!("total={v}"));
-    }
-  }
-  if let Some(v) = u.details.cache_read {
-    if v > 0 {
-      parts.push(format!("cache_read={v}"));
-    }
-  }
-  if let Some(v) = u.details.cache_write {
-    if v > 0 {
-      parts.push(format!("cache_write={v}"));
-    }
-  }
-  if let Some(v) = u.details.reasoning {
-    if v > 0 {
-      parts.push(format!("reason={v}"));
-    }
-  }
-  if parts.is_empty() {
-    String::new()
-  } else {
-    format!(" {}", parts.join(" "))
-  }
-}
-
+/// Interactive request lifecycle display used by the gateway CLI.
+///
+/// The public event contract remains presentation-neutral; this consumer folds
+/// stable traffic observations into the historical terminal layout.
 pub struct ProgressEventHandler {
   multi: MultiProgress,
-  bars: HashMap<String, BarState>,
-  pending: HashMap<String, Arc<Mutex<PendingCompletion>>>,
-  /// Style for in-flight bars (spinner + dynamic message).
+  bars: HashMap<tokn_events::RequestId, BarState>,
   style: ProgressStyle,
-  /// Persistent footer bar (last line) showing session counters.
   footer: ProgressBar,
-  /// Session counters.
   in_flight: u64,
   completed: u64,
   errors: u64,
+  finished: bool,
 }
 
 impl ProgressEventHandler {
   pub fn new() -> Self {
-    let multi = multi().clone();
+    Self::with_multi(multi().clone())
+  }
+
+  fn with_multi(multi: MultiProgress) -> Self {
     let style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
       .unwrap_or_else(|_| ProgressStyle::default_spinner())
       .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
-
-    // Footer bar: a borderless line that never finishes, always at the bottom.
     let footer = multi.add(ProgressBar::new_spinner());
-    let footer_style = ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
-    footer.set_style(footer_style);
+    footer.set_style(ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()));
 
     let handler = Self {
       multi,
       bars: HashMap::new(),
-      pending: HashMap::new(),
       style,
       footer,
       in_flight: 0,
       completed: 0,
       errors: 0,
+      finished: false,
     };
     handler.refresh_footer();
     handler
   }
 
-  fn refresh(&mut self, request_id: &str) {
-    if let Some(state) = self.bars.get(request_id) {
-      let msg = state.request.render_in_flight(request_id);
-      state.bar.set_message(msg);
-      state.bar.tick();
+  fn handle_traffic(&mut self, event: &TrafficEvent) {
+    if self.finished {
+      return;
+    }
+    match &event.kind {
+      TrafficEventKind::Started(started) => self.start_request(event, started),
+      TrafficEventKind::Finished(finished) => self.finish_request(event, finished),
+      _ => {
+        if let Some(state) = self.bars.get_mut(&event.request_id) {
+          state.request.observe(event);
+        }
+        self.refresh(&event.request_id);
+      }
     }
   }
 
-  fn prune_finished_pending(&mut self) {
-    self.pending.retain(|_, pending| {
-      let Ok(pending) = pending.lock() else {
-        return false;
-      };
-      !pending.done
-    });
+  fn start_request(&mut self, event: &TrafficEvent, started: &RequestStarted) {
+    if let Some(state) = self.bars.get_mut(&event.request_id) {
+      state.request.elapsed_ms = event.elapsed_ms;
+      self.refresh(&event.request_id);
+      return;
+    }
+
+    let bar = self.multi.insert_before(&self.footer, ProgressBar::new_spinner());
+    bar.set_style(self.style.clone());
+    bar.enable_steady_tick(Duration::from_millis(120));
+    self.bars.insert(
+      event.request_id.clone(),
+      BarState {
+        bar,
+        request: RequestState::new(started, event.elapsed_ms),
+      },
+    );
+    self.in_flight = self.in_flight.saturating_add(1);
+    self.refresh(&event.request_id);
+    self.refresh_footer();
   }
 
-  fn finalize_pending(multi: &MultiProgress, request_id: &str, pending: &Arc<Mutex<PendingCompletion>>) {
-    let Ok(mut pending) = pending.lock() else {
+  fn finish_request(&mut self, event: &TrafficEvent, finished: &RequestFinished) {
+    let Some(mut state) = self.bars.remove(&event.request_id) else {
       return;
     };
-    if pending.done {
-      return;
+    state.request.elapsed_ms = event.elapsed_ms;
+    if let Some(status) = finished.downstream_status {
+      state.request.final_status = Some(status);
     }
-    let latency_ms = pending.request.started.elapsed().as_millis() as u64;
-    let final_msg = pending.request.render_completed(
-      request_id,
-      pending.success,
-      pending.attempts,
-      pending.request.final_status,
-      latency_ms,
-      pending.request.error.as_deref(),
-    );
-    pending.bar.disable_steady_tick();
-    let _ = multi.println(final_msg);
-    pending.bar.finish_and_clear();
-    pending.done = true;
+    if let Some(failure) = &finished.failure {
+      state.request.error = Some(failure.message.to_string());
+    } else if matches!(finished.outcome, RequestOutcome::Cancelled) {
+      state.request.error = Some("cancelled".to_string());
+    }
+
+    let line = state.request.render_completed(event.request_id.as_str(), finished);
+    state.bar.disable_steady_tick();
+    let _ = self.multi.println(line);
+    state.bar.finish_and_clear();
+    self.in_flight = self.in_flight.saturating_sub(1);
+    self.completed = self.completed.saturating_add(1);
+    if !matches!(finished.outcome, RequestOutcome::Delivered) {
+      self.errors = self.errors.saturating_add(1);
+    }
+    self.refresh_footer();
   }
 
-  fn queue_pending_completion(&mut self, request_id: String, state: BarState, attempts: u32) {
-    state
-      .bar
-      .set_message(state.request.render_waiting_for_usage(&request_id));
-    let pending = Arc::new(Mutex::new(PendingCompletion {
-      bar: state.bar,
-      request: state.request,
-      success: true,
-      attempts,
-      done: false,
-    }));
-    self.pending.insert(request_id.clone(), pending.clone());
-
-    let multi = self.multi.clone();
-    std::thread::spawn(move || {
-      std::thread::sleep(USAGE_GRACE_PERIOD);
-      Self::finalize_pending(&multi, &request_id, &pending);
-    });
-  }
-
-  fn finalize_pending_if_waiting(&mut self, request_id: &str) {
-    if let Some(pending) = self.pending.remove(request_id) {
-      Self::finalize_pending(&self.multi, request_id, &pending);
+  fn refresh(&self, request_id: &tokn_events::RequestId) {
+    if let Some(state) = self.bars.get(request_id) {
+      state
+        .bar
+        .set_message(state.request.render_in_flight(request_id.as_str()));
+      state.bar.tick();
     }
   }
 
@@ -402,166 +415,29 @@ impl ProgressEventHandler {
     } else {
       format!("errors={}", self.errors)
     };
-    let msg = format!(
+    self.footer.set_message(format!(
       "─── in-flight={} completed={} {} ───",
       style(self.in_flight).bold(),
       style(self.completed).green(),
       errors_part,
-    );
-    self.footer.set_message(msg);
+    ));
     self.footer.tick();
   }
-}
 
-impl Default for ProgressEventHandler {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl ProgressEventHandler {
-  fn handle_request(&mut self, event: &RequestEvent) {
-    self.prune_finished_pending();
-    let request_id = event.request_id.as_str();
-    let composite_id = if event.attempt == 0 {
-      request_id.to_string()
-    } else {
-      format!("{}:{}", request_id, event.attempt)
-    };
-    match &event.payload {
-      RequestEventPayload::Stage(StageEvent::Started { request_endpoint }) => {
-        let bar = self.multi.insert_before(&self.footer, ProgressBar::new_spinner());
-        bar.set_style(self.style.clone());
-        bar.enable_steady_tick(std::time::Duration::from_millis(120));
-        let state = BarState {
-          bar,
-          request: RequestState::new(request_endpoint.as_str().to_string()),
-        };
-        self.bars.insert(composite_id.clone(), state);
-        self.in_flight = self.in_flight.saturating_add(1);
-        self.refresh(&composite_id);
-        self.refresh_footer();
-      }
-      RequestEventPayload::Stage(StageEvent::Extract(s)) => {
-        if let Some(state) = self.bars.get_mut(&composite_id) {
-          state.request.model = s.model.to_string();
-        }
-        self.refresh(&composite_id);
-      }
-      RequestEventPayload::Stage(StageEvent::Resolve(s)) => {
-        if let Some(state) = self.bars.get_mut(&composite_id) {
-          state.request.provider = s.provider_id.to_string();
-          state.request.account = s.account_id.to_string();
-        }
-        self.refresh(&composite_id);
-      }
-      RequestEventPayload::Record(RecordEvent::UpstreamReq { body, .. }) => {
-        if let Some(state) = self.bars.get_mut(&composite_id) {
-          state.request.sent_bytes = body.len() as u64;
-        }
-        self.refresh(&composite_id);
-      }
-      RequestEventPayload::Record(RecordEvent::Usage(usage)) => {
-        if let Some(state) = self.bars.get_mut(&composite_id) {
-          state.request.merge_usage(usage);
-          self.refresh(&composite_id);
-          return;
-        }
-        if let Some(pending) = self.pending.get(&composite_id).cloned() {
-          if let Ok(mut pending) = pending.lock() {
-            pending.request.merge_usage(usage);
-          }
-          self.finalize_pending_if_waiting(&composite_id);
-        }
-      }
-      RequestEventPayload::Record(RecordEvent::UpstreamResp { status, .. }) => {
-        if let Some(state) = self.bars.get_mut(&composite_id) {
-          state.request.final_status = Some(*status);
-        } else if let Some(pending) = self.pending.get(&composite_id).cloned() {
-          if let Ok(mut pending) = pending.lock() {
-            pending.request.final_status = Some(*status);
-          }
-        }
-      }
-      RequestEventPayload::Stage(StageEvent::Error { message, .. }) => {
-        if let Some(state) = self.bars.get_mut(&composite_id) {
-          state.request.error = Some(message.to_string());
-        } else if let Some(pending) = self.pending.get(&composite_id).cloned() {
-          if let Ok(mut pending) = pending.lock() {
-            pending.request.error = Some(message.to_string());
-          }
-        }
-      }
-      RequestEventPayload::Stage(StageEvent::Completed { success, attempts }) => {
-        if let Some(state) = self.bars.remove(&composite_id) {
-          if *success {
-            self.queue_pending_completion(composite_id.clone(), state, *attempts);
-          } else {
-            let latency_ms = state.request.started.elapsed().as_millis() as u64;
-            let final_msg = state.request.render_completed(
-              &composite_id,
-              *success,
-              *attempts,
-              state.request.final_status,
-              latency_ms,
-              state.request.error.as_deref(),
-            );
-            state.bar.disable_steady_tick();
-            let _ = self.multi.println(final_msg);
-            state.bar.finish_and_clear();
-          }
-        }
-        self.in_flight = self.in_flight.saturating_sub(1);
-        self.completed = self.completed.saturating_add(1);
-        if !success {
-          self.errors = self.errors.saturating_add(1);
-        }
-        self.refresh_footer();
-      }
-      _ => {}
+  fn finish_session(&mut self) {
+    if self.finished {
+      return;
     }
-  }
-}
-
-impl EventHandler for ProgressEventHandler {
-  fn handle(&mut self, event: &Event) {
-    self.prune_finished_pending();
-    match event {
-      Event::Requests(e) => self.handle_request(e),
-      Event::StreamProgress {
-        request_id,
-        bytes_streamed,
-        usage,
-        ..
-      } => {
-        if let Some(state) = self.bars.get_mut(request_id) {
-          state.request.recv_bytes = *bytes_streamed;
-          // Merge any non-None usage fields seen so far.
-          state.request.merge_usage(usage);
-        }
-        self.refresh(request_id);
-      }
-      _ => {}
-    }
-  }
-
-  fn flush(&mut self) {
-    // For each in-flight straggler: emit a one-line interrupted summary
-    // via multi.println (suspends bars during emit) then clear the bar
-    // so the live region shrinks. The println line lands in scrollback.
-    let stragglers: Vec<(String, BarState)> = self.bars.drain().collect();
+    self.finished = true;
+    let stragglers = self.bars.drain().collect::<Vec<_>>();
     for (request_id, state) in stragglers {
-      let line = state.request.render_interrupted(&request_id);
-      let _ = self.multi.println(line);
+      let _ = self
+        .multi
+        .println(state.request.render_interrupted(request_id.as_str()));
       state.bar.disable_steady_tick();
       state.bar.finish_and_clear();
     }
-    let waiting: Vec<(String, Arc<Mutex<PendingCompletion>>)> = self.pending.drain().collect();
-    for (request_id, pending) in waiting {
-      Self::finalize_pending(&self.multi, &request_id, &pending);
-    }
 
-    // Footer: print final session summary, then clear the live footer bar.
     let interrupted_part = if self.in_flight > 0 {
       format!(" interrupted={}", style(self.in_flight).yellow())
     } else {
@@ -572,24 +448,45 @@ impl EventHandler for ProgressEventHandler {
     } else {
       format!("errors={}", self.errors)
     };
-    let summary = format!(
+    let _ = self.multi.println(format!(
       "─── session ended: completed={} {}{} ───",
       style(self.completed).green(),
       errors_part,
       interrupted_part,
-    );
-    let _ = self.multi.println(summary);
+    ));
     self.footer.finish_and_clear();
   }
 }
 
-pub struct ProgressLogEventHandler {
-  writer: BufWriter<File>,
-  requests: HashMap<String, RequestState>,
-  in_flight: u64,
-  completed: u64,
-  errors: u64,
-  write_failed: bool,
+impl Default for ProgressEventHandler {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl EventConsumer<GatewayEvent> for ProgressEventHandler {
+  fn name(&self) -> &str {
+    "cli.request_progress"
+  }
+
+  fn handle(&mut self, _sequence: EventSeq, event: &GatewayEvent) -> ConsumerResult {
+    if let GatewayEvent::Traffic(event) = event {
+      self.handle_traffic(event);
+    }
+    Ok(())
+  }
+
+  // Hub flush barriers are not terminal. Final scrollback and interruption
+  // summaries are emitted from Drop when the dispatcher releases consumers.
+  fn flush(&mut self) -> ConsumerResult {
+    Ok(())
+  }
+}
+
+impl Drop for ProgressEventHandler {
+  fn drop(&mut self) {
+    self.finish_session();
+  }
 }
 
 struct ArchiveBarState {
@@ -600,6 +497,10 @@ struct ArchiveBarState {
   total_bytes: u64,
 }
 
+/// Interactive progress display for the compatibility request-DB archiver.
+///
+/// This shares the process-wide [`MultiProgress`] with request rendering so
+/// archive scans never garble active request bars.
 pub struct ArchiveProgressEventHandler {
   multi: MultiProgress,
   bars: HashMap<String, ArchiveBarState>,
@@ -608,7 +509,10 @@ pub struct ArchiveProgressEventHandler {
 
 impl ArchiveProgressEventHandler {
   pub fn new() -> Self {
-    let multi = multi().clone();
+    Self::with_multi(multi().clone())
+  }
+
+  fn with_multi(multi: MultiProgress) -> Self {
     let style = ProgressStyle::with_template("{spinner:.yellow} {msg}")
       .unwrap_or_else(|_| ProgressStyle::default_spinner())
       .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
@@ -628,7 +532,7 @@ impl ArchiveProgressEventHandler {
       };
       let elapsed = state.started.elapsed().as_secs_f64();
       let speed_kbs = if elapsed > 0.05 {
-        (bytes_read as f64) / 1024.0 / elapsed
+        bytes_read as f64 / 1024.0 / elapsed
       } else {
         0.0
       };
@@ -666,7 +570,7 @@ impl ArchiveEventHandler for ArchiveProgressEventHandler {
       } => {
         let bar = self.multi.add(ProgressBar::new_spinner());
         bar.set_style(self.style.clone());
-        bar.enable_steady_tick(std::time::Duration::from_millis(120));
+        bar.enable_steady_tick(Duration::from_millis(120));
         self.bars.insert(
           id.clone(),
           ArchiveBarState {
@@ -738,7 +642,7 @@ impl ArchiveEventHandler for ArchiveProgressEventHandler {
   }
 
   fn flush(&mut self) {
-    let bars: Vec<ArchiveBarState> = self.bars.drain().map(|(_, state)| state).collect();
+    let bars = self.bars.drain().map(|(_, state)| state).collect::<Vec<_>>();
     for state in bars {
       let _ = self.multi.println(format!(
         "{} archive {} interrupted",
@@ -751,310 +655,610 @@ impl ArchiveEventHandler for ArchiveProgressEventHandler {
   }
 }
 
-impl ProgressLogEventHandler {
-  pub fn new(log_dir: &Path) -> io::Result<Self> {
-    std::fs::create_dir_all(log_dir)?;
-    let file = OpenOptions::new()
-      .create(true)
-      .append(true)
-      .open(progress_log_path(log_dir))?;
-    Ok(Self {
-      writer: BufWriter::new(file),
-      requests: HashMap::new(),
-      in_flight: 0,
-      completed: 0,
-      errors: 0,
-      write_failed: false,
-    })
-  }
-
-  fn write_line(&mut self, line: &str) {
-    if self.write_failed {
-      return;
-    }
-    if let Err(e) = writeln!(self.writer, "{line}").and_then(|_| self.writer.flush()) {
-      self.write_failed = true;
-      tracing::warn!(error = %e, "failed to write progress log");
-    }
-  }
-
-  fn summary(&self) -> String {
-    let interrupted_part = if self.in_flight > 0 {
-      format!(" interrupted={}", style(self.in_flight).yellow())
+fn initial_endpoint(started: &RequestStarted) -> String {
+  let target = started.target.as_str().trim();
+  if started.method.eq_ignore_ascii_case("CONNECT") {
+    if target.is_empty() {
+      "CONNECT".to_string()
     } else {
-      String::new()
-    };
-    let errors_part = if self.errors > 0 {
-      format!("errors={}", style(self.errors).red())
-    } else {
-      format!("errors={}", self.errors)
-    };
-    format!(
-      "─── session ended: completed={} {}{} ───",
-      style(self.completed).green(),
-      errors_part,
-      interrupted_part,
-    )
+      format!("CONNECT {target}")
+    }
+  } else if target.is_empty() {
+    "unknown".to_string()
+  } else {
+    target.to_string()
   }
 }
 
-impl ProgressLogEventHandler {
-  fn handle_request(&mut self, event: &RequestEvent) {
-    let request_id = event.request_id.as_str();
-    let composite_id = if event.attempt == 0 {
-      request_id.to_string()
-    } else {
-      format!("{}:{}", request_id, event.attempt)
-    };
-    match &event.payload {
-      RequestEventPayload::Stage(StageEvent::Started { request_endpoint }) => {
-        self
-          .requests
-          .insert(composite_id, RequestState::new(request_endpoint.as_str().to_string()));
-        self.in_flight = self.in_flight.saturating_add(1);
-      }
-      RequestEventPayload::Stage(StageEvent::Extract(s)) => {
-        if let Some(state) = self.requests.get_mut(&composite_id) {
-          state.model = s.model.to_string();
-        }
-      }
-      RequestEventPayload::Stage(StageEvent::Resolve(s)) => {
-        if let Some(state) = self.requests.get_mut(&composite_id) {
-          state.provider = s.provider_id.to_string();
-          state.account = s.account_id.to_string();
-        }
-      }
-      RequestEventPayload::Record(RecordEvent::UpstreamReq { body, .. }) => {
-        if let Some(state) = self.requests.get_mut(&composite_id) {
-          state.sent_bytes = body.len() as u64;
-        }
-      }
-      RequestEventPayload::Record(RecordEvent::Usage(usage)) => {
-        if let Some(state) = self.requests.get_mut(&composite_id) {
-          state.merge_usage(usage);
-        }
-      }
-      RequestEventPayload::Record(RecordEvent::UpstreamResp { status, .. }) => {
-        if let Some(state) = self.requests.get_mut(&composite_id) {
-          state.final_status = Some(*status);
-        }
-      }
-      RequestEventPayload::Stage(StageEvent::Error { message, .. }) => {
-        if let Some(state) = self.requests.get_mut(&composite_id) {
-          state.error = Some(message.to_string());
-        }
-      }
-      RequestEventPayload::Stage(StageEvent::Completed { success, .. }) => {
-        if let Some(state) = self.requests.remove(&composite_id) {
-          let latency_ms = state.started.elapsed().as_millis() as u64;
-          let line = state.render_completed(
-            &composite_id,
-            *success,
-            1,
-            state.final_status,
-            latency_ms,
-            state.error.as_deref(),
-          );
-          self.write_line(&line);
-        }
-        self.in_flight = self.in_flight.saturating_sub(1);
-        self.completed = self.completed.saturating_add(1);
-        if !success {
-          self.errors = self.errors.saturating_add(1);
-        }
-      }
-      _ => {}
-    }
+fn file_label(path: &Path) -> String {
+  path
+    .file_name()
+    .and_then(|value| value.to_str())
+    .unwrap_or_else(|| path.to_str().unwrap_or("unknown"))
+    .to_string()
+}
+
+fn truncate(value: &str, max_chars: usize) -> Cow<'_, str> {
+  if value.chars().count() <= max_chars {
+    Cow::Borrowed(value)
+  } else {
+    Cow::Owned(value.chars().take(max_chars).collect())
   }
 }
 
-impl EventHandler for ProgressLogEventHandler {
-  fn handle(&mut self, event: &Event) {
-    match event {
-      Event::Requests(e) => self.handle_request(e),
-      Event::StreamProgress {
-        request_id,
-        bytes_streamed,
-        usage,
-        ..
-      } => {
-        if let Some(state) = self.requests.get_mut(request_id) {
-          state.recv_bytes = *bytes_streamed;
-          state.merge_usage(usage);
-        }
-      }
-      _ => {}
-    }
-  }
-
-  fn flush(&mut self) {
-    let stragglers: Vec<(String, RequestState)> = self.requests.drain().collect();
-    for (request_id, state) in stragglers {
-      let line = state.render_interrupted(&request_id);
-      self.write_line(&line);
-    }
-    let summary = self.summary();
-    self.write_line(&summary);
+fn style_status(status: u16) -> StyledObject<u16> {
+  match status {
+    200..=299 => style(status).green(),
+    300..=399 => style(status).cyan(),
+    400..=499 => style(status).yellow(),
+    500..=599 => style(status).red(),
+    _ => style(status),
   }
 }
 
-fn progress_log_path(log_dir: &Path) -> PathBuf {
-  let date = OffsetDateTime::now_utc()
-    .format(format_description!("[year]-[month]-[day]"))
-    .unwrap_or_else(|_| "unknown-date".to_string());
-  log_dir.join(format!("tokn-router-progress.log.{date}"))
+fn format_usage(usage: &TokenUsage) -> String {
+  let mut parts = Vec::with_capacity(6);
+  for (label, value) in [
+    ("in", usage.input),
+    ("out", usage.output),
+    ("total", usage.total),
+    ("cache_read", usage.cache_read),
+    ("cache_write", usage.cache_write),
+    ("reason", usage.reasoning),
+  ] {
+    if let Some(value) = value.filter(|value| *value > 0) {
+      parts.push(format!("{label}={value}"));
+    }
+  }
+  if parts.is_empty() {
+    String::new()
+  } else {
+    format!(" {}", parts.join(" "))
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use bytes::Bytes;
-  use tokn_core::db::UsageDetails;
-  use tokn_core::request_event::{RequestEventPayload, StageEvent};
+  use console::strip_ansi_codes;
+  use tokn_events::{
+    AttemptHttpRequest, AttemptHttpResponseHead, AttemptOutcome, AttemptUsage, BodyCapture, BodyProgress,
+    CaptureOmission, CapturedHeaders, CapturedUri, ConnectAction, ConnectClosed, ConnectReady, Correlation,
+    EventFailure, HttpFamily, HttpRequestSnapshot, HttpResponseHead, RequestBodyObservation, RequestPhase,
+    RequestSource, RetryDecision, TargetSelection, UsageKind,
+  };
 
-  fn req(payload: RequestEventPayload) -> RequestEvent {
-    RequestEvent {
-      request_id: "req-1".into(),
-      attempt: 0,
-      ts: 0,
-      payload,
+  const REQUEST_ID: &str = "request-123456";
+
+  fn hidden_handler() -> ProgressEventHandler {
+    ProgressEventHandler::with_multi(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
+  }
+
+  fn hidden_archive_handler() -> ArchiveProgressEventHandler {
+    ArchiveProgressEventHandler::with_multi(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
+  }
+
+  fn plain(value: &str) -> String {
+    strip_ansi_codes(value).into_owned()
+  }
+
+  fn request_id() -> tokn_events::RequestId {
+    tokn_events::RequestId::new(REQUEST_ID).unwrap()
+  }
+
+  fn emit(handler: &mut ProgressEventHandler, sequence: u64, elapsed_ms: u64, kind: TrafficEventKind) {
+    handler
+      .handle(
+        EventSeq::ZERO,
+        &GatewayEvent::Traffic(TrafficEvent {
+          request_id: request_id(),
+          sequence,
+          at_unix_ms: sequence as i64,
+          elapsed_ms,
+          kind,
+        }),
+      )
+      .unwrap();
+  }
+
+  #[test]
+  fn archive_progress_preserves_the_historical_transfer_layout() {
+    let mut handler = hidden_archive_handler();
+    let path = PathBuf::from("/tmp/requests/2026-07-01.db");
+    let archive = PathBuf::from("/tmp/requests/2026-07-01.db.zstd");
+    handler.handle(&ArchiveEvent::FileStarted {
+      id: "archive-1".to_string(),
+      path: path.clone(),
+      archive: archive.clone(),
+      total_bytes: 2 * 1024 * 1024,
+    });
+    handler.handle(&ArchiveEvent::FileProgress {
+      id: "archive-1".to_string(),
+      bytes_read: 1024 * 1024,
+      total_bytes: 2 * 1024 * 1024,
+    });
+
+    let message = handler.bars["archive-1"].bar.message();
+    let message = plain(message.as_ref());
+    assert!(
+      message.starts_with("archive 2026-07-01.db 50.0% 1.0/2.0MB"),
+      "{message}"
+    );
+    assert!(message.ends_with("-> 2026-07-01.db.zstd"), "{message}");
+
+    handler.handle(&ArchiveEvent::FileCompleted {
+      id: "archive-1".to_string(),
+      path,
+      archive,
+      bytes_in: 2 * 1024 * 1024,
+      bytes_out: 1024 * 1024,
+    });
+    assert!(handler.bars.is_empty());
+  }
+
+  #[test]
+  fn archive_progress_flush_clears_interrupted_transfers() {
+    let mut handler = hidden_archive_handler();
+    handler.handle(&ArchiveEvent::FileStarted {
+      id: "archive-1".to_string(),
+      path: PathBuf::from("2026-07-01.db"),
+      archive: PathBuf::from("2026-07-01.db.xz"),
+      total_bytes: 128,
+    });
+
+    handler.flush();
+
+    assert!(handler.bars.is_empty());
+  }
+
+  fn started(method: &str, target: &str) -> RequestStarted {
+    RequestStarted {
+      source: RequestSource::Embedded {
+        profile_id: "test-profile".into(),
+      },
+      http_version: Some("HTTP/1.1".into()),
+      method: method.into(),
+      target: CapturedUri::exact(target),
+      headers: CapturedHeaders::default(),
+      body_present: method != "CONNECT",
+      correlation: Correlation::default(),
+    }
+  }
+
+  fn target(provider: &str, account: &str, model: &str) -> TargetSelection {
+    TargetSelection {
+      family: HttpFamily::Managed,
+      account_id: Some(account.into()),
+      provider_id: Some(provider.into()),
+      upstream_id: Some("primary".into()),
+      requested_model: Some(model.into()),
+      upstream_model: Some(model.into()),
+      requested_operation: Some("responses".into()),
+      upstream_operation: Some("responses".into()),
+    }
+  }
+
+  fn request_body(model: Option<&str>, outcome: BodyOutcome) -> RequestBodyObservation {
+    RequestBodyObservation {
+      wire: BodyCapture::Omitted {
+        reason: CaptureOmission::Disabled,
+        bytes_seen: 512,
+      },
+      decoded: None,
+      requested_model: model.map(Into::into),
+      stream: Some(true),
+      initiator: None,
+      outcome,
+    }
+  }
+
+  fn attempt_request(attempt: AttemptNo, bytes_seen: u64) -> AttemptHttpRequest {
+    AttemptHttpRequest {
+      attempt,
+      request: HttpRequestSnapshot {
+        method: "POST".into(),
+        uri: CapturedUri::exact("https://api.example/v1/responses"),
+        headers: CapturedHeaders::default(),
+        body: BodyCapture::Omitted {
+          reason: CaptureOmission::Disabled,
+          bytes_seen,
+        },
+      },
+    }
+  }
+
+  fn response_head(attempt: AttemptNo, status: u16) -> AttemptHttpResponseHead {
+    AttemptHttpResponseHead {
+      attempt,
+      response: HttpResponseHead {
+        status,
+        headers: CapturedHeaders::default(),
+      },
+    }
+  }
+
+  fn finished(outcome: RequestOutcome, status: Option<u16>, attempt_count: u32) -> RequestFinished {
+    RequestFinished {
+      outcome,
+      phase: RequestPhase::Complete,
+      downstream_status: status,
+      failure: None,
+      attempt_count,
     }
   }
 
   #[test]
-  fn tty_handler_tracks_sent_bytes_and_usage_from_records() {
-    let mut handler = ProgressEventHandler::new();
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
-      request_endpoint: tokn_core::request_event::RequestEndpoint::custom("responses"),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::UpstreamReq {
-      method: "POST".into(),
-      url: "https://example.test".into(),
-      headers: tokn_headers::HeaderMap::new(),
-      body: Bytes::from_static(b"123456"),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::Usage(Usage {
-      input_tokens: Some(11),
-      output_tokens: Some(13),
-      total_tokens: Some(24),
-      usage_type: None,
-      details: UsageDetails {
-        cache_read: Some(17),
-        cache_write: Some(18),
-        reasoning: Some(19),
+  fn managed_request_preserves_historical_fields_and_usage_order() {
+    let mut handler = hidden_handler();
+    emit(
+      &mut handler,
+      1,
+      0,
+      TrafficEventKind::Started(started("POST", "/v1/responses")),
+    );
+    emit(
+      &mut handler,
+      2,
+      2,
+      TrafficEventKind::Admitted(RequestAdmitted::Http {
+        scheme: "http".into(),
+        authority: "localhost".into(),
+        path_and_query: CapturedUri::exact("/v1/responses"),
+        operation: Some("responses".into()),
+      }),
+    );
+    emit(
+      &mut handler,
+      3,
+      3,
+      TrafficEventKind::RequestBody(request_body(Some("gpt-5.4"), BodyOutcome::Accepted)),
+    );
+    emit(
+      &mut handler,
+      4,
+      5,
+      TrafficEventKind::AttemptStarted(AttemptStarted {
+        attempt: AttemptNo::FIRST,
+        target: target("openai", "acct-1", "gpt-5.4"),
+      }),
+    );
+    emit(
+      &mut handler,
+      5,
+      10,
+      TrafficEventKind::AttemptRequest(attempt_request(AttemptNo::FIRST, 2_048)),
+    );
+    emit(
+      &mut handler,
+      6,
+      1_000,
+      TrafficEventKind::BodyProgress(BodyProgress {
+        leg: BodyLeg::Downstream,
+        bytes_seen: 4_096,
+        chunks: 4,
+      }),
+    );
+    emit(
+      &mut handler,
+      7,
+      1_000,
+      TrafficEventKind::AttemptUsage(AttemptUsage {
+        attempt: AttemptNo::FIRST,
+        usage: TokenUsage {
+          kind: Some(UsageKind::Responses),
+          input: Some(11),
+          output: Some(13),
+          total: Some(24),
+          cache_read: Some(3),
+          cache_write: Some(4),
+          reasoning: Some(5),
+        },
+      }),
+    );
+    emit(
+      &mut handler,
+      8,
+      1_000,
+      TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: 200,
+        headers: CapturedHeaders::default(),
+      }),
+    );
+
+    let state = &handler.bars.get(&request_id()).unwrap().request;
+    assert_eq!(
+      plain(&state.render_in_flight(REQUEST_ID)),
+      "[request-] openai gpt-5.4 acct-1 responses sent=2.0kB recv=4.0kB 4.0kB/s elapsed=1.0s"
+    );
+    assert_eq!(
+      plain(&state.render_completed(REQUEST_ID, &finished(RequestOutcome::Delivered, Some(200), 1))),
+      "[request-] \u{2713} 200 openai gpt-5.4 acct-1 responses sent=2.0kB recv=4.0kB in=11 out=13 total=24 cache_read=3 cache_write=4 reason=5 latency=1.0s"
+    );
+
+    emit(
+      &mut handler,
+      9,
+      1_250,
+      TrafficEventKind::Finished(finished(RequestOutcome::Delivered, Some(200), 1)),
+    );
+    assert!(handler.bars.is_empty());
+    assert_eq!(handler.in_flight, 0);
+    assert_eq!(handler.completed, 1);
+    assert_eq!(handler.errors, 0);
+  }
+
+  #[test]
+  fn retry_reuses_one_bar_and_projects_attempt_to_historical_retry_index() {
+    let mut handler = hidden_handler();
+    emit(
+      &mut handler,
+      1,
+      0,
+      TrafficEventKind::Started(started("POST", "/v1/responses")),
+    );
+    emit(
+      &mut handler,
+      2,
+      1,
+      TrafficEventKind::RequestBody(request_body(Some("model-1"), BodyOutcome::Accepted)),
+    );
+    emit(
+      &mut handler,
+      3,
+      2,
+      TrafficEventKind::AttemptStarted(AttemptStarted {
+        attempt: AttemptNo::FIRST,
+        target: target("provider-1", "account-1", "model-1"),
+      }),
+    );
+    emit(
+      &mut handler,
+      4,
+      100,
+      TrafficEventKind::AttemptRequest(attempt_request(AttemptNo::FIRST, 1_024)),
+    );
+    emit(
+      &mut handler,
+      5,
+      200,
+      TrafficEventKind::BodyProgress(BodyProgress {
+        leg: BodyLeg::Downstream,
+        bytes_seen: 512,
+        chunks: 1,
+      }),
+    );
+    emit(
+      &mut handler,
+      6,
+      250,
+      TrafficEventKind::AttemptFinished(AttemptFinished {
+        attempt: AttemptNo::FIRST,
+        outcome: AttemptOutcome::Response,
+        phase: RequestPhase::UpstreamResponse,
+        upstream_status: Some(429),
+        failure: None,
+        retry: Some(RetryDecision {
+          delay_ms: Some(25),
+          reason: EventFailure {
+            code: "rate_limited".into(),
+            message: "retry after rate limit".into(),
+          },
+        }),
+      }),
+    );
+    let second = AttemptNo::new(2).unwrap();
+    emit(
+      &mut handler,
+      7,
+      300,
+      TrafficEventKind::AttemptStarted(AttemptStarted {
+        attempt: second,
+        target: target("provider-2", "account-2", "model-2"),
+      }),
+    );
+
+    assert_eq!(handler.bars.len(), 1);
+    assert_eq!(handler.in_flight, 1);
+    let state = &handler.bars.get(&request_id()).unwrap().request;
+    assert_eq!(state.attempt, Some(second));
+    assert_eq!(state.sent_bytes, 0);
+    assert_eq!(state.recv_bytes, 0);
+    assert_eq!(state.final_status, None);
+    assert_eq!(state.error, None);
+    let in_flight = plain(&state.render_in_flight(REQUEST_ID));
+    assert!(in_flight.contains("provider-2 model-2 account-2 a=1 responses"));
+
+    emit(
+      &mut handler,
+      8,
+      400,
+      TrafficEventKind::AttemptRequest(attempt_request(second, 2_048)),
+    );
+    emit(
+      &mut handler,
+      9,
+      500,
+      TrafficEventKind::AttemptResponseHead(response_head(second, 200)),
+    );
+    let state = &handler.bars.get(&request_id()).unwrap().request;
+    let final_line = plain(&state.render_completed(REQUEST_ID, &finished(RequestOutcome::Delivered, Some(200), 2)));
+    assert!(final_line.ends_with("latency=0.5s attempts=2"));
+
+    emit(
+      &mut handler,
+      10,
+      550,
+      TrafficEventKind::Finished(finished(RequestOutcome::Delivered, Some(200), 2)),
+    );
+    assert_eq!(handler.completed, 1);
+    assert_eq!(handler.errors, 0);
+  }
+
+  #[test]
+  fn parsing_failure_finishes_without_inventing_target_fields() {
+    let mut handler = hidden_handler();
+    let message = "解析失败".repeat(40);
+    let failure = EventFailure {
+      code: "invalid_json".into(),
+      message: message.clone().into(),
+    };
+    emit(
+      &mut handler,
+      1,
+      0,
+      TrafficEventKind::Started(started("POST", "/v1/responses")),
+    );
+    emit(
+      &mut handler,
+      2,
+      2,
+      TrafficEventKind::Admitted(RequestAdmitted::Http {
+        scheme: "http".into(),
+        authority: "localhost".into(),
+        path_and_query: CapturedUri::exact("/v1/responses"),
+        operation: Some("responses".into()),
+      }),
+    );
+    emit(
+      &mut handler,
+      3,
+      4,
+      TrafficEventKind::RequestBody(request_body(None, BodyOutcome::Rejected(failure.clone()))),
+    );
+    emit(
+      &mut handler,
+      4,
+      5,
+      TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: 400,
+        headers: CapturedHeaders::default(),
+      }),
+    );
+
+    let state = &handler.bars.get(&request_id()).unwrap().request;
+    assert!(state.provider.is_empty());
+    assert!(state.model.is_empty());
+    assert!(state.account.is_empty());
+    let line = plain(&state.render_completed(
+      REQUEST_ID,
+      &RequestFinished {
+        outcome: RequestOutcome::Rejected,
+        phase: RequestPhase::RequestBody,
+        downstream_status: Some(400),
+        failure: Some(failure.clone()),
+        attempt_count: 0,
       },
-    }))));
+    ));
+    assert!(line.contains("\u{2717} 400    responses"));
+    assert!(line.ends_with(&message.chars().take(80).collect::<String>()));
 
-    let state = handler.bars.get("req-1").expect("request state must exist");
-    assert_eq!(state.request.sent_bytes, 6);
-    assert_eq!(state.request.usage.input_tokens, Some(11));
-    assert_eq!(state.request.usage.output_tokens, Some(13));
-    assert_eq!(state.request.usage.total_tokens, Some(24));
-    assert_eq!(state.request.usage.details.cache_read, Some(17));
-    assert_eq!(state.request.usage.details.cache_write, Some(18));
-    assert_eq!(state.request.usage.details.reasoning, Some(19));
+    emit(
+      &mut handler,
+      5,
+      6,
+      TrafficEventKind::Finished(RequestFinished {
+        outcome: RequestOutcome::Rejected,
+        phase: RequestPhase::RequestBody,
+        downstream_status: Some(400),
+        failure: Some(failure),
+        attempt_count: 0,
+      }),
+    );
+    assert_eq!(handler.completed, 1);
+    assert_eq!(handler.errors, 1);
   }
 
   #[test]
-  fn tty_handler_waits_for_usage_then_finalizes() {
-    let mut handler = ProgressEventHandler::new();
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
-      request_endpoint: tokn_core::request_event::RequestEndpoint::custom("responses"),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Completed {
-      success: true,
-      attempts: 1,
-    })));
+  fn connect_uses_transport_byte_totals_without_fake_attempts() {
+    let mut handler = hidden_handler();
+    emit(
+      &mut handler,
+      1,
+      0,
+      TrafficEventKind::Started(started("CONNECT", "example.test:443")),
+    );
+    emit(
+      &mut handler,
+      2,
+      2,
+      TrafficEventKind::Admitted(RequestAdmitted::Connect {
+        authority: "example.test:443".into(),
+      }),
+    );
+    emit(
+      &mut handler,
+      3,
+      3,
+      TrafficEventKind::ConnectReady(ConnectReady {
+        action: ConnectAction::Tunnel,
+        authority: "example.test:443".into(),
+      }),
+    );
+    emit(
+      &mut handler,
+      4,
+      1_000,
+      TrafficEventKind::ConnectClosed(ConnectClosed {
+        action: ConnectAction::Tunnel,
+        client_to_upstream_bytes: Some(2_048),
+        upstream_to_client_bytes: Some(4_096),
+        result: BodyResult::Complete,
+      }),
+    );
+    emit(
+      &mut handler,
+      5,
+      1_000,
+      TrafficEventKind::DownstreamResponseHead(HttpResponseHead {
+        status: 200,
+        headers: CapturedHeaders::default(),
+      }),
+    );
 
-    assert!(!handler.bars.contains_key("req-1"));
-    assert!(handler.pending.contains_key("req-1"));
-
-    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::Usage(Usage {
-      input_tokens: Some(7),
-      output_tokens: Some(9),
-      total_tokens: None,
-      usage_type: None,
-      details: UsageDetails::default(),
-    }))));
-
-    assert!(!handler.pending.contains_key("req-1"));
+    let state = &handler.bars.get(&request_id()).unwrap().request;
+    let line = plain(&state.render_completed(REQUEST_ID, &finished(RequestOutcome::Delivered, Some(200), 0)));
+    assert!(line.contains("CONNECT example.test:443 sent=2.0kB recv=4.0kB"));
+    assert!(!line.contains("attempts="));
   }
 
   #[test]
-  fn log_handler_tracks_sent_bytes_and_usage_from_records() {
-    let dir = std::env::temp_dir().join(format!("tokn-router-progress-test-{}", uuid::Uuid::new_v4()));
-    let mut handler = ProgressLogEventHandler::new(&dir).unwrap();
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
-      request_endpoint: tokn_core::request_event::RequestEndpoint::custom("responses"),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::UpstreamReq {
-      method: "POST".into(),
-      url: "https://example.test".into(),
-      headers: tokn_headers::HeaderMap::new(),
-      body: Bytes::from_static(b"123456789"),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::Usage(Usage {
-      input_tokens: Some(3),
-      output_tokens: Some(5),
-      total_tokens: None,
-      usage_type: None,
-      details: UsageDetails::default(),
-    }))));
+  fn flush_barrier_is_non_terminal_but_drop_cleanup_is_idempotent() {
+    let mut handler = hidden_handler();
+    emit(
+      &mut handler,
+      1,
+      0,
+      TrafficEventKind::Started(started("POST", "/v1/responses")),
+    );
 
-    let state = handler.requests.get("req-1").expect("request state must exist");
-    assert_eq!(state.sent_bytes, 9);
-    assert_eq!(state.usage.input_tokens, Some(3));
-    assert_eq!(state.usage.output_tokens, Some(5));
+    EventConsumer::<GatewayEvent>::flush(&mut handler).unwrap();
+    assert_eq!(handler.bars.len(), 1);
+    assert!(!handler.footer.is_finished());
 
-    drop(handler);
-    std::fs::remove_dir_all(&dir).unwrap();
+    handler.finish_session();
+    assert!(handler.bars.is_empty());
+    assert!(handler.footer.is_finished());
+    assert!(handler.finished);
+    handler.finish_session();
   }
 
   #[test]
-  fn tty_handler_tracks_status_and_error_for_completion() {
-    let mut handler = ProgressEventHandler::new();
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
-      request_endpoint: tokn_core::request_event::RequestEndpoint::custom("responses"),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::UpstreamResp {
-      status: 502,
-      headers: tokn_headers::HeaderMap::new(),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Error {
-      stage: tokn_core::request_event::Stage::Send,
-      message: "upstream 502: boom".into(),
-      recoverable: true,
-      stop: false,
-    })));
+  fn truncation_is_unicode_safe_and_usage_updates_do_not_erase_values() {
+    assert_eq!(truncate("模型请求", 3), "模型请");
 
-    let state = handler.bars.get("req-1").expect("request state must exist");
-    assert_eq!(state.request.final_status, Some(502));
-    assert_eq!(state.request.error.as_deref(), Some("upstream 502: boom"));
-  }
-
-  #[test]
-  fn log_handler_tracks_status_and_error_for_completion() {
-    let dir = std::env::temp_dir().join(format!("tokn-router-progress-test-{}", uuid::Uuid::new_v4()));
-    let mut handler = ProgressLogEventHandler::new(&dir).unwrap();
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
-      request_endpoint: tokn_core::request_event::RequestEndpoint::custom("responses"),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::UpstreamResp {
-      status: 429,
-      headers: tokn_headers::HeaderMap::new(),
-    })));
-    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Error {
-      stage: tokn_core::request_event::Stage::Send,
-      message: "upstream 429: rate limited".into(),
-      recoverable: false,
-      stop: false,
-    })));
-
-    let state = handler.requests.get("req-1").expect("request state must exist");
-    assert_eq!(state.final_status, Some(429));
-    assert_eq!(state.error.as_deref(), Some("upstream 429: rate limited"));
-
-    drop(handler);
-    std::fs::remove_dir_all(&dir).unwrap();
+    let mut usage = TokenUsage {
+      input: Some(8),
+      cache_read: Some(3),
+      ..TokenUsage::default()
+    };
+    usage.merge_from(&TokenUsage {
+      output: Some(5),
+      cache_read: None,
+      ..TokenUsage::default()
+    });
+    assert_eq!(usage.input, Some(8));
+    assert_eq!(usage.output, Some(5));
+    assert_eq!(usage.cache_read, Some(3));
+    assert_eq!(format_usage(&usage), " in=8 out=5 cache_read=3");
   }
 }

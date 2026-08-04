@@ -1,19 +1,10 @@
-//! Account management and request routing.
+//! Provider bindings and account selection for compiled gateway policy.
 //!
-//! `pool` owns provider-bucketed account acquisition; `affinity` keeps
-//! session ids pinned to accounts across related requests; `routing`
-//! resolves a requested model into a route mode + upstream selector for the
-//! pool to consume.
+//! This crate links configured upstreams and accounts, materializes immutable
+//! account pools, selects one request target, and settles the resulting
+//! selection state. Listener admission and route matching belong to the
+//! router.
 
 pub mod affinity;
-pub mod inventory;
+pub mod link;
 pub mod registry;
-pub mod routing;
-
-mod handle;
-mod pool;
-
-pub use handle::AccountHandle;
-pub use inventory::{AccountInventory, AccountPoolRuleset};
-pub use pool::{AccountPool, EndpointAcquire, Error, Result, SessionAcquire};
-pub use routing::{ResolveError, RouteResolution, RouteResolver, RouteSelector};

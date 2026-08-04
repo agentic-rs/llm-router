@@ -36,13 +36,21 @@ pub(crate) fn api_status_error(message: String, status: u16, body: String) -> Na
 pub(crate) fn sdk_error(error: SdkError) -> NapiError {
   let message = error_chain(&error);
   match error {
-    SdkError::LoadConfig { .. } | SdkError::BuildEngine { .. } | SdkError::UnknownProfile { .. } => {
-      native_error(CONFIGURATION_ERROR, message)
-    }
+    SdkError::ResolveConfigPath { .. }
+    | SdkError::LoadConfig { .. }
+    | SdkError::InvalidProfileId { .. }
+    | SdkError::UnknownProfile { .. }
+    | SdkError::NonManagedProfile { .. }
+    | SdkError::LinkRuntime { .. }
+    | SdkError::BuildExecutor { .. } => native_error(CONFIGURATION_ERROR, message),
     SdkError::LoadCredentials { .. } => native_error(AUTHENTICATION_ERROR, message),
-    SdkError::InvalidGenerateRequest { .. }
+    SdkError::InvalidHeaderName { .. }
+    | SdkError::InvalidHeaderValue { .. }
+    | SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }
-    | SdkError::Pipeline { .. }
+    | SdkError::ManagedRequest { .. }
+    | SdkError::CoolingDown { .. }
+    | SdkError::NoEligible { .. }
     | SdkError::UnexpectedStream
     | SdkError::UnexpectedBuffered => native_error(REQUEST_ERROR, message),
     SdkError::GenerateResponseStatus { status, body } => api_status_error(message, status, body),

@@ -2,18 +2,18 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::config::{Config, LogTarget};
+use crate::config::LogTarget;
 use crate::logging::{self, RunMode};
 
 mod account;
 mod agent;
 mod api_key;
+mod command_config;
 mod config_cmd;
 mod error;
 mod headers;
 mod import;
 mod inspect;
-mod lan_bootstrap;
 mod login;
 mod migration;
 mod onboarding;
@@ -50,8 +50,8 @@ pub enum Cmd {
   ApiKey(api_key::ApiKeyCmd),
   /// Show the Copilot identity headers that will be sent upstream
   Headers(headers::HeadersArgs),
-  /// Run the local OpenAI-compatible server
-  Serve(serve::ServeArgs),
+  /// Run every listener declared by the compiled gateway config
+  Serve,
   /// Run the local MITM forward proxy or print proxy env exports
   Proxy(proxy::ProxyArgs),
   /// Query usage statistics from the local SQLite log
@@ -75,9 +75,51 @@ pub enum Cmd {
 impl Cli {
   pub async fn run(self) -> Result<()> {
     let cfg_path = self.config.clone();
+    // The listener-graph server is v2-only. Keep legacy home migration and
+    // partial Config loading out of its startup path; v2 logging will replace
+    // the basic subscriber once it is represented by ServicePlan.
+    if matches!(&self.cmd, Cmd::Serve) {
+      logging::init_basic();
+      return serve::run(cfg_path).await.map_err(Error::from);
+    }
+
+    // Proxy client helpers derive their endpoint and interception CA directly
+    // from the compiled listener graph. Keep legacy home migration and
+    // partial Config loading out of this path as well.
+    if matches!(&self.cmd, Cmd::Proxy(_)) {
+      logging::init_basic();
+      let Cmd::Proxy(args) = self.cmd else {
+        unreachable!("the proxy predicate only matches proxy commands")
+      };
+      return proxy::run(cfg_path, args).await.map_err(Error::from);
+    }
+
+    // Catalogue smoke commands are either config-free or load the strict v2
+    // service plan themselves. Keep legacy migration, logging config, and
+    // partial config decoding out of both paths.
+    if matches!(&self.cmd, Cmd::Smoke(cmd) if cmd.bypasses_legacy_startup()) {
+      logging::init_basic();
+      let Cmd::Smoke(cmd) = self.cmd else {
+        unreachable!("the smoke predicate only matches smoke commands")
+      };
+      return smoke::run_cmd(cfg_path, cmd).await.map_err(Error::from);
+    }
+
+    // Config commands own their schema-specific loading and mutation. Keep
+    // legacy home migration, partial Config loading, and configured logging
+    // out of every config command. In particular, migrate-v2 must observe
+    // legacy files exactly as they are before its read-only planner runs.
+    if matches!(&self.cmd, Cmd::Config(_)) {
+      let Cmd::Config(args) = self.cmd else {
+        unreachable!("the config predicate only matches config commands")
+      };
+      return config_cmd::run(cfg_path, args).await.map_err(Error::from);
+    }
+
     let is_inspect = matches!(&self.cmd, Cmd::Inspect(_));
-    if !is_inspect {
-      prepare_default_config_home(cfg_path.as_deref())?;
+    let versioned_schema = command_config::CommandConfig::uses_versioned_schema(cfg_path.as_deref());
+    if !is_inspect && matches!(versioned_schema, Ok(false)) {
+      prepare_legacy_default_config_home(cfg_path.as_deref())?;
     }
 
     // Initialize logging *before* dispatching: load just enough config to
@@ -85,15 +127,27 @@ impl Cli {
     // config loading fails we fall back to a stderr-only emergency
     // subscriber so the resulting error still gets logged sanely.
     let mode = run_mode_for(&self.cmd);
-    let _guard = match Config::load(cfg_path.as_deref()) {
-      Ok((cfg, _)) => {
-        let mut logging_cfg = cfg.logging.clone();
-        if is_inspect {
-          logging_cfg.target = LogTarget::Stderr;
+    let _guard = match versioned_schema {
+      Ok(false) => match command_config::CommandConfig::load(cfg_path.as_deref()) {
+        Ok(command_config) => {
+          let mut logging_cfg = command_config
+            .legacy_logging()
+            .expect("an unversioned command config contains legacy logging")
+            .clone();
+          if is_inspect {
+            logging_cfg.target = LogTarget::Stderr;
+          }
+          Some(logging::init(&logging_cfg, mode))
         }
-        Some(logging::init(&logging_cfg, mode))
-      }
-      Err(_) => {
+        Err(_) => {
+          logging::init_basic();
+          None
+        }
+      },
+      Ok(true) | Err(_) => {
+        // Logging is not part of the v2 service schema yet. Invalid configs
+        // are also left to the owning command so config-independent commands
+        // remain usable for recovery.
         logging::init_basic();
         None
       }
@@ -104,12 +158,12 @@ impl Cli {
       Cmd::Agent(c) => agent::run(cfg_path, c).await,
       Cmd::ApiKey(c) => api_key::run(c).await,
       Cmd::Headers(a) => headers::run(cfg_path, a).await,
-      Cmd::Serve(a) => serve::run(cfg_path, a).await,
-      Cmd::Proxy(a) => proxy::run(cfg_path, a).await,
+      Cmd::Serve => unreachable!("the v2 serve command is dispatched before legacy CLI setup"),
+      Cmd::Proxy(_) => unreachable!("proxy helpers are dispatched before legacy CLI setup"),
       Cmd::Usage(a) => usage::run(cfg_path, a).await,
       Cmd::Inspect(a) => inspect::run(cfg_path, a).await,
       Cmd::Sessions(c) => sessions::run(c).await,
-      Cmd::Config(a) => config_cmd::run(cfg_path, a).await,
+      Cmd::Config(_) => unreachable!("config commands are dispatched before legacy CLI setup"),
       Cmd::Update(a) => update::run(a).await,
       Cmd::Migration(a) => migration::run(cfg_path, a).await,
       Cmd::Smoke(c) => smoke::run_cmd(cfg_path, c).await,
@@ -118,7 +172,7 @@ impl Cli {
   }
 }
 
-fn prepare_default_config_home(cfg_path: Option<&Path>) -> anyhow::Result<()> {
+fn prepare_legacy_default_config_home(cfg_path: Option<&Path>) -> anyhow::Result<()> {
   if cfg_path.is_some() {
     return Ok(());
   }
@@ -137,9 +191,7 @@ fn prepare_default_config_home(cfg_path: Option<&Path>) -> anyhow::Result<()> {
 /// progress at info; the long-running server gets full info logging.
 fn run_mode_for(cmd: &Cmd) -> RunMode {
   use account::AccountCmd;
-  use config_cmd::ConfigCmd::*;
   match cmd {
-    Cmd::Serve(_) | Cmd::Proxy(_) => RunMode::Server,
     Cmd::Inspect(_) => RunMode::ReadOnlyCli,
     Cmd::Update(_) | Cmd::Migration(_) => RunMode::MutatingCli,
     Cmd::Sessions(_) => RunMode::MutatingCli,
@@ -159,10 +211,6 @@ fn run_mode_for(cmd: &Cmd) -> RunMode {
       | AccountCmd::Refresh { .. }
       | AccountCmd::Remove { .. }
       | AccountCmd::Switch(_) => RunMode::MutatingCli,
-    },
-    Cmd::Config(args) => match args.cmd {
-      Set(_) | Unset(_) | Edit | Init(_) => RunMode::MutatingCli,
-      _ => RunMode::ReadOnlyCli,
     },
     _ => RunMode::ReadOnlyCli,
   }

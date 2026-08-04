@@ -20,6 +20,12 @@ impl Endpoint {
   }
 }
 
+impl std::fmt::Display for Endpoint {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(self.as_str())
+  }
+}
+
 impl FromStr for Endpoint {
   type Err = UnknownEndpoint;
 
@@ -42,9 +48,40 @@ mod tests {
   use super::*;
 
   #[test]
-  fn round_trip_strings() {
-    for ep in [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages] {
-      assert_eq!(Endpoint::from_str(ep.as_str()).unwrap(), ep);
+  fn canonical_strings_and_display_match() {
+    for (endpoint, canonical) in [
+      (Endpoint::ChatCompletions, "chat_completions"),
+      (Endpoint::Responses, "responses"),
+      (Endpoint::Messages, "messages"),
+    ] {
+      assert_eq!(endpoint.as_str(), canonical);
+      assert_eq!(endpoint.to_string(), canonical);
+    }
+  }
+
+  #[test]
+  fn from_str_accepts_canonical_names_and_compatibility_aliases() {
+    for alias in ["chat_completions", "chat", "chat-completions"] {
+      assert_eq!(Endpoint::from_str(alias).unwrap(), Endpoint::ChatCompletions);
+    }
+    assert_eq!(Endpoint::from_str("responses").unwrap(), Endpoint::Responses);
+    assert_eq!(Endpoint::from_str("messages").unwrap(), Endpoint::Messages);
+  }
+
+  #[test]
+  fn from_str_reports_the_unknown_value() {
+    let error = Endpoint::from_str("completions").unwrap_err();
+
+    assert_eq!(error.0, "completions");
+    assert_eq!(error.to_string(), "unknown endpoint: completions");
+  }
+
+  #[test]
+  fn serde_round_trips_canonical_names() {
+    for endpoint in [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages] {
+      let encoded = serde_json::to_string(&endpoint).unwrap();
+      assert_eq!(encoded, format!("\"{}\"", endpoint.as_str()));
+      assert_eq!(serde_json::from_str::<Endpoint>(&encoded).unwrap(), endpoint);
     }
   }
 }

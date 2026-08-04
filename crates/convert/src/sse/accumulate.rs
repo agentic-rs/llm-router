@@ -1,11 +1,11 @@
 use super::super::error::{ConvertError, Result};
 use super::super::ir::{IrDelta, IrResponse};
 use super::event::SseEvent;
-use crate::provider::Endpoint;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use tokn_endpoint_core::Endpoint;
 
 #[derive(Default)]
 struct ResponsesState {

@@ -15,6 +15,7 @@ from tokn import (
   APIStatusError,
   Client,
   Completed,
+  ConfigurationError,
   GenerateRequest,
   Message,
   ReasoningDelta,
@@ -305,7 +306,6 @@ class ModelTests(unittest.TestCase):
       temperature=0.2,
       top_k=40,
       options=RequestOptions(
-        profile="fast",
         request_id="python-detached",
         headers=[("x-sdk-test", "detached")],
       ),
@@ -338,6 +338,7 @@ class ModelTests(unittest.TestCase):
       ),
     )
     self.assertEqual(changed.options.request_id, "python-detached")
+    self.assertNotIn("profile", changed.options.to_dict())
     changed.messages[0].content = "Changed copy."
     self.assertEqual(restored.messages[0].content, "Answer briefly.")
 
@@ -350,6 +351,15 @@ class ModelTests(unittest.TestCase):
     )
     copied.messages[0].content = "Changed copied message."
     self.assertEqual(caller_message.content, "Caller-owned message.")
+
+  def test_request_profile_is_client_bound(self) -> None:
+    with self.assertRaisesRegex(TypeError, "profile is client-bound"):
+      RequestOptions.from_dict({"profile": "legacy-per-request"})
+
+    with self.assertRaisesRegex(TypeError, "unknown request option 'requestd_id'"):
+      RequestOptions.from_dict({"requestd_id": "typo"})
+
+    self.assertFalse(hasattr(GenerateRequest.builder("smart"), "profile"))
 
   def test_models_and_typed_events_round_trip(self) -> None:
     usage = Usage(
@@ -610,7 +620,50 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
     root = Path(cls.root.name)
     cls.config_path = root / "config.toml"
     cls.auth_path = root / "auth.yaml"
-    cls.config_path.write_text('[defaults]\nmode = "exact"\n')
+    cls.config_path.write_text(
+      f"""schema_version = 2
+
+[profiles.default]
+route = "local-llama"
+
+[profiles.openai]
+route = "local-openai"
+
+[routes.local-llama]
+kind = "managed"
+account_pool = "local-llama"
+upstream = {{ kind = "fixed", upstream = "local-llama" }}
+model = {{ kind = "qualified", namespace = "provider" }}
+operation = "translate_compatible"
+
+[routes.local-openai]
+kind = "managed"
+account_pool = "local-openai"
+upstream = {{ kind = "fixed", upstream = "local-openai" }}
+model = {{ kind = "qualified", namespace = "provider" }}
+operation = "translate_compatible"
+
+[account_pools.local-llama]
+active_accounts = ["local-llama"]
+providers = ["llama-cpp"]
+strategy = "round_robin"
+
+[account_pools.local-openai]
+active_accounts = ["local-openai"]
+providers = ["openai"]
+strategy = "round_robin"
+
+[upstreams.local-llama]
+provider = "llama-cpp"
+base_url = "http://127.0.0.1:{cls.server.server_port}"
+accounts = ["local-llama"]
+
+[upstreams.local-openai]
+provider = "openai"
+base_url = "http://127.0.0.1:{cls.server.server_port}"
+accounts = ["local-openai"]
+"""
+    )
     cls.auth_path.write_text(
       "\n".join(
         [
@@ -641,11 +694,32 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
     ProviderHandler.idle_stream_started.clear()
     ProviderHandler.idle_stream_release.clear()
 
-  def client(self) -> Client:
+  def client(self, profile: str = "default") -> Client:
     return Client(
       config_path=self.config_path,
       auth_path=self.auth_path,
+      profile=profile,
     )
+
+  def test_client_exposes_its_bound_profile(self) -> None:
+    default = Client(
+      config_path=self.config_path,
+      auth_path=self.auth_path,
+    )
+    self.assertEqual(default.profile, "default")
+    self.assertEqual(self.client("openai").profile, "openai")
+
+  def test_invalid_profiles_and_legacy_config_are_configuration_errors(self) -> None:
+    for profile in ["missing", "invalid/profile"]:
+      with self.subTest(profile=profile):
+        with self.assertRaises(ConfigurationError):
+          self.client(profile)
+
+    with tempfile.TemporaryDirectory() as root:
+      legacy_config = Path(root) / "config.toml"
+      legacy_config.write_text('[defaults]\nmode = "route"\n')
+      with self.assertRaises(ConfigurationError):
+        Client(config_path=legacy_config, auth_path=self.auth_path)
 
   def last_request(self) -> dict[str, Any]:
     self.assertTrue(ProviderHandler.requests)
@@ -726,7 +800,7 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
 
   async def test_openai_generation_lowers_reasoning_and_output_limit(self) -> None:
     response = await (
-      self.client()
+      self.client("openai")
       .generate("openai/gpt-5")
       .prompt("Think carefully.")
       .max_tokens(1024)
@@ -749,7 +823,7 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
   async def test_unsupported_top_k_surfaces_as_request_error(self) -> None:
     with self.assertRaisesRegex(RequestError, "top_k"):
       await (
-        self.client()
+        self.client("openai")
         .generate("openai/gpt-5")
         .prompt("Reject unsupported sampling.")
         .top_k(40)
@@ -912,7 +986,7 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
       .prompt("stream-error")
       .build()
     )
-    stream = await self.client().stream(request)
+    stream = await self.client("openai").stream(request)
 
     with self.assertRaises(StreamError):
       await stream.__anext__()

@@ -1,6 +1,8 @@
 //! `tokn-router config` subcommand — git-style key/value access. Comment-
 //! preserving edits via `toml_edit`.
 
+use self::v2_io::V2ConfigFile;
+use crate::cli::command_config::CommandConfig;
 use crate::config::{paths, Config};
 use crate::util::http::build_client;
 use anyhow::{anyhow, bail, Context, Result};
@@ -9,7 +11,12 @@ use inquire::{Confirm, Select, Text};
 use std::path::PathBuf;
 use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
+use tokn_core::account::AccountConfig;
+use tokn_router_legacy_config::v2::{plan_v2_migration, V2ListenerSelection, V2MigrationOptions};
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value as EditValue};
+
+mod migrate_v2;
+mod v2_io;
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
@@ -33,6 +40,45 @@ pub enum ConfigCmd {
   Path,
   /// Initialize config with onboarding wizard
   Init(InitArgs),
+  /// Preview or apply a validated version 2 config migration
+  #[command(name = "migrate-v2")]
+  MigrateV2(MigrateV2Args),
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateV2Args {
+  /// Legacy listener surface to represent in the generated config
+  #[arg(long, value_enum)]
+  pub activate: V2ActivationArg,
+  /// Permit non-loopback cleartext HTTP account upstreams
+  #[arg(long)]
+  pub allow_insecure_upstreams: bool,
+  /// Back up the legacy config and activate the generated version 2 config
+  #[arg(long)]
+  pub apply: bool,
+  /// Apply without an interactive confirmation
+  #[arg(long, requires = "apply")]
+  pub yes: bool,
+  /// Acknowledge flattening effective config.d fragments into the version 2 root
+  #[arg(long, requires = "apply")]
+  pub flatten_config_d: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum V2ActivationArg {
+  Api,
+  Proxy,
+  Both,
+}
+
+impl V2ActivationArg {
+  fn listener_selection(self) -> V2ListenerSelection {
+    match self {
+      Self::Api => V2ListenerSelection::Api,
+      Self::Proxy => V2ListenerSelection::Proxy,
+      Self::Both => V2ListenerSelection::ApiAndProxy,
+    }
+  }
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -61,6 +107,12 @@ pub struct InitArgs {
   /// Non-interactive mode.
   #[arg(long)]
   pub yes: bool,
+  /// Listener surface for a newly-created version 2 config.
+  #[arg(long, value_enum, default_value = "api")]
+  pub activate: V2ActivationArg,
+  /// Permit non-loopback cleartext HTTP account upstreams in a new config.
+  #[arg(long)]
+  pub allow_insecure_upstreams: bool,
   /// Runtime route mode override.
   #[arg(long, value_enum)]
   pub route_mode: Option<RouteModeArg>,
@@ -114,10 +166,7 @@ pub struct UnsetArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
-  let path = match cfg_path {
-    Some(p) => p,
-    None => paths::config_path()?,
-  };
+  let path = paths::resolve_config_path(cfg_path.as_deref())?;
 
   match args.cmd {
     ConfigCmd::Get(a) => cmd_get(&path, a),
@@ -127,6 +176,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
     ConfigCmd::Edit => cmd_edit(&path),
     ConfigCmd::Path => cmd_path(&path),
     ConfigCmd::Init(a) => cmd_init(&path, a).await,
+    ConfigCmd::MigrateV2(a) => migrate_v2::run(&path, &a),
   }
 }
 
@@ -170,8 +220,7 @@ fn render_item(item: &Item) -> String {
 fn cmd_set(path: &std::path::Path, args: SetArgs) -> Result<()> {
   let segments = key_segments(args.account.as_deref(), &args.key);
   ensure_root_key_is_not_fragment_managed(path, &segments)?;
-  #[allow(clippy::result_large_err)]
-  Config::edit_in_place(path, |doc| {
+  edit_command_config(path, |doc| {
     if args.add {
       append_array(doc, &segments, &args.value)?;
     } else {
@@ -183,6 +232,29 @@ fn cmd_set(path: &std::path::Path, args: SetArgs) -> Result<()> {
   })?;
   tracing::info!(key = %args.key, account = ?args.account, add = args.add, "config set");
   println!("set {}", args.key);
+  Ok(())
+}
+
+/// Apply a comment-preserving edit through the validator for the active
+/// schema. Version 2 uses an exact file snapshot so a concurrent writer can
+/// never be overwritten between validation and replacement.
+fn edit_command_config<F>(path: &std::path::Path, edit: F) -> Result<()>
+where
+  F: FnOnce(&mut DocumentMut) -> Result<()>,
+{
+  let command_config = CommandConfig::load(Some(path))?;
+  if command_config.is_v2() {
+    let file = V2ConfigFile::read(path)?;
+    let source = std::str::from_utf8(file.contents())
+      .with_context(|| format!("read version 2 config `{}` as UTF-8", path.display()))?;
+    let mut document: DocumentMut = source.parse().context("parse version 2 config as editable TOML")?;
+    edit(&mut document)?;
+    file.replace_contents(document.to_string().as_bytes())?;
+    return Ok(());
+  }
+
+  #[allow(clippy::result_large_err)]
+  Config::edit_in_place(path, |document| edit(document).map_err(Into::into))?;
   Ok(())
 }
 
@@ -238,10 +310,9 @@ fn append_array(doc: &mut DocumentMut, segments: &[String], raw: &str) -> Result
 fn cmd_unset(path: &std::path::Path, args: UnsetArgs) -> Result<()> {
   let segments = key_segments(args.account.as_deref(), &args.key);
   ensure_root_key_is_not_fragment_managed(path, &segments)?;
-  #[allow(clippy::result_large_err)]
-  Config::edit_in_place(path, |doc| {
+  edit_command_config(path, |doc| {
     if !remove(doc, &segments) {
-      return Err(anyhow::anyhow!("key not found: {}", args.key).into());
+      bail!("key not found: {}", args.key);
     }
     Ok(())
   })?;
@@ -253,28 +324,36 @@ fn cmd_unset(path: &std::path::Path, args: UnsetArgs) -> Result<()> {
 // --- list / edit / path ------------------------------------------------
 
 fn cmd_list(path: &std::path::Path) -> Result<()> {
-  let (cfg, _) = Config::load(Some(path))?;
-  let s = toml::to_string_pretty(&cfg)?;
+  let command_config = CommandConfig::load(Some(path))?;
+  let s = if command_config.is_v2() {
+    toml::to_string_pretty(&tokn_config::v2::load_raw(path)?)?
+  } else {
+    let (cfg, _) = Config::load(Some(path))?;
+    toml::to_string_pretty(&cfg)?
+  };
   print!("{s}");
   Ok(())
 }
 
 fn cmd_edit(path: &std::path::Path) -> Result<()> {
-  let fragment_dir = paths::config_fragment_dir(path);
-  if fragment_dir.is_dir() {
-    let has_fragments = std::fs::read_dir(&fragment_dir)
-      .ok()
-      .into_iter()
-      .flatten()
-      .filter_map(Result::ok)
-      .map(|entry| entry.path())
-      .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
-    if has_fragments {
-      eprintln!(
-        "note: linked-agent state is managed separately under {}; this editor changes only {}",
-        fragment_dir.display(),
-        path.display()
-      );
+  let command_config = CommandConfig::load(Some(path))?;
+  if !command_config.is_v2() {
+    let fragment_dir = paths::config_fragment_dir(path);
+    if fragment_dir.is_dir() {
+      let has_fragments = std::fs::read_dir(&fragment_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
+      if has_fragments {
+        eprintln!(
+          "note: linked-agent state is managed separately under {}; this editor changes only {}",
+          fragment_dir.display(),
+          path.display()
+        );
+      }
     }
   }
   if let Some(parent) = path.parent() {
@@ -284,7 +363,7 @@ fn cmd_edit(path: &std::path::Path) -> Result<()> {
   // Validate
   let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
   let _: DocumentMut = raw.parse().context("edited file is not valid TOML")?;
-  let (_cfg, _) = Config::load(Some(path)).context("validation failed after edit")?;
+  CommandConfig::load(Some(path)).context("validation failed after edit")?;
   println!("ok");
   Ok(())
 }
@@ -314,38 +393,100 @@ struct AccountSpec {
 }
 
 async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
+  if path.exists() {
+    let command_config = CommandConfig::load(Some(path))?;
+    if command_config.is_v2() {
+      return cmd_init_existing_v2(command_config, args).await;
+    }
+    return cmd_init_legacy(path, args).await;
+  }
+
+  cmd_init_new_v2(path, args).await
+}
+
+async fn cmd_init_legacy(path: &std::path::Path, args: InitArgs) -> Result<()> {
   // `config init` owns the primary config file. Do not flatten managed agent
   // overlays from `config.d` back into it when refreshing runtime settings.
   let (mut cfg, _) = Config::load_primary(Some(path))?;
   println!("Config path: {}", path.display());
 
   apply_runtime_overrides(&mut cfg, &args);
+  if !args.yes {
+    interactive_runtime_prompts(&mut cfg)?;
+  }
 
+  let mut store = AuthStore::load(None, Some(path))?;
+  let client = build_client(&cfg.proxy)?;
+  let upserted = collect_init_accounts(&mut store, &client, &args).await?;
+
+  cfg.save(path)?;
+  store.save()?;
+  println!("Initialized config and upserted {upserted} account(s).");
+  if !args.yes {
+    println!("Next: tokn-router serve");
+  }
+  Ok(())
+}
+
+async fn cmd_init_existing_v2(command_config: CommandConfig, args: InitArgs) -> Result<()> {
+  if has_v2_graph_overrides(&args) {
+    bail!(
+      "listener and route overrides cannot be applied to an existing version 2 graph; use `config set` or `config edit`"
+    );
+  }
+
+  println!("Config path: {}", command_config.path().display());
+  let mut store = AuthStore::load(None, Some(command_config.path()))?;
+  let client = tokn_core::util::http::build_client(&command_config.outbound_http_options())?;
+  let upserted = collect_init_accounts(&mut store, &client, &args).await?;
+  store.save()?;
+  println!("Version 2 config unchanged; upserted {upserted} account(s).");
+  Ok(())
+}
+
+async fn cmd_init_new_v2(path: &std::path::Path, args: InitArgs) -> Result<()> {
+  let mut legacy_recipe = Config::default();
+  apply_runtime_overrides(&mut legacy_recipe, &args);
+  if !args.yes {
+    interactive_v2_runtime_prompts(&mut legacy_recipe, args.activate)?;
+  }
+  validate_v2_init_modes(&legacy_recipe, args.activate)?;
+
+  println!("Config path: {}", path.display());
+  let mut store = AuthStore::load(None, Some(path))?;
+  let client = build_client(&legacy_recipe.proxy)?;
+  let upserted = collect_init_accounts(&mut store, &client, &args).await?;
+  let rendered = render_initial_v2_config(path, &legacy_recipe, &store.accounts, &args)?;
+
+  // Credentials become durable first. If config creation then loses a race,
+  // the additional credentials remain valid standalone state and no config is
+  // overwritten.
+  store.save()?;
+  tokn_config::replace_contents_if_unchanged(path, None, rendered.as_bytes())
+    .with_context(|| format!("create version 2 config `{}`", path.display()))?;
+  println!("Initialized version 2 config and upserted {upserted} account(s).");
+  println!("Next: tokn-router serve");
+  Ok(())
+}
+
+async fn collect_init_accounts(store: &mut AuthStore, client: &reqwest::Client, args: &InitArgs) -> Result<usize> {
   if args.yes {
     if args.accounts.is_empty() {
       bail!("--yes requires at least one --account spec");
     }
-    let mut store = AuthStore::load(None, Some(path))?;
-    let client = build_client(&cfg.proxy)?;
     for raw in &args.accounts {
       let spec = parse_account_spec(raw)?;
       let source = account_source_from_spec(&spec, false)?;
       let account =
-        crate::cli::onboarding::resolve_account(&client, &spec.provider, Some(spec.id.clone()), source).await?;
+        crate::cli::onboarding::resolve_account(client, &spec.provider, Some(spec.id.clone()), source).await?;
       store.upsert_in_main(account)?;
     }
-    cfg.save(path)?;
-    store.save()?;
-    println!("Initialized config and upserted {} account(s).", args.accounts.len());
-    return Ok(());
+    return Ok(args.accounts.len());
   }
 
-  interactive_runtime_prompts(&mut cfg)?;
-  let mut store = AuthStore::load(None, Some(path))?;
-  let client = build_client(&cfg.proxy)?;
   let mut upserted = 0usize;
   loop {
-    let account = crate::cli::onboarding::interactive_add_account(&client, None, None).await?;
+    let account = crate::cli::onboarding::interactive_add_account(client, None, None).await?;
     store.upsert_in_main(account)?;
     upserted += 1;
     let more = Confirm::new("Add another account?")
@@ -356,12 +497,7 @@ async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
       break;
     }
   }
-
-  cfg.save(path)?;
-  store.save()?;
-  println!("Initialized config and upserted {upserted} account(s).");
-  println!("Next: tokn-router serve  # or tokn-router proxy start");
-  Ok(())
+  Ok(upserted)
 }
 
 fn apply_runtime_overrides(cfg: &mut Config, args: &InitArgs) {
@@ -385,80 +521,148 @@ fn apply_runtime_overrides(cfg: &mut Config, args: &InitArgs) {
   }
 }
 
-fn interactive_runtime_prompts(cfg: &mut Config) -> Result<()> {
-  let route_options = vec!["route", "passthrough", "switch", "exact", "fuzzy"];
-  let default_idx = match cfg.defaults.mode {
-    RouteMode::Route => 0,
-    RouteMode::Passthrough => 1,
-    RouteMode::Switch => 2,
-    RouteMode::Exact => 3,
-    RouteMode::Fuzzy => 4,
-  };
-  let selected = Select::new("Route mode:", route_options.clone())
-    .with_starting_cursor(default_idx)
-    .prompt()
-    .context("route mode selection cancelled")?;
-  cfg.defaults.mode = match selected {
-    "route" => RouteMode::Route,
-    "passthrough" => RouteMode::Passthrough,
-    "switch" => RouteMode::Switch,
-    "exact" => RouteMode::Exact,
-    "fuzzy" => RouteMode::Fuzzy,
-    _ => RouteMode::Route,
-  };
+fn has_v2_graph_overrides(args: &InitArgs) -> bool {
+  args.activate != V2ActivationArg::Api
+    || args.allow_insecure_upstreams
+    || args.route_mode.is_some()
+    || args.host.is_some()
+    || args.port.is_some()
+    || args.proxy_host.is_some()
+    || args.proxy_port.is_some()
+    || args.proxy_route_mode.is_some()
+}
 
-  let proxy_default_idx = match cfg.proxy_mode.route_mode {
-    RouteMode::Route => 0,
-    RouteMode::Passthrough => 1,
-    RouteMode::Switch => 2,
-    RouteMode::Exact => 3,
-    RouteMode::Fuzzy => 4,
-  };
-  let proxy_selected = Select::new("Proxy route mode:", route_options)
-    .with_starting_cursor(proxy_default_idx)
-    .prompt()
-    .context("proxy route mode selection cancelled")?;
-  cfg.proxy_mode.route_mode = match proxy_selected {
-    "route" => RouteMode::Route,
-    "passthrough" => RouteMode::Passthrough,
-    "switch" => RouteMode::Switch,
-    "exact" => RouteMode::Exact,
-    "fuzzy" => RouteMode::Fuzzy,
-    _ => RouteMode::Route,
-  };
-
-  if Confirm::new("Set serve host/port?")
-    .with_default(false)
-    .prompt()
-    .context("serve host/port prompt cancelled")?
+fn validate_v2_init_modes(cfg: &Config, activation: V2ActivationArg) -> Result<()> {
+  if matches!(activation, V2ActivationArg::Api | V2ActivationArg::Both)
+    && !matches!(cfg.defaults.mode, RouteMode::Route | RouteMode::Exact)
   {
-    let host = Text::new("Serve host:")
-      .with_initial_value(&cfg.server.host)
-      .prompt()
-      .context("serve host prompt cancelled")?;
-    let port = Text::new("Serve port:")
-      .with_initial_value(&cfg.server.port.to_string())
-      .prompt()
-      .context("serve port prompt cancelled")?;
-    cfg.server.host = host;
-    cfg.server.port = port.parse().context("serve port must be a valid u16")?;
+    bail!(
+      "version 2 API initialization supports route or exact mode, not {}",
+      route_mode_name(cfg.defaults.mode)
+    );
   }
+  if matches!(activation, V2ActivationArg::Proxy | V2ActivationArg::Both)
+    && !matches!(cfg.proxy_mode.route_mode, RouteMode::Route | RouteMode::Exact)
+  {
+    bail!(
+      "version 2 proxy initialization supports route or exact mode, not {}",
+      route_mode_name(cfg.proxy_mode.route_mode)
+    );
+  }
+  Ok(())
+}
 
-  if Confirm::new("Set proxy host/port?")
+fn render_initial_v2_config(
+  path: &std::path::Path,
+  legacy_recipe: &Config,
+  accounts: &[AccountConfig],
+  args: &InitArgs,
+) -> Result<String> {
+  let plan = plan_v2_migration(
+    legacy_recipe,
+    accounts,
+    V2MigrationOptions {
+      listener_selection: args.activate.listener_selection(),
+      allow_insecure_upstreams: args.allow_insecure_upstreams,
+    },
+  )
+  .context("build initial version 2 config")?;
+  let rendered = toml::to_string_pretty(plan.raw_config()).context("render initial version 2 config")?;
+  let compiled = tokn_config::v2::parse(&rendered, path).context("validate initial version 2 config")?;
+  tokn_router::runtime::link_builtin_gateway_runtime(compiled.gateway(), accounts)
+    .context("link initial version 2 runtime")?;
+  Ok(rendered)
+}
+
+fn interactive_runtime_prompts(cfg: &mut Config) -> Result<()> {
+  let options = ["route", "passthrough", "switch", "exact", "fuzzy"];
+  cfg.defaults.mode = prompt_route_mode("Route mode:", cfg.defaults.mode, &options)?;
+  cfg.proxy_mode.route_mode = prompt_route_mode("Proxy route mode:", cfg.proxy_mode.route_mode, &options)?;
+  prompt_bind(
+    "Set serve host/port?",
+    "Serve",
+    &mut cfg.server.host,
+    &mut cfg.server.port,
+  )?;
+  prompt_bind(
+    "Set proxy host/port?",
+    "Proxy",
+    &mut cfg.proxy_mode.host,
+    &mut cfg.proxy_mode.port,
+  )?;
+  Ok(())
+}
+
+fn interactive_v2_runtime_prompts(cfg: &mut Config, activation: V2ActivationArg) -> Result<()> {
+  let options = ["route", "exact"];
+  if matches!(activation, V2ActivationArg::Api | V2ActivationArg::Both) {
+    cfg.defaults.mode = prompt_route_mode("API route mode:", cfg.defaults.mode, &options)?;
+    prompt_bind("Set API host/port?", "API", &mut cfg.server.host, &mut cfg.server.port)?;
+  }
+  if matches!(activation, V2ActivationArg::Proxy | V2ActivationArg::Both) {
+    cfg.proxy_mode.route_mode = prompt_route_mode("Proxy route mode:", cfg.proxy_mode.route_mode, &options)?;
+    prompt_bind(
+      "Set proxy host/port?",
+      "Proxy",
+      &mut cfg.proxy_mode.host,
+      &mut cfg.proxy_mode.port,
+    )?;
+  }
+  Ok(())
+}
+
+fn prompt_route_mode(prompt: &str, current: RouteMode, options: &[&str]) -> Result<RouteMode> {
+  let default_index = options
+    .iter()
+    .position(|candidate| *candidate == route_mode_name(current))
+    .unwrap_or(0);
+  let selected = Select::new(prompt, options.to_vec())
+    .with_starting_cursor(default_index)
+    .prompt()
+    .with_context(|| {
+      format!(
+        "{} selection cancelled",
+        prompt.trim_end_matches(':').to_ascii_lowercase()
+      )
+    })?;
+  match selected {
+    "route" => Ok(RouteMode::Route),
+    "passthrough" => Ok(RouteMode::Passthrough),
+    "switch" => Ok(RouteMode::Switch),
+    "exact" => Ok(RouteMode::Exact),
+    "fuzzy" => Ok(RouteMode::Fuzzy),
+    _ => bail!("unknown route mode `{selected}`"),
+  }
+}
+
+fn route_mode_name(mode: RouteMode) -> &'static str {
+  match mode {
+    RouteMode::Route => "route",
+    RouteMode::Passthrough => "passthrough",
+    RouteMode::Switch => "switch",
+    RouteMode::Exact => "exact",
+    RouteMode::Fuzzy => "fuzzy",
+  }
+}
+
+fn prompt_bind(prompt: &str, label: &str, host: &mut String, port: &mut u16) -> Result<()> {
+  if Confirm::new(prompt)
     .with_default(false)
     .prompt()
-    .context("proxy host/port prompt cancelled")?
+    .with_context(|| format!("{} host/port prompt cancelled", label.to_ascii_lowercase()))?
   {
-    let host = Text::new("Proxy host:")
-      .with_initial_value(&cfg.proxy_mode.host)
+    let selected_host = Text::new(&format!("{label} host:"))
+      .with_initial_value(host)
       .prompt()
-      .context("proxy host prompt cancelled")?;
-    let port = Text::new("Proxy port:")
-      .with_initial_value(&cfg.proxy_mode.port.to_string())
+      .with_context(|| format!("{} host prompt cancelled", label.to_ascii_lowercase()))?;
+    let selected_port = Text::new(&format!("{label} port:"))
+      .with_initial_value(&port.to_string())
       .prompt()
-      .context("proxy port prompt cancelled")?;
-    cfg.proxy_mode.host = host;
-    cfg.proxy_mode.port = port.parse().context("proxy port must be a valid u16")?;
+      .with_context(|| format!("{} port prompt cancelled", label.to_ascii_lowercase()))?;
+    *host = selected_host;
+    *port = selected_port
+      .parse()
+      .with_context(|| format!("{} port must be a valid u16", label.to_ascii_lowercase()))?;
   }
   Ok(())
 }
@@ -581,6 +785,9 @@ fn ensure_root_key_is_not_fragment_managed(path: &std::path::Path, segments: &[S
     return Ok(());
   };
   if section != "agents" && section != "profiles" {
+    return Ok(());
+  }
+  if CommandConfig::load(Some(path))?.is_v2() {
     return Ok(());
   }
   let loaded = Config::load_with_sources(Some(path))?;
@@ -777,6 +984,21 @@ fn load_doc(path: &std::path::Path) -> Result<DocumentMut> {
 mod tests {
   use super::*;
 
+  fn init_args(activation: V2ActivationArg) -> InitArgs {
+    InitArgs {
+      yes: true,
+      activate: activation,
+      allow_insecure_upstreams: false,
+      route_mode: None,
+      host: None,
+      port: None,
+      proxy_host: None,
+      proxy_port: None,
+      proxy_route_mode: None,
+      accounts: Vec::new(),
+    }
+  }
+
   fn doc(s: &str) -> DocumentMut {
     s.parse().unwrap()
   }
@@ -835,6 +1057,123 @@ agent_id = "opencode"
     assert!(
       ensure_root_key_is_not_fragment_managed(&root, &["profiles".into(), "other".into(), "mode".into()],).is_ok()
     );
+  }
+
+  #[test]
+  fn v2_set_and_unset_preserve_comments_and_validate_the_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "# operator note\nschema_version = 2\n").unwrap();
+
+    cmd_set(
+      &path,
+      SetArgs {
+        key: "service.persistence.enabled".into(),
+        value: "false".into(),
+        add: false,
+        account: None,
+      },
+    )
+    .unwrap();
+
+    let after_set = std::fs::read_to_string(&path).unwrap();
+    assert!(after_set.contains("# operator note"));
+    assert!(after_set.contains("enabled = false"));
+    tokn_config::v2::parse(&after_set, &path).unwrap();
+
+    cmd_unset(
+      &path,
+      UnsetArgs {
+        key: "service.persistence.enabled".into(),
+        account: None,
+      },
+    )
+    .unwrap();
+
+    let after_unset = std::fs::read_to_string(&path).unwrap();
+    assert!(after_unset.contains("# operator note"));
+    assert!(!after_unset.contains("enabled = false"));
+    tokn_config::v2::parse(&after_unset, &path).unwrap();
+  }
+
+  #[test]
+  fn invalid_v2_set_does_not_replace_the_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let original = "# unchanged\nschema_version = 2\n";
+    std::fs::write(&path, original).unwrap();
+
+    let error = cmd_set(
+      &path,
+      SetArgs {
+        key: "schema_version".into(),
+        value: "3".into(),
+        add: false,
+        account: None,
+      },
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("unsupported schema version"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+  }
+
+  #[test]
+  fn legacy_fragments_do_not_shadow_v2_root_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("config.toml");
+    std::fs::write(&root, "schema_version = 2\n").unwrap();
+    let fragment = paths::agent_config_fragment_path(&root, "opencode");
+    std::fs::create_dir_all(fragment.parent().unwrap()).unwrap();
+    std::fs::write(&fragment, "[profiles.opencode]\nagent_id = \"opencode\"\n").unwrap();
+
+    ensure_root_key_is_not_fragment_managed(&root, &["profiles".into(), "opencode".into(), "mode".into()]).unwrap();
+  }
+
+  #[test]
+  fn new_init_renders_a_linkable_v2_graph_without_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let account: AccountConfig = toml::from_str(
+      r#"
+id = "work"
+provider = "openai"
+api_key = "must-not-be-rendered"
+"#,
+    )
+    .unwrap();
+    let args = init_args(V2ActivationArg::Both);
+
+    let rendered = render_initial_v2_config(&path, &Config::default(), &[account], &args).unwrap();
+    let raw = tokn_config::v2::decode(&rendered, &path).unwrap();
+
+    assert_eq!(raw.schema_version, 2);
+    assert!(raw.listeners.contains_key("api"));
+    assert!(raw.listeners.contains_key("proxy"));
+    assert!(!rendered.contains("must-not-be-rendered"));
+  }
+
+  #[test]
+  fn new_v2_init_rejects_modes_without_an_exact_recipe() {
+    let mut config = Config::default();
+    config.defaults.mode = RouteMode::Switch;
+
+    let error = validate_v2_init_modes(&config, V2ActivationArg::Api)
+      .unwrap_err()
+      .to_string();
+
+    assert!(error.contains("supports route or exact mode"));
+    assert!(error.contains("switch"));
+  }
+
+  #[test]
+  fn existing_v2_init_accepts_account_only_options() {
+    let mut args = init_args(V2ActivationArg::Api);
+    args.accounts.push("id=work,provider=openai,from=env".into());
+    assert!(!has_v2_graph_overrides(&args));
+
+    args.port = Some(8181);
+    assert!(has_v2_graph_overrides(&args));
   }
 
   #[test]

@@ -3,6 +3,8 @@ members = [
   "crates/tokn",
   "crates/mock-server",
   "crates/core",
+  "crates/events",
+  "crates/policy",
   "crates/config",
   "crates/legacy-config",
   "crates/agent-migration",
@@ -46,6 +48,8 @@ license = "MIT"
 tokn = { version = "0.2.1", path = "crates/tokn" }
 tokn-mock-server = { version = "0.2.1", path = "crates/mock-server" }
 tokn-core = { version = "0.2.1", path = "crates/core" }
+tokn-events = { version = "0.2.1", path = "crates/events" }
+tokn-policy = { version = "0.2.1", path = "crates/policy" }
 tokn-config = { package = "tokn-router-config", version = "0.2.1", path = "crates/config" }
 tokn-router-legacy-config = { version = "0.2.1", path = "crates/legacy-config" }
 tokn-agent-migration = { version = "0.2.1", path = "crates/agent-migration" }
@@ -100,6 +104,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 rpassword = "7"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+same-file = "1.0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -127,10 +132,10 @@ lto = "thin"
 strip = true
 codegen-units = 1
 
-[profile.dev.package.lzma-rust2]
+[profile.dev.package.zstd]
 opt-level = 3
 
-[profile.dev.package.zstd]
+[profile.dev.package.lzma-rust2]
 opt-level = 3
 
 [profile.dev.package.zstd-safe]
@@ -139,10 +144,10 @@ opt-level = 3
 [profile.dev.package.zstd-sys]
 opt-level = 3
 
-[profile.test.package.lzma-rust2]
+[profile.test.package.zstd]
 opt-level = 3
 
-[profile.test.package.zstd]
+[profile.test.package.lzma-rust2]
 opt-level = 3
 
 [profile.test.package.zstd-safe]

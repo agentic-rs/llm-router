@@ -9,11 +9,14 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+tokn-endpoint-core = { workspace = true }
 tokn-headers = { workspace = true }
+tokn-policy = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 directories = { workspace = true }
+http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,5 +25,7 @@ sha2 = { workspace = true }
 snafu = { workspace = true }
 time = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -13,7 +13,7 @@ default = ["lzma"]
 lzma = ["dep:lzma-rust2"]
 
 [dependencies]
-tokn-core = { workspace = true }
+tokn-events = { workspace = true }
 tokn-headers = { workspace = true }
 base64 = "0.22"
 bytes = { workspace = true }
@@ -32,5 +32,4 @@ lzma-rust2 = { workspace = true, optional = true }
 [dev-dependencies]
 parking_lot = { workspace = true }
 uuid = { workspace = true }
-smol_str = { workspace = true }
 serde_json = { workspace = true }

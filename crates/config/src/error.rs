@@ -12,6 +12,21 @@ pub enum Error {
   #[snafu(display("parse config `{}`", path.display()))]
   Parse { path: PathBuf, source: toml::de::Error },
 
+  #[snafu(display(
+    "config `{}` uses schema version 2 and cannot be handled by the legacy config API; use the v2 loader",
+    path.display()
+  ))]
+  V2ConfigRequiresV2Loader { path: PathBuf },
+
+  #[snafu(display("config `{}` has a non-integer `schema_version`", path.display()))]
+  InvalidSchemaVersion { path: PathBuf },
+
+  #[snafu(display(
+    "config `{}` uses unsupported schema version {found}; expected an unversioned legacy config or version 2",
+    path.display()
+  ))]
+  UnsupportedSchemaVersion { path: PathBuf, found: i64 },
+
   #[snafu(display("parse config `{}` as editable document", path.display()))]
   ParseEdit {
     path: PathBuf,
@@ -27,6 +42,77 @@ pub enum Error {
   #[snafu(display("write `{}`", path.display()))]
   Write { path: PathBuf, source: std::io::Error },
 
+  #[snafu(display(
+    "lock config `{}` using `{}`: {source}",
+    path.display(),
+    lock_path.display()
+  ))]
+  ConfigLock {
+    path: PathBuf,
+    lock_path: PathBuf,
+    source: std::io::Error,
+  },
+
+  #[snafu(display(
+    "config `{}` is being modified by another process (lock `{}` is held); retry the operation",
+    path.display(),
+    lock_path.display()
+  ))]
+  ConfigLocked { path: PathBuf, lock_path: PathBuf },
+
+  #[snafu(display(
+    "refusing to use symbolic-link config lock `{}` for `{}`",
+    lock_path.display(),
+    path.display()
+  ))]
+  ConfigLockSymlink { path: PathBuf, lock_path: PathBuf },
+
+  #[snafu(display(
+    "config lock `{}` for `{}` changed while it was being acquired; retry the operation",
+    lock_path.display(),
+    path.display()
+  ))]
+  ConfigLockChanged { path: PathBuf, lock_path: PathBuf },
+
+  #[snafu(display("config path `{}` has no file name and cannot be locked", path.display()))]
+  InvalidConfigLockPath { path: PathBuf },
+
+  #[snafu(display(
+    "resolve config directory `{}` for `{}`",
+    parent.display(),
+    path.display()
+  ))]
+  ResolveConfigDirectory {
+    path: PathBuf,
+    parent: PathBuf,
+    source: std::io::Error,
+  },
+
+  #[snafu(display("refusing to replace config symlink `{}`", path.display()))]
+  ConfigSymlink { path: PathBuf },
+
+  #[snafu(display("refusing to read symbolic-link config source `{}`", path.display()))]
+  ConfigSourceSymlink { path: PathBuf },
+
+  #[snafu(display("config source `{}` must be {expected}", path.display()))]
+  InvalidConfigSourceType { path: PathBuf, expected: &'static str },
+
+  #[snafu(display("config source `{}` changed while it was being captured; retry the operation", path.display()))]
+  ConfigSourceChanged { path: PathBuf },
+
+  #[snafu(display(
+    "effective config sources for `{}` changed while they were being loaded or validated; retry the operation",
+    path.display()
+  ))]
+  ConfigSourcesChanged { path: PathBuf },
+
+  #[snafu(display(
+    "config lock for `{}` cannot validate source snapshot for `{}`",
+    lock_root.display(),
+    snapshot_root.display()
+  ))]
+  ConfigSnapshotLockMismatch { snapshot_root: PathBuf, lock_root: PathBuf },
+
   #[snafu(display("set permissions on `{}`", path.display()))]
   SetPermissions { path: PathBuf, source: std::io::Error },
 
@@ -37,11 +123,22 @@ pub enum Error {
     source: std::io::Error,
   },
 
+  #[snafu(display(
+    "sync directory `{}` after committing config `{}`; the config may already contain the new contents",
+    parent.display(),
+    path.display()
+  ))]
+  SyncParentAfterCommit {
+    path: PathBuf,
+    parent: PathBuf,
+    source: std::io::Error,
+  },
+
   #[snafu(display("could not resolve XDG project dirs"))]
   NoProjectDirs,
 
-  #[snafu(display("[proxy].url is not a valid URL `{url}`: {message}"))]
-  ProxyUrl { url: String, message: String },
+  #[snafu(display("[proxy].url is not a valid URL: {message}"))]
+  ProxyUrl { message: String },
 
   #[snafu(display("[proxy].url has unsupported scheme: {scheme}"))]
   ProxyScheme { scheme: String },

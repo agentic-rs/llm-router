@@ -19,6 +19,13 @@ import type {
 const ROLES = new Set(["system", "user", "assistant", "tool"]);
 const REASONING_MODES = new Set(["enabled", "disabled", "adaptive"]);
 const REASONING_EXTRAS = new Set(["reasoning", "thinking", "reasoning_effort", "output_config"]);
+export const REQUEST_OPTION_NAMES: ReadonlySet<string> = new Set([
+  "request_id",
+  "session_id",
+  "project_id",
+  "initiator",
+  "headers",
+]);
 
 function fail(message: string): never {
   throw new RequestError(message);
@@ -183,6 +190,10 @@ export function normalizeRequestOptions(value: RequestOptions | undefined): Requ
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     fail("request options must be an object");
   }
+  const unknownOption = Object.keys(value).find((name) => !REQUEST_OPTION_NAMES.has(name));
+  if (unknownOption !== undefined) {
+    fail(`unknown request option '${unknownOption}'`);
+  }
 
   if (value.headers !== undefined && !Array.isArray(value.headers)) {
     fail("headers must be an array");
@@ -197,7 +208,6 @@ export function normalizeRequestOptions(value: RequestOptions | undefined): Requ
     ] as const;
   });
   const normalized: RequestOptions = {
-    ...(value.profile === undefined ? {} : { profile: requireString(value.profile, "profile") }),
     ...(value.request_id === undefined ? {} : { request_id: requireString(value.request_id, "request_id") }),
     ...(value.session_id === undefined ? {} : { session_id: requireString(value.session_id, "session_id") }),
     ...(value.project_id === undefined ? {} : { project_id: requireString(value.project_id, "project_id") }),
@@ -448,11 +458,6 @@ export class RequestBuilder {
 
   options(options: RequestOptions): this {
     this.requestOptionsValue = normalizeRequestOptions(options) ?? {};
-    return this;
-  }
-
-  profile(profile: string): this {
-    this.requestOptionsValue = { ...this.requestOptionsValue, profile };
     return this;
   }
 

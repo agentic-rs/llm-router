@@ -16,7 +16,6 @@ export interface ClientOptions {
 }
 
 export interface RequestOptions {
-  readonly profile?: string;
   readonly request_id?: string;
   readonly session_id?: string;
   readonly project_id?: string;

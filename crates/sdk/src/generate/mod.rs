@@ -14,8 +14,9 @@ use tokn_convert::ir::{
   ContentPart as IrContentPart, IrMessage, IrRequest, Role as IrRole, Sampling, ToolCall as IrToolCall,
 };
 use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary};
-use tokn_core::provider::Endpoint;
-use tokn_requests::pipeline::error::RequestsError;
+use tokn_endpoint_core::Endpoint;
+use tokn_requests::execution::ManagedAttemptError;
+use tokn_router::runtime::ManagedGatewayError;
 
 use crate::response::ResponseBody;
 use crate::{Client, Error, RequestOptions, Result};
@@ -598,11 +599,6 @@ macro_rules! generate_builder_methods {
         self
       }
 
-      pub fn profile(mut self, profile: impl Into<String>) -> Self {
-        self.request.options.profile = Some(profile.into());
-        self
-      }
-
       pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request.options.request_id = Some(request_id.into());
         self
@@ -679,7 +675,7 @@ impl Client {
   pub async fn send(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateResponse> {
     let request = request.borrow();
     let body = request.responses_body(false)?;
-    let response = self
+    let execution = self
       .execute_generation(
         Endpoint::Responses,
         body,
@@ -687,8 +683,10 @@ impl Client {
         request.generation_options(),
       )
       .await
-      .map_err(map_generation_error)?
-      .into_buffered()?;
+      .map_err(map_generation_error)?;
+    let (response, semantic_completion) = execution.into_parts();
+    drop(semantic_completion);
+    let response = response.into_buffered()?;
     ensure_success(response.status, &response.data)?;
     let raw = serde_json::from_slice(&response.data).map_err(|source| Error::DeserializeResponse { source })?;
     Ok(GenerateResponse::from_raw(response.status, response.headers, raw))
@@ -698,7 +696,7 @@ impl Client {
   pub async fn stream(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateStream> {
     let request = request.borrow();
     let body = request.responses_body(true)?;
-    let response = self
+    let execution = self
       .execute_generation(
         Endpoint::Responses,
         body,
@@ -707,8 +705,12 @@ impl Client {
       )
       .await
       .map_err(map_generation_error)?;
+    let (response, semantic_completion) = execution.into_parts();
     ensure_raw_success(&response)?;
-    Ok(stream::parse_events(response.into_stream()?.into_stream()))
+    Ok(stream::parse_events_with_completion(
+      response.into_stream()?.into_stream(),
+      semantic_completion,
+    ))
   }
 
   /// Stream only generated text deltas.
@@ -719,21 +721,22 @@ impl Client {
 }
 
 fn map_generation_error(error: Error) -> Error {
-  let Error::Pipeline { source } = error else {
-    return error;
-  };
-  match source.inner() {
-    RequestsError::UpstreamStatus { status, body } => Error::GenerateResponseStatus {
-      status: *status,
-      body: body.clone(),
+  let generation_control = match &error {
+    Error::ManagedRequest { source } => match source.as_ref() {
+      ManagedGatewayError::Attempt {
+        source: ManagedAttemptError::GenerationControl { source },
+        ..
+      } => Some(source),
+      _ => None,
     },
-    RequestsError::InvalidGenerationOptions { .. } | RequestsError::UnsupportedGenerationControl { .. } => {
-      Error::InvalidGenerateRequest {
-        message: source.inner().to_string(),
-      }
-    }
-    _ => Error::Pipeline { source },
+    _ => None,
+  };
+  if let Some(source) = generation_control {
+    return Error::InvalidGenerateRequest {
+      message: source.to_string(),
+    };
   }
+  error
 }
 
 fn ensure_raw_success(response: &crate::RawResponse) -> Result<()> {
@@ -850,16 +853,24 @@ mod tests {
     let request: GenerateRequest = serde_json::from_value(serde_json::json!({
       "model": "smart",
       "messages": [{"role": "user", "content": "Hello"}],
-      "options": {"profile": "fast"}
+      "options": {"session_id": "session-1"}
     }))
     .expect("deserialize sparse request options");
 
-    assert_eq!(request.options.profile.as_deref(), Some("fast"));
+    assert_eq!(request.options.session_id.as_deref(), Some("session-1"));
     assert!(request.options.headers.is_empty());
     assert!(serde_json::to_value(request)
       .expect("serialize request")
       .pointer("/options/headers")
       .is_none());
+
+    let error = serde_json::from_value::<GenerateRequest>(serde_json::json!({
+      "model": "smart",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "options": {"profile": "legacy-per-request-profile"}
+    }))
+    .expect_err("per-request profiles must not be silently ignored");
+    assert!(error.to_string().contains("unknown field `profile`"));
   }
 
   #[test]

@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
-use tokn_core::provider::{Endpoint, EndpointRule, Provider, Result};
+use tokn_core::provider::{Endpoint, EndpointRule, Provider, ProviderTarget, Result};
 
 use crate::provider::{CredentialFlavor, ProviderAuth};
 
@@ -63,8 +63,9 @@ pub struct ProviderDescriptor {
   /// Hosts the proxy should intercept on behalf of this provider. The
   /// first entry is treated as canonical for display purposes.
   pub hosts: &'static [&'static str],
-  /// Canonical upstream base URL (no trailing slash). Provider impls may
-  /// still honour a per-account `AccountConfig::base_url` override.
+  /// Default upstream base URL (no trailing slash). Runtime construction
+  /// canonicalizes this into a [`ProviderTarget`] when no explicit target
+  /// is selected.
   pub base_url: &'static str,
   /// Credential flavors this provider accepts during onboarding. Listed
   /// in priority order — the CLI picker presents them in this sequence.
@@ -93,8 +94,9 @@ pub struct ProviderDescriptor {
   pub matches_url: fn(&str, &str, &'static str) -> bool,
   /// Validates an [`AccountConfig`] before it is built into a `Provider`.
   pub validate: fn(&AccountConfig) -> Result<()>,
-  /// Constructs the runtime [`Provider`] for a validated account.
-  pub build: fn(Arc<AccountConfig>) -> Result<Arc<dyn Provider>>,
+  /// Constructs the runtime [`Provider`] for a validated account at the
+  /// explicitly selected upstream target.
+  pub build: fn(Arc<AccountConfig>, ProviderTarget) -> Result<Arc<dyn Provider>>,
   /// Accessor for the [`ProviderAuth`] impl, or `None` for hypothetical
   /// passive-intercept providers that need no credentials.
   pub build_auth: Option<fn() -> &'static dyn ProviderAuth>,

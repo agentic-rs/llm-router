@@ -776,15 +776,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
-name = "fsevent-sys"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1208,26 +1199,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inotify"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "533e68a5842e734946fe159fb03fc9bbbb254f590dd0d8ad321ae5ff7beca2c1"
-dependencies = [
- "bitflags",
- "inotify-sys",
- "libc",
-]
-
-[[package]]
-name = "inotify-sys"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "inquire"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1339,26 +1310,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kqueue"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "273c0752728918e0ac4976f2b275b6fefb9ecd400585dec929419f3844cd87b5"
-dependencies = [
- "kqueue-sys",
- "libc",
-]
-
-[[package]]
-name = "kqueue-sys"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
-dependencies = [
- "bitflags",
- "libc",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1447,9 +1398,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lzma-rust2"
-version = "0.16.4"
+version = "0.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce716bf1a316f47a280fc76295f6495b5bea4752bca01c3b3885e101b1c23c02"
+checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
 dependencies = [
  "sha2",
 ]
@@ -1581,33 +1532,6 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
-]
-
-[[package]]
-name = "notify"
-version = "8.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
-dependencies = [
- "bitflags",
- "fsevent-sys",
- "inotify",
- "kqueue",
- "libc",
- "log",
- "mio",
- "notify-types",
- "walkdir",
- "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "notify-types"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
-dependencies = [
- "bitflags",
 ]
 
 [[package]]
@@ -2758,12 +2682,15 @@ dependencies = [
  "tokn-endpoint-macros",
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
+ "tokn-events",
  "tokn-headers",
+ "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
  "tokn-provider-llama-cpp",
  "tokn-provider-openai",
  "tokn-provider-zai",
+ "tokn-requests",
  "tokn-router",
  "tokn-router-config",
  "tokn-sdk",
@@ -2790,22 +2717,21 @@ dependencies = [
 name = "tokn-accounts"
 version = "0.2.1"
 dependencies = [
- "arc-swap",
  "async-trait",
  "parking_lot",
  "reqwest",
  "serde_json",
+ "smol_str",
  "snafu",
  "tokn-auth",
  "tokn-core",
+ "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
  "tokn-provider-llama-cpp",
  "tokn-provider-openai",
  "tokn-provider-zai",
- "tokn-router-config",
  "toml",
- "tracing",
 ]
 
 [[package]]
@@ -2869,23 +2795,19 @@ dependencies = [
 name = "tokn-convert"
 version = "0.2.1"
 dependencies = [
- "anyhow",
  "bytes",
  "eventsource-stream",
  "futures",
  "futures-util",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "snafu",
- "tokio",
  "tokn-core",
  "tokn-endpoint-chat-completions",
  "tokn-endpoint-core",
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
- "tokn-router-config",
 ]
 
 [[package]]
@@ -2896,6 +2818,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "directories",
+ "http",
  "reqwest",
  "serde",
  "serde_json",
@@ -2904,7 +2827,9 @@ dependencies = [
  "snafu",
  "time",
  "tokio",
+ "tokn-endpoint-core",
  "tokn-headers",
+ "tokn-policy",
  "toml",
  "tracing",
 ]
@@ -2958,26 +2883,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-events"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "smol_str",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "tokn-gateway-cli"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "arc-swap",
- "async-trait",
- "axum",
- "bytes",
  "clap",
  "console",
- "directories",
- "eventsource-stream",
  "futures",
  "futures-util",
  "http",
  "humantime",
  "indicatif",
  "inquire",
- "notify",
- "parking_lot",
  "reqwest",
  "rpassword",
  "rusqlite",
@@ -2988,18 +2915,16 @@ dependencies = [
  "time",
  "tokio",
  "tokn-access",
+ "tokn-accounts",
  "tokn-agent-migration",
  "tokn-auth",
  "tokn-catalogue",
- "tokn-convert",
  "tokn-core",
- "tokn-headers",
+ "tokn-events",
  "tokn-mock-server",
  "tokn-persistence",
+ "tokn-policy",
  "tokn-provider-copilot",
- "tokn-provider-deepseek",
- "tokn-provider-openai",
- "tokn-provider-zai",
  "tokn-requests",
  "tokn-router",
  "tokn-router-config",
@@ -3007,8 +2932,6 @@ dependencies = [
  "tokn-router-legacy-config",
  "toml",
  "toml_edit",
- "tower",
- "tower-http",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -3056,15 +2979,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "smol_str",
  "snafu",
  "time",
  "tokio",
- "tokn-core",
+ "tokn-events",
  "tokn-headers",
  "tracing",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "tokn-policy"
+version = "0.2.1"
+dependencies = [
+ "smol_str",
 ]
 
 [[package]]
@@ -3085,6 +3014,7 @@ dependencies = [
  "tokn-catalogue",
  "tokn-core",
  "tokn-headers",
+ "tokn-mock-server",
  "toml",
  "tracing",
 ]
@@ -3184,29 +3114,23 @@ dependencies = [
 name = "tokn-requests"
 version = "0.2.1"
 dependencies = [
- "arc-swap",
- "async-trait",
  "bytes",
- "flate2",
  "futures-util",
  "http",
  "reqwest",
- "serde",
  "serde_json",
- "serde_yaml",
- "smol_str",
  "snafu",
+ "thiserror",
  "tokio",
  "tokn-accounts",
  "tokn-convert",
  "tokn-core",
+ "tokn-events",
  "tokn-headers",
  "tokn-mock-server",
- "tokn-provider-copilot",
- "tokn-provider-openai",
+ "tokn-policy",
  "tokn-router-config",
- "tracing",
- "zstd",
+ "uuid",
 ]
 
 [[package]]
@@ -3214,17 +3138,14 @@ name = "tokn-router"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-trait",
  "axum",
- "base64",
  "bytes",
  "flate2",
  "futures-util",
  "http",
  "hyper",
  "hyper-util",
- "ipnet",
  "parking_lot",
  "rcgen",
  "reqwest",
@@ -3242,22 +3163,16 @@ dependencies = [
  "tokio-rustls",
  "tokn-access",
  "tokn-accounts",
- "tokn-auth",
- "tokn-catalogue",
- "tokn-convert",
  "tokn-core",
+ "tokn-events",
  "tokn-headers",
- "tokn-provider-copilot",
- "tokn-provider-deepseek",
- "tokn-provider-openai",
- "tokn-provider-zai",
+ "tokn-mock-server",
+ "tokn-persistence",
+ "tokn-policy",
  "tokn-requests",
  "tokn-router-config",
  "toml",
- "tower",
- "tower-http",
  "tracing",
- "uuid",
  "zstd",
 ]
 
@@ -3267,12 +3182,14 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "reqwest",
+ "same-file",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
  "tokn-core",
  "tokn-headers",
+ "tokn-policy",
  "toml",
  "toml_edit",
  "tracing",
@@ -3298,9 +3215,11 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "directories",
+ "reqwest",
  "serde",
  "serde_yaml",
  "tempfile",
+ "thiserror",
  "tokn-core",
  "tokn-router-config",
  "toml",
@@ -3316,9 +3235,9 @@ dependencies = [
  "bytes",
  "eventsource-stream",
  "futures-util",
+ "http",
  "serde",
  "serde_json",
- "smol_str",
  "tempfile",
  "thiserror",
  "tokio",
@@ -3326,10 +3245,13 @@ dependencies = [
  "tokn-convert",
  "tokn-core",
  "tokn-endpoint-chat-completions",
+ "tokn-endpoint-core",
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
+ "tokn-events",
  "tokn-headers",
  "tokn-mock-server",
+ "tokn-policy",
  "tokn-requests",
  "tokn-router",
  "tokn-router-config",
@@ -3437,9 +3359,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]

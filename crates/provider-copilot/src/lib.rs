@@ -11,8 +11,8 @@ pub mod config;
 
 pub use tokn_catalogue as catalogue;
 pub use tokn_core::provider::{
-  error, AuthKind, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx,
-  Result, TemplateVars, ID_GITHUB_COPILOT,
+  error, AuthKind, CredentialPatchCtx, Endpoint, EndpointRule, HeaderPatchCtx, Provider, ProviderInfo,
+  ProviderRequestKind, RequestCtx, Result, TemplateVars, ID_GITHUB_COPILOT,
 };
 pub use tokn_core::{provider, util};
 
@@ -21,6 +21,7 @@ pub use github_copilot::*;
 use std::sync::Arc;
 use tokn_auth::descriptor::{EndpointSpec, ProviderDescriptor};
 use tokn_auth::provider::CredentialFlavor;
+use tokn_core::provider::ProviderTarget;
 
 pub const COPILOT_BASE_URL: &str = "https://api.githubcopilot.com";
 pub const COPILOT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
@@ -115,6 +116,9 @@ pub fn validate(account: &tokn_core::account::AccountConfig) -> tokn_core::provi
 
 pub fn build(
   account: Arc<tokn_core::account::AccountConfig>,
+  target: ProviderTarget,
 ) -> tokn_core::provider::Result<Arc<dyn tokn_core::provider::Provider>> {
-  Ok(Arc::new(github_copilot::CopilotProvider::from_account(account)?))
+  Ok(Arc::new(github_copilot::CopilotProvider::from_account_at(
+    account, target,
+  )?))
 }

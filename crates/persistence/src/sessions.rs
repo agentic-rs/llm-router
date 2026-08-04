@@ -1,4 +1,4 @@
-use super::{migrate, MessageRecord, PartRecord, Result};
+use super::{migrate, Result};
 #[cfg(test)]
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -9,18 +9,20 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokn_core::db::SessionSource;
 use tokn_headers::inbound::{PARENT_THREAD_ID_HEADERS, THREAD_ID_HEADERS};
 use tracing::debug;
 
 mod live;
+mod records;
 mod semantic;
 
-pub use live::SessionEventHandler;
+pub use live::SessionPersistenceConsumer;
+pub use records::{MessageRecord, PartRecord};
 use semantic::{request_messages_from_json, response_messages_from_body};
 
 const BOOTSTRAP: &str = include_str!("../schemas/snapshot/sessions/v0.2.1.sql");
 const REQUESTS_TS_MILLIS_SCHEMA_VERSION: u32 = 8;
+const SESSION_SOURCE_HEADER: &str = "header";
 const MIGRATIONS: &[migrate::Migration] = &[
   migrate::Migration {
     version: 1,
@@ -222,7 +224,7 @@ impl SessionsDb {
       params![
         r.session_id,
         r.ts,
-        SessionSource::Header.as_str(),
+        SESSION_SOURCE_HEADER,
         r.account_id.as_deref(),
         r.provider_id.as_deref(),
         r.model.as_deref(),
@@ -843,7 +845,7 @@ fn playback_request_connection(
     let ts: i64 = row.get(0)?;
     let session_id: String = row.get(1)?;
     let request_id: String = row.get(2)?;
-    let endpoint: String = row.get(3)?;
+    let endpoint: Option<String> = row.get(3)?;
     let request_order: i64 = row.get(8)?;
     if !options.force && sessions.node_exists(&session_id, &request_id)? {
       report.rows_existing += 1;
@@ -851,6 +853,16 @@ fn playback_request_connection(
       emit_playback_row_progress(progress, ctx, report);
       continue;
     }
+    let Some(endpoint) = endpoint else {
+      tracing::warn!(
+        requests_db = %ctx.requests_db.display(),
+        request_id = %request_id,
+        "request playback endpoint missing"
+      );
+      report.rows_skipped += 1;
+      emit_playback_row_progress(progress, ctx, report);
+      continue;
+    };
     let (headers, body, response_body) = select_playback_payload(requests, &request_id)?;
     let header_json = parse_json_bytes(&headers).unwrap_or(Value::Null);
     let body_json = if body.is_empty() {
@@ -2508,6 +2520,37 @@ mod tests {
       )
       .unwrap();
     assert_eq!(node_count, 0);
+  }
+
+  #[test]
+  fn playback_requests_skips_partial_rows_without_an_endpoint() {
+    let dir = tempdir();
+    let requests_path = dir.join("2026-05-22.db");
+    let sessions_path = dir.join("sessions.db");
+    crate::requests::open_day_db(&requests_path).unwrap();
+    let conn = Connection::open(&requests_path).unwrap();
+    conn
+      .execute(
+        "INSERT INTO request_connection (request_id, ts, ver, request_error)
+         VALUES ('req-partial', 100, 'test', 'request_body: invalid JSON')",
+        [],
+      )
+      .unwrap();
+    conn
+      .execute(
+        "INSERT INTO request_metadata (request_id, session_id)
+         VALUES ('req-partial', 'sess-1')",
+        [],
+      )
+      .unwrap();
+
+    let report = playback_requests_into_sessions(&requests_path, &sessions_path).unwrap();
+
+    assert_eq!(report.rows_seen, 1);
+    assert_eq!(report.rows_with_session, 1);
+    assert_eq!(report.rows_recorded, 0);
+    assert_eq!(report.rows_skipped, 1);
+    assert_eq!(report.decode_errors, 0);
   }
 
   #[test]

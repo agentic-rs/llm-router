@@ -25,5 +25,5 @@ pub use provider::{
   DeviceCodeHandle, DeviceFlowOutcome, MeteredBucket, ProviderAuth, QuotaSnapshot, RefreshOutcome, Result, UsageBucket,
   VerifyOutcome,
 };
-pub use store::{default_auth_path, AuthSource, AuthStore};
+pub use store::{default_auth_path, AuthSource, AuthStore, AuthStoreLock};
 pub use tokn_core::account::{AccountConfig, AccountState, AccountTier};

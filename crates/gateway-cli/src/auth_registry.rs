@@ -1,14 +1,14 @@
 //! Provider-id → [`ProviderAuth`] dispatch.
 //!
 //! Both the dispatch table and the list of known providers are derived
-//! from the [`tokn_router::accounts::registry::Registry`] descriptor list,
+//! from the [`tokn_accounts::registry::Registry`] descriptor list,
 //! which now carries `build_auth: Option<fn() -> &'static dyn ProviderAuth>`
 //! on every [`tokn_auth::ProviderDescriptor`]. Adding a new provider only
 //! requires registering its descriptor; this module needs no edits.
 
 use std::sync::OnceLock;
+use tokn_accounts::registry::Registry;
 use tokn_auth::ProviderAuth;
-use tokn_router::accounts::registry::Registry;
 
 fn registry() -> &'static Registry {
   static R: OnceLock<Registry> = OnceLock::new();

@@ -25,19 +25,16 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 /// noise from `tokn_router`.
 #[derive(Copy, Clone, Debug)]
 pub enum RunMode {
-  /// Long-running server process: full info-level logging.
-  Server,
-  /// Read-only CLI subcommand (account ls, usage stats, config get).
+  /// Read-only CLI subcommand (account ls, usage stats).
   /// Suppresses our own info-level chatter to keep stdout clean.
   ReadOnlyCli,
-  /// Mutating CLI subcommand (login, import, config set).
+  /// Mutating CLI subcommand (login, import).
   MutatingCli,
 }
 
 impl RunMode {
   fn default_directive(self) -> &'static str {
     match self {
-      RunMode::Server => "info,tokn_router=info",
       RunMode::ReadOnlyCli => "warn,tokn_router=warn",
       RunMode::MutatingCli => "warn,tokn_router=info",
     }
@@ -229,13 +226,13 @@ mod tests {
     // 1. RUST_LOG wins.
     std::env::set_var("RUST_LOG", "trace,tokn_router=trace");
     cfg.level = "warn,tokn_router=warn".into();
-    let f = build_filter(&cfg, RunMode::Server);
+    let f = build_filter(&cfg, RunMode::MutatingCli);
     assert!(format!("{f}").contains("trace"), "env should win: {f}");
 
     // 2. Config level wins over RunMode default when env is unset.
     std::env::remove_var("RUST_LOG");
     cfg.level = "warn,tokn_router=debug".into();
-    let f = build_filter(&cfg, RunMode::Server);
+    let f = build_filter(&cfg, RunMode::MutatingCli);
     let s = format!("{f}");
     assert!(s.contains("tokn_router=debug"), "config should win: {s}");
 
@@ -248,7 +245,7 @@ mod tests {
     // 4. Malformed env directive falls through to config.
     std::env::set_var("RUST_LOG", "this is not a filter ===");
     cfg.level = "info,tokn_router=info".into();
-    let f = build_filter(&cfg, RunMode::Server);
+    let f = build_filter(&cfg, RunMode::MutatingCli);
     let s = format!("{f}");
     assert!(s.contains("tokn_router=info"), "fallback on bad env: {s}");
 

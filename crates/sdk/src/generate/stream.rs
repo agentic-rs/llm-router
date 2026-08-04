@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use tokn_convert::ir::IrDelta;
 use tokn_convert::sse::SseAccumulator;
-use tokn_core::provider::Endpoint;
+use tokn_endpoint_core::Endpoint;
 
 use super::response::finish_reason;
 use super::Usage;
@@ -41,24 +41,38 @@ pub enum GenerateEvent {
 }
 
 /// A stream of provider-neutral generation events.
+///
+/// A recognized protocol terminal ends the semantic stream without waiting
+/// for the HTTP peer to close the connection. When lifecycle publication is
+/// enabled, its terminal batch is submitted before that semantic terminal is
+/// exposed. Dropping the stream before a terminal cancels the attached request
+/// lifecycle.
 pub type GenerateStream = BoxStream<'static, Result<GenerateEvent>>;
 
 /// A convenience stream containing only generated text deltas.
+///
+/// It retains the same semantic-terminal and early-drop behavior as
+/// [`GenerateStream`].
 pub type TextStream = BoxStream<'static, Result<String>>;
 
 struct EventParseState {
   events: EventStream<crate::ByteStream>,
   accumulator: SseAccumulator,
   pending: VecDeque<Result<GenerateEvent>>,
+  semantic_completion: Option<tokn_router::runtime::ManagedSemanticCompletion>,
   stop_after_pending: bool,
 }
 
 impl EventParseState {
-  fn new(bytes: crate::ByteStream) -> Self {
+  fn new(
+    bytes: crate::ByteStream,
+    semantic_completion: Option<tokn_router::runtime::ManagedSemanticCompletion>,
+  ) -> Self {
     Self {
       events: bytes.eventsource(),
       accumulator: SseAccumulator::new(Endpoint::Responses),
       pending: VecDeque::new(),
+      semantic_completion,
       stop_after_pending: false,
     }
   }
@@ -75,43 +89,71 @@ impl EventParseState {
     }
   }
 
+  fn complete_semantically(&mut self) -> Result<()> {
+    let Some(completion) = self.semantic_completion.take() else {
+      return Ok(());
+    };
+    completion.complete().map_err(|error| Error::GenerateStream {
+      message: format!("could not publish generation lifecycle completion: {error}"),
+    })
+  }
+
   fn fail(&mut self, error: Error) {
     self.enqueue(vec![Err(error)], true);
   }
 }
 
-pub(super) fn parse_events(bytes: crate::ByteStream) -> GenerateStream {
-  stream::unfold(EventParseState::new(bytes), |mut state| async move {
-    loop {
-      if let Some(result) = state.pending.pop_front() {
-        return Some((result, state));
-      }
-      if state.stop_after_pending {
-        return None;
-      }
+#[cfg(test)]
+fn parse_events(bytes: crate::ByteStream) -> GenerateStream {
+  parse_events_with_completion(bytes, None)
+}
 
-      match state.events.next().await {
-        Some(Ok(event)) if event.data.trim().is_empty() => {}
-        Some(Ok(event)) if event.data.trim() == "[DONE]" => {
-          state.stop_after_pending = true;
+pub(super) fn parse_events_with_completion(
+  bytes: crate::ByteStream,
+  semantic_completion: Option<tokn_router::runtime::ManagedSemanticCompletion>,
+) -> GenerateStream {
+  stream::unfold(
+    EventParseState::new(bytes, semantic_completion),
+    |mut state| async move {
+      loop {
+        if let Some(result) = state.pending.pop_front() {
+          return Some((result, state));
         }
-        Some(Ok(event)) => match serde_json::from_str::<Value>(&event.data) {
-          Ok(value) => {
-            let terminal = is_terminal_value(&value);
-            let results = results_from_value(&mut state.accumulator, value);
-            state.enqueue(results, terminal);
-          }
-          Err(source) => state.fail(Error::DeserializeStreamEvent { source }),
-        },
-        Some(Err(error)) => state.fail(Error::GenerateStream {
-          message: error.to_string(),
-        }),
-        None => state.fail(Error::GenerateStream {
-          message: "generation stream ended before a terminal event".into(),
-        }),
+        if state.stop_after_pending {
+          return None;
+        }
+
+        match state.events.next().await {
+          Some(Ok(event)) if event.data.trim().is_empty() => {}
+          Some(Ok(event)) if event.data.trim() == "[DONE]" => match state.complete_semantically() {
+            Ok(()) => state.stop_after_pending = true,
+            Err(error) => state.fail(error),
+          },
+          Some(Ok(event)) => match serde_json::from_str::<Value>(&event.data) {
+            Ok(value) => {
+              let terminal = is_terminal_value(&value);
+              let results = results_from_value(&mut state.accumulator, value);
+              if terminal {
+                match state.complete_semantically() {
+                  Ok(()) => state.enqueue(results, true),
+                  Err(error) => state.fail(error),
+                }
+              } else {
+                state.enqueue(results, false);
+              }
+            }
+            Err(source) => state.fail(Error::DeserializeStreamEvent { source }),
+          },
+          Some(Err(error)) => state.fail(Error::GenerateStream {
+            message: error.to_string(),
+          }),
+          None => state.fail(Error::GenerateStream {
+            message: "generation stream ended before a terminal event".into(),
+          }),
+        }
       }
-    }
-  })
+    },
+  )
   .boxed()
 }
 
@@ -263,9 +305,27 @@ mod tests {
   use super::*;
   use bytes::Bytes;
   use futures_util::stream;
+  use std::collections::VecDeque;
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::sync::Arc;
+  use std::task::Poll;
 
   fn byte_stream(body: String) -> crate::ByteStream {
     Box::pin(stream::once(async move { Ok(Bytes::from(body)) }))
+  }
+
+  fn tracked_byte_stream(chunks: Vec<std::io::Result<Bytes>>) -> (crate::ByteStream, Arc<AtomicBool>) {
+    let reached_eof = Arc::new(AtomicBool::new(false));
+    let eof_observation = Arc::clone(&reached_eof);
+    let mut chunks = VecDeque::from(chunks);
+    let bytes = stream::poll_fn(move |_| match chunks.pop_front() {
+      Some(chunk) => Poll::Ready(Some(chunk)),
+      None => {
+        eof_observation.store(true, Ordering::SeqCst);
+        Poll::Ready(None)
+      }
+    });
+    (Box::pin(bytes), reached_eof)
   }
 
   fn sse(values: impl IntoIterator<Item = Value>) -> String {
@@ -428,7 +488,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn successful_terminal_events_finish_without_polling_later_events() {
+  async fn successful_terminal_events_ignore_later_events() {
     let body = sse([
       serde_json::json!({
         "type": "response.completed",
@@ -453,6 +513,97 @@ mod tests {
         finish_reason: Some("stop".into())
       }]
     );
+  }
+
+  #[tokio::test]
+  async fn terminal_event_completes_before_transport_eof() {
+    let terminal = sse([serde_json::json!({
+      "type": "response.completed",
+      "response": {
+        "status": "completed",
+        "output": []
+      }
+    })]);
+    let (bytes, reached_eof) = tracked_byte_stream(vec![
+      Ok(Bytes::from(terminal)),
+      Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+    ]);
+    let mut events = parse_events(bytes);
+
+    assert!(matches!(
+      events.next().await,
+      Some(Ok(GenerateEvent::Completed {
+        finish_reason: Some(reason)
+      })) if reason == "stop"
+    ));
+    assert!(!reached_eof.load(Ordering::SeqCst));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn done_marker_without_semantic_terminal_completes_before_eof() {
+    let (bytes, reached_eof) = tracked_byte_stream(vec![Ok(Bytes::from_static(b"data: [DONE]\n\n"))]);
+
+    let events = parse_events(bytes)
+      .try_collect::<Vec<_>>()
+      .await
+      .expect("DONE marker should end the semantic stream");
+
+    assert!(events.is_empty());
+    assert!(!reached_eof.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn transport_error_after_semantic_terminal_does_not_replace_completion() {
+    let terminal = sse([serde_json::json!({
+      "type": "response.completed",
+      "response": {
+        "status": "completed",
+        "output": []
+      }
+    })]);
+    let bytes: crate::ByteStream = Box::pin(stream::iter([
+      Ok(Bytes::from(terminal)),
+      Err(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset while draining",
+      )),
+    ]));
+    let mut events = parse_events(bytes);
+
+    assert!(matches!(
+      events.next().await,
+      Some(Ok(GenerateEvent::Completed {
+        finish_reason: Some(reason)
+      })) if reason == "stop"
+    ));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn terminal_event_does_not_wait_for_a_peer_that_keeps_the_connection_open() {
+    let terminal = sse([serde_json::json!({
+      "type": "response.completed",
+      "response": {
+        "status": "completed",
+        "output": []
+      }
+    })]);
+    let bytes: crate::ByteStream = Box::pin(
+      stream::once(async move { Ok(Bytes::from(terminal)) }).chain(stream::pending::<std::io::Result<Bytes>>()),
+    );
+    let mut events = parse_events(bytes);
+
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), events.next())
+      .await
+      .expect("semantic completion waited for transport EOF");
+    assert!(matches!(
+      terminal,
+      Some(Ok(GenerateEvent::Completed {
+        finish_reason: Some(reason)
+      })) if reason == "stop"
+    ));
+    assert!(events.next().await.is_none());
   }
 
   #[tokio::test]

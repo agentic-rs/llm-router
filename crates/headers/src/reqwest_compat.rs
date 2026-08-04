@@ -33,7 +33,7 @@ impl From<&ReqMap> for HeaderMap {
     let mut out = HeaderMap::with_capacity(value.len());
     for (name, val) in value {
       let Ok(s) = val.to_str() else { continue };
-      out.insert(name.as_str(), HeaderValue::from_string(s.to_string()));
+      out.append(name.as_str(), HeaderValue::from_string(s.to_string()));
     }
     out
   }
@@ -63,6 +63,10 @@ mod tests {
     m.append("Set-Cookie", "b=2");
     let r: ReqMap = m.into();
     let all: Vec<_> = r.get_all("set-cookie").iter().map(|v| v.to_str().unwrap()).collect();
+    assert_eq!(all, vec!["a=1", "b=2"]);
+
+    let back: HeaderMap = (&r).into();
+    let all: Vec<_> = back.get_all("set-cookie").map(HeaderValue::as_str).collect();
     assert_eq!(all, vec!["a=1", "b=2"]);
   }
 }

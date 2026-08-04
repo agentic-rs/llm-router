@@ -1,27 +1,66 @@
 # @tokn/sdk
 
-Embedded TypeScript SDK for routing LLM requests through the providers,
-profiles, configuration, and credentials already managed by tokn.
+Embedded TypeScript SDK for routing LLM requests through a managed profile in
+a strict `schema_version = 2` tokn gateway configuration.
 
 The package is an ESM package for Node.js 22+ and Bun. Its public API is
 TypeScript, while routing and provider execution run in-process through the
 same Rust engine as `tokn-gateway`.
+
+Each client is bound to one managed profile for its complete lifetime. The
+profile may point at a listener-free route, so embedding the SDK does not
+require starting a gateway server. Build another client when an application
+needs another profile; requests cannot override the client-bound profile.
 
 The repository package is currently a source preview and is deliberately
 marked private. Build it from this checkout and link the directory into an
 application; npm publication stays disabled until the release pipeline builds,
 assembles, and install-tests every declared native package.
 
+## Configuration
+
+The SDK loads the compiled v2 gateway graph and the normal tokn credential
+store. A minimal listener-free profile can use a fixed upstream and
+provider-qualified model names:
+
+```toml
+schema_version = 2
+
+[profiles.work]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "default"
+upstream = { kind = "fixed", upstream = "local" }
+model = { kind = "qualified", namespace = "provider" }
+operation = "translate_compatible"
+
+[account_pools.default]
+active_accounts = ["*"]
+providers = ["llama-cpp"]
+
+[upstreams.local]
+provider = "llama-cpp"
+base_url = "http://127.0.0.1:8080/v1"
+accounts = ["local-llama"]
+```
+
+Only managed profiles can be embedded. Relay and transparent routes require a
+listener-backed gateway. `Client.create()` uses the conventional `default`
+profile when `profile` is omitted. The immutable selection is available as
+the read-only `client.profile` property.
+
 ## Usage
 
 ```ts
 import { Client } from "@tokn/sdk";
 
-const client = await Client.create();
+const client = await Client.create({ profile: "work" });
 
 try {
   const response = await client
-    .generate("smart")
+    .generate("llama-cpp/qwen3")
     .system("You are a TypeScript expert.")
     .prompt("Explain this function.")
     .temperature(0.2)
@@ -38,7 +77,7 @@ or transform:
 
 ```ts
 const request = {
-  model: "smart",
+  model: "llama-cpp/qwen3",
   prompt: "Plan this migration.",
   top_p: 0.9,
   max_output_tokens: 2048,
@@ -62,7 +101,7 @@ Generation streams are pull-based async iterables:
 const controller = new AbortController();
 const stream = await client.textStream(
   {
-    model: "smart",
+    model: "llama-cpp/qwen3",
     prompt: "Write a short explanation.",
   },
   { signal: controller.signal },
@@ -83,17 +122,18 @@ read.
 
 ## Raw endpoints
 
-The provider-neutral API is the default. Raw endpoint namespaces remain
-available when an application needs an exact wire shape:
+The provider-neutral API is the default. Endpoint-shaped requests are also
+available when an application needs to provide Chat Completions, Responses,
+or Messages JSON directly. The managed profile may still translate that
+request for its selected upstream:
 
 ```ts
 const response = await client.chat.completions.create(
   {
-    model: "smart",
+    model: "llama-cpp/qwen3",
     messages: [{ role: "user", content: "Hello" }],
   },
   {
-    profile: "work",
     request_id: crypto.randomUUID(),
   },
 );

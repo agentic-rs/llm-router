@@ -84,6 +84,10 @@ impl PyClient {
     self.inner.auth_path().to_string_lossy().into_owned()
   }
 
+  fn profile(&self) -> String {
+    self.inner.profile().to_string()
+  }
+
   #[pyo3(signature = (endpoint, body_json, options_json=None))]
   fn request<'py>(
     &self,
@@ -384,13 +388,21 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
 fn sdk_error(error: SdkError) -> PyErr {
   let message = error_chain(&error);
   match error {
-    SdkError::LoadConfig { .. } | SdkError::BuildEngine { .. } | SdkError::UnknownProfile { .. } => {
-      ConfigurationError::new_err(message)
-    }
+    SdkError::ResolveConfigPath { .. }
+    | SdkError::LoadConfig { .. }
+    | SdkError::InvalidProfileId { .. }
+    | SdkError::UnknownProfile { .. }
+    | SdkError::NonManagedProfile { .. }
+    | SdkError::LinkRuntime { .. }
+    | SdkError::BuildExecutor { .. } => ConfigurationError::new_err(message),
     SdkError::LoadCredentials { .. } => AuthenticationError::new_err(message),
-    SdkError::InvalidGenerateRequest { .. }
+    SdkError::InvalidHeaderName { .. }
+    | SdkError::InvalidHeaderValue { .. }
+    | SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }
-    | SdkError::Pipeline { .. }
+    | SdkError::ManagedRequest { .. }
+    | SdkError::CoolingDown { .. }
+    | SdkError::NoEligible { .. }
     | SdkError::UnexpectedStream
     | SdkError::UnexpectedBuffered => RequestError::new_err(message),
     SdkError::GenerateResponseStatus { status, body } => api_status_error(message, status, body),

@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::db::UsageDb;
 use anyhow::Result;
 use clap::Args;
@@ -21,8 +20,8 @@ pub struct UsageArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: UsageArgs) -> Result<()> {
-  let (cfg, _) = Config::load(cfg_path.as_deref())?;
-  let path = cfg.db.resolve_paths()?.usage_db;
+  let config = super::command_config::CommandConfig::load(cfg_path.as_deref())?;
+  let path = config.persistence_paths()?.usage_db;
   let db = UsageDb::open(&path)?;
 
   let since: Duration = humantime::parse_duration(&args.since)?;

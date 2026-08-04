@@ -1,12 +1,12 @@
 use crate::auth_registry::known_providers;
 use crate::cli::onboarding::{resolve_account, CredentialSource};
-use crate::config::{Config, ProxyConfig};
-use crate::util::http::build_client;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use tokn_auth::AuthStore;
+use tokn_core::util::http::{build_client, HttpClientOptions};
+
+use super::command_config::CommandConfig;
 
 #[derive(Args, Debug)]
 pub struct LoginArgs {
@@ -28,15 +28,14 @@ pub struct LoginArgs {
   pub no_proxy: bool,
 }
 
-pub async fn run(cfg_path: Option<PathBuf>, args: LoginArgs) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
-  let proxy = if args.no_proxy {
-    ProxyConfig::default()
+pub async fn run(config: &CommandConfig, args: LoginArgs) -> Result<()> {
+  let mut store = AuthStore::load(None, Some(config.path()))?;
+  let http_options = if args.no_proxy {
+    HttpClientOptions::default()
   } else {
-    cfg.proxy.clone()
+    config.outbound_http_options()
   };
-  let client = build_client(&proxy)?;
+  let client = build_client(&http_options)?;
 
   let provider = match args.provider {
     Some(p) => p,

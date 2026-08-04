@@ -76,9 +76,18 @@ pub fn load_legacy_accounts(config_path: &Path) -> Result<Option<Vec<AccountConf
   if !config_path.exists() {
     return Ok(None);
   }
-  let raw = fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?;
-  let parsed: LegacyAccounts =
-    toml::from_str(&raw).with_context(|| format!("parsing legacy {}", config_path.display()))?;
+  let raw = fs::read(config_path).with_context(|| format!("reading {}", config_path.display()))?;
+  parse_legacy_accounts(&raw, config_path)
+}
+
+/// Parse embedded legacy accounts from an exact config-file snapshot.
+///
+/// Migration transactions use this entry point so credentials are derived
+/// from the same bytes that are later backed up and guarded as the config
+/// replacement preimage.
+pub fn parse_legacy_accounts(raw: &[u8], source: &Path) -> Result<Option<Vec<AccountConfig>>> {
+  let raw = std::str::from_utf8(raw).with_context(|| format!("reading {} as UTF-8", source.display()))?;
+  let parsed: LegacyAccounts = toml::from_str(raw).with_context(|| format!("parsing legacy {}", source.display()))?;
   if parsed.accounts.is_empty() {
     Ok(None)
   } else {
@@ -225,5 +234,31 @@ enabled = true
     let accounts = load_legacy_accounts(&present).unwrap().unwrap();
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0].id, "legacy");
+  }
+
+  #[test]
+  fn parse_legacy_accounts_uses_the_supplied_snapshot() {
+    let source = Path::new("captured-config.toml");
+    let captured = br#"
+[[accounts]]
+id = "captured"
+provider = "openai"
+enabled = true
+"#;
+
+    let accounts = parse_legacy_accounts(captured, source).unwrap().unwrap();
+
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, "captured");
+  }
+
+  #[test]
+  fn parse_legacy_accounts_reports_the_snapshot_source() {
+    let source = Path::new("captured-config.toml");
+
+    let error = parse_legacy_accounts(&[0xff], source).unwrap_err();
+
+    assert!(format!("{error:#}").contains("captured-config.toml"));
+    assert!(format!("{error:#}").contains("UTF-8"));
   }
 }

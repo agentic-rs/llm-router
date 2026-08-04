@@ -1,11 +1,12 @@
 use crate::cli::onboarding::{resolve_account, CredentialSource};
-use crate::config::{Config, ProxyConfig};
-use crate::util::http::build_client;
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use std::io::Read;
 use std::path::PathBuf;
 use tokn_auth::{AuthStore, CredentialFlavor};
+use tokn_core::util::http::{build_client, HttpClientOptions};
+
+use super::command_config::CommandConfig;
 
 /// `account import` — non-interactive credential import.
 ///
@@ -65,13 +66,12 @@ pub struct ImportArgs {
   pub id: Option<String>,
 }
 
-pub async fn run(cfg_path: Option<PathBuf>, args: ImportArgs) -> Result<()> {
+pub async fn run(config: &CommandConfig, args: ImportArgs) -> Result<()> {
   let source = build_source(&args)?;
-  let client = build_client(&ProxyConfig::default())?;
+  let client = build_client(&HttpClientOptions::default())?;
   let account = resolve_account(&client, &args.provider, args.id.clone(), source).await?;
 
-  let (_cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
+  let mut store = AuthStore::load(None, Some(config.path()))?;
   let id = account.id.clone();
   let provider = account.provider.clone();
   store.upsert_in_main(account)?;

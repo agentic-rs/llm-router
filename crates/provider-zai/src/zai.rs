@@ -21,24 +21,29 @@ use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::Value;
 use tokn_core::account::AccountConfig;
-use tokn_core::pipeline::InputTransformer;
+use tokn_core::provider::{InputTransformer, ProviderTarget};
+use tokn_core::upstream_url::CleartextHttpPolicy;
 use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-  error, AuthKind, HeaderPatchCtx, ModelInfo, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
-  ZAI_PROVIDERS,
+  error, AuthKind, CredentialPatchCtx, HeaderPatchCtx, ModelInfo, Provider, ProviderInfo, ProviderRequestKind,
+  RequestCtx, Result, ID_ZAI, ID_ZAI_CODING_PLAN, ID_ZHIPUAI, ID_ZHIPUAI_CODING_PLAN, ZAI_PROVIDERS,
 };
 
-/// Default upstream for the coding plan. Override per-account via
-/// `[accounts.<id>.zai] base_url = "..."`.
-pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+/// Canonical upstreams for the four Z.ai provider identities. Legacy account
+/// URLs may override these until destination ownership moves fully to v2
+/// upstream resources.
+pub const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+pub const ZAI_CODING_PLAN_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+pub const ZHIPUAI_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+pub const ZHIPUAI_CODING_PLAN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
 pub struct ZaiProvider {
   pub id: String,
   api_key: Secret<String>,
-  base_url: String,
+  target: ProviderTarget,
   info: ProviderInfo,
 }
 
@@ -48,7 +53,7 @@ impl std::fmt::Debug for ZaiProvider {
     // panic output.
     f.debug_struct("ZaiProvider")
       .field("id", &self.id)
-      .field("base_url", &self.base_url)
+      .field("base_url", &self.target.base_url())
       .field("provider", &self.info.id)
       .finish()
   }
@@ -76,28 +81,45 @@ impl ZaiProvider {
 
   pub fn from_account(a: std::sync::Arc<AccountConfig>) -> Result<Self> {
     Self::validate_account(&a)?;
+    let base_url = a.base_url.clone().unwrap_or_else(|| {
+      default_base_url(&a.provider)
+        .expect("validated Z.ai provider id")
+        .to_string()
+    });
+    let target = ProviderTarget::parse(&base_url, CleartextHttpPolicy::Allow).map_err(|source| {
+      error::Error::InvalidUpstreamUrl {
+        account: a.id.clone(),
+        source,
+      }
+    })?;
+    Ok(Self::from_validated_account_at(a, target))
+  }
+
+  pub fn from_account_at(a: std::sync::Arc<AccountConfig>, target: ProviderTarget) -> Result<Self> {
+    Self::validate_account(&a)?;
+    Ok(Self::from_validated_account_at(a, target))
+  }
+
+  fn from_validated_account_at(a: std::sync::Arc<AccountConfig>, target: ProviderTarget) -> Self {
     let key = a.api_key.clone().expect("validated api_key");
-    let base_url = a
-      .base_url
-      .clone()
-      .unwrap_or_else(|| default_base_url(&a.provider).to_string());
+    let upstream_url = target.base_url().to_string();
 
     let info = ProviderInfo {
       id: a.provider.clone(),
       aliases: &[],
       display_name: "Z.ai (GLM Coding Plan)",
-      upstream_url: base_url.clone(),
+      upstream_url,
       auth_kind: AuthKind::StaticApiKey,
       default_models: models::catalogue_for(&a.provider),
       default_endpoints: crate::DEFAULT_ENDPOINTS,
-      model_cache: std::sync::Arc::new(tokn_core::provider::ModelCache::default()),
+      model_cache: target.model_cache().clone(),
     };
-    Ok(Self {
+    Self {
       id: format!("{}:{}", a.provider, a.id),
       api_key: key,
-      base_url,
+      target,
       info,
-    })
+    }
   }
 
   fn auth_headers(&self, streaming: bool) -> Result<HeaderMap> {
@@ -130,8 +152,14 @@ impl InputTransformer for ZaiProvider {
   }
 }
 
-pub fn default_base_url(_provider: &str) -> &'static str {
-  DEFAULT_BASE_URL
+pub fn default_base_url(provider: &str) -> Option<&'static str> {
+  match provider {
+    ID_ZAI => Some(ZAI_BASE_URL),
+    ID_ZAI_CODING_PLAN => Some(ZAI_CODING_PLAN_BASE_URL),
+    ID_ZHIPUAI => Some(ZHIPUAI_BASE_URL),
+    ID_ZHIPUAI_CODING_PLAN => Some(ZHIPUAI_CODING_PLAN_BASE_URL),
+    _ => None,
+  }
 }
 
 #[async_trait]
@@ -152,7 +180,7 @@ impl Provider for ZaiProvider {
     self.info.default_models.iter().find(|m| m.id == model)
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> Result<()> {
     headers.insert(
       &AUTHORIZATION,
       HeaderValue::from_string(format!("Bearer {}", self.api_key.expose())),
@@ -182,14 +210,13 @@ impl Provider for ZaiProvider {
     fields(account = %self.id, key_fp = %self.api_key.fingerprint(), status = tracing::field::Empty, count = tracing::field::Empty),
   )]
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
-    let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+    let url = self.target.base_url().operation_url(["models"])?;
     debug!(%url, "GET zai models");
     let resp = crate::util::http::send(
       http,
       Method::GET,
-      &url,
+      url.as_str(),
       self.auth_headers(false)?,
-      None,
       None,
       "zai /models",
     )
@@ -230,7 +257,7 @@ impl Provider for ZaiProvider {
     span.record("model", model_id);
     span.record("reasoning", reasoning);
 
-    let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+    let url = self.target.base_url().operation_url(["chat", "completions"])?;
     debug!(%url, "POST zai chat");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -244,20 +271,13 @@ impl Provider for ZaiProvider {
         initiator: ctx.initiator,
         inbound_headers: ctx.inbound_headers,
         vars: &ctx.vars,
-        agent_id: &ctx.agent_id,
+        wire_identity: ctx.wire_identity.as_ref(),
       },
     )?;
     let body_bytes = ctx.request_body_bytes();
-    let resp = crate::util::http::send(
-      ctx.http,
-      Method::POST,
-      &url,
-      headers,
-      Some(body_bytes),
-      ctx.outbound.as_ref(),
-      "zai chat",
-    )
-    .await?;
+    let resp = ctx
+      .send(Method::POST, url.as_str(), headers, Some(body_bytes), "zai chat")
+      .await?;
     span.record("status", resp.status().as_u16());
     Ok(resp)
   }
@@ -277,9 +297,11 @@ impl Provider for ZaiProvider {
 mod tests {
   use super::*;
   use crate::config::Account as AcctCfg;
-  use crate::provider::{new_outbound_capture, Endpoint, RequestCtx, ZAI_PROVIDERS};
+  use crate::provider::{Endpoint, RequestCtx, ZAI_PROVIDERS};
   use crate::TemplateVars;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+  const MAX_TEST_REQUEST_BYTES: usize = 64 * 1024;
 
   fn acct(provider: &str, key: Option<&str>) -> AcctCfg {
     AcctCfg {
@@ -304,6 +326,51 @@ mod tests {
       refresh_url: None,
       last_refresh: None,
       settings: toml::Table::new(),
+    }
+  }
+
+  async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (Vec<u8>, Vec<u8>) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+      let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buffer))
+        .await
+        .expect("request read timed out")
+        .expect("read request");
+      assert!(read > 0, "client closed before sending the complete request");
+      request.extend_from_slice(&buffer[..read]);
+      assert!(
+        request.len() <= MAX_TEST_REQUEST_BYTES,
+        "request exceeded {MAX_TEST_REQUEST_BYTES}-byte test bound"
+      );
+
+      let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        continue;
+      };
+      let body_start = head_end + 4;
+      let head = std::str::from_utf8(&request[..body_start]).expect("request head is UTF-8");
+      let body_len = head
+        .lines()
+        .find_map(|line| {
+          let (name, value) = line.split_once(':')?;
+          name
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().expect("valid content-length"))
+        })
+        .expect("request has content-length");
+      let request_len = body_start
+        .checked_add(body_len)
+        .expect("request length does not overflow");
+      assert!(
+        request_len <= MAX_TEST_REQUEST_BYTES,
+        "declared request length exceeded test bound"
+      );
+      if request.len() >= request_len {
+        return (
+          request[..body_start].to_vec(),
+          request[body_start..request_len].to_vec(),
+        );
+      }
     }
   }
 
@@ -337,9 +404,16 @@ mod tests {
   }
 
   #[test]
-  fn defaults_to_official_endpoint() {
-    let p = ZaiProvider::from_account(std::sync::Arc::new(acct("zai", Some("sk-x")))).unwrap();
-    assert_eq!(p.base_url, DEFAULT_BASE_URL);
+  fn each_alias_defaults_to_its_descriptor_endpoint() {
+    for (provider, expected) in [
+      (ID_ZAI, ZAI_BASE_URL),
+      (ID_ZAI_CODING_PLAN, ZAI_CODING_PLAN_BASE_URL),
+      (ID_ZHIPUAI, ZHIPUAI_BASE_URL),
+      (ID_ZHIPUAI_CODING_PLAN, ZHIPUAI_CODING_PLAN_BASE_URL),
+    ] {
+      let provider = ZaiProvider::from_account(std::sync::Arc::new(acct(provider, Some("sk-x")))).unwrap();
+      assert_eq!(provider.target.base_url().as_str(), format!("{expected}/"));
+    }
   }
 
   #[test]
@@ -347,7 +421,30 @@ mod tests {
     let mut a = acct("zhipuai", Some("sk-x"));
     a.base_url = Some("https://open.bigmodel.cn/api/paas/v4".into());
     let p = ZaiProvider::from_account(std::sync::Arc::new(a)).unwrap();
-    assert_eq!(p.base_url, "https://open.bigmodel.cn/api/paas/v4");
+    assert_eq!(p.target.base_url().as_str(), "https://open.bigmodel.cn/api/paas/v4/");
+  }
+
+  #[test]
+  fn explicit_target_owns_the_destination_and_cache() {
+    let mut account = acct("zai", Some("sk-x"));
+    account.base_url = Some("https://ignored.example/v1".into());
+    let target = ProviderTarget::parse("https://gateway.example/zai", CleartextHttpPolicy::Allow).unwrap();
+    let cache = target.model_cache().clone();
+
+    let provider = ZaiProvider::from_account_at(std::sync::Arc::new(account), target).unwrap();
+
+    assert_eq!(provider.target.base_url().as_str(), "https://gateway.example/zai/");
+    assert_eq!(
+      provider
+        .target
+        .base_url()
+        .operation_url(["chat", "completions"])
+        .unwrap()
+        .as_str(),
+      "https://gateway.example/zai/chat/completions"
+    );
+    assert_eq!(provider.info().upstream_url, "https://gateway.example/zai/");
+    assert!(std::sync::Arc::ptr_eq(&provider.info().model_cache, &cache));
   }
 
   #[test]
@@ -374,18 +471,18 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn captures_transformed_outbound_body() {
+  async fn sends_the_exact_transformed_body() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
       let (mut stream, _) = listener.accept().await.unwrap();
-      let mut buf = vec![0_u8; 8192];
-      let n = stream.read(&mut buf).await.unwrap();
-      assert!(String::from_utf8_lossy(&buf[..n]).contains("POST /chat/completions"));
+      let (head, body) = read_http_request(&mut stream).await;
+      assert!(String::from_utf8_lossy(&head).starts_with("POST /chat/completions HTTP/1.1\r\n"));
       stream
         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
         .await
         .unwrap();
+      body
     });
 
     let mut cfg = acct("zai-coding-plan", Some("sk-test"));
@@ -399,7 +496,6 @@ mod tests {
       )
       .unwrap();
     let inbound = HeaderMap::new();
-    let capture = new_outbound_capture();
     let ctx = RequestCtx {
       endpoint: Endpoint::ChatCompletions,
       http: &http,
@@ -410,19 +506,18 @@ mod tests {
       initiator: "user",
       inbound_headers: &inbound,
       client_headers: None,
-      outbound: Some(capture.clone()),
       vars: TemplateVars::default(),
-      agent_id: tokn_core::AgentId::Opencode,
+      wire_identity: Some(tokn_core::AgentId::Opencode),
+      request_observer: None,
     };
     let resp = provider.chat(ctx).await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    server.await.unwrap();
-    let captured = capture.get().expect("captured outbound");
-    let captured_body: Value = serde_json::from_slice(captured.req_body.as_ref()).unwrap();
-    assert_eq!(captured.method.as_deref(), Some("POST"));
+    let outbound_body = server.await.unwrap();
+    assert_eq!(outbound_body, serde_json::to_vec(&body).unwrap());
+    let outbound: Value = serde_json::from_slice(&outbound_body).unwrap();
     assert!(
-      captured_body.get("thinking").is_some(),
-      "body was not transformed: {captured_body}"
+      outbound.get("thinking").is_some(),
+      "body was not transformed: {outbound}"
     );
   }
 
@@ -441,7 +536,7 @@ mod tests {
       initiator: "user",
       inbound_headers: Box::leak(Box::new(HeaderMap::new())),
       vars: Box::leak(Box::new(TemplateVars::default())),
-      agent_id: Box::leak(Box::new(tokn_core::AgentId::Opencode)),
+      wire_identity: Some(Box::leak(Box::new(tokn_core::AgentId::Opencode))),
     }
   }
 

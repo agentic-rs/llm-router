@@ -1,16 +1,18 @@
-use crate::account::AccountConfig;
+use crate::upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy, InvalidUpstreamUrl};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
+use tokn_headers::keys::{AUTHORIZATION, CHATGPT_ACCOUNT_ID, COOKIE, X_API_KEY};
 pub use tokn_headers::TemplateVars;
 use tokn_headers::{AgentId, HeaderMap};
 
 pub mod error;
 
 pub use error::{Error, Result};
+pub use tokn_endpoint_core::Endpoint;
 
 pub const ID_GITHUB_COPILOT: &str = "github-copilot";
 pub const ID_DEEPSEEK: &str = "deepseek";
@@ -159,43 +161,36 @@ impl ModelCache {
   }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Endpoint {
-  ChatCompletions,
-  Responses,
-  Messages,
+/// Runtime destination shared by every account binding for one configured
+/// upstream.
+///
+/// Construct one target per upstream id, then clone it when binding eligible
+/// accounts. Clones intentionally share the model cache; constructing another
+/// target, even for the same URL, creates an independent cache.
+#[derive(Clone, Debug)]
+pub struct ProviderTarget {
+  base_url: CanonicalUpstreamUrl,
+  model_cache: Arc<ModelCache>,
 }
 
-impl Endpoint {
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Endpoint::ChatCompletions => "chat_completions",
-      Endpoint::Responses => "responses",
-      Endpoint::Messages => "messages",
+impl ProviderTarget {
+  pub fn new(base_url: CanonicalUpstreamUrl) -> Self {
+    Self {
+      base_url,
+      model_cache: Arc::new(ModelCache::default()),
     }
   }
 
-  /// Best-effort guess at which [`Endpoint`] variant a given path
-  /// represents. Used only to populate [`tokn_requests::RawInbound::endpoint`];
-  /// the proxy passthrough pipeline never branches on it.
-  pub fn infer_from(path: impl AsRef<str>) -> Option<Self> {
-    let path = path.as_ref();
-    if path.ends_with("/chat/completions") {
-      Some(Endpoint::ChatCompletions)
-    } else if path.ends_with("/responses") {
-      Some(Endpoint::Responses)
-    } else if path.ends_with("/messages") {
-      Some(Endpoint::Messages)
-    } else {
-      None
-    }
+  pub fn parse(base_url: &str, cleartext: CleartextHttpPolicy) -> Result<Self, InvalidUpstreamUrl> {
+    CanonicalUpstreamUrl::parse(base_url, cleartext).map(Self::new)
   }
-}
 
-impl std::fmt::Display for Endpoint {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(self.as_str())
+  pub fn base_url(&self) -> &CanonicalUpstreamUrl {
+    &self.base_url
+  }
+
+  pub fn model_cache(&self) -> &Arc<ModelCache> {
+    &self.model_cache
   }
 }
 
@@ -273,9 +268,16 @@ pub struct RequestCtx<'a> {
   pub initiator: &'a str,
   pub inbound_headers: &'a HeaderMap,
   pub client_headers: Option<HeaderMap>,
-  pub outbound: Option<OutboundCapture>,
   pub vars: TemplateVars,
-  pub agent_id: AgentId,
+  /// Explicit client identity to present on the upstream wire. `None` means
+  /// provider-required headers only; providers must not invent a persona.
+  pub wire_identity: Option<AgentId>,
+  /// Optional observer invoked after the provider has prepared the final URL,
+  /// headers, and body, but before the request is handed to reqwest.
+  ///
+  /// This is deliberately transport-shaped rather than event-shaped. Library
+  /// users that do not need request lifecycle observation leave it as `None`.
+  pub request_observer: Option<&'a mut dyn OutboundRequestObserver>,
 }
 
 impl RequestCtx<'_> {
@@ -286,25 +288,38 @@ impl RequestCtx<'_> {
       .unwrap_or_else(|| Bytes::from(serde_json::to_vec(self.body).unwrap_or_default()))
   }
 
-  pub fn capture_outbound(&self, method: &str, url: &str, headers: &HeaderMap, body: Bytes) {
-    if let Some(slot) = self.outbound.as_ref() {
-      let _ = slot.set(crate::db::OutboundSnapshot {
-        method: Some(method.to_string()),
-        url: Some(url.to_string()),
-        status: None,
-        req_headers: headers.clone(),
-        req_body: body,
-        resp_headers: HeaderMap::new(),
-        resp_body: Bytes::new(),
-      });
-    }
+  /// Send the final provider-prepared request through the shared transport
+  /// boundary, notifying the optional observer before any network I/O begins.
+  pub async fn send(
+    mut self,
+    method: reqwest::Method,
+    url: &str,
+    headers: HeaderMap,
+    body: Option<Bytes>,
+    what: &'static str,
+  ) -> Result<reqwest::Response> {
+    crate::util::http::send_observed(
+      self.http,
+      method,
+      url,
+      headers,
+      body,
+      what,
+      self.request_observer.take(),
+    )
+    .await
   }
 }
 
-pub type OutboundCapture = Arc<OnceLock<crate::db::OutboundSnapshot>>;
-
-pub fn new_outbound_capture() -> OutboundCapture {
-  Arc::new(OnceLock::new())
+/// Async observation hook for one fully prepared outbound HTTP request.
+///
+/// The supplied [`reqwest::Request`] has already had transport-derived `Host`
+/// and `Content-Length` fields removed. Its URL, remaining native headers, and
+/// reusable byte body are the last application-visible representation before
+/// reqwest performs connection-specific framing.
+#[async_trait]
+pub trait OutboundRequestObserver: Send {
+  async fn observe(&mut self, request: &reqwest::Request) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +347,17 @@ impl ProviderRequestKind {
   }
 }
 
+/// Credential-only inputs for provider-owned authorization patches.
+///
+/// This deliberately excludes payload and header-normalization state so
+/// opaque relay requests can replace account credentials without changing
+/// the client's remaining wire headers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialPatchCtx<'a> {
+  pub request_kind: ProviderRequestKind,
+  pub bearer_token: Option<&'a str>,
+}
+
 pub struct HeaderPatchCtx<'a> {
   pub request_kind: ProviderRequestKind,
   pub body: &'a Value,
@@ -341,10 +367,19 @@ pub struct HeaderPatchCtx<'a> {
   pub initiator: &'a str,
   pub inbound_headers: &'a HeaderMap,
   pub vars: &'a TemplateVars,
-  pub agent_id: &'a AgentId,
+  /// Explicit client identity to normalize around. `None` requests a neutral
+  /// provider-owned header shape without synthesized persona markers.
+  pub wire_identity: Option<&'a AgentId>,
 }
 
 impl HeaderPatchCtx<'_> {
+  fn credential_patch_ctx(&self) -> CredentialPatchCtx<'_> {
+    CredentialPatchCtx {
+      request_kind: self.request_kind,
+      bearer_token: self.bearer_token,
+    }
+  }
+
   pub fn endpoint(&self) -> Option<Endpoint> {
     self.request_kind.endpoint()
   }
@@ -356,12 +391,21 @@ impl HeaderPatchCtx<'_> {
   }
 }
 
+/// Provider-owned final transformation of a managed request body.
+///
+/// Managed execution invokes this after endpoint conversion and shared
+/// generation-option lowering, immediately before serializing the upstream
+/// wire body.
+pub trait InputTransformer: Send + Sync {
+  fn transform_input(&self, endpoint: Endpoint, body: Value) -> Result<Value>;
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
   fn id(&self) -> &str;
   fn info(&self) -> &ProviderInfo;
 
-  fn input_transformer(&self) -> Option<&dyn crate::pipeline::InputTransformer> {
+  fn input_transformer(&self) -> Option<&dyn InputTransformer> {
     None
   }
 
@@ -436,16 +480,63 @@ pub trait Provider: Send + Sync {
   /// bearer tokens, API keys, or provider account identifiers. These values
   /// are treated as credentials, not ordinary header fallbacks. Final
   /// transport/default enforcement belongs in [`Provider::normalize_headers`].
-  fn inject_credentials(&self, _headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+  ///
+  /// Provider implementations must override this hook rather than relying on
+  /// a custom [`Provider::patch_headers`] implementation. Both managed header
+  /// patching and opaque request authorization call it through
+  /// [`Provider::replace_credentials`].
+  fn inject_credentials(&self, _headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> Result<()> {
+    Ok(())
+  }
+
+  /// Remove client account credentials, then inject the selected account's
+  /// provider-owned replacements. A replacement keeps the original header
+  /// position when that credential name was already present; other credential
+  /// kinds are removed before the request leaves the process.
+  ///
+  /// Cookie authentication is credential material too: retaining it beside a
+  /// selected bearer or API key could authenticate as a different account.
+  fn replace_credentials(&self, headers: &mut HeaderMap, ctx: &CredentialPatchCtx<'_>) -> Result<()> {
+    let mut injected = HeaderMap::new();
+    self.inject_credentials(&mut injected, ctx)?;
+    for name in [&AUTHORIZATION, &X_API_KEY, &CHATGPT_ACCOUNT_ID, &COOKIE] {
+      if !injected.contains_key(name) {
+        headers.remove(name);
+      }
+    }
+    for (name, value) in injected {
+      headers.insert(name, value);
+    }
     Ok(())
   }
 
   fn patch_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
-    self.inject_credentials(headers, ctx)?;
+    self.replace_credentials(headers, &ctx.credential_patch_ctx())?;
     if let Some(new_headers) = self.normalize_headers(headers, ctx)? {
       *headers = new_headers;
     }
     Ok(())
+  }
+
+  /// Authorize a request without normalizing its remaining headers.
+  ///
+  /// This is the provider hook for opaque relay traffic. Static providers use
+  /// the default credential injector; providers with asynchronously refreshed
+  /// credentials can override it. Payload-dependent normalization must remain
+  /// in [`Provider::patch_headers`] and is intentionally not called here.
+  async fn authorize_request(
+    &self,
+    _http: &reqwest::Client,
+    headers: &mut HeaderMap,
+    request_kind: ProviderRequestKind,
+  ) -> Result<()> {
+    self.replace_credentials(
+      headers,
+      &CredentialPatchCtx {
+        request_kind,
+        bearer_token: None,
+      },
+    )
   }
 
   /// Final provider-owned header shape enforcement.
@@ -481,14 +572,6 @@ pub trait Provider: Send + Sync {
   }
 
   fn on_unauthorized(&self) {}
-
-  fn needs_refresh(&self, _cfg: &AccountConfig) -> bool {
-    false
-  }
-
-  async fn refresh(&self, cfg: &AccountConfig, _http: &reqwest::Client) -> Result<AccountConfig> {
-    Ok(cfg.clone())
-  }
 }
 
 #[cfg(test)]
@@ -561,6 +644,25 @@ mod tests {
     assert!(!c.contains("bar"));
   }
 
+  #[test]
+  fn provider_target_clones_share_only_their_upstream_cache() {
+    let base_url = CanonicalUpstreamUrl::parse(
+      "https://api.example.com/v1",
+      crate::upstream_url::CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+    let first = ProviderTarget::new(base_url.clone());
+    let first_clone = first.clone();
+    let second = ProviderTarget::new(base_url);
+
+    assert!(Arc::ptr_eq(first.model_cache(), first_clone.model_cache()));
+    assert!(!Arc::ptr_eq(first.model_cache(), second.model_cache()));
+
+    first.model_cache().set(HashSet::from(["gpt-test".into()]));
+    assert!(first_clone.model_cache().contains("gpt-test"));
+    assert!(!second.model_cache().is_warm());
+  }
+
   // --- has_endpoint / supports layering tests ---
 
   use async_trait::async_trait;
@@ -581,6 +683,10 @@ mod tests {
     }
     fn endpoint_rules(&self) -> Option<&'static [EndpointRule]> {
       self.rules
+    }
+    fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &CredentialPatchCtx<'_>) -> error::Result<()> {
+      headers.insert(&AUTHORIZATION, "Bearer selected");
+      Ok(())
     }
     async fn list_models(&self, _http: &reqwest::Client) -> error::Result<Value> {
       Ok(Value::Null)
@@ -642,5 +748,39 @@ mod tests {
     assert!(!p.supports("", Endpoint::Messages));
     // Non-empty unknown model → identity gate denies.
     assert!(!p.supports("unknown", Endpoint::ChatCompletions));
+  }
+
+  #[test]
+  fn credential_replacement_preserves_matching_header_position() {
+    let provider = stub(Some(&[]), &[Endpoint::ChatCompletions]);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-before", "1");
+    headers.append(&AUTHORIZATION, "Bearer client-1");
+    headers.append(&AUTHORIZATION, "Bearer client-2");
+    headers.insert(&COOKIE, "session=client");
+    headers.insert(&X_API_KEY, "client-key");
+    headers.insert("x-after", "2");
+
+    provider
+      .replace_credentials(
+        &mut headers,
+        &CredentialPatchCtx {
+          request_kind: ProviderRequestKind::Opaque,
+          bearer_token: None,
+        },
+      )
+      .unwrap();
+
+    assert_eq!(
+      headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>(),
+      [
+        ("x-before", "1"),
+        ("authorization", "Bearer selected"),
+        ("x-after", "2"),
+      ]
+    );
   }
 }
