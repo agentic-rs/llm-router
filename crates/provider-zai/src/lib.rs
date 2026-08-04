@@ -28,7 +28,7 @@ pub static DESCRIPTOR_ZAI: ProviderDescriptor = ProviderDescriptor {
   id: ID_ZAI,
   display_name: "Z.ai",
   hosts: ZAI_HOSTS,
-  base_url: "https://api.z.ai/api/paas/v4",
+  base_url: zai::ZAI_BASE_URL,
   credentials: &[CredentialFlavor::ApiKey],
   endpoints: &[EndpointSpec {
     endpoint: Endpoint::ChatCompletions,
@@ -49,7 +49,7 @@ pub static DESCRIPTOR_ZAI_CODING_PLAN: ProviderDescriptor = ProviderDescriptor {
   id: ID_ZAI_CODING_PLAN,
   display_name: "Z.ai Coding Plan",
   hosts: ZAI_HOSTS,
-  base_url: "https://api.z.ai/api/coding/paas/v4",
+  base_url: zai::ZAI_CODING_PLAN_BASE_URL,
   credentials: &[CredentialFlavor::ApiKey],
   endpoints: &[EndpointSpec {
     endpoint: Endpoint::ChatCompletions,
@@ -70,7 +70,7 @@ pub static DESCRIPTOR_ZHIPUAI: ProviderDescriptor = ProviderDescriptor {
   id: ID_ZHIPUAI,
   display_name: "Zhipu BigModel",
   hosts: ZHIPU_HOSTS,
-  base_url: "https://open.bigmodel.cn/api/paas/v4",
+  base_url: zai::ZHIPUAI_BASE_URL,
   credentials: &[CredentialFlavor::ApiKey],
   endpoints: &[EndpointSpec {
     endpoint: Endpoint::ChatCompletions,
@@ -91,7 +91,7 @@ pub static DESCRIPTOR_ZHIPUAI_CODING_PLAN: ProviderDescriptor = ProviderDescript
   id: ID_ZHIPUAI_CODING_PLAN,
   display_name: "Zhipu BigModel Coding Plan",
   hosts: ZHIPU_HOSTS,
-  base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
+  base_url: zai::ZHIPUAI_CODING_PLAN_BASE_URL,
   credentials: &[CredentialFlavor::ApiKey],
   endpoints: &[EndpointSpec {
     endpoint: Endpoint::ChatCompletions,

@@ -1,4 +1,5 @@
 use crate::account::AccountConfig;
+use crate::upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy, InvalidUpstreamUrl};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Serialize;
@@ -156,6 +157,39 @@ impl ModelCache {
 
   pub fn snapshot(&self) -> Option<HashSet<String>> {
     self.inner.read().ok().and_then(|g| g.clone())
+  }
+}
+
+/// Runtime destination shared by every account binding for one configured
+/// upstream.
+///
+/// Construct one target per upstream id, then clone it when binding eligible
+/// accounts. Clones intentionally share the model cache; constructing another
+/// target, even for the same URL, creates an independent cache.
+#[derive(Clone, Debug)]
+pub struct ProviderTarget {
+  base_url: CanonicalUpstreamUrl,
+  model_cache: Arc<ModelCache>,
+}
+
+impl ProviderTarget {
+  pub fn new(base_url: CanonicalUpstreamUrl) -> Self {
+    Self {
+      base_url,
+      model_cache: Arc::new(ModelCache::default()),
+    }
+  }
+
+  pub fn parse(base_url: &str, cleartext: CleartextHttpPolicy) -> Result<Self, InvalidUpstreamUrl> {
+    CanonicalUpstreamUrl::parse(base_url, cleartext).map(Self::new)
+  }
+
+  pub fn base_url(&self) -> &CanonicalUpstreamUrl {
+    &self.base_url
+  }
+
+  pub fn model_cache(&self) -> &Arc<ModelCache> {
+    &self.model_cache
   }
 }
 
@@ -559,6 +593,25 @@ mod tests {
     assert!(c.is_warm());
     assert!(c.contains("foo"));
     assert!(!c.contains("bar"));
+  }
+
+  #[test]
+  fn provider_target_clones_share_only_their_upstream_cache() {
+    let base_url = CanonicalUpstreamUrl::parse(
+      "https://api.example.com/v1",
+      crate::upstream_url::CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+    let first = ProviderTarget::new(base_url.clone());
+    let first_clone = first.clone();
+    let second = ProviderTarget::new(base_url);
+
+    assert!(Arc::ptr_eq(first.model_cache(), first_clone.model_cache()));
+    assert!(!Arc::ptr_eq(first.model_cache(), second.model_cache()));
+
+    first.model_cache().set(HashSet::from(["gpt-test".into()]));
+    assert!(first_clone.model_cache().contains("gpt-test"));
+    assert!(!second.model_cache().is_warm());
   }
 
   // --- has_endpoint / supports layering tests ---

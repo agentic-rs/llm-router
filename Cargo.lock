@@ -2759,6 +2759,7 @@ dependencies = [
  "tokn-endpoint-messages",
  "tokn-endpoint-responses",
  "tokn-headers",
+ "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
  "tokn-provider-llama-cpp",
@@ -2905,6 +2906,7 @@ dependencies = [
  "time",
  "tokio",
  "tokn-headers",
+ "tokn-policy",
  "toml",
  "tracing",
 ]
@@ -3068,6 +3070,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-policy"
+version = "0.2.1"
+dependencies = [
+ "smol_str",
+]
+
+[[package]]
 name = "tokn-provider-copilot"
 version = "0.2.1"
 dependencies = [
@@ -3085,6 +3094,7 @@ dependencies = [
  "tokn-catalogue",
  "tokn-core",
  "tokn-headers",
+ "tokn-mock-server",
  "toml",
  "tracing",
 ]
@@ -3273,6 +3283,7 @@ dependencies = [
  "tempfile",
  "tokn-core",
  "tokn-headers",
+ "tokn-policy",
  "toml",
  "toml_edit",
  "tracing",
