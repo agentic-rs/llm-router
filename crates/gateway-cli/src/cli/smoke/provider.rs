@@ -266,4 +266,17 @@ mod tests {
     assert!(ids.is_empty());
     assert!(seen.is_empty());
   }
+
+  #[tokio::test]
+  async fn live_model_fetch_reports_explicit_config_load_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("missing.toml");
+
+    let error = fetch_live_models(Some(&config_path), "openai").await.unwrap_err();
+
+    assert_eq!(
+      error.to_string(),
+      format!("load compiled gateway config `{}`", config_path.display())
+    );
+  }
 }
