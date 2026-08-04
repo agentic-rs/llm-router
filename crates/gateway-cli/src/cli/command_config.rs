@@ -16,8 +16,8 @@ pub struct CommandConfig {
 }
 
 enum CommandConfigSource {
-  Legacy(Config),
-  V2(CompiledConfig),
+  Legacy(Box<Config>),
+  V2(Box<CompiledConfig>),
 }
 
 impl CommandConfig {
@@ -32,13 +32,13 @@ impl CommandConfig {
   pub fn load(explicit: Option<&Path>) -> Result<Self> {
     let path = tokn_config::paths::resolve_config_path(explicit).context("resolve the gateway config path")?;
     let source = if path.exists() && has_schema_marker(&path)? {
-      CommandConfigSource::V2(
+      CommandConfigSource::V2(Box::new(
         tokn_config::v2::load(&path).with_context(|| format!("load version 2 config `{}`", path.display()))?,
-      )
+      ))
     } else {
       let (config, resolved) = Config::load(Some(&path)).context("load legacy command configuration")?;
       debug_assert_eq!(resolved, path);
-      CommandConfigSource::Legacy(config)
+      CommandConfigSource::Legacy(Box::new(config))
     };
     Ok(Self { path, source })
   }
