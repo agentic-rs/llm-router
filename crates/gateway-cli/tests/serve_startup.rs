@@ -6,6 +6,7 @@ fn run_serve(home: &Path) -> Output {
   Command::new(env!("CARGO_BIN_EXE_tokn-gateway"))
     .arg("serve")
     .env("HOME", home)
+    .env("TOKN_ROUTER_HOME", home.join(".tokn/router"))
     .env("XDG_CONFIG_HOME", home.join(".config"))
     .env("XDG_DATA_HOME", home.join(".local/share"))
     .env("XDG_CACHE_HOME", home.join(".cache"))

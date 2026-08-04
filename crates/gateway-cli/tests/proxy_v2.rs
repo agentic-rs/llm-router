@@ -29,6 +29,7 @@ impl Fixture {
       .arg("proxy")
       .args(args)
       .env("HOME", &self.home)
+      .env("TOKN_ROUTER_HOME", self.home.join(".tokn/router"))
       .env("XDG_CONFIG_HOME", self.home.join(".config"))
       .env("XDG_DATA_HOME", self.home.join(".local/share"))
       .env("XDG_CACHE_HOME", self.home.join(".cache"))
