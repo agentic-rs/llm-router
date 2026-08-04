@@ -287,4 +287,54 @@ mod tests {
     assert!(!body.is_complete());
     assert!(!format!("{body:?}").contains("private payload"));
   }
+
+  #[test]
+  fn capture_value_objects_report_policy_without_exposing_content() {
+    let value = CapturedHeader::value("x-label", Bytes::from_static(b"private"));
+    assert_eq!(value.captured_value().as_bytes(), Some(b"private".as_slice()));
+    assert!(!value.captured_value().is_redacted());
+    assert!(!format!("{value:?}").contains("private"));
+
+    let redacted = CapturedHeader::redacted("authorization");
+    assert_eq!(redacted.captured_value().as_bytes(), None);
+    assert_eq!(format!("{:?}", redacted.captured_value()), "Redacted");
+
+    let empty = std::iter::empty::<CapturedHeader>().collect::<CapturedHeaders>();
+    assert!(empty.is_empty());
+    assert_eq!(empty.iter().len(), 0);
+
+    let exact_uri = CapturedUri::exact("/v1/models?limit=1");
+    assert_eq!(exact_uri.as_str(), "/v1/models?limit=1");
+    assert!(!exact_uri.is_redacted());
+    assert!(!format!("{exact_uri:?}").contains("/v1/models"));
+
+    let redacted_uri = CapturedUri::redacted("/v1/models?<redacted>");
+    assert_eq!(redacted_uri.as_str(), "/v1/models?<redacted>");
+    assert!(redacted_uri.is_redacted());
+    assert!(!format!("{redacted_uri:?}").contains("/v1/models"));
+  }
+
+  #[test]
+  fn body_capture_reports_every_retention_state() {
+    let absent = BodyCapture::Absent;
+    assert_eq!(absent.bytes(), None);
+    assert_eq!(absent.bytes_seen(), 0);
+    assert!(absent.is_complete());
+    assert_eq!(format!("{absent:?}"), "Absent");
+
+    let omitted = BodyCapture::Omitted {
+      reason: CaptureOmission::Sensitive,
+      bytes_seen: 12,
+    };
+    assert_eq!(omitted.bytes(), None);
+    assert_eq!(omitted.bytes_seen(), 12);
+    assert!(!omitted.is_complete());
+    assert_eq!(format!("{omitted:?}"), "Omitted { reason: Sensitive, bytes_seen: 12 }");
+
+    let complete = BodyCapture::Complete(Bytes::from_static(b"private"));
+    assert_eq!(complete.bytes(), Some(b"private".as_slice()));
+    assert_eq!(complete.bytes_seen(), 7);
+    assert!(complete.is_complete());
+    assert_eq!(format!("{complete:?}"), "Complete { bytes: 7 }");
+  }
 }

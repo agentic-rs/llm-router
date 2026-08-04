@@ -1575,6 +1575,156 @@ mod tests {
     }
   }
 
+  fn sample_failure(kind: ConsumerFailureKind) -> Arc<HubFailure> {
+    Arc::new(HubFailure {
+      consumer_name: Arc::from("consumer"),
+      sequence: EventSeq(4),
+      operation: ConsumerOperation::Flush,
+      kind,
+      stats: DeliveryStats {
+        accepted: 5,
+        delivered: 4,
+        undelivered: 1,
+      },
+    })
+  }
+
+  #[test]
+  fn public_event_values_have_stable_diagnostics_and_recover_payloads() {
+    assert_eq!(EventSeq(4).get(), 4);
+    assert_eq!(EventSeq(4).to_string(), "4");
+    assert_eq!(ConsumerOperation::Handle.to_string(), "handling an event");
+    assert_eq!(ConsumerOperation::Flush.to_string(), "flushing");
+    assert_eq!(
+      ConsumerFailureKind::Error(Arc::from("disk full")).to_string(),
+      "returned an error: disk full"
+    );
+    assert_eq!(
+      ConsumerFailureKind::Panic(Arc::from("render failed")).to_string(),
+      "panicked: render failed"
+    );
+
+    let failure = sample_failure(ConsumerFailureKind::Error(Arc::from("disk full")));
+    assert_eq!(
+      failure.to_string(),
+      "event consumer `consumer` failed while flushing at sequence 4: returned an error: disk full (accepted 5, delivered 4, undelivered 1)"
+    );
+
+    let context = TerminalContext::now();
+    assert!(context.submitted_at() <= Instant::now());
+    assert!(context.submitted_at_system_time() <= SystemTime::now());
+    let batch = TerminalBatch::new(1, vec![2, 3]);
+    assert_eq!(batch.len(), 3);
+    assert!(!batch.is_empty());
+
+    let closed = TerminalRegistrationError::Closed(10);
+    assert_eq!(format!("{closed:?}"), "TerminalRegistrationError::Closed(..)");
+    assert_eq!(closed.to_string(), "event hub is closed");
+    assert_eq!(closed.into_event(), 10);
+
+    let failed = TerminalRegistrationError::Failed {
+      event: 11,
+      failure: Arc::clone(&failure),
+    };
+    assert!(format!("{failed:?}").contains("TerminalRegistrationError::Failed"));
+    assert!(failed
+      .to_string()
+      .contains("event hub failed: event consumer `consumer`"));
+    assert_eq!(failed.into_event(), 11);
+
+    assert_eq!(TerminalSubmitError::Closed.to_string(), "event hub is closed");
+    assert_eq!(
+      TerminalSubmitError::Failed(Arc::clone(&failure)).to_string(),
+      format!("event hub failed: {failure}")
+    );
+    assert_eq!(
+      TerminalSubmitError::RelayStopped.to_string(),
+      "event terminal relay stopped unexpectedly"
+    );
+
+    let publish_closed = PublishError::Closed(12);
+    assert_eq!(format!("{publish_closed:?}"), "PublishError::Closed(..)");
+    assert_eq!(publish_closed.to_string(), "event hub is closed");
+    assert_eq!(publish_closed.into_event(), 12);
+    let publish_failed = PublishError::Failed {
+      event: 13,
+      failure: Arc::clone(&failure),
+    };
+    assert!(format!("{publish_failed:?}").contains("PublishError::Failed"));
+    assert!(publish_failed
+      .to_string()
+      .contains("event hub failed: event consumer `consumer`"));
+    assert_eq!(publish_failed.into_event(), 13);
+
+    for (error, diagnostic, event) in [
+      (TryPublishError::Full(14), "TryPublishError::Full(..)", 14),
+      (TryPublishError::Closed(15), "TryPublishError::Closed(..)", 15),
+    ] {
+      assert_eq!(format!("{error:?}"), diagnostic);
+      assert_eq!(error.into_event(), event);
+    }
+    assert_eq!(TryPublishError::Full(16).to_string(), "event hub ingress is full");
+    assert_eq!(TryPublishError::Closed(17).to_string(), "event hub is closed");
+    let try_failed = TryPublishError::Failed {
+      event: 18,
+      failure: Arc::clone(&failure),
+    };
+    assert!(format!("{try_failed:?}").contains("TryPublishError::Failed"));
+    assert!(try_failed
+      .to_string()
+      .contains("event hub failed: event consumer `consumer`"));
+    assert_eq!(try_failed.into_event(), 18);
+
+    assert_eq!(FlushError::Closed.to_string(), "event hub is closed");
+    assert!(FlushError::Failed(Arc::clone(&failure))
+      .to_string()
+      .contains("event hub failed"));
+    assert_eq!(
+      WaitFailedError::Closed(DeliveryStats::default()).to_string(),
+      "event hub closed without a consumer failure"
+    );
+    for error in [
+      ShutdownError::Closed,
+      ShutdownError::Failed(Arc::clone(&failure)),
+      ShutdownError::DispatcherStopped,
+      ShutdownError::ShutdownTask(Arc::from("cancelled")),
+      ShutdownError::JoinDispatcher(Arc::from("cancelled")),
+      ShutdownError::DispatcherPanicked(Arc::from("panic")),
+      ShutdownError::TerminalRelayStopped,
+      ShutdownError::JoinTerminalRelay(Arc::from("cancelled")),
+      ShutdownError::TerminalRelayPanicked(Arc::from("panic")),
+    ] {
+      assert!(!error.to_string().is_empty());
+    }
+  }
+
+  #[tokio::test]
+  async fn running_handles_expose_non_sensitive_debug_state() {
+    let (publisher, hub) = HubBuilder::new()
+      .consumer(RecordingConsumer {
+        name: "writer",
+        records: Arc::new(Mutex::new(Vec::new())),
+        flushes: None,
+      })
+      .start()
+      .unwrap();
+    assert!(format!("{publisher:?}").contains("Running"));
+    assert!(matches!(hub.status(), HubStatus::Running));
+
+    let guard = publisher.begin_guarded(1, |_| TerminalBatch::one(2)).await.unwrap();
+    let debug = format!("{guard:?}");
+    assert!(debug.contains("Running"));
+    assert!(debug.contains("armed: true"));
+    guard
+      .finish_with(|context| {
+        assert!(context.submitted_at() <= Instant::now());
+        TerminalBatch::one(3)
+      })
+      .unwrap();
+
+    assert_eq!(hub.shutdown().await.unwrap().delivered, 2);
+  }
+
   #[tokio::test]
   async fn fans_out_in_registration_order_with_global_sequences() {
     let records = Arc::new(Mutex::new(Vec::new()));

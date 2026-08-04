@@ -183,7 +183,12 @@ mod tests {
     let from_str: RequestId = "request-1".parse().unwrap();
     let from_string = RequestId::try_from(String::from("request-1")).unwrap();
     let from_smol = RequestId::try_from(SmolStr::new("request-1")).unwrap();
+    let from_ref = RequestId::try_from("request-1").unwrap();
     assert_eq!(from_str, from_string);
     assert_eq!(from_string, from_smol);
+    assert_eq!(from_smol, from_ref);
+    assert_eq!(from_ref.as_ref(), "request-1");
+    assert_eq!(from_ref.to_string(), "request-1");
+    assert_eq!(format!("{from_ref:?}"), "RequestId(\"request-1\")");
   }
 }
