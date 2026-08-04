@@ -42,7 +42,7 @@ pub(crate) fn sdk_error(error: SdkError) -> NapiError {
     SdkError::LoadCredentials { .. } => native_error(AUTHENTICATION_ERROR, message),
     SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }
-    | SdkError::Pipeline { .. }
+    | SdkError::Request { .. }
     | SdkError::UnexpectedStream
     | SdkError::UnexpectedBuffered => native_error(REQUEST_ERROR, message),
     SdkError::GenerateResponseStatus { status, body } => api_status_error(message, status, body),

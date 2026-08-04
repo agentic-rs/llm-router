@@ -6,15 +6,12 @@
 //! 1. Resolve an effective [`tokn_core::AgentId`] — `extracted.agent_id`
 //!    wins if set, else the stage's per-provider default mapping is used, else
 //!    a stage-wide fallback.
-//! 2. Build [`TemplateVars`] from the inbound `HeaderMap` (the same scan
-//!    behavior as the legacy router's `api::first_header`).
-//! 3. Ask the [`registry::lookup`] for the schema pair:
-//!    - `Some(schema)` → build the agent headers and, if
-//!      `schema.overlay` is `Some`, build the overlay's typed struct via
-//!      `OverlayKind`-specific dispatch and `.dump()` it; compose with
-//!      [`ResolvedSchema::compose`].
-//!    - `None` (unknown provider) → fall back to an agent-only map; no
-//!      overlay.
+//! 2. Build template variables from the inbound headers using the same scan
+//!    behavior as the legacy router's `api::first_header`.
+//! 3. Delegate wire identity composition to
+//!    [`build_wire_identity_headers`]. The shared registry helper combines
+//!    the selected agent schema with the provider overlay, or falls back to
+//!    agent-only headers for an unknown provider.
 //!
 //! Output: [`BuiltHeaders { headers, vars }`]. `vars` is retained so later
 //! stages can splice correlation values into bodies without re-parsing the
@@ -27,11 +24,8 @@ use async_trait::async_trait;
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use tokn_core::AgentId;
-use tokn_headers::agent::build_agent_headers;
 use tokn_headers::inbound::build_template_vars;
-use tokn_headers::registry::{lookup, OverlayKind, ResolvedSchema};
-use tokn_headers::schemas::{CodexOverlay, CopilotOverlay};
-use tokn_headers::{HeaderMap, TemplateVars};
+use tokn_headers::registry::build_wire_identity_headers;
 
 /// Default BuildHeaders stage. See module docs for the resolution
 /// algorithm.
@@ -93,10 +87,7 @@ impl BuildHeadersStage for DefaultBuildHeaders {
     let vars = build_template_vars(inbound);
     let agent_id = self.effective_agent_id(extracted, resolved);
 
-    let headers = match lookup(resolved.provider_id.as_str(), agent_id.as_str()) {
-      Some(schema) => compose_with_schema(&schema, &vars, inbound),
-      None => build_agent_headers(agent_id.as_str(), &vars, inbound),
-    };
+    let headers = build_wire_identity_headers(resolved.provider_id.as_str(), agent_id.as_str(), &vars, inbound);
 
     Ok(BuiltHeaders {
       headers,
@@ -104,24 +95,6 @@ impl BuildHeadersStage for DefaultBuildHeaders {
       agent_id,
     })
   }
-}
-
-/// Build the agent half and, if the schema names an overlay, build the
-/// overlay's typed struct and `.dump()` it. Then [`ResolvedSchema::compose`]
-/// merges with overlay-wins semantics.
-fn compose_with_schema(schema: &ResolvedSchema, vars: &TemplateVars, inbound: &HeaderMap) -> HeaderMap {
-  let agent_map = schema.agent.build_outbound(vars, inbound);
-  let overlay_map = schema.overlay.map(|kind| match kind {
-    OverlayKind::Copilot => {
-      use tokn_headers::HeaderSchema as _;
-      CopilotOverlay::build(vars, inbound).dump()
-    }
-    OverlayKind::Codex => {
-      use tokn_headers::HeaderSchema as _;
-      CodexOverlay::build(vars, inbound).dump()
-    }
-  });
-  ResolvedSchema::compose(agent_map, overlay_map)
 }
 
 #[cfg(test)]
@@ -132,7 +105,7 @@ mod tests {
   use serde_json::json;
   use std::sync::Arc;
   use tokn_core::provider::Endpoint;
-  use tokn_headers::{keys, HeaderValue};
+  use tokn_headers::{keys, HeaderMap, HeaderValue};
 
   fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut m = HeaderMap::new();

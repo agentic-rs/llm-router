@@ -5,8 +5,7 @@
 //! It builds a [`tokn_requests::RawInbound`] from the intercepted request,
 //! supplies a [`tokn_requests::RunConfig`] populated with the resolved
 //! authority / method / path / scheme under the `proxy.*` keys, and
-//! invokes [`AppState::proxy_passthrough_pipeline`] via
-//! [`tokn_requests::Pipeline::run_with`].
+//! invokes [`AppState::proxy_passthrough_service`].
 //!
 //! Host/port resolution lives in this module — see
 //! [`resolve_host_with_port`]. The resolved value is used as the
@@ -22,7 +21,7 @@
 //!
 //! [`ProxyResolve`]: tokn_requests::stages::ProxyResolve
 //! [`ProxySend`]: tokn_requests::stages::ProxySend
-//! [`AppState::proxy_passthrough_pipeline`]: crate::api::AppState::proxy_passthrough_pipeline
+//! [`AppState::proxy_passthrough_service`]: crate::api::AppState::proxy_passthrough_service
 
 use crate::api::error::ApiError;
 use crate::api::AppState;
@@ -249,7 +248,7 @@ async fn proxy_via_pipeline_inner(
     .with_str(tokn_requests::stages::send::proxy::send_keys::PATH, &path_and_query)
     .with_str(tokn_requests::stages::send::proxy::send_keys::METHOD, method.as_str())
     .with_str(tokn_requests::stages::send::proxy::send_keys::SCHEME, scheme);
-  let pipeline = match mode {
+  let service = match mode {
     ProxyPipelineMode::Passthrough => {
       // Identity resolution — fingerprint the inbound bearer against
       // locally-known accounts so DB rows / events attribute the
@@ -275,7 +274,7 @@ async fn proxy_via_pipeline_inner(
       if let Some(account_id) = identity.account_id.as_deref() {
         cfg_builder = cfg_builder.with_str(tokn_requests::stages::resolve::proxy::keys::ACCOUNT_ID, account_id);
       }
-      &state.proxy_passthrough_pipeline
+      &state.proxy_passthrough_service
     }
     ProxyPipelineMode::Switch => {
       let Some(provider_id) = state.provider_registry.provider_id_for_url(&full_url) else {
@@ -298,7 +297,7 @@ async fn proxy_via_pipeline_inner(
           serde_json::Value::Array(providers.iter().cloned().map(serde_json::Value::String).collect()),
         );
       }
-      &state.proxy_switch_pipeline
+      &state.proxy_switch_service
     }
   };
 
@@ -313,9 +312,12 @@ async fn proxy_via_pipeline_inner(
     request_id: Some(request_id),
   };
 
-  match pipeline.run_with(raw, cfg).await {
+  match service
+    .execute(tokn_requests::ExecutionRequest::new(raw).with_config(cfg))
+    .await
+  {
     Ok(converted) => crate::api::response::converted_to_axum(converted),
-    Err(err) => proxy_pipeline_error_to_api_error(&err, &host_with_port).into_response(),
+    Err(err) => proxy_request_error_to_api_error(&err, &host_with_port).into_response(),
   }
 }
 
@@ -418,6 +420,14 @@ fn is_default_intercept_host(host_with_port: &str) -> bool {
   let (host, _) = split_host_port(host_with_port);
   let host = host.trim_matches(['[', ']']);
   super::INTERCEPT_HOSTS.contains(&host)
+}
+
+fn proxy_request_error_to_api_error(err: &tokn_requests::RequestError, host_with_port: &str) -> ApiError {
+  let Some(err) = err.pipeline() else {
+    tracing::warn!(host = %host_with_port, error = %err, "proxy request service failed");
+    return ApiError::bad_gateway(err.to_string());
+  };
+  proxy_pipeline_error_to_api_error(err, host_with_port)
 }
 
 fn proxy_pipeline_error_to_api_error(err: &tokn_requests::PipelineError, host_with_port: &str) -> ApiError {

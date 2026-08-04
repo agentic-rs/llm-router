@@ -12,7 +12,7 @@ use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RequestEndpoint;
 use tokn_headers::keys::{ACCEPT, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
-use tokn_requests::{RawInbound, RunConfig};
+use tokn_requests::{ExecutionRequest, RawInbound, RunConfig};
 use tokn_router::api::{AppState, RequestPolicyRuntime};
 
 use crate::endpoint::{ChatCompletions, Messages, Responses};
@@ -232,15 +232,15 @@ impl Client {
       config = config.with_generation_options(generation_options);
     }
     let config = config.build();
-    let pipeline = match policy.mode {
-      tokn_config::RouteMode::Passthrough => &policy.passthrough_pipeline,
-      tokn_config::RouteMode::Switch => &policy.switch_pipeline,
-      _ => &policy.request_pipeline,
+    let service = match policy.mode {
+      tokn_config::RouteMode::Passthrough => &policy.passthrough_service,
+      tokn_config::RouteMode::Switch => &policy.switch_service,
+      _ => &policy.request_service,
     };
-    let response = pipeline
-      .run_with(raw, config)
+    let response = service
+      .execute(ExecutionRequest::new(raw).with_config(config))
       .await
-      .map_err(|source| Error::Pipeline { source })?;
+      .map_err(|source| Error::Request { source })?;
     Ok(response.into())
   }
 

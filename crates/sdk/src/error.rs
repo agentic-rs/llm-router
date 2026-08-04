@@ -46,10 +46,10 @@ pub enum Error {
     #[source]
     source: serde_json::Error,
   },
-  #[error("request pipeline failed")]
-  Pipeline {
+  #[error("request execution failed")]
+  Request {
     #[source]
-    source: tokn_requests::PipelineError,
+    source: tokn_requests::RequestError,
   },
   #[error("expected a buffered response but received a stream; use the endpoint's stream method")]
   UnexpectedStream,

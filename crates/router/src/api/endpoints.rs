@@ -14,6 +14,7 @@ use tokn_convert::value::messages::DEFAULT_MESSAGES_MAX_TOKENS;
 use tokn_core::event::Event as CoreEvent;
 use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEvent, RequestEventPayload};
 use tokn_requests::pipeline::error::RequestsError;
+use tokn_requests::ExecutionRequest;
 use tracing::instrument;
 
 async fn handle(
@@ -69,10 +70,10 @@ async fn handle(
     body_json: decoded.value.clone(),
     request_id: Some(SmolStr::new(&hx.request_id)),
   };
-  let pipeline = match mode {
-    Some(tokn_config::RouteMode::Passthrough) => &policy.passthrough_pipeline,
-    Some(tokn_config::RouteMode::Switch) => &policy.switch_pipeline,
-    _ => &policy.request_pipeline,
+  let service = match mode {
+    Some(tokn_config::RouteMode::Passthrough) => &policy.passthrough_service,
+    Some(tokn_config::RouteMode::Switch) => &policy.switch_service,
+    _ => &policy.request_service,
   };
   let mut run_config = tokn_requests::RunConfig::builder().with_agent_id_opt(policy.agent_id.clone());
   if let Some(providers) = access.providers.provider_ids() {
@@ -82,9 +83,19 @@ async fn handle(
     );
   }
   let run_config = run_config.build();
-  match pipeline.run_with(raw, run_config).await {
+  match service
+    .execute(ExecutionRequest::new(raw).with_config(run_config))
+    .await
+  {
     Ok(converted) => Ok(super::response::converted_to_axum(converted)),
-    Err(err) => Err(pipeline_error_to_api_error(err)),
+    Err(err) => Err(request_error_to_api_error(err)),
+  }
+}
+
+fn request_error_to_api_error(err: tokn_requests::RequestError) -> ApiError {
+  match err.into_pipeline() {
+    Ok(err) => pipeline_error_to_api_error(err),
+    Err(err) => ApiError::bad_gateway(err.to_string()),
   }
 }
 

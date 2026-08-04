@@ -390,7 +390,7 @@ fn sdk_error(error: SdkError) -> PyErr {
     SdkError::LoadCredentials { .. } => AuthenticationError::new_err(message),
     SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }
-    | SdkError::Pipeline { .. }
+    | SdkError::Request { .. }
     | SdkError::UnexpectedStream
     | SdkError::UnexpectedBuffered => RequestError::new_err(message),
     SdkError::GenerateResponseStatus { status, body } => api_status_error(message, status, body),

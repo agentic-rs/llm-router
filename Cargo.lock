@@ -2897,6 +2897,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "directories",
+ "http",
  "reqwest",
  "serde",
  "serde_json",
@@ -3215,6 +3216,7 @@ dependencies = [
  "tokn-provider-copilot",
  "tokn-provider-openai",
  "tokn-router-config",
+ "tower",
  "tracing",
  "zstd",
 ]

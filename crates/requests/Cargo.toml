@@ -26,6 +26,7 @@ smol_str = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 zstd = { workspace = true }
 
 [dev-dependencies]
