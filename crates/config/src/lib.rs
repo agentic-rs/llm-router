@@ -1,5 +1,6 @@
 pub mod error;
 pub mod paths;
+pub mod v2;
 
 pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
