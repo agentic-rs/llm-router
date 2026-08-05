@@ -976,6 +976,35 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
     self.assertIn(b'"content": "hel"', payload)
     self.assertIn(b"data: [DONE]", payload)
 
+  async def test_request_lifecycle_subscription_exposes_completed_event(self) -> None:
+    client = self.client()
+    events = client.subscribe_events()
+    client.reload()
+    await client.chat.completions.create(
+      {
+        "model": "llama-cpp/mock-model",
+        "messages": [{"role": "user", "content": "observe lifecycle"}],
+      },
+      options=RequestOptions(request_id="python-lifecycle"),
+    )
+
+    async with events:
+      async with asyncio.timeout(5):
+        async for event in events:
+          if event["request_id"] != "python-lifecycle":
+            continue
+          self.assertIn(event["payload"]["category"], {"stage", "record", "custom"})
+          if event["payload"] == {
+            "category": "stage",
+            "event": {
+              "type": "completed",
+              "data": {"success": True, "attempts": 1},
+            },
+          }:
+            break
+        else:
+          self.fail("request lifecycle stream closed before completion")
+
 
 if __name__ == "__main__":
   unittest.main()

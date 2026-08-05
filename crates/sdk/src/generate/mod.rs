@@ -722,9 +722,21 @@ fn map_generation_error(error: Error) -> Error {
   let Error::Request { source } = error else {
     return error;
   };
-  let source = match source.into_pipeline() {
+  let request_error = match source.into_source().downcast::<tokn_requests::RequestError>() {
+    Ok(source) => *source,
+    Err(source) => {
+      return Error::Request {
+        source: tokn_service::ServiceError::from_boxed(source),
+      }
+    }
+  };
+  let source = match request_error.into_pipeline() {
     Ok(source) => source,
-    Err(source) => return Error::Request { source },
+    Err(source) => {
+      return Error::Request {
+        source: tokn_service::ServiceError::new(source),
+      }
+    }
   };
   match source.inner() {
     RequestsError::UpstreamStatus { status, body } => Error::GenerateResponseStatus {
@@ -736,7 +748,9 @@ fn map_generation_error(error: Error) -> Error {
         message: source.inner().to_string(),
       }
     }
-    _ => Error::Request { source: source.into() },
+    _ => Error::Request {
+      source: tokn_service::ServiceError::new(tokn_requests::RequestError::from(source)),
+    },
   }
 }
 

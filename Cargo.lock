@@ -329,6 +329,9 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cc"
@@ -3201,6 +3204,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "http",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",
@@ -3216,6 +3220,7 @@ dependencies = [
  "tokn-provider-copilot",
  "tokn-provider-openai",
  "tokn-router-config",
+ "tokn-service",
  "tower",
  "tracing",
  "zstd",
@@ -3234,6 +3239,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "ipnet",
@@ -3266,6 +3272,7 @@ dependencies = [
  "tokn-provider-zai",
  "tokn-requests",
  "tokn-router-config",
+ "tokn-service",
  "toml",
  "tower",
  "tower-http",
@@ -3331,6 +3338,8 @@ dependencies = [
  "bytes",
  "eventsource-stream",
  "futures-util",
+ "http",
+ "http-body-util",
  "serde",
  "serde_json",
  "smol_str",
@@ -3348,6 +3357,20 @@ dependencies = [
  "tokn-requests",
  "tokn-router",
  "tokn-router-config",
+ "tokn-service",
+]
+
+[[package]]
+name = "tokn-service"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

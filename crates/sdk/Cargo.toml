@@ -14,10 +14,13 @@ arc-swap.workspace = true
 bytes.workspace = true
 eventsource-stream.workspace = true
 futures-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol_str.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tokn-auth.workspace = true
 tokn-config.workspace = true
 tokn-convert.workspace = true
@@ -28,8 +31,8 @@ tokn-endpoint-responses.workspace = true
 tokn-headers.workspace = true
 tokn-requests.workspace = true
 tokn-router.workspace = true
+tokn-service.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-tokio.workspace = true
 tokn-mock-server.workspace = true

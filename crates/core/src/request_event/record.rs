@@ -24,6 +24,7 @@
 
 use crate::db::Usage;
 use bytes::Bytes;
+use serde::Serialize;
 use smol_str::SmolStr;
 use tokn_headers::HeaderMap;
 
@@ -35,7 +36,8 @@ use tokn_headers::HeaderMap;
 /// arrives, response status+headers as soon as they come back, body
 /// once it's been drained/accumulated, and converted body once the client-facing
 /// payload is fully materialized.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RecordEvent {
   /// Inbound client->router connection facts captured by the transport
   /// before the pipeline starts. Emitted outside the runner so callers can

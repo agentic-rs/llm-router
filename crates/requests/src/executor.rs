@@ -10,7 +10,11 @@
 //! [`PipelineRunner`]: crate::PipelineRunner
 
 use crate::pipeline::error::PipelineError;
+use crate::pipeline::stages::ConvertedBody;
 use crate::pipeline::{ConvertedResponse, PipelineRunner, RawInbound, RunConfig};
+use bytes::Bytes;
+use http::{Method, Uri};
+use http_body_util::BodyExt;
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::sync::Arc;
@@ -25,6 +29,33 @@ use tower::{Service, ServiceExt};
 pub struct ExecutionRequest {
   inbound: RawInbound,
   config: RunConfig,
+}
+
+/// Pipeline-specific context carried in native HTTP request extensions.
+///
+/// Low-level services do not know this type exists. High-level adapters use
+/// it to retain endpoint identity, request ids, run configuration, and an
+/// already-decoded inspection copy while the wire message stays ordinary
+/// [`http::Request`].
+#[derive(Debug, Clone)]
+pub struct PipelineRequestContext {
+  request_endpoint: tokn_core::request_event::RequestEndpoint,
+  request_id: Option<smol_str::SmolStr>,
+  config: RunConfig,
+  prepared_body: Option<PreparedBody>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedBody {
+  decoded_body: Bytes,
+  body_json: serde_json::Value,
+}
+
+/// Compatibility response-body classification retained in HTTP extensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineResponseKind {
+  Buffered,
+  Stream,
 }
 
 type BoxError = Box<dyn StdError + Send + Sync + 'static>;
@@ -130,6 +161,39 @@ impl ExecutionRequest {
   pub fn into_parts(self) -> (RawInbound, RunConfig) {
     (self.inbound, self.config)
   }
+
+  /// Convert this compatibility request into the native low-level HTTP form.
+  ///
+  /// The original wire body remains the HTTP body. Pipeline-only decoded
+  /// state is attached as an extension and is invisible to arbitrary Tower
+  /// layers that operate only on the HTTP message.
+  pub fn into_http(self, method: Method, uri: Uri) -> Result<tokn_service::Request, http::Error> {
+    let (inbound, config) = self.into_parts();
+    let RawInbound {
+      request_endpoint,
+      headers,
+      raw_body,
+      decoded_body,
+      body_json,
+      request_id,
+    } = inbound;
+    let context = PipelineRequestContext {
+      request_endpoint,
+      request_id,
+      config,
+      prepared_body: Some(PreparedBody {
+        decoded_body,
+        body_json,
+      }),
+    };
+    let mut request = http::Request::builder()
+      .method(method)
+      .uri(uri)
+      .body(tokn_service::body::full(raw_body))?;
+    *request.headers_mut() = headers.into();
+    request.extensions_mut().insert(context);
+    Ok(request)
+  }
 }
 
 /// Cloneable, type-erased request service used by router and embedded SDKs.
@@ -168,10 +232,72 @@ impl RequestService {
     }))
   }
 
+  /// Adapt the compatibility pipeline into the public native HTTP service.
+  pub fn http_from_pipeline(pipeline: Arc<PipelineRunner>) -> tokn_service::RequestService {
+    let service = Self::from_pipeline(pipeline);
+    tokn_service::RequestService::new(tower::service_fn(move |request: tokn_service::Request| {
+      let service = service.clone();
+      async move {
+        let request = execution_from_http(request).await?;
+        let response = service.execute(request).await?;
+        converted_to_http(response)
+      }
+    }))
+  }
+
   /// Wait for readiness and execute one logical request.
   pub async fn execute(&self, request: ExecutionRequest) -> Result<ConvertedResponse, RequestError> {
     self.clone().oneshot(request).await
   }
+}
+
+async fn execution_from_http(request: tokn_service::Request) -> Result<ExecutionRequest, RequestError> {
+  let (mut parts, body) = request.into_parts();
+  let context = parts.extensions.remove::<PipelineRequestContext>();
+  let raw_body = body.collect().await.map_err(RequestError::service)?.to_bytes();
+  let headers: tokn_headers::HeaderMap = (&parts.headers).into();
+  let request_endpoint = context
+    .as_ref()
+    .map(|context| context.request_endpoint.clone())
+    .unwrap_or_else(|| tokn_core::request_event::RequestEndpoint::infer_from_path(parts.uri.path()));
+  let (decoded_body, body_json) = match context.as_ref().and_then(|context| context.prepared_body.clone()) {
+    Some(prepared) => (prepared.decoded_body, prepared.body_json),
+    None => {
+      let decoded =
+        crate::utils::codec::decode_json_request(&headers, raw_body.clone()).map_err(RequestError::service)?;
+      (decoded.decoded_body, decoded.value)
+    }
+  };
+  let request_id = context.as_ref().and_then(|context| context.request_id.clone());
+  let config = context.map_or_else(RunConfig::default, |context| context.config);
+  Ok(
+    ExecutionRequest::new(RawInbound {
+      request_endpoint,
+      headers,
+      raw_body,
+      decoded_body,
+      body_json,
+      request_id,
+    })
+    .with_config(config),
+  )
+}
+
+fn converted_to_http(response: ConvertedResponse) -> Result<tokn_service::Response, RequestError> {
+  let ConvertedResponse { status, headers, body } = response;
+  let (body, kind) = match body {
+    ConvertedBody::Buffered { body_bytes, .. } => {
+      (tokn_service::body::full(body_bytes), PipelineResponseKind::Buffered)
+    }
+    ConvertedBody::Stream { body } => (tokn_service::body::stream(body), PipelineResponseKind::Stream),
+  };
+  let mut response = http::Response::builder()
+    .status(status)
+    .body(body)
+    .map_err(RequestError::service)?;
+  *response.headers_mut() = headers.into();
+  response.extensions_mut().insert(kind);
+  Ok(response)
 }
 
 impl Service<ExecutionRequest> for RequestService {
@@ -262,5 +388,48 @@ mod tests {
     let _ = service.execute(request()).await;
 
     assert_eq!(polls.load(Ordering::Relaxed), 1);
+  }
+
+  #[tokio::test]
+  async fn native_http_request_is_adapted_without_losing_duplicate_headers() {
+    let mut request = http::Request::post("/v1/responses")
+      .body(tokn_service::body::full(Bytes::from_static(br#"{"model":"test"}"#)))
+      .unwrap();
+    request
+      .headers_mut()
+      .append("x-duplicate", http::HeaderValue::from_static("first"));
+    request
+      .headers_mut()
+      .append("x-duplicate", http::HeaderValue::from_static("second"));
+
+    let execution = execution_from_http(request).await.unwrap();
+    let (inbound, _) = execution.into_parts();
+
+    assert_eq!(inbound.request_endpoint, Endpoint::Responses);
+    assert_eq!(inbound.decoded_body, Bytes::from_static(br#"{"model":"test"}"#));
+    assert_eq!(inbound.body_json["model"], "test");
+    assert_eq!(
+      inbound
+        .headers
+        .get_all("x-duplicate")
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>(),
+      ["first", "second"]
+    );
+  }
+
+  #[tokio::test]
+  async fn compatibility_request_round_trips_through_native_http_extensions() {
+    let config = RunConfig::builder().with_str("custom.value", "present").build();
+    let request = request()
+      .with_config(config)
+      .into_http(Method::POST, Uri::from_static("/v1/chat/completions"))
+      .unwrap();
+
+    let execution = execution_from_http(request).await.unwrap();
+
+    assert_eq!(execution.config().get_str("custom.value"), Some("present"));
+    assert_eq!(execution.inbound().request_id.as_deref(), Some("req-service-test"));
+    assert_eq!(execution.inbound().body_json, serde_json::json!({}));
   }
 }

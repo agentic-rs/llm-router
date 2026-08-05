@@ -20,6 +20,7 @@ import type {
   NativeCancellation,
   NativeClient,
   NativeGenerateStream,
+  NativeRequestEventStream,
   NativeResponse,
   NativeTextStream,
 } from "../src/native.js";
@@ -97,6 +98,14 @@ class FakeClient implements NativeClient {
     JSON.stringify({ type: "text_delta", text: "hello" }),
     JSON.stringify({ type: "completed", finish_reason: "stop" }),
   ]) as NativeGenerateStream & FakePullStream<string>;
+  requestEventStream = new FakePullStream<string>([
+    JSON.stringify({
+      request_id: "request-1",
+      attempt: 0,
+      ts: 1,
+      payload: { category: "stage", event: { type: "started", data: { request_endpoint: "responses" } } },
+    }),
+  ]) as NativeRequestEventStream & FakePullStream<string>;
   textOutputStream = new FakePullStream<string>(["hello", " world"]) as NativeTextStream &
     FakePullStream<string>;
 
@@ -110,6 +119,10 @@ class FakeClient implements NativeClient {
   async reload(cancellation: NativeCancellation): Promise<void> {
     this.reloadCalls += 1;
     this.lastCancellation = cancellation as FakeCancellation;
+  }
+
+  subscribeEvents(): NativeRequestEventStream {
+    return this.requestEventStream;
   }
 
   async close(): Promise<void> {
@@ -264,6 +277,25 @@ test("reload delegates to the native client", async () => {
 
   await client.reload();
   assert.equal(native.reloadCalls, 1);
+});
+
+test("request lifecycle subscriptions expose structured events", async () => {
+  const native = new FakeClient();
+  setNativeBindingForTests(fakeBinding(native));
+  const client = await Client.create();
+  const events = client.subscribeEvents();
+
+  assert.deepEqual(await events.next(), {
+    done: false,
+    value: {
+      request_id: "request-1",
+      attempt: 0,
+      ts: 1,
+      payload: { category: "stage", event: { type: "started", data: { request_endpoint: "responses" } } },
+    },
+  });
+  await events.close();
+  assert.equal(native.requestEventStream.closeCalls, 1);
 });
 
 test("client-bound generation keeps the fluent UX while sending a plain request", async () => {

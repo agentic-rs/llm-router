@@ -27,7 +27,7 @@ pub mod utils;
 pub(crate) mod test_support;
 
 pub use event::{CustomEvent, Event, EventBus, EventPayload, Stage, StageEvent};
-pub use executor::{ExecutionRequest, RequestError, RequestService};
+pub use executor::{ExecutionRequest, PipelineRequestContext, PipelineResponseKind, RequestError, RequestService};
 pub use pipeline::{
   ctx::PipelineCtx, error::PipelineError, stages as stage_traits, Pipeline, PipelineRunner, RawInbound, RetryPolicy,
   RunConfig, RunConfigBuilder,

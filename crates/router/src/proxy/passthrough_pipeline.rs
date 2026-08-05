@@ -312,10 +312,14 @@ async fn proxy_via_pipeline_inner(
     request_id: Some(request_id),
   };
 
-  match service
-    .execute(tokn_requests::ExecutionRequest::new(raw).with_config(cfg))
-    .await
+  let request = match tokn_requests::ExecutionRequest::new(raw)
+    .with_config(cfg)
+    .into_http(method.clone(), parts.uri.clone())
   {
+    Ok(request) => request,
+    Err(error) => return ApiError::internal(format!("building proxy service message: {error}")).into_response(),
+  };
+  match service.execute(request).await {
     Ok(converted) => crate::api::response::converted_to_axum(converted),
     Err(err) => proxy_request_error_to_api_error(&err, &host_with_port).into_response(),
   }
@@ -422,10 +426,14 @@ fn is_default_intercept_host(host_with_port: &str) -> bool {
   super::INTERCEPT_HOSTS.contains(&host)
 }
 
-fn proxy_request_error_to_api_error(err: &tokn_requests::RequestError, host_with_port: &str) -> ApiError {
-  let Some(err) = err.pipeline() else {
+fn proxy_request_error_to_api_error(err: &tokn_service::ServiceError, host_with_port: &str) -> ApiError {
+  let Some(request_error) = err.downcast_ref::<tokn_requests::RequestError>() else {
     tracing::warn!(host = %host_with_port, error = %err, "proxy request service failed");
     return ApiError::bad_gateway(err.to_string());
+  };
+  let Some(err) = request_error.pipeline() else {
+    tracing::warn!(host = %host_with_port, error = %request_error, "proxy request service failed");
+    return ApiError::bad_gateway(request_error.to_string());
   };
   proxy_pipeline_error_to_api_error(err, host_with_port)
 }

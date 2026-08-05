@@ -10,7 +10,9 @@ use napi::{Env, Result};
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokn_sdk::{Client, Endpoint, GenerateRequest, GenerateResponse, RequestOptions, ResponseBody, ToolCall, Usage};
+use tokn_sdk::{
+  Client, Endpoint, Event, GenerateRequest, GenerateResponse, RequestOptions, ResponseBody, ToolCall, Usage,
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +68,59 @@ pub struct NativeClient {
   state: Arc<ClientState>,
 }
 
+#[napi]
+pub struct NativeRequestEventStream {
+  receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::broadcast::Receiver<Arc<Event>>>>>,
+}
+
+#[napi]
+impl NativeRequestEventStream {
+  #[napi]
+  pub fn next(&self, env: Env) -> Result<AsyncBlock<Option<String>>> {
+    let receiver = self.receiver.clone();
+    AsyncBlockBuilder::new(async move {
+      let mut receiver = receiver.lock().await;
+      let Some(receiver) = receiver.as_mut() else {
+        return Ok(None);
+      };
+      loop {
+        match receiver.recv().await {
+          Ok(event) => {
+            let Event::Requests(event) = event.as_ref() else {
+              continue;
+            };
+            let event = serde_json::to_string(event).map_err(|error| {
+              native_error(
+                SERIALIZATION_ERROR,
+                format!("failed to serialize request lifecycle event: {error}"),
+              )
+            })?;
+            return Ok(Some(event));
+          }
+          Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+            return Err(native_error(
+              REQUEST_ERROR,
+              format!("request event stream lagged by {count} events"),
+            ));
+          }
+          Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(None),
+        }
+      }
+    })
+    .build(&env)
+  }
+
+  #[napi]
+  pub fn close(&self, env: Env) -> Result<AsyncBlock<()>> {
+    let receiver = self.receiver.clone();
+    AsyncBlockBuilder::new(async move {
+      *receiver.lock().await = None;
+      Ok(())
+    })
+    .build(&env)
+  }
+}
+
 impl Drop for NativeClient {
   fn drop(&mut self) {
     self.state.begin_close();
@@ -82,6 +137,13 @@ impl NativeClient {
   #[napi(getter)]
   pub fn auth_path(&self) -> String {
     self.state.client.auth_path().to_string_lossy().into_owned()
+  }
+
+  #[napi]
+  pub fn subscribe_events(&self) -> NativeRequestEventStream {
+    NativeRequestEventStream {
+      receiver: Arc::new(tokio::sync::Mutex::new(Some(self.state.client.subscribe_events()))),
+    }
   }
 
   #[napi]

@@ -1,4 +1,5 @@
 use arc_swap::ArcSwap;
+use http::{Method, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
@@ -6,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
 use tokn_config::Config;
-use tokn_core::event::EventBus;
+use tokn_core::event::{Event, EventBus};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RequestEndpoint;
@@ -120,6 +121,7 @@ struct Snapshot {
 
 pub struct Client {
   source: Source,
+  events: Arc<EventBus>,
   snapshot: ArcSwap<Snapshot>,
 }
 
@@ -138,16 +140,26 @@ impl Client {
       auth_path: builder.auth_path,
       profile: builder.profile,
     };
-    let snapshot = load_snapshot(&source)?;
+    let events = Arc::new(EventBus::new(EVENT_BUS_CAPACITY));
+    let snapshot = load_snapshot(&source, events.clone())?;
     Ok(Self {
       source,
+      events,
       snapshot: ArcSwap::from_pointee(snapshot),
     })
   }
 
   pub fn reload(&self) -> Result<()> {
-    self.snapshot.store(Arc::new(load_snapshot(&self.source)?));
+    self
+      .snapshot
+      .store(Arc::new(load_snapshot(&self.source, self.events.clone())?));
     Ok(())
+  }
+
+  /// Subscribe to the same lifecycle stream used by the configured request
+  /// pipeline. The subscription remains valid across successful reloads.
+  pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Arc<Event>> {
+    self.events.subscribe()
   }
 
   pub fn config_path(&self) -> PathBuf {
@@ -238,10 +250,17 @@ impl Client {
       _ => &policy.request_service,
     };
     let response = service
-      .execute(ExecutionRequest::new(raw).with_config(config))
+      .execute(
+        ExecutionRequest::new(raw)
+          .with_config(config)
+          .into_http(Method::POST, endpoint_uri(endpoint))
+          .map_err(|source| Error::Request {
+            source: tokn_service::ServiceError::new(source),
+          })?,
+      )
       .await
       .map_err(|source| Error::Request { source })?;
-    Ok(response.into())
+    RawResponse::from_http(response).await
   }
 
   pub(crate) async fn execute_typed<T: Serialize>(
@@ -259,7 +278,15 @@ impl Client {
   }
 }
 
-fn load_snapshot(source: &Source) -> Result<Snapshot> {
+fn endpoint_uri(endpoint: Endpoint) -> Uri {
+  match endpoint {
+    Endpoint::ChatCompletions => Uri::from_static("/v1/chat/completions"),
+    Endpoint::Responses => Uri::from_static("/v1/responses"),
+    Endpoint::Messages => Uri::from_static("/v1/messages"),
+  }
+}
+
+fn load_snapshot(source: &Source, events: Arc<EventBus>) -> Result<Snapshot> {
   let (config, config_path) =
     Config::load(source.config_path.as_deref()).map_err(|source| Error::LoadConfig { source })?;
   let auth_path = match &source.auth_path {
@@ -273,7 +300,6 @@ fn load_snapshot(source: &Source) -> Result<Snapshot> {
     path: auth_path.clone(),
     source,
   })?;
-  let events = Arc::new(EventBus::new(EVENT_BUS_CAPACITY));
   let state = tokn_router::api::build_state(&config, &credentials.accounts, events)
     .map_err(|source| Error::BuildEngine { source })?;
   if let Some(profile) = &source.profile {

@@ -295,3 +295,45 @@ async fn router_stream_returns_sse_and_persists_drained_stream_row() {
 
   mock.shutdown().await;
 }
+
+#[tokio::test]
+async fn malformed_body_returns_bad_request_and_persists_completed_row() {
+  let mut harness = RequestsHarness::new();
+  let cfg = cfg_for(&harness.requests_dir, RouteMode::Route);
+  let state = build_state(&cfg, &[zai_account("http://127.0.0.1:9")], harness.events.clone()).unwrap();
+  let app = router(state);
+  let request_id = "router-malformed-body";
+
+  let response = app
+    .oneshot(
+      Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-request-id", request_id)
+        .body(Body::from(r#"{"model":"#))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+  assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+  let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+  assert!(std::str::from_utf8(&response_body)
+    .unwrap()
+    .contains("invalid JSON request body"));
+
+  harness.shutdown().await;
+  let row = harness.row(request_id).await;
+  assert_eq!(text(&row, "inbound_req_method").as_deref(), Some("POST"));
+  assert_eq!(text(&row, "endpoint").as_deref(), Some("chat_completions"));
+  assert_eq!(int(&row, "status"), Some(400));
+  assert_eq!(int(&row, "inbound_resp_status"), Some(400));
+  assert!(text(&row, "request_error")
+    .unwrap_or_default()
+    .contains("invalid JSON request body"));
+  assert!(body_json(&row, "inbound_resp_body")["error"]["message"]
+    .as_str()
+    .unwrap_or_default()
+    .contains("invalid JSON request body"));
+}

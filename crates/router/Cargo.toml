@@ -19,6 +19,7 @@ tokn-catalogue = { workspace = true }
 tokn-convert = { workspace = true }
 tokn-headers = { workspace = true }
 tokn-requests = { workspace = true }
+tokn-service = { workspace = true }
 tokn-provider-copilot = { workspace = true }
 tokn-provider-deepseek = { workspace = true }
 tokn-provider-openai = { workspace = true }
@@ -32,6 +33,7 @@ bytes = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 ipnet = { workspace = true }

@@ -4,6 +4,7 @@ from ._client import (
   GenerateRequestBuilder,
   GenerateStream,
   Response,
+  RequestEventStream,
   StreamResponse,
   TextStream,
 )
@@ -59,6 +60,7 @@ __all__ = [
   "ReasoningOptions",
   "ReasoningSummary",
   "RequestError",
+  "RequestEventStream",
   "RequestOptions",
   "Response",
   "Role",

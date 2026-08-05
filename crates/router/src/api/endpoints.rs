@@ -3,7 +3,7 @@ use super::{AppState, LiveAppState, RequestPolicyRuntime};
 use crate::pipeline::{request_header_extract, ChatParser, MessagesParser, RequestParser, ResponsesParser};
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use serde_json::Value;
 use smol_str::SmolStr;
@@ -12,7 +12,9 @@ use tokn_access::AccessContext;
 use tokn_accounts::routing::{route_mode_as_str, ResolveError};
 use tokn_convert::value::messages::DEFAULT_MESSAGES_MAX_TOKENS;
 use tokn_core::event::Event as CoreEvent;
-use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEvent, RequestEventPayload};
+use tokn_core::request_event::{
+  ConvertedResponseSummary, RecordEvent, RequestEndpoint, RequestEvent, RequestEventPayload, Stage, StageEvent,
+};
 use tokn_requests::pipeline::error::RequestsError;
 use tokn_requests::ExecutionRequest;
 use tracing::instrument;
@@ -60,8 +62,17 @@ async fn handle(
       url: None,
     }),
   }));
-  let mut decoded = super::codec::decode_json_request(&inbound, body)?;
-  apply_endpoint_compat_defaults(parser.endpoint(), &inbound, &mut decoded)?;
+  let mut decoded = match super::codec::decode_json_request(&inbound, body) {
+    Ok(decoded) => decoded,
+    Err(error) => {
+      emit_terminal_error(&state, &hx.request_id, parser.endpoint(), &error);
+      return Err(error);
+    }
+  };
+  if let Err(error) = apply_endpoint_compat_defaults(parser.endpoint(), &inbound, &mut decoded) {
+    emit_terminal_error(&state, &hx.request_id, parser.endpoint(), &error);
+    return Err(error);
+  }
   let raw = tokn_requests::RawInbound {
     request_endpoint: RequestEndpoint::from(parser.endpoint()),
     headers: (&inbound).into(),
@@ -83,16 +94,76 @@ async fn handle(
     );
   }
   let run_config = run_config.build();
-  match service
-    .execute(ExecutionRequest::new(raw).with_config(run_config))
-    .await
-  {
+  let request = ExecutionRequest::new(raw)
+    .with_config(run_config)
+    .into_http(Method::POST, endpoint_uri(parser.endpoint()))
+    .map_err(|error| ApiError::internal(format!("building request service message: {error}")))?;
+  match service.execute(request).await {
     Ok(converted) => Ok(super::response::converted_to_axum(converted)),
     Err(err) => Err(request_error_to_api_error(err)),
   }
 }
 
-fn request_error_to_api_error(err: tokn_requests::RequestError) -> ApiError {
+fn emit_terminal_error(state: &AppState, request_id: &str, endpoint: crate::provider::Endpoint, error: &ApiError) {
+  let request_id = SmolStr::new(request_id);
+  let ts = tokn_core::util::now_unix_ms();
+  state.events.emit(CoreEvent::Requests(RequestEvent {
+    request_id: request_id.clone(),
+    attempt: 0,
+    ts,
+    payload: RequestEventPayload::Stage(StageEvent::Started {
+      request_endpoint: RequestEndpoint::from(endpoint),
+    }),
+  }));
+  state.events.emit(CoreEvent::Requests(RequestEvent {
+    request_id: request_id.clone(),
+    attempt: 0,
+    ts,
+    payload: RequestEventPayload::Stage(StageEvent::Error {
+      stage: Stage::Extract,
+      message: SmolStr::new(error.to_string()),
+      recoverable: false,
+      stop: true,
+    }),
+  }));
+
+  let body = serde_json::from_slice(&error.body_bytes()).unwrap_or(Value::Null);
+  let mut headers = tokn_headers::HeaderMap::new();
+  headers.insert("content-type", "application/json");
+  state.events.emit(CoreEvent::Requests(RequestEvent {
+    request_id: request_id.clone(),
+    attempt: 0,
+    ts,
+    payload: RequestEventPayload::Stage(StageEvent::ConvertResponse(ConvertedResponseSummary {
+      status: error.status().as_u16(),
+      headers,
+      body: Some(Arc::new(body)),
+    })),
+  }));
+  state.events.emit(CoreEvent::Requests(RequestEvent {
+    request_id,
+    attempt: 0,
+    ts,
+    payload: RequestEventPayload::Stage(StageEvent::Completed {
+      success: false,
+      attempts: 1,
+    }),
+  }));
+}
+
+fn endpoint_uri(endpoint: crate::provider::Endpoint) -> Uri {
+  match endpoint {
+    crate::provider::Endpoint::ChatCompletions => Uri::from_static("/v1/chat/completions"),
+    crate::provider::Endpoint::Responses => Uri::from_static("/v1/responses"),
+    crate::provider::Endpoint::Messages => Uri::from_static("/v1/messages"),
+  }
+}
+
+fn request_error_to_api_error(err: tokn_service::ServiceError) -> ApiError {
+  let err = match err.into_source().downcast::<tokn_requests::RequestError>() {
+    Ok(err) => *err,
+    Err(source) => return ApiError::bad_gateway(source.to_string()),
+  };
   match err.into_pipeline() {
     Ok(err) => pipeline_error_to_api_error(err),
     Err(err) => ApiError::bad_gateway(err.to_string()),

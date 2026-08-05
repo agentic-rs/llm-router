@@ -1,53 +1,41 @@
-//! Adapter helpers for materializing a [`tokn_requests::ConvertedResponse`]
-//! into an axum `Response` for the router's default `tokn-requests` path.
+//! Adapter from the low-level native HTTP service response to axum.
 //!
-//! The router rebuilds response headers instead of forwarding upstream
-//! headers verbatim. A fresh header map is built containing only what the
-//! client needs (content-type for
-//! map is built containing only what the client needs (content-type for
-//! buffered JSON, SSE headers for streams). This avoids leaking
-//! `content-encoding: gzip` from the upstream while reqwest has already
-//! decoded the body — which would otherwise make clients try to gunzip
-//! plain text and fail.
+//! Compatibility pipeline responses retain their body classification in an
+//! HTTP extension. Router-owned JSON and SSE endpoints rebuild the same safe
+//! downstream headers as before, avoiding stale upstream content encodings.
+//! Arbitrary low-level responses preserve their native headers unchanged.
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
-use axum::response::IntoResponse;
-use tokn_requests::pipeline::stages::{ConvertedBody, ConvertedResponse};
+use axum::http::{header, HeaderMap, HeaderValue, Response};
+use futures_util::TryStreamExt;
+use http_body_util::BodyExt;
+use tokn_requests::PipelineResponseKind;
 
-/// Convert a [`ConvertedResponse`] into an axum response.
-///
-/// Status code is preserved from upstream. Headers are rebuilt from
-/// scratch (see module-level docs for rationale). Body comes through
-/// either as a single `Bytes` (Buffered) or a `BoxStream` (Stream).
-pub(crate) fn converted_to_axum(c: ConvertedResponse) -> Response<Body> {
-  let status = to_status(c.status);
-  match c.body {
-    ConvertedBody::Buffered { body_bytes, .. } => {
-      let headers = buffered_headers();
-      (status, headers, Body::from(body_bytes)).into_response()
-    }
-    ConvertedBody::Stream { body } => {
-      let headers = sse_headers();
-      (status, headers, Body::from_stream(body)).into_response()
-    }
+pub(crate) fn converted_to_axum(response: tokn_service::Response) -> Response<Body> {
+  let (mut parts, body) = response.into_parts();
+  match parts.extensions.get::<PipelineResponseKind>().copied() {
+    Some(PipelineResponseKind::Buffered) => parts.headers = buffered_headers(),
+    Some(PipelineResponseKind::Stream) => parts.headers = sse_headers(),
+    None => {}
   }
-}
-
-fn to_status(status: u16) -> StatusCode {
-  StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
+  let body = Body::from_stream(
+    body
+      .into_data_stream()
+      .map_err(|error| std::io::Error::other(error.to_string())),
+  );
+  Response::from_parts(parts, body)
 }
 
 fn buffered_headers() -> HeaderMap {
-  let mut h = HeaderMap::new();
-  h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-  h
+  let mut headers = HeaderMap::new();
+  headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+  headers
 }
 
 fn sse_headers() -> HeaderMap {
-  let mut h = HeaderMap::new();
-  h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-  h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-  h.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
-  h
+  let mut headers = HeaderMap::new();
+  headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+  headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+  headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+  headers
 }

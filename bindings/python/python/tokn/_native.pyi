@@ -42,6 +42,12 @@ class NativeTextStream:
   async def aclose(self) -> None: ...
 
 
+class NativeRequestEventStream:
+  async def next_event(self) -> str: ...
+
+  async def aclose(self) -> None: ...
+
+
 class NativeClient:
   def __init__(
     self,
@@ -55,6 +61,8 @@ class NativeClient:
   def config_path(self) -> str: ...
 
   def auth_path(self) -> str: ...
+
+  def subscribe_events(self) -> NativeRequestEventStream: ...
 
   async def request(
     self,

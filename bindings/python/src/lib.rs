@@ -6,8 +6,8 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tokn_sdk::{
-  ByteStream, Client, Endpoint, Error as SdkError, GenerateRequest, GenerateResponse, GenerateStream, RequestOptions,
-  ResponseBody, TextStream, ToolCall, Usage,
+  ByteStream, Client, Endpoint, Error as SdkError, Event, GenerateRequest, GenerateResponse, GenerateStream,
+  RequestOptions, ResponseBody, TextStream, ToolCall, Usage,
 };
 
 pyo3::create_exception!(
@@ -82,6 +82,12 @@ impl PyClient {
 
   fn auth_path(&self) -> String {
     self.inner.auth_path().to_string_lossy().into_owned()
+  }
+
+  fn subscribe_events(&self) -> NativeRequestEventStream {
+    NativeRequestEventStream {
+      receiver: Arc::new(Mutex::new(Some(self.inner.subscribe_events()))),
+    }
   }
 
   #[pyo3(signature = (endpoint, body_json, options_json=None))]
@@ -172,6 +178,48 @@ impl PyClient {
       Ok(NativeTextStream {
         stream: Arc::new(ClosableStream::new(stream)),
       })
+    })
+  }
+}
+
+#[pyclass(name = "NativeRequestEventStream")]
+struct NativeRequestEventStream {
+  receiver: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<Arc<Event>>>>>,
+}
+
+#[pymethods]
+impl NativeRequestEventStream {
+  fn next_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    let receiver = self.receiver.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+      let mut receiver = receiver.lock().await;
+      let receiver = receiver.as_mut().ok_or_else(|| PyStopAsyncIteration::new_err(()))?;
+      loop {
+        match receiver.recv().await {
+          Ok(event) => {
+            let Event::Requests(event) = event.as_ref() else {
+              continue;
+            };
+            return serde_json::to_string(event).map_err(serialization_error);
+          }
+          Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+            return Err(StreamError::new_err(format!(
+              "request event stream lagged by {count} events"
+            )));
+          }
+          Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            return Err(PyStopAsyncIteration::new_err(()));
+          }
+        }
+      }
+    })
+  }
+
+  fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    let receiver = self.receiver.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+      *receiver.lock().await = None;
+      Ok(())
     })
   }
 }
@@ -465,6 +513,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
   module.add_class::<PyStream>()?;
   module.add_class::<NativeGenerateStream>()?;
   module.add_class::<NativeTextStream>()?;
+  module.add_class::<NativeRequestEventStream>()?;
   module.add("ToknError", module.py().get_type::<ToknError>())?;
   module.add("ConfigurationError", module.py().get_type::<ConfigurationError>())?;
   module.add("AuthenticationError", module.py().get_type::<AuthenticationError>())?;
