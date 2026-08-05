@@ -42,6 +42,8 @@ impl AuthStoreLock {
       open_private_lock_file(&lock_path).with_context(|| format!("opening auth store lock {}", lock_path.display()))?;
     match file.try_lock() {
       Ok(()) => {
+        revalidate_locked_file(&lock_path, &file)
+          .with_context(|| format!("revalidating auth store lock {}", lock_path.display()))?;
         validate_direct_auth_layout(&auth_path)?;
         Ok(Self {
           auth_path,
@@ -154,7 +156,7 @@ fn auth_lock_path(auth_path: &Path) -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn open_private_lock_file(path: &Path) -> std::io::Result<fs::File> {
-  use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+  use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
   validate_lock_path_before_open(path)?;
   let file = fs::OpenOptions::new()
@@ -164,14 +166,7 @@ fn open_private_lock_file(path: &Path) -> std::io::Result<fs::File> {
     .write(true)
     .mode(0o600)
     .open(path)?;
-  let opened = file.metadata()?;
-  let linked = validate_opened_lock_path(path)?;
-  if opened.dev() != linked.dev() || opened.ino() != linked.ino() {
-    return Err(invalid_lock_file(path, "changed while it was being opened"));
-  }
-  if opened.nlink() != 1 {
-    return Err(invalid_lock_file(path, "must not have multiple hard links"));
-  }
+  revalidate_locked_file(path, &file)?;
   file.set_permissions(fs::Permissions::from_mode(0o600))?;
   Ok(file)
 }
@@ -185,8 +180,40 @@ fn open_private_lock_file(path: &Path) -> std::io::Result<fs::File> {
     .read(true)
     .write(true)
     .open(path)?;
-  validate_opened_lock_path(path)?;
+  revalidate_locked_file(path, &file)?;
   Ok(file)
+}
+
+#[cfg(unix)]
+fn revalidate_locked_file(path: &Path, file: &fs::File) -> std::io::Result<()> {
+  use std::os::unix::fs::MetadataExt;
+
+  let opened = file.metadata()?;
+  let linked = validate_opened_lock_path(path)?;
+  if opened.dev() != linked.dev() || opened.ino() != linked.ino() {
+    return Err(invalid_lock_file(path, "changed while it was being opened or locked"));
+  }
+  if opened.nlink() != 1 {
+    return Err(invalid_lock_file(path, "must not have multiple hard links"));
+  }
+  Ok(())
+}
+
+#[cfg(windows)]
+fn revalidate_locked_file(path: &Path, file: &fs::File) -> std::io::Result<()> {
+  validate_opened_lock_path(path)?;
+  let opened = tokn_config::FileIdentity::from_file(file)?;
+  let linked = tokn_config::FileIdentity::from_path(path)?;
+  if opened != linked {
+    return Err(invalid_lock_file(path, "changed while it was being opened or locked"));
+  }
+  Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn revalidate_locked_file(path: &Path, _file: &fs::File) -> std::io::Result<()> {
+  validate_opened_lock_path(path)?;
+  Ok(())
 }
 
 fn validate_lock_path_before_open(path: &Path) -> std::io::Result<()> {
@@ -256,6 +283,24 @@ mod tests {
     assert!(format!("{error:#}").contains("must not be a symlink"));
     assert_eq!(fs::read(&victim).unwrap(), victim_contents);
     assert_eq!(fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o644);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn locked_file_revalidation_rejects_a_replaced_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join(".auth.yaml.lock");
+    let displaced_path = dir.path().join("displaced.lock");
+    let file = open_private_lock_file(&lock_path).unwrap();
+    file.try_lock().unwrap();
+    fs::rename(&lock_path, &displaced_path).unwrap();
+    fs::write(&lock_path, "replacement").unwrap();
+
+    let error = revalidate_locked_file(&lock_path, &file).unwrap_err();
+
+    assert!(error
+      .to_string()
+      .contains("changed while it was being opened or locked"));
   }
 
   #[cfg(unix)]
