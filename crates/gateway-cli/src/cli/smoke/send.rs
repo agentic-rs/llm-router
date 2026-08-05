@@ -339,7 +339,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     }
     Err(err) => {
       let Some(source) = err.pipeline() else {
-        anyhow::bail!("request service failed: {err}");
+        anyhow::bail!("{err}");
       };
       print_failure_outcome(source, &snapshot, persisted.as_ref(), args.format, !args.no_redact)?;
       anyhow::bail!("pipeline failed: {}: {}", source.stage, source.message());
