@@ -318,6 +318,18 @@ mod tests {
   }
 
   #[test]
+  fn pinned_server_config_uses_the_connect_identity_and_http1() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = load_or_generate_ca(dir.path(), false).unwrap();
+    let host = CanonicalHost::parse("api.example.com").unwrap();
+
+    let config = ca.pinned_server_config(&host).unwrap();
+
+    assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    assert!(ca.cert_cache.lock().contains_key(host.as_str()));
+  }
+
+  #[test]
   fn leaf_cache_evicts_the_least_recently_used_identity() {
     let dir = tempfile::tempdir().unwrap();
     let ca = load_or_generate_ca(dir.path(), false).unwrap();
