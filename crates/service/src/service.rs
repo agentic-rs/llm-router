@@ -56,17 +56,17 @@ impl StdError for ServiceError {
 /// Request extensions are preserved, so higher-level adapters can attach
 /// routing or lifecycle context without adding those concepts to this crate.
 #[derive(Clone)]
-pub struct RequestService {
+pub struct HttpService {
   inner: BoxCloneSyncService<Request, Response, ServiceError>,
 }
 
-impl std::fmt::Debug for RequestService {
+impl std::fmt::Debug for HttpService {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    formatter.debug_struct("RequestService").finish_non_exhaustive()
+    formatter.debug_struct("HttpService").finish_non_exhaustive()
   }
 }
 
-impl RequestService {
+impl HttpService {
   /// Erase a cloneable Tower HTTP service behind the public boundary.
   pub fn new<S>(service: S) -> Self
   where
@@ -85,7 +85,7 @@ impl RequestService {
   }
 }
 
-impl Service<Request> for RequestService {
+impl Service<Request> for HttpService {
   type Response = Response;
   type Error = ServiceError;
   type Future = <BoxCloneSyncService<Request, Response, ServiceError> as Service<Request>>::Future;
@@ -111,7 +111,7 @@ mod tests {
   #[tokio::test]
   async fn executes_native_http_service_after_readiness() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let service = RequestService::new(tower::service_fn({
+    let service = HttpService::new(tower::service_fn({
       let calls = calls.clone();
       move |request: Request| {
         let calls = calls.clone();

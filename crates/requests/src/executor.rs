@@ -1,9 +1,11 @@
 //! Transitional request-service boundary shared by pipeline and layered runtimes.
 //!
-//! Router and SDK callers depend on [`RequestService`] instead of the
-//! concrete six-stage pipeline. The current [`PipelineRunner`]
-//! implementation is adapted behind the service, while a later
-//! [`tower::Layer`] stack can be supplied without changing those callers.
+//! SDK callers depend on [`RequestService`] instead of the concrete six-stage
+//! pipeline. HTTP-facing callers use [`tokn_service::HttpService`], produced
+//! by adapting this request-domain service through
+//! [`RequestService::http_service`]. The current [`PipelineRunner`]
+//! implementation remains behind both boundaries while the request-domain
+//! contract evolves independently from the HTTP transport contract.
 //! The current [`RawInbound`] request and [`ConvertedResponse`] response are
 //! compatibility types, not the final low-level SDK contract.
 //!
@@ -232,10 +234,10 @@ impl RequestService {
     }))
   }
 
-  /// Adapt the compatibility pipeline into the public native HTTP service.
-  pub fn http_from_pipeline(pipeline: Arc<PipelineRunner>) -> tokn_service::RequestService {
-    let service = Self::from_pipeline(pipeline);
-    tokn_service::RequestService::new(tower::service_fn(move |request: tokn_service::Request| {
+  /// Adapt this request-domain service into the public native HTTP service.
+  pub fn http_service(&self) -> tokn_service::HttpService {
+    let service = self.clone();
+    tokn_service::HttpService::new(tower::service_fn(move |request: tokn_service::Request| {
       let service = service.clone();
       async move {
         let request = execution_from_http(request).await?;
@@ -243,6 +245,11 @@ impl RequestService {
         converted_to_http(response)
       }
     }))
+  }
+
+  /// Adapt the compatibility pipeline into the public native HTTP service.
+  pub fn http_from_pipeline(pipeline: Arc<PipelineRunner>) -> tokn_service::HttpService {
+    Self::from_pipeline(pipeline).http_service()
   }
 
   /// Wait for readiness and execute one logical request.

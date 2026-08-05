@@ -49,7 +49,7 @@ pub enum Error {
   #[error("request execution failed")]
   Request {
     #[source]
-    source: tokn_service::ServiceError,
+    source: tokn_requests::RequestError,
   },
   #[error("expected a buffered response but received a stream; use the endpoint's stream method")]
   UnexpectedStream,

@@ -2,7 +2,7 @@
 //!
 //! This crate deliberately has no dependency on tokn configuration, account
 //! pools, persistence, provider implementations, or built-in header policy.
-//! Higher-level crates compile those concerns into a [`RequestService`].
+//! Higher-level crates compile those concerns into an [`HttpService`].
 
 pub mod body;
 mod service;
@@ -10,7 +10,7 @@ mod service;
 use std::error::Error as StdError;
 
 pub use body::{Body, BodyError};
-pub use service::{RequestService, ServiceError};
+pub use service::{HttpService, ServiceError};
 
 /// Type-erased thread-safe error used by streaming bodies.
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;

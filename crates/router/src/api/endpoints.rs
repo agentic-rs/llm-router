@@ -82,9 +82,9 @@ async fn handle(
     request_id: Some(SmolStr::new(&hx.request_id)),
   };
   let service = match mode {
-    Some(tokn_config::RouteMode::Passthrough) => &policy.passthrough_service,
-    Some(tokn_config::RouteMode::Switch) => &policy.switch_service,
-    _ => &policy.request_service,
+    Some(tokn_config::RouteMode::Passthrough) => policy.passthrough_runtime.http_service(),
+    Some(tokn_config::RouteMode::Switch) => policy.switch_runtime.http_service(),
+    _ => policy.request_runtime.http_service(),
   };
   let mut run_config = tokn_requests::RunConfig::builder().with_agent_id_opt(policy.agent_id.clone());
   if let Some(providers) = access.providers.provider_ids() {

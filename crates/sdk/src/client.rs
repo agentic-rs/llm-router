@@ -1,5 +1,4 @@
 use arc_swap::ArcSwap;
-use http::{Method, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
@@ -245,22 +244,15 @@ impl Client {
     }
     let config = config.build();
     let service = match policy.mode {
-      tokn_config::RouteMode::Passthrough => &policy.passthrough_service,
-      tokn_config::RouteMode::Switch => &policy.switch_service,
-      _ => &policy.request_service,
+      tokn_config::RouteMode::Passthrough => policy.passthrough_runtime.request_service(),
+      tokn_config::RouteMode::Switch => policy.switch_runtime.request_service(),
+      _ => policy.request_runtime.request_service(),
     };
     let response = service
-      .execute(
-        ExecutionRequest::new(raw)
-          .with_config(config)
-          .into_http(Method::POST, endpoint_uri(endpoint))
-          .map_err(|source| Error::Request {
-            source: tokn_service::ServiceError::new(source),
-          })?,
-      )
+      .execute(ExecutionRequest::new(raw).with_config(config))
       .await
       .map_err(|source| Error::Request { source })?;
-    RawResponse::from_http(response).await
+    Ok(RawResponse::from(response))
   }
 
   pub(crate) async fn execute_typed<T: Serialize>(
@@ -275,14 +267,6 @@ impl Client {
       object.insert("stream".into(), Value::Bool(stream));
     }
     self.execute(endpoint, body, options).await
-  }
-}
-
-fn endpoint_uri(endpoint: Endpoint) -> Uri {
-  match endpoint {
-    Endpoint::ChatCompletions => Uri::from_static("/v1/chat/completions"),
-    Endpoint::Responses => Uri::from_static("/v1/responses"),
-    Endpoint::Messages => Uri::from_static("/v1/messages"),
   }
 }
 

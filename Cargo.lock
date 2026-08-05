@@ -2771,6 +2771,7 @@ dependencies = [
  "tokn-router",
  "tokn-router-config",
  "tokn-sdk",
+ "tokn-service",
 ]
 
 [[package]]
@@ -3338,8 +3339,6 @@ dependencies = [
  "bytes",
  "eventsource-stream",
  "futures-util",
- "http",
- "http-body-util",
  "serde",
  "serde_json",
  "smol_str",
@@ -3357,7 +3356,6 @@ dependencies = [
  "tokn-requests",
  "tokn-router",
  "tokn-router-config",
- "tokn-service",
 ]
 
 [[package]]

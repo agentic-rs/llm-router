@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::{StreamExt, TryStreamExt};
-use http_body_util::BodyExt;
+use futures_util::TryStreamExt;
 use serde::de::DeserializeOwned;
 use tokn_headers::HeaderMap;
 use tokn_requests::pipeline::stages::{ConvertedBody, ConvertedResponse};
@@ -59,31 +58,6 @@ impl From<ConvertedResponse> for RawResponse {
 }
 
 impl RawResponse {
-  pub(crate) async fn from_http(response: tokn_service::Response) -> Result<Self> {
-    let (parts, body) = response.into_parts();
-    let kind = parts.extensions.get::<tokn_requests::PipelineResponseKind>().copied();
-    let body = match kind {
-      Some(tokn_requests::PipelineResponseKind::Buffered) => {
-        let bytes = body.collect().await.map_err(|source| Error::Request {
-          source: tokn_service::ServiceError::new(source),
-        })?;
-        ResponseBody::Buffered(bytes.to_bytes())
-      }
-      Some(tokn_requests::PipelineResponseKind::Stream) | None => {
-        let stream = body
-          .into_data_stream()
-          .map_err(|error| std::io::Error::other(error.to_string()))
-          .boxed();
-        ResponseBody::Stream(stream)
-      }
-    };
-    Ok(Self {
-      status: parts.status.as_u16(),
-      headers: (&parts.headers).into(),
-      body,
-    })
-  }
-
   pub fn into_buffered(self) -> Result<BufferedResponse<Bytes>> {
     match self.body {
       ResponseBody::Buffered(data) => Ok(BufferedResponse {
