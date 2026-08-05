@@ -10,12 +10,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokn_policy::CanonicalHost;
 
 const CA_CERT_FILE: &str = "ca.crt";
 const CA_KEY_FILE: &str = "ca.key";
 const CA_BUNDLE_FILE: &str = "ca-bundle.crt";
 const LEAF_VALIDITY: TimeDuration = TimeDuration::days(7);
 const LEAF_REFRESH_AFTER: TimeDuration = TimeDuration::days(6);
+const LEAF_CACHE_CAPACITY: usize = 256;
 
 pub fn load_or_generate_ca(dir: &Path, force_regenerate: bool) -> Result<ProxyCa> {
   std::fs::create_dir_all(dir).with_context(|| format!("create ca dir {}", dir.display()))?;
@@ -97,6 +99,7 @@ pub struct ProxyCa {
 struct CachedCertificate {
   certified_key: Arc<CertifiedKey>,
   refresh_at: OffsetDateTime,
+  last_used_at: OffsetDateTime,
 }
 
 impl ProxyCa {
@@ -136,19 +139,37 @@ impl ProxyCa {
     Ok(bundle_path)
   }
 
+  /// Build one server configuration whose identity is fixed by CONNECT.
+  ///
+  /// Certificate selection must never follow an untrusted ClientHello SNI.
+  /// Missing SNI is accepted because the certificate remains pinned; a
+  /// supplied SNI must name the exact canonical CONNECT host.
+  pub(crate) fn pinned_server_config(&self, host: &CanonicalHost) -> Result<Arc<rustls::ServerConfig>> {
+    let certified_key = self.certified_key_for(host.as_str())?;
+    let resolver = Arc::new(PinnedResolver {
+      host: host.clone(),
+      certified_key,
+    });
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+      .with_safe_default_protocol_versions()
+      .context("select safe TLS protocol versions for intercepted connections")?
+      .with_no_client_auth()
+      .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+  }
+
   pub(super) fn certified_key_for(&self, host: &str) -> Result<Arc<CertifiedKey>> {
     self.certified_key_for_at(host, OffsetDateTime::now_utc())
   }
 
   fn certified_key_for_at(&self, host: &str, now: OffsetDateTime) -> Result<Arc<CertifiedKey>> {
-    if let Some(existing) = self
-      .cert_cache
-      .lock()
-      .get(host)
-      .filter(|cached| now < cached.refresh_at)
-      .map(|cached| cached.certified_key.clone())
     {
-      return Ok(existing);
+      let mut cache = self.cert_cache.lock();
+      if let Some(existing) = cache.get_mut(host).filter(|cached| now < cached.refresh_at) {
+        existing.last_used_at = now;
+        return Ok(existing.certified_key.clone());
+      }
     }
 
     let mut params = CertificateParams::new(vec![host.to_string()]).context("build leaf certificate params")?;
@@ -178,10 +199,21 @@ impl ProxyCa {
     let cached = CachedCertificate {
       certified_key: certified.clone(),
       refresh_at: now + LEAF_REFRESH_AFTER,
+      last_used_at: now,
     };
     let mut cache = self.cert_cache.lock();
-    if let Some(existing) = cache.get(host).filter(|existing| now < existing.refresh_at) {
+    if let Some(existing) = cache.get_mut(host).filter(|existing| now < existing.refresh_at) {
+      existing.last_used_at = now;
       return Ok(existing.certified_key.clone());
+    }
+    cache.retain(|_, existing| now < existing.refresh_at);
+    if cache.len() >= LEAF_CACHE_CAPACITY {
+      let least_recently_used = cache
+        .iter()
+        .min_by_key(|(_, existing)| existing.last_used_at)
+        .map(|(host, _)| host.clone())
+        .expect("a full leaf cache always has one entry");
+      cache.remove(&least_recently_used);
     }
     cache.insert(host.to_string(), cached);
     Ok(certified)
@@ -225,16 +257,22 @@ pub(super) fn hexify(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug)]
-pub(super) struct DynamicResolver {
-  pub(super) ca: Arc<ProxyCa>,
-  pub(super) fallback_host: String,
+struct PinnedResolver {
+  host: CanonicalHost,
+  certified_key: Arc<CertifiedKey>,
 }
 
-impl ResolvesServerCert for DynamicResolver {
+impl ResolvesServerCert for PinnedResolver {
   fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-    let host = client_hello.server_name().unwrap_or(&self.fallback_host);
-    self.ca.certified_key_for(host).ok()
+    server_name_matches(&self.host, client_hello.server_name()).then(|| self.certified_key.clone())
   }
+}
+
+fn server_name_matches(expected: &CanonicalHost, server_name: Option<&str>) -> bool {
+  let Some(server_name) = server_name else {
+    return true;
+  };
+  CanonicalHost::parse(server_name).is_ok_and(|server_name| &server_name == expected)
 }
 
 #[cfg(test)]
@@ -267,5 +305,55 @@ mod tests {
     assert!(Arc::ptr_eq(&initial, &cached));
     assert!(!Arc::ptr_eq(&initial, &refreshed));
     assert!(Arc::ptr_eq(&refreshed, &refreshed_cached));
+  }
+
+  #[test]
+  fn pinned_identity_accepts_only_the_connect_server_name() {
+    let expected = CanonicalHost::parse("api.example.com").unwrap();
+
+    assert!(server_name_matches(&expected, None));
+    assert!(server_name_matches(&expected, Some("API.EXAMPLE.COM")));
+    assert!(!server_name_matches(&expected, Some("other.example.com")));
+    assert!(!server_name_matches(&expected, Some("api.example.com.")));
+  }
+
+  #[test]
+  fn pinned_server_config_uses_the_connect_identity_and_http1() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = load_or_generate_ca(dir.path(), false).unwrap();
+    let host = CanonicalHost::parse("api.example.com").unwrap();
+
+    let config = ca.pinned_server_config(&host).unwrap();
+
+    assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    assert!(ca.cert_cache.lock().contains_key(host.as_str()));
+  }
+
+  #[test]
+  fn leaf_cache_evicts_the_least_recently_used_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = load_or_generate_ca(dir.path(), false).unwrap();
+    let generated_at = OffsetDateTime::now_utc();
+    let retained = ca.certified_key_for_at("retained.example", generated_at).unwrap();
+
+    for index in 0..LEAF_CACHE_CAPACITY - 1 {
+      ca.certified_key_for_at(
+        &format!("host-{index}.example"),
+        generated_at + TimeDuration::seconds(index as i64 + 1),
+      )
+      .unwrap();
+    }
+    let touched_at = generated_at + TimeDuration::seconds(LEAF_CACHE_CAPACITY as i64);
+    assert!(Arc::ptr_eq(
+      &retained,
+      &ca.certified_key_for_at("retained.example", touched_at).unwrap()
+    ));
+    ca.certified_key_for_at("overflow.example", touched_at + TimeDuration::seconds(1))
+      .unwrap();
+
+    let cache = ca.cert_cache.lock();
+    assert_eq!(cache.len(), LEAF_CACHE_CAPACITY);
+    assert!(cache.contains_key("retained.example"));
+    assert!(!cache.contains_key("host-0.example"));
   }
 }
