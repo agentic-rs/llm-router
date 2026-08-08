@@ -5,6 +5,7 @@ import type {
   NativeByteStream,
   NativeClient,
   NativeGenerateStream,
+  NativeRequestEventStream,
   NativeResponse,
   NativeTextStream,
 } from "./native.js";
@@ -19,6 +20,7 @@ import {
   ByteStreamImpl,
   CancellationScope,
   GenerateStreamImpl,
+  RequestEventStreamImpl,
   TextStreamImpl,
   runCancellable,
 } from "./streams.js";
@@ -33,6 +35,7 @@ import type {
   OperationOptions,
   RawRequestOptions,
   RequestOptions,
+  RequestEventStream,
   Response,
   TextStream,
 } from "./types.js";
@@ -171,7 +174,7 @@ export class Client implements AsyncDisposable {
 
   private readonly binding: NativeBinding;
   private readonly native: NativeClient;
-  private readonly activeStreams = new Set<ByteStream | GenerateStream | TextStream>();
+  private readonly activeStreams = new Set<ByteStream | GenerateStream | TextStream | RequestEventStream>();
   private closed = false;
   private closePromise: Promise<void> | undefined;
 
@@ -208,6 +211,18 @@ export class Client implements AsyncDisposable {
   async reload(): Promise<void> {
     this.ensureOpen();
     await runCancellable(this.binding, undefined, (cancellation) => this.native.reload(cancellation));
+  }
+
+  subscribeEvents(options: OperationOptions = {}): RequestEventStream {
+    this.ensureOpen();
+    const cancellation = new CancellationScope(this.binding, options.signal);
+    const native: NativeRequestEventStream = this.native.subscribeEvents();
+    let stream: RequestEventStreamImpl;
+    stream = new RequestEventStreamImpl(native, cancellation, () => {
+      this.activeStreams.delete(stream);
+    });
+    this.activeStreams.add(stream);
+    return stream;
   }
 
   generate(model: string): GenerateCall;
@@ -320,7 +335,9 @@ export class Client implements AsyncDisposable {
     }
   }
 
-  private async registerStream<T extends ByteStream | GenerateStream | TextStream>(stream: T): Promise<T> {
+  private async registerStream<T extends ByteStream | GenerateStream | TextStream | RequestEventStream>(
+    stream: T,
+  ): Promise<T> {
     if (this.closed) {
       await stream.close();
       throw new ClientClosedError();

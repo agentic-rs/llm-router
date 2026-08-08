@@ -34,6 +34,8 @@ pub use stage::{
   ResolvedSummary, SentSummary, Stage, StageEvent,
 };
 
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 use smol_str::SmolStr;
 use std::any::Any;
 use std::sync::Arc;
@@ -41,7 +43,7 @@ use std::sync::Arc;
 /// A single requests pipeline event. Carries the per-request bookkeeping
 /// (request_id, attempt, ts) plus a typed or `Any`-typed payload.
 /// `ts` is a millisecond-precision unix timestamp captured at emission time.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RequestEvent {
   pub request_id: SmolStr,
   pub attempt: u32,
@@ -57,7 +59,8 @@ pub struct RequestEvent {
 ///   such as inbound connection facts, outbound wire-truth, and usage.
 /// - [`Custom`](RequestEventPayload::Custom) — `Any`-typed escape hatch
 ///   for middleware / decorator stages.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "category", content = "event", rename_all = "snake_case")]
 pub enum RequestEventPayload {
   Stage(StageEvent),
   Record(RecordEvent),
@@ -82,6 +85,19 @@ impl std::fmt::Debug for CustomEvent {
       .field("kind", &self.kind)
       .field("payload", &"<Any>")
       .finish()
+  }
+}
+
+impl Serialize for CustomEvent {
+  /// Serialize the stable custom-event kind. The type-erased Rust payload is
+  /// intentionally unavailable to cross-language event consumers.
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    let mut state = serializer.serialize_struct("CustomEvent", 1)?;
+    state.serialize_field("kind", self.kind)?;
+    state.end()
   }
 }
 

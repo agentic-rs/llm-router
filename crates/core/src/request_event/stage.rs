@@ -86,7 +86,8 @@ impl std::fmt::Display for RequestEndpoint {
 /// success variants (implicit via the variant name) and as a field on
 /// [`StageEvent::Error`] so subscribers can filter without pattern-matching
 /// on N error variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Stage {
   Extract,
   Resolve,
@@ -117,7 +118,7 @@ impl std::fmt::Display for Stage {
 
 /// Cloneable summary of `tokn_requests::pipeline::stages::Extracted`. Drops
 /// the requests-internal `content_encoding` enum (kept inside requests only).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExtractedSummary {
   pub agent_id: Option<AgentId>,
   pub model: SmolStr,
@@ -136,7 +137,7 @@ pub struct ExtractedSummary {
 /// Cloneable summary of `tokn_requests::pipeline::stages::Resolved`. Drops
 /// the typed `AccountHandle` (which would require tokn-core to depend on
 /// tokn-accounts).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ResolvedSummary {
   pub agent_id: Option<AgentId>,
   pub model: SmolStr,
@@ -148,7 +149,7 @@ pub struct ResolvedSummary {
 }
 
 /// Cloneable summary of `tokn_requests::pipeline::stages::BuiltHeaders`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct BuiltHeadersSummary {
   pub headers: HeaderMap,
   pub vars: TemplateVars,
@@ -159,7 +160,7 @@ pub struct BuiltHeadersSummary {
 /// `content_encoding` is the wire token (e.g. `"gzip"`/`"zstd"`); the
 /// requests-internal codec enum is intentionally not exposed here to keep
 /// tokn-core free of requests's `utils::codec` types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConvertedRequestSummary {
   pub upstream_body: Arc<Value>,
   pub upstream_wire_body: Bytes,
@@ -170,7 +171,7 @@ pub struct ConvertedRequestSummary {
 /// Cloneable summary of `tokn_requests::pipeline::stages::SentResponse`.
 /// The full struct can't be cloned (it owns a single-shot `reqwest::Response`),
 /// so the `Send` event carries this summary instead.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SentSummary {
   pub status: u16,
   pub headers: HeaderMap,
@@ -182,7 +183,7 @@ pub struct SentSummary {
 /// Cloneable summary of `tokn_requests::pipeline::stages::ConvertedResponse`.
 /// `Buffered` shares the response's `Arc<Value>` body; `Stream` leaves
 /// `body` as `None` because the live SSE byte stream is single-shot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConvertedResponseSummary {
   pub status: u16,
   pub headers: HeaderMap,
@@ -190,7 +191,8 @@ pub struct ConvertedResponseSummary {
   pub body: Option<Arc<Value>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StageEvent {
   /// Emitted once at the very start of requests's `PipelineRunner::run`,
   /// before any stage has produced output.

@@ -5,8 +5,8 @@ use tempfile::TempDir;
 use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 use tokn_sdk::chat_completions::{ChatRequest, ChatResponse};
 use tokn_sdk::{
-  Client, Error, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary, RequestOptions, Tool,
-  ToolCall, ToolChoice,
+  Client, Error, Event, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary,
+  RequestEventPayload, RequestOptions, StageEvent, Tool, ToolCall, ToolChoice,
 };
 
 struct Fixture {
@@ -69,6 +69,48 @@ fn chat_request() -> ChatRequest {
     "messages": [{"role": "user", "content": "hello"}]
   }))
   .expect("deserialize chat request fixture")
+}
+
+#[tokio::test]
+async fn lifecycle_subscription_survives_reload_and_serializes_request_events() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let client = fixture.client();
+  let mut events = client.subscribe_events();
+  client.reload().expect("reload SDK client");
+
+  client
+    .chat_completions()
+    .create_with(
+      &chat_request(),
+      RequestOptions::default().with_request_id("sdk-lifecycle"),
+    )
+    .await
+    .expect("execute lifecycle request");
+
+  tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    loop {
+      let event = events.recv().await.expect("receive lifecycle event");
+      let Event::Requests(event) = event.as_ref() else {
+        continue;
+      };
+      if event.request_id != "sdk-lifecycle" {
+        continue;
+      }
+      let serialized = serde_json::to_value(event).expect("serialize request event");
+      assert_eq!(serialized["request_id"], "sdk-lifecycle");
+      if matches!(
+        event.payload,
+        RequestEventPayload::Stage(StageEvent::Completed { success: true, .. })
+      ) {
+        break;
+      }
+    }
+  })
+  .await
+  .expect("lifecycle completion timed out");
+
+  mock.shutdown().await;
 }
 
 #[tokio::test]

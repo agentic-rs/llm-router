@@ -4,10 +4,11 @@ import type {
   NativeByteStream,
   NativeCancellation,
   NativeGenerateStream,
+  NativeRequestEventStream,
   NativeTextStream,
 } from "./native.js";
-import { parseNativeGenerateEvent, parseNativeHeaders } from "./native-values.js";
-import type { GenerateEvent, HeaderValue } from "./types.js";
+import { parseNativeGenerateEvent, parseNativeHeaders, parseNativeRequestEvent } from "./native-values.js";
+import type { GenerateEvent, HeaderValue, RequestEvent } from "./types.js";
 
 export class CancellationScope {
   readonly native: NativeCancellation;
@@ -215,5 +216,15 @@ export class TextStreamImpl extends PullStream<string, string> {
 
   protected convert(value: string): string {
     return value;
+  }
+}
+
+export class RequestEventStreamImpl extends PullStream<string, RequestEvent> {
+  constructor(native: NativeRequestEventStream, cancellation: CancellationScope, onFinish?: () => void) {
+    super(native, cancellation, onFinish);
+  }
+
+  protected convert(value: string): RequestEvent {
+    return parseNativeRequestEvent(value);
   }
 }

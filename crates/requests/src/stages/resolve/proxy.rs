@@ -8,7 +8,7 @@
 //!
 //! * Reads `proxy.host` and `proxy.provider_id` from
 //!   [`PipelineCtx::config`] (the [`RunConfig`] populated by the proxy
-//!   transport layer before calling `pipeline.run_with`).
+//!   transport layer before executing the request service).
 //! * Picks a dummy `account_id` (`"proxy"`) and a `provider_id` set to
 //!   either the caller-supplied value or the host.
 //! * Constructs a [`ProxyStubProvider`] inside an [`AccountHandle`]; the
@@ -33,8 +33,7 @@ use tokn_core::account::AccountConfig;
 use tokn_core::provider::{AuthKind, ModelCache, Provider, ProviderInfo, ProviderRequestKind};
 
 /// Config keys consumed by [`ProxyResolve`]. The proxy transport layer
-/// is responsible for populating these before calling
-/// `pipeline.run_with`.
+/// is responsible for populating these before executing the request service.
 pub mod keys {
   pub const HOST: &str = "proxy.host";
   pub const PROVIDER_ID: &str = "proxy.provider_id";

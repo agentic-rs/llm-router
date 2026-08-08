@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   APIStatusError,
@@ -20,6 +21,7 @@ import type {
   NativeCancellation,
   NativeClient,
   NativeGenerateStream,
+  NativeRequestEventStream,
   NativeResponse,
   NativeTextStream,
 } from "../src/native.js";
@@ -76,6 +78,28 @@ class FakePullStream<T> {
   }
 }
 
+class PendingPullStream<T> {
+  closeCalls = 0;
+  private closed = false;
+  private resolveNext: ((value: T | null) => void) | undefined;
+
+  next(): Promise<T | null> {
+    if (this.closed) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      this.resolveNext = resolve;
+    });
+  }
+
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    this.closed = true;
+    this.resolveNext?.(null);
+    this.resolveNext = undefined;
+  }
+}
+
 class FakeClient implements NativeClient {
   readonly configPath = "/config.toml";
   readonly authPath = "/auth.yaml";
@@ -97,6 +121,14 @@ class FakeClient implements NativeClient {
     JSON.stringify({ type: "text_delta", text: "hello" }),
     JSON.stringify({ type: "completed", finish_reason: "stop" }),
   ]) as NativeGenerateStream & FakePullStream<string>;
+  requestEventStream: NativeRequestEventStream & { closeCalls: number } = new FakePullStream<string>([
+    JSON.stringify({
+      request_id: "request-1",
+      attempt: 0,
+      ts: 1,
+      payload: { category: "stage", event: { type: "started", data: { request_endpoint: "responses" } } },
+    }),
+  ]) as NativeRequestEventStream & FakePullStream<string>;
   textOutputStream = new FakePullStream<string>(["hello", " world"]) as NativeTextStream &
     FakePullStream<string>;
 
@@ -110,6 +142,10 @@ class FakeClient implements NativeClient {
   async reload(cancellation: NativeCancellation): Promise<void> {
     this.reloadCalls += 1;
     this.lastCancellation = cancellation as FakeCancellation;
+  }
+
+  subscribeEvents(): NativeRequestEventStream {
+    return this.requestEventStream;
   }
 
   async close(): Promise<void> {
@@ -264,6 +300,46 @@ test("reload delegates to the native client", async () => {
 
   await client.reload();
   assert.equal(native.reloadCalls, 1);
+});
+
+test("request lifecycle subscriptions expose structured events", async () => {
+  const native = new FakeClient();
+  setNativeBindingForTests(fakeBinding(native));
+  const client = await Client.create();
+  const events = client.subscribeEvents();
+
+  assert.deepEqual(await events.next(), {
+    done: false,
+    value: {
+      request_id: "request-1",
+      attempt: 0,
+      ts: 1,
+      payload: { category: "stage", event: { type: "started", data: { request_endpoint: "responses" } } },
+    },
+  });
+  await events.close();
+  assert.equal(native.requestEventStream.closeCalls, 1);
+});
+
+test("closing request lifecycle subscriptions interrupts a pending read", async () => {
+  const native = new FakeClient();
+  const requestEvents = new PendingPullStream<string>();
+  native.requestEventStream = requestEvents;
+  setNativeBindingForTests(fakeBinding(native));
+  const client = await Client.create();
+  const events = client.subscribeEvents();
+  const pending = events.next();
+  await Promise.resolve();
+
+  await Promise.race([
+    events.close(),
+    delay(500).then(() => {
+      throw new Error("closing an idle request event stream timed out");
+    }),
+  ]);
+
+  assert.deepEqual(await pending, { done: true, value: undefined });
+  assert.equal(requestEvents.closeCalls, 1);
 });
 
 test("client-bound generation keeps the fluent UX while sending a plain request", async () => {

@@ -9,7 +9,7 @@ use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, DefaultSend, NoopBuildHeaders,
   NoopConvertRequest, PoolResolve,
 };
-use tokn_requests::{PipelineRunner, Profile};
+use tokn_requests::{ExecutionRequest, PipelineRunner, Profile, RequestService};
 
 #[tokio::test]
 async fn pre_send_happy_path_emits_expected_event_sequence() {
@@ -21,14 +21,15 @@ async fn pre_send_happy_path_emits_expected_event_sequence() {
     Arc::new(NoopBuildHeaders),
     Arc::new(NoopConvertRequest),
   ));
-  let runner = PipelineRunner::new(profile, bus);
+  let service = RequestService::from_pipeline(Arc::new(PipelineRunner::new(profile, bus)));
 
-  let err = runner
-    .run(raw_chat("input-model"))
+  let err = service
+    .execute(ExecutionRequest::new(raw_chat("input-model")))
     .await
     .expect_err("without_send must return Err(stop) at Send");
-  assert!(err.stop, "expected a stop error, got {err:?}");
-  assert_eq!(err.stage, Stage::Send);
+  let source = err.pipeline().expect("pipeline adapter must retain its source");
+  assert!(source.stop, "expected a stop error, got {source:?}");
+  assert_eq!(source.stage, Stage::Send);
 
   let events = drain_until_completed(&log).await;
   let kinds = known_kinds(&events);

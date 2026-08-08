@@ -2,14 +2,14 @@
 //!
 //! Two modes:
 //!
-//! * `--dry-run` builds a [`Profile::without_send`]; the runner halts at
+//! * `--dry-run` builds a [`Profile::without_send`]; the service halts at
 //!   Send via `PipelineError::stop` after every prior stage's event has
 //!   fired. A bus subscriber captures the per-stage outputs
 //!   (`Resolved` / `BuiltHeaders` / `ConvertedRequest`) and they are
 //!   printed as the dry-run report.
 //! * Default (live) mode builds a [`Profile::full`] with [`DefaultSend`] and
 //!   [`DefaultConvertResponse`] and contacts the upstream provider. The
-//!   response (returned from `run`) is either printed as a buffered JSON
+//!   response returned by the service is either printed as a buffered JSON
 //!   payload or streamed chunk-by-chunk to stdout (curl `-N` style).
 //!
 //! In both modes every [`StageEvent`] is mirrored to stdout via a separate
@@ -37,7 +37,10 @@ use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, DefaultSend, PoolAccountSelector,
   PoolResolve,
 };
-use tokn_requests::{Event, EventBus, EventPayload, PipelineError, PipelineRunner, Profile, RawInbound, StageEvent};
+use tokn_requests::{
+  Event, EventBus, EventPayload, ExecutionRequest, PipelineError, PipelineRunner, Profile, RawInbound, RequestService,
+  StageEvent,
+};
 use tokn_router::api::AppState;
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -252,7 +255,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
       Arc::new(DefaultConvertResponse::new()),
     ))
   };
-  let runner = PipelineRunner::new(profile, bus.clone());
+  let service = RequestService::from_pipeline(Arc::new(PipelineRunner::new(profile, bus.clone())));
 
   bus.emit(CoreEvent::Requests(RequestEvent {
     request_id: request_id.clone().into(),
@@ -279,7 +282,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     request_id: Some(request_id.into()),
   };
 
-  let result = match runner.run(raw).await {
+  let result = match service.execute(ExecutionRequest::new(raw)).await {
     Ok(converted) if matches!(&converted.body, ConvertedBody::Stream { .. }) => {
       let snapshot = captured.snapshot();
       print_live_outcome(converted, &snapshot, None, args.format, !args.no_redact).await?;
@@ -331,12 +334,15 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     Ok(converted) => {
       print_live_outcome(converted, &snapshot, persisted.as_ref(), args.format, !args.no_redact).await?;
     }
-    Err(err) if err.stop && args.dry_run => {
+    Err(err) if err.pipeline().is_some_and(|source| source.stop) && args.dry_run => {
       print_dry_run_outcome(&snapshot, persisted.as_ref(), args.format, !args.no_redact)?;
     }
     Err(err) => {
-      print_failure_outcome(&err, &snapshot, persisted.as_ref(), args.format, !args.no_redact)?;
-      anyhow::bail!("pipeline failed: {}: {}", err.stage, err.message());
+      let Some(source) = err.pipeline() else {
+        anyhow::bail!("{err}");
+      };
+      print_failure_outcome(source, &snapshot, persisted.as_ref(), args.format, !args.no_redact)?;
+      anyhow::bail!("pipeline failed: {}: {}", source.stage, source.message());
     }
   }
 

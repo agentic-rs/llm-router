@@ -118,36 +118,41 @@ pub struct AppState {
   pub route: Arc<RouteResolver>,
   pub default_policy: Arc<RequestPolicyRuntime>,
   pub profiles: Arc<BTreeMap<String, Arc<RequestPolicyRuntime>>>,
+  /// Compatibility HTTP client shared by model discovery, provider auth,
+  /// and the current request pipelines.
+  ///
+  /// The later layered transport must split those roles before selecting
+  /// managed or opaque data-plane policies independently.
   pub http: reqwest::Client,
   pub events: Arc<EventBus>,
   pub body_max_bytes: usize,
   pub cors_allowed_origins: Arc<BTreeSet<String>>,
   pub cors_allow_localhost: bool,
   pub proxy_provider_modes: Arc<std::collections::BTreeMap<String, ProxyProviderMode>>,
-  /// Shared `tokn-requests` pipeline used for router-owned JSON endpoints.
-  pub request_pipeline: Arc<tokn_requests::Pipeline>,
-  /// Shared `tokn-requests` pipeline used when the resolved route mode is
+  /// Shared request service used for router-owned JSON endpoints.
+  pub request_service: tokn_service::HttpService,
+  /// Shared request service used when the resolved route mode is
   /// [`RouteMode::Passthrough`]. Forwards the inbound request verbatim
-  /// (no JSON parse, no cross-endpoint translation) while still
-  /// emitting `RecordEvent::*` for observability and persistence.
-  pub passthrough_pipeline: Arc<tokn_requests::Pipeline>,
-  /// Shared `tokn-requests` pipeline used when router-owned JSON
+  /// after router admission, without cross-endpoint translation, while
+  /// still emitting `RecordEvent::*` for observability and persistence.
+  pub passthrough_service: tokn_service::HttpService,
+  /// Shared request service used when router-owned JSON
   /// endpoints run in [`RouteMode::Switch`]. The body stays verbatim,
   /// but inbound auth is stripped before provider auth is injected.
-  pub switch_pipeline: Arc<tokn_requests::Pipeline>,
-  /// Shared `tokn-requests` pipeline used by the MITM proxy passthrough
-  /// path. Unlike [`Self::passthrough_pipeline`], this variant does **no
+  pub switch_service: tokn_service::HttpService,
+  /// Shared request service used by the MITM proxy passthrough
+  /// path. Unlike [`Self::passthrough_service`], this variant does **no
   /// account resolution** — the intercepted TLS host is the upstream
   /// and the client's own `Authorization` reaches it unchanged. Wired
   /// via `RunConfig` keys (`proxy.host`, `proxy.path`, `proxy.method`,
   /// `proxy.provider_id`, `proxy.account_id`) that the proxy transport
-  /// layer fills before calling `run_with`.
-  pub proxy_passthrough_pipeline: Arc<tokn_requests::Pipeline>,
-  /// Shared `tokn-requests` pipeline used by the MITM proxy `switch`
+  /// layer fills before executing the request.
+  pub proxy_passthrough_service: tokn_service::HttpService,
+  /// Shared request service used by the MITM proxy `switch`
   /// path. This variant resolves the provider from the intercepted URL,
   /// selects a configured account for that provider, and forwards the
   /// request bytes verbatim with router-managed auth injection.
-  pub proxy_switch_pipeline: Arc<tokn_requests::Pipeline>,
+  pub proxy_switch_service: tokn_service::HttpService,
 }
 
 #[derive(Clone)]
@@ -159,9 +164,33 @@ pub struct RequestPolicyRuntime {
   pub pool: Arc<AccountPool>,
   pub route: Arc<RouteResolver>,
   pub model_families: Vec<ModelFamily>,
-  pub request_pipeline: Arc<tokn_requests::Pipeline>,
-  pub passthrough_pipeline: Arc<tokn_requests::Pipeline>,
-  pub switch_pipeline: Arc<tokn_requests::Pipeline>,
+  pub request_runtime: RequestRuntime,
+  pub passthrough_runtime: RequestRuntime,
+  pub switch_runtime: RequestRuntime,
+}
+
+/// One compiled request-domain service and its HTTP-facing adapter.
+#[derive(Clone)]
+pub struct RequestRuntime {
+  requests: tokn_requests::RequestService,
+  http: tokn_service::HttpService,
+}
+
+impl RequestRuntime {
+  fn new(requests: tokn_requests::RequestService) -> Self {
+    let http = requests.http_service();
+    Self { requests, http }
+  }
+
+  /// Request-domain entry point used by embedded SDK clients.
+  pub fn request_service(&self) -> &tokn_requests::RequestService {
+    &self.requests
+  }
+
+  /// Native HTTP entry point used by router endpoints.
+  pub fn http_service(&self) -> &tokn_service::HttpService {
+    &self.http
+  }
 }
 
 #[derive(Clone)]
@@ -444,7 +473,8 @@ fn build_state_inner(
     cfg.defaults.default_provider_id.clone(),
     &default_families,
   ));
-  let http = tokn_core::util::http::build_client(&cfg.proxy.to_http_options())?;
+  let http_options = cfg.proxy.to_http_options();
+  let http = tokn_core::util::http::build_client(&http_options)?;
   let body_max_bytes = if cfg.db.enabled { cfg.db.body_max_bytes } else { 0 };
   let default_policy = build_policy_runtime(
     "default",
@@ -478,8 +508,12 @@ fn build_state_inner(
     );
     profiles.insert(name.clone(), runtime);
   }
-  let proxy_passthrough_pipeline = build_proxy_passthrough_pipeline(http.clone(), events.clone());
-  let proxy_switch_pipeline = build_proxy_switch_pipeline(pool.clone(), http.clone(), events.clone());
+  // The compatibility provider API shares one client across control-plane
+  // auth and data-plane calls, while ConvertedResponse does not preserve
+  // Content-Encoding. Keep the current pipelines on the legacy client until
+  // the layered transport splits those roles and carries response headers.
+  let proxy_passthrough_service = build_proxy_passthrough_service(http.clone(), events.clone());
+  let proxy_switch_service = build_proxy_switch_service(pool.clone(), http.clone(), events.clone());
   let cors_allowed_origins = if cfg.server.cors.enabled {
     cfg.server.cors.canonical_allowed_origins()?
   } else {
@@ -493,9 +527,9 @@ fn build_state_inner(
     provider_registry,
     identity,
     route,
-    request_pipeline: default_policy.request_pipeline.clone(),
-    passthrough_pipeline: default_policy.passthrough_pipeline.clone(),
-    switch_pipeline: default_policy.switch_pipeline.clone(),
+    request_service: default_policy.request_runtime.http_service().clone(),
+    passthrough_service: default_policy.passthrough_runtime.http_service().clone(),
+    switch_service: default_policy.switch_runtime.http_service().clone(),
     default_policy,
     profiles: Arc::new(profiles),
     http,
@@ -504,8 +538,8 @@ fn build_state_inner(
     cors_allowed_origins: Arc::new(cors_allowed_origins),
     cors_allow_localhost: cfg.server.cors.enabled && cfg.server.cors.allow_localhost,
     proxy_provider_modes: Arc::new(cfg.proxy_mode.provider_modes.clone()),
-    proxy_passthrough_pipeline,
-    proxy_switch_pipeline,
+    proxy_passthrough_service,
+    proxy_switch_service,
   })
 }
 
@@ -578,6 +612,29 @@ fn build_policy_runtime(name: &str, spec: PolicySpec, deps: PolicyBuildDeps) -> 
   let ruleset = AccountPoolRuleset::from_filters(spec.providers, spec.accounts);
   let pool = AccountPool::from_inventory(&deps.inventory, &deps.cfg, &ruleset)
     .expect("building account pool from validated inventory must not fail");
+  let request_service = build_request_service(
+    format!("router-{name}"),
+    pool.clone(),
+    route.clone(),
+    deps.http.clone(),
+    deps.events.clone(),
+  );
+  let passthrough_service = build_passthrough_service(
+    format!("router-{name}-passthrough"),
+    pool.clone(),
+    route.clone(),
+    deps.http.clone(),
+    deps.events.clone(),
+    PassthroughAuthMode::PreserveClient,
+  );
+  let switch_service = build_passthrough_service(
+    format!("router-{name}-switch"),
+    pool.clone(),
+    route.clone(),
+    deps.http,
+    deps.events,
+    PassthroughAuthMode::Router,
+  );
   Arc::new(RequestPolicyRuntime {
     mode: spec.mode,
     agent_id: spec.agent_id,
@@ -586,29 +643,9 @@ fn build_policy_runtime(name: &str, spec: PolicySpec, deps: PolicyBuildDeps) -> 
     pool: pool.clone(),
     route: route.clone(),
     model_families: spec.families,
-    request_pipeline: build_request_pipeline(
-      format!("router-{name}"),
-      pool.clone(),
-      route.clone(),
-      deps.http.clone(),
-      deps.events.clone(),
-    ),
-    passthrough_pipeline: build_passthrough_pipeline(
-      format!("router-{name}-passthrough"),
-      pool.clone(),
-      route.clone(),
-      deps.http.clone(),
-      deps.events.clone(),
-      PassthroughAuthMode::PreserveClient,
-    ),
-    switch_pipeline: build_passthrough_pipeline(
-      format!("router-{name}-switch"),
-      pool,
-      route,
-      deps.http,
-      deps.events,
-      PassthroughAuthMode::Router,
-    ),
+    request_runtime: RequestRuntime::new(request_service),
+    passthrough_runtime: RequestRuntime::new(passthrough_service),
+    switch_runtime: RequestRuntime::new(switch_service),
   })
 }
 
@@ -738,13 +775,13 @@ fn validate_policy_accounts(cfg: &Config, accounts: &[AccountConfig]) -> Result<
 /// endpoints. The pipeline shares `AppState.events` so persistence
 /// (`RequestEventHandler`) receives `StageEvent::*` and `RecordEvent::*`
 /// automatically.
-fn build_request_pipeline(
+fn build_request_service(
   name: impl Into<smol_str::SmolStr>,
   pool: Arc<AccountPool>,
   route: Arc<RouteResolver>,
   http: reqwest::Client,
   events: Arc<EventBus>,
-) -> Arc<tokn_requests::Pipeline> {
+) -> tokn_requests::RequestService {
   use tokn_requests::stages::{
     DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, DefaultSend,
     PoolAccountSelector, PoolResolve,
@@ -759,11 +796,11 @@ fn build_request_pipeline(
     Arc::new(DefaultSend::new(http)),
     Arc::new(DefaultConvertResponse::new()),
   );
-  Arc::new(tokn_requests::Pipeline::new_with_retry(
+  tokn_requests::RequestService::from_pipeline(Arc::new(tokn_requests::Pipeline::new_with_retry(
     Arc::new(profile),
     events,
     PIPELINE_RETRY_POLICY,
-  ))
+  )))
 }
 
 /// Construct the passthrough `tokn-requests` pipeline. Forwards the
@@ -774,14 +811,14 @@ fn build_request_pipeline(
 ///
 /// Mirrors the behaviour of the legacy `crates/router/src/relay/passthrough.rs`
 /// helpers but reuses the standard pipeline plumbing.
-fn build_passthrough_pipeline(
+fn build_passthrough_service(
   name: impl Into<smol_str::SmolStr>,
   pool: Arc<AccountPool>,
   route: Arc<RouteResolver>,
   http: reqwest::Client,
   events: Arc<EventBus>,
   auth_mode: PassthroughAuthMode,
-) -> Arc<tokn_requests::Pipeline> {
+) -> tokn_requests::RequestService {
   use tokn_requests::stages::{
     DefaultSend, PassthroughBuildHeaders, PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract,
     PoolAccountSelector, PoolResolve,
@@ -799,11 +836,11 @@ fn build_passthrough_pipeline(
     Arc::new(DefaultSend::new(http)),
     Arc::new(PassthroughConvertResponse::new()),
   );
-  Arc::new(tokn_requests::Pipeline::new_with_retry(
+  tokn_requests::RequestService::from_pipeline(Arc::new(tokn_requests::Pipeline::new_with_retry(
     Arc::new(profile),
     events,
     PIPELINE_RETRY_POLICY,
-  ))
+  )))
 }
 
 #[derive(Clone, Copy)]
@@ -814,17 +851,17 @@ enum PassthroughAuthMode {
 
 /// Construct the proxy-passthrough `tokn-requests` pipeline used by the
 /// MITM proxy when the resolved route mode is
-/// [`RouteMode::Passthrough`]. Unlike [`build_passthrough_pipeline`],
+/// [`RouteMode::Passthrough`]. Unlike [`build_passthrough_service`],
 /// this variant performs **no account resolution** — the intercepted
 /// TLS host is the upstream, the client's `Authorization` reaches it
 /// untouched, and there is no provider-side auth injection.
 ///
 /// The proxy transport layer supplies per-request hints
 /// (`proxy.host`, `proxy.path`, `proxy.method`, …) through a
-/// [`tokn_requests::RunConfig`] passed to `Pipeline::run_with`.
+/// [`tokn_requests::RunConfig`] carried by an execution request.
 /// [`ProxyResolve`] and [`ProxySend`] read those keys; the remaining
 /// stages are the same as the standard passthrough variant.
-fn build_proxy_passthrough_pipeline(http: reqwest::Client, events: Arc<EventBus>) -> Arc<tokn_requests::Pipeline> {
+fn build_proxy_passthrough_service(http: reqwest::Client, events: Arc<EventBus>) -> tokn_service::HttpService {
   use tokn_requests::stages::{
     PassthroughBuildHeaders, PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, ProxyResolve,
     ProxySend,
@@ -838,18 +875,18 @@ fn build_proxy_passthrough_pipeline(http: reqwest::Client, events: Arc<EventBus>
     Arc::new(ProxySend::new(http)),
     Arc::new(PassthroughConvertResponse::new()),
   );
-  Arc::new(tokn_requests::Pipeline::new_with_retry(
+  tokn_requests::RequestService::http_from_pipeline(Arc::new(tokn_requests::Pipeline::new_with_retry(
     Arc::new(profile),
     events,
     PIPELINE_RETRY_POLICY,
-  ))
+  )))
 }
 
-fn build_proxy_switch_pipeline(
+fn build_proxy_switch_service(
   pool: Arc<AccountPool>,
   http: reqwest::Client,
   events: Arc<EventBus>,
-) -> Arc<tokn_requests::Pipeline> {
+) -> tokn_service::HttpService {
   use tokn_requests::stages::{
     PassthroughBuildHeaders, PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract,
     ProxyProviderResolve, ProxySend,
@@ -863,7 +900,7 @@ fn build_proxy_switch_pipeline(
     Arc::new(ProxySend::new(http)),
     Arc::new(PassthroughConvertResponse::new()),
   );
-  Arc::new(tokn_requests::Pipeline::new(Arc::new(profile), events))
+  tokn_requests::RequestService::http_from_pipeline(Arc::new(tokn_requests::Pipeline::new(Arc::new(profile), events)))
 }
 
 #[cfg(test)]

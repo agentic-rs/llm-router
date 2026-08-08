@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
 use tokn_config::Config;
-use tokn_core::event::EventBus;
+use tokn_core::event::{Event, EventBus};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RequestEndpoint;
 use tokn_headers::keys::{ACCEPT, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
-use tokn_requests::{RawInbound, RunConfig};
+use tokn_requests::{ExecutionRequest, RawInbound, RunConfig};
 use tokn_router::api::{AppState, RequestPolicyRuntime};
 
 use crate::endpoint::{ChatCompletions, Messages, Responses};
@@ -120,6 +120,7 @@ struct Snapshot {
 
 pub struct Client {
   source: Source,
+  events: Arc<EventBus>,
   snapshot: ArcSwap<Snapshot>,
 }
 
@@ -138,16 +139,26 @@ impl Client {
       auth_path: builder.auth_path,
       profile: builder.profile,
     };
-    let snapshot = load_snapshot(&source)?;
+    let events = Arc::new(EventBus::new(EVENT_BUS_CAPACITY));
+    let snapshot = load_snapshot(&source, events.clone())?;
     Ok(Self {
       source,
+      events,
       snapshot: ArcSwap::from_pointee(snapshot),
     })
   }
 
   pub fn reload(&self) -> Result<()> {
-    self.snapshot.store(Arc::new(load_snapshot(&self.source)?));
+    self
+      .snapshot
+      .store(Arc::new(load_snapshot(&self.source, self.events.clone())?));
     Ok(())
+  }
+
+  /// Subscribe to the same lifecycle stream used by the configured request
+  /// pipeline. The subscription remains valid across successful reloads.
+  pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Arc<Event>> {
+    self.events.subscribe()
   }
 
   pub fn config_path(&self) -> PathBuf {
@@ -232,16 +243,16 @@ impl Client {
       config = config.with_generation_options(generation_options);
     }
     let config = config.build();
-    let pipeline = match policy.mode {
-      tokn_config::RouteMode::Passthrough => &policy.passthrough_pipeline,
-      tokn_config::RouteMode::Switch => &policy.switch_pipeline,
-      _ => &policy.request_pipeline,
+    let service = match policy.mode {
+      tokn_config::RouteMode::Passthrough => policy.passthrough_runtime.request_service(),
+      tokn_config::RouteMode::Switch => policy.switch_runtime.request_service(),
+      _ => policy.request_runtime.request_service(),
     };
-    let response = pipeline
-      .run_with(raw, config)
+    let response = service
+      .execute(ExecutionRequest::new(raw).with_config(config))
       .await
-      .map_err(|source| Error::Pipeline { source })?;
-    Ok(response.into())
+      .map_err(|source| Error::Request { source })?;
+    Ok(RawResponse::from(response))
   }
 
   pub(crate) async fn execute_typed<T: Serialize>(
@@ -259,7 +270,7 @@ impl Client {
   }
 }
 
-fn load_snapshot(source: &Source) -> Result<Snapshot> {
+fn load_snapshot(source: &Source, events: Arc<EventBus>) -> Result<Snapshot> {
   let (config, config_path) =
     Config::load(source.config_path.as_deref()).map_err(|source| Error::LoadConfig { source })?;
   let auth_path = match &source.auth_path {
@@ -273,7 +284,6 @@ fn load_snapshot(source: &Source) -> Result<Snapshot> {
     path: auth_path.clone(),
     source,
   })?;
-  let events = Arc::new(EventBus::new(EVENT_BUS_CAPACITY));
   let state = tokn_router::api::build_state(&config, &credentials.accounts, events)
     .map_err(|source| Error::BuildEngine { source })?;
   if let Some(profile) = &source.profile {

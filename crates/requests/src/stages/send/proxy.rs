@@ -51,8 +51,8 @@ fn format_proxy_send_error(url: &str, err: &reqwest::Error) -> String {
 
 /// Config keys consumed by [`ProxySend`]. These complement the keys
 /// read by [`ProxyResolve`](crate::stages::ProxyResolve) and must be
-/// populated by the proxy transport layer before calling
-/// `pipeline.run_with`.
+/// populated by the proxy transport layer before executing the request
+/// service.
 pub mod send_keys {
   /// HTTP method as an upper-case string, e.g. `"POST"`. When absent,
   /// `POST` is used as the default (matches the common LLM API case).

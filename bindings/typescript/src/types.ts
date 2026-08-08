@@ -146,6 +146,13 @@ export interface Response<T = JsonValue> {
   readonly data: T;
 }
 
+export interface RequestEvent {
+  readonly request_id: string;
+  readonly attempt: number;
+  readonly ts: number;
+  readonly payload: JsonObject;
+}
+
 export interface AsyncStream<T> extends AsyncIterableIterator<T>, AsyncDisposable {
   close(): Promise<void>;
 }
@@ -158,3 +165,5 @@ export interface ByteStream extends AsyncStream<Uint8Array> {
 export interface GenerateStream extends AsyncStream<GenerateEvent> {}
 
 export interface TextStream extends AsyncStream<string> {}
+
+export interface RequestEventStream extends AsyncStream<RequestEvent> {}

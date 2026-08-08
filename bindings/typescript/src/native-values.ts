@@ -6,6 +6,7 @@ import type {
   HeaderValue,
   JsonObject,
   JsonValue,
+  RequestEvent,
   ToolCall,
   Usage,
 } from "./types.js";
@@ -167,4 +168,21 @@ export function parseNativeGenerateEvent(value: string): GenerateEvent {
       return invalid("an unsupported generation event");
   }
   return event as unknown as GenerateEvent;
+}
+
+export function parseNativeRequestEvent(value: string): RequestEvent {
+  const event = parseJsonObject(value, "request lifecycle event");
+  if (typeof requireOwn(event, "request_id", "request lifecycle event") !== "string") {
+    return invalid("a request lifecycle event without a string request_id");
+  }
+  for (const key of ["attempt", "ts"]) {
+    const field = requireOwn(event, key, "request lifecycle event");
+    if (typeof field !== "number" || !Number.isSafeInteger(field)) {
+      return invalid(`a request lifecycle event without an integer ${key}`);
+    }
+  }
+  if (!isObject(requireOwn(event, "payload", "request lifecycle event"))) {
+    return invalid("a request lifecycle event without an object payload");
+  }
+  return event as unknown as RequestEvent;
 }

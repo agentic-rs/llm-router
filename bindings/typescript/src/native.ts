@@ -34,9 +34,15 @@ export interface NativeTextStream {
   close(): Promise<void>;
 }
 
+export interface NativeRequestEventStream {
+  next(): Promise<string | null | undefined>;
+  close(): Promise<void>;
+}
+
 export interface NativeClient {
   readonly configPath: string;
   readonly authPath: string;
+  subscribeEvents(): NativeRequestEventStream;
   reload(cancellation: NativeCancellation): Promise<void>;
   close(): Promise<void>;
   request(

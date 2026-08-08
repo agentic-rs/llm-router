@@ -42,6 +42,8 @@ export type {
   ReasoningOptions,
   ReasoningSummary,
   RequestOptions,
+  RequestEvent,
+  RequestEventStream,
   Response,
   Role,
   Tool,

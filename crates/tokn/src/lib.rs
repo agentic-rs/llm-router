@@ -20,3 +20,4 @@ pub mod provider {
 }
 pub use tokn_router as router;
 pub use tokn_sdk as sdk;
+pub use tokn_service as service;

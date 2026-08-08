@@ -1,7 +1,7 @@
 //! Integration test for the passthrough pipeline served by `router(state)`.
 //!
 //! Drives a real `POST /passthrough/v1/chat/completions` through the axum router →
-//! `endpoints::handle` (which dispatches to `state.passthrough_pipeline`)
+//! `endpoints::handle` (which dispatches to `state.passthrough_service`)
 //! → mock upstream TCP server. Asserts:
 //!
 //! * The upstream receives the inbound body **verbatim** (no

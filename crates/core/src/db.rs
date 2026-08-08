@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -23,14 +24,15 @@ impl SessionSource {
   }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct UsageDetails {
   pub cache_read: Option<u64>,
   pub cache_write: Option<u64>,
   pub reasoning: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UsageType {
   Chat,
   Responses,
@@ -47,7 +49,7 @@ impl UsageType {
   }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Usage {
   /// Total prompt/input tokens (includes any cached tokens).
   pub input_tokens: Option<u64>,

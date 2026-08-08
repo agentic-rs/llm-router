@@ -12,6 +12,7 @@ license.workspace = true
 tokn-accounts = { workspace = true }
 tokn-core = { workspace = true }
 tokn-headers = { workspace = true }
+tokn-service = { workspace = true }
 tokn-config = { workspace = true }
 tokn-convert = { workspace = true }
 arc-swap = { workspace = true }
@@ -19,6 +20,8 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,6 +29,7 @@ smol_str = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 zstd = { workspace = true }
 
 [dev-dependencies]

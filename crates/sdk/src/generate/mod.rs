@@ -719,8 +719,12 @@ impl Client {
 }
 
 fn map_generation_error(error: Error) -> Error {
-  let Error::Pipeline { source } = error else {
+  let Error::Request { source } = error else {
     return error;
+  };
+  let source = match source.into_pipeline() {
+    Ok(source) => source,
+    Err(source) => return Error::Request { source },
   };
   match source.inner() {
     RequestsError::UpstreamStatus { status, body } => Error::GenerateResponseStatus {
@@ -732,7 +736,7 @@ fn map_generation_error(error: Error) -> Error {
         message: source.inner().to_string(),
       }
     }
-    _ => Error::Pipeline { source },
+    _ => Error::Request { source: source.into() },
   }
 }
 

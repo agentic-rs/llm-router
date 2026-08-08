@@ -33,6 +33,7 @@ from ._models import (
 from ._native import (
   NativeClient,
   NativeGenerateStream,
+  NativeRequestEventStream,
   NativeStream,
   NativeTextStream,
 )
@@ -114,6 +115,29 @@ class TextStream(AsyncIterator[str]):
     await self._native.aclose()
 
   async def __aenter__(self) -> TextStream:
+    return self
+
+  async def __aexit__(self, *exc_info: object) -> None:
+    del exc_info
+    await self.aclose()
+
+
+class RequestEventStream(AsyncIterator[JsonObject]):
+  """The complete request lifecycle emitted by the embedded pipeline."""
+
+  def __init__(self, native: NativeRequestEventStream) -> None:
+    self._native = native
+
+  def __aiter__(self) -> RequestEventStream:
+    return self
+
+  async def __anext__(self) -> JsonObject:
+    return cast(JsonObject, json.loads(await self._native.next_event()))
+
+  async def aclose(self) -> None:
+    await self._native.aclose()
+
+  async def __aenter__(self) -> RequestEventStream:
     return self
 
   async def __aexit__(self, *exc_info: object) -> None:
@@ -362,6 +386,11 @@ class Client:
 
   def reload(self) -> None:
     self._native.reload()
+
+  def subscribe_events(self) -> RequestEventStream:
+    """Subscribe to request lifecycle events emitted after this call."""
+
+    return RequestEventStream(self._native.subscribe_events())
 
   def generate(self, model: str) -> GenerateCall:
     """Start a client-bound, provider-neutral generation."""
