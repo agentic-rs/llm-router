@@ -10,6 +10,7 @@ use napi::{Env, Result};
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokn_sdk::{
   Client, Endpoint, Event, GenerateRequest, GenerateResponse, RequestOptions, ResponseBody, ToolCall, Usage,
 };
@@ -71,6 +72,64 @@ pub struct NativeClient {
 #[napi]
 pub struct NativeRequestEventStream {
   receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::broadcast::Receiver<Arc<Event>>>>>,
+  close_tx: watch::Sender<bool>,
+}
+
+async fn next_request_event(
+  receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::broadcast::Receiver<Arc<Event>>>>>,
+  mut close_rx: watch::Receiver<bool>,
+) -> Result<Option<String>> {
+  if *close_rx.borrow() {
+    return Ok(None);
+  }
+  let mut receiver = receiver.lock().await;
+  let Some(receiver) = receiver.as_mut() else {
+    return Ok(None);
+  };
+  loop {
+    let received = tokio::select! {
+      biased;
+      _ = wait_for_request_event_close(&mut close_rx) => return Ok(None),
+      received = receiver.recv() => received,
+    };
+    match received {
+      Ok(event) => {
+        let Event::Requests(event) = event.as_ref() else {
+          continue;
+        };
+        let event = serde_json::to_string(event).map_err(|error| {
+          native_error(
+            SERIALIZATION_ERROR,
+            format!("failed to serialize request lifecycle event: {error}"),
+          )
+        })?;
+        return Ok(Some(event));
+      }
+      Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+        return Err(native_error(
+          REQUEST_ERROR,
+          format!("request event stream lagged by {count} events"),
+        ));
+      }
+      Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(None),
+    }
+  }
+}
+
+async fn close_request_event_stream(
+  receiver: Arc<tokio::sync::Mutex<Option<tokio::sync::broadcast::Receiver<Arc<Event>>>>>,
+  close_tx: watch::Sender<bool>,
+) {
+  close_tx.send_replace(true);
+  *receiver.lock().await = None;
+}
+
+async fn wait_for_request_event_close(close_rx: &mut watch::Receiver<bool>) {
+  loop {
+    if *close_rx.borrow() || close_rx.changed().await.is_err() {
+      return;
+    }
+  }
 }
 
 #[napi]
@@ -78,43 +137,16 @@ impl NativeRequestEventStream {
   #[napi]
   pub fn next(&self, env: Env) -> Result<AsyncBlock<Option<String>>> {
     let receiver = self.receiver.clone();
-    AsyncBlockBuilder::new(async move {
-      let mut receiver = receiver.lock().await;
-      let Some(receiver) = receiver.as_mut() else {
-        return Ok(None);
-      };
-      loop {
-        match receiver.recv().await {
-          Ok(event) => {
-            let Event::Requests(event) = event.as_ref() else {
-              continue;
-            };
-            let event = serde_json::to_string(event).map_err(|error| {
-              native_error(
-                SERIALIZATION_ERROR,
-                format!("failed to serialize request lifecycle event: {error}"),
-              )
-            })?;
-            return Ok(Some(event));
-          }
-          Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-            return Err(native_error(
-              REQUEST_ERROR,
-              format!("request event stream lagged by {count} events"),
-            ));
-          }
-          Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(None),
-        }
-      }
-    })
-    .build(&env)
+    let close_rx = self.close_tx.subscribe();
+    AsyncBlockBuilder::new(next_request_event(receiver, close_rx)).build(&env)
   }
 
   #[napi]
   pub fn close(&self, env: Env) -> Result<AsyncBlock<()>> {
     let receiver = self.receiver.clone();
+    let close_tx = self.close_tx.clone();
     AsyncBlockBuilder::new(async move {
-      *receiver.lock().await = None;
+      close_request_event_stream(receiver, close_tx).await;
       Ok(())
     })
     .build(&env)
@@ -141,8 +173,10 @@ impl NativeClient {
 
   #[napi]
   pub fn subscribe_events(&self) -> NativeRequestEventStream {
+    let (close_tx, _) = watch::channel(false);
     NativeRequestEventStream {
       receiver: Arc::new(tokio::sync::Mutex::new(Some(self.state.client.subscribe_events()))),
+      close_tx,
     }
   }
 
@@ -452,4 +486,33 @@ fn serialize_generate_response(response: &GenerateResponse) -> serde_json::Resul
     usage: &response.usage,
     raw: &response.raw,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::time::Duration;
+
+  #[tokio::test]
+  async fn closing_request_events_interrupts_pending_read() {
+    let (_events, receiver) = tokio::sync::broadcast::channel::<Arc<Event>>(1);
+    let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+    let (close_tx, _) = watch::channel(false);
+    let pending = tokio::spawn(next_request_event(receiver.clone(), close_tx.subscribe()));
+    tokio::task::yield_now().await;
+
+    tokio::time::timeout(
+      Duration::from_millis(100),
+      close_request_event_stream(receiver, close_tx),
+    )
+    .await
+    .expect("closing an idle request event stream must not hang");
+    let result = tokio::time::timeout(Duration::from_millis(100), pending)
+      .await
+      .expect("pending request event read must stop after close")
+      .expect("request event task must not panic")
+      .expect("closing a request event stream must not fail");
+
+    assert!(result.is_none());
+  }
 }

@@ -85,8 +85,10 @@ impl PyClient {
   }
 
   fn subscribe_events(&self) -> NativeRequestEventStream {
+    let (close_tx, _) = watch::channel(false);
     NativeRequestEventStream {
       receiver: Arc::new(Mutex::new(Some(self.inner.subscribe_events()))),
+      close_tx,
     }
   }
 
@@ -185,17 +187,27 @@ impl PyClient {
 #[pyclass(name = "NativeRequestEventStream")]
 struct NativeRequestEventStream {
   receiver: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<Arc<Event>>>>>,
+  close_tx: watch::Sender<bool>,
 }
 
 #[pymethods]
 impl NativeRequestEventStream {
   fn next_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     let receiver = self.receiver.clone();
+    let mut close_rx = self.close_tx.subscribe();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
+      if *close_rx.borrow() {
+        return Err(PyStopAsyncIteration::new_err(()));
+      }
       let mut receiver = receiver.lock().await;
       let receiver = receiver.as_mut().ok_or_else(|| PyStopAsyncIteration::new_err(()))?;
       loop {
-        match receiver.recv().await {
+        let received = tokio::select! {
+          biased;
+          _ = wait_for_close(&mut close_rx) => return Err(PyStopAsyncIteration::new_err(())),
+          received = receiver.recv() => received,
+        };
+        match received {
           Ok(event) => {
             let Event::Requests(event) = event.as_ref() else {
               continue;
@@ -217,7 +229,9 @@ impl NativeRequestEventStream {
 
   fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     let receiver = self.receiver.clone();
+    let close_tx = self.close_tx.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
+      close_tx.send_replace(true);
       *receiver.lock().await = None;
       Ok(())
     })

@@ -1005,6 +1005,16 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
         else:
           self.fail("request lifecycle stream closed before completion")
 
+  async def test_request_lifecycle_close_interrupts_pending_read(self) -> None:
+    client = self.client()
+    events = client.subscribe_events()
+    pending = asyncio.create_task(events.__anext__())
+    await asyncio.sleep(0)
+
+    await asyncio.wait_for(events.aclose(), timeout=0.5)
+    with self.assertRaises(StopAsyncIteration):
+      await asyncio.wait_for(pending, timeout=0.5)
+
 
 if __name__ == "__main__":
   unittest.main()
