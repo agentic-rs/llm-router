@@ -36,7 +36,7 @@ pub struct AccountPool {
   buckets: BTreeMap<String, ProviderBucket>,
   accounts: Vec<Arc<AccountHandle>>,
   cooldown_base: Duration,
-  affinity: Affinity,
+  affinity: Affinity<String>,
 }
 
 struct ProviderBucket {
@@ -72,7 +72,7 @@ impl AccountPool {
       buckets: BTreeMap::new(),
       accounts: Vec::new(),
       cooldown_base: Duration::from_secs(cfg.pool.failure_cooldown_secs),
-      affinity: Affinity::new(
+      affinity: Affinity::with_legacy_absolute_retention(
         Duration::from_secs(cfg.pool.session_ttl_secs),
         Duration::from_secs(cfg.pool.session_tombstone_secs),
       ),
@@ -127,7 +127,7 @@ impl AccountPool {
       buckets,
       accounts,
       cooldown_base: Duration::from_secs(cfg.pool.failure_cooldown_secs),
-      affinity: Affinity::new(
+      affinity: Affinity::with_legacy_absolute_retention(
         Duration::from_secs(cfg.pool.session_ttl_secs),
         Duration::from_secs(cfg.pool.session_tombstone_secs),
       ),
@@ -716,7 +716,7 @@ mod tests {
       buckets,
       accounts: vec![a1, a2, b1],
       cooldown_base: Duration::from_secs(1),
-      affinity: Affinity::new(session_ttl, tombstone_ttl),
+      affinity: Affinity::with_legacy_absolute_retention(session_ttl, tombstone_ttl),
     }
   }
 
@@ -738,7 +738,7 @@ mod tests {
       buckets,
       accounts: vec![account],
       cooldown_base: Duration::from_secs(1),
-      affinity: Affinity::new(Duration::from_secs(60), Duration::from_secs(120)),
+      affinity: Affinity::with_legacy_absolute_retention(Duration::from_secs(60), Duration::from_secs(120)),
     }
   }
 

@@ -203,8 +203,8 @@ pub fn validate(account: &AccountConfig) -> Result<()> {
   Ok(())
 }
 
-pub fn build(account: Arc<AccountConfig>) -> Result<Arc<dyn Provider>> {
-  Ok(Arc::new(CodexProvider::from_account(account)?))
+pub fn build(account: Arc<AccountConfig>, target: ProviderTarget) -> Result<Arc<dyn Provider>> {
+  Ok(Arc::new(CodexProvider::from_account_at(account, target)?))
 }
 
 #[async_trait]
