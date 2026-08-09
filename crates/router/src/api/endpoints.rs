@@ -159,7 +159,7 @@ fn endpoint_uri(endpoint: crate::provider::Endpoint) -> Uri {
   }
 }
 
-fn request_error_to_api_error(err: tokn_service::ServiceError) -> ApiError {
+pub(crate) fn request_error_to_api_error(err: tokn_service::ServiceError) -> ApiError {
   let err = match err.into_source().downcast::<tokn_requests::RequestError>() {
     Ok(err) => *err,
     Err(source) => return ApiError::bad_gateway(source.to_string()),
@@ -170,7 +170,7 @@ fn request_error_to_api_error(err: tokn_service::ServiceError) -> ApiError {
   }
 }
 
-fn pipeline_error_to_api_error(err: tokn_requests::PipelineError) -> ApiError {
+pub(crate) fn pipeline_error_to_api_error(err: tokn_requests::PipelineError) -> ApiError {
   match err.inner() {
     RequestsError::Resolve {
       source: ResolveError::InvalidRouteMode { .. },
@@ -181,6 +181,7 @@ fn pipeline_error_to_api_error(err: tokn_requests::PipelineError) -> ApiError {
     RequestsError::SessionExpired { session_id } => ApiError::session_expired(session_id.to_string()),
     RequestsError::ProviderAccessDenied => ApiError::forbidden("API key does not allow the requested provider"),
     RequestsError::InvalidAccessPolicy => ApiError::internal("invalid API-key provider policy"),
+    RequestsError::InvalidRouteRequest { message } => ApiError::bad_request(message.to_string()),
     RequestsError::NoAccount { endpoint, model } => ApiError::not_implemented(endpoint.to_string(), model.to_string()),
     RequestsError::NoProviderAccount { provider_id } => ApiError::not_implemented("provider", provider_id.to_string()),
     RequestsError::UpstreamStatus { status, body } => match StatusCode::from_u16(*status) {
@@ -198,7 +199,7 @@ fn request_record_mode(mode: Option<tokn_config::RouteMode>) -> &'static str {
   }
 }
 
-fn apply_endpoint_compat_defaults(
+pub(crate) fn apply_endpoint_compat_defaults(
   endpoint: crate::provider::Endpoint,
   inbound: &HeaderMap,
   decoded: &mut super::codec::DecodedJsonRequest,

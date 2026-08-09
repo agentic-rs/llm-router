@@ -92,7 +92,7 @@ pub(crate) fn request_content_encoding(headers: &HeaderMap) -> Result<Option<Con
   }
 }
 
-fn decode_body_bytes(body: Bytes, encoding: Option<ContentEncodingKind>) -> Result<Bytes, ApiError> {
+pub(crate) fn decode_body_bytes(body: Bytes, encoding: Option<ContentEncodingKind>) -> Result<Bytes, ApiError> {
   match encoding {
     None => Ok(body),
     Some(ContentEncodingKind::Gzip) => {
