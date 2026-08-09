@@ -1,17 +1,14 @@
-//! Socket startup for a fully linked and materialized gateway.
-//!
-//! Binding is a separate phase from serving so startup can acquire every
-//! configured socket before any listener begins accepting connections.
+//! Request admission and execution for a fully linked v2 gateway.
 
 mod adapter;
 mod admission;
 mod auth;
-mod bind;
 mod body;
 mod connect;
 mod error;
 mod http;
 mod response;
+mod service;
 mod state;
 mod tunnel;
 
@@ -22,7 +19,6 @@ pub use admission::{
   RequestTargetForm,
 };
 pub use auth::{authenticate_forward_proxy_client, authenticate_llm_api_client, ClientAuthError};
-pub use bind::{bind_gateway_listeners, BoundGatewayListeners, BoundListener, ListenerBindError, ListenerBindResult};
 pub use body::{
   buffer_matched_body, BufferedRequestBody, ManagedRequestBody, RequestBodyError, RequestBodyLimits, RequestBodyResult,
 };
@@ -33,6 +29,7 @@ pub use connect::{
 pub use error::{AuthBoundary, ConnectUpgradeUnavailableReason, ServerError};
 pub use http::{handle_admitted_http, request_body_present};
 pub use response::{managed_response_to_axum, opaque_response_to_axum, ResponseBridgeError, ResponseBridgeResult};
+pub use service::{GatewayEngine, GatewayEngineError, GatewayEngineResult};
 pub use state::{
   GatewayServerState, GatewayServerStateError, GatewayServerStateResult, GatewayServingDefaults, ListenerServerState,
 };

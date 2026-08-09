@@ -14,8 +14,8 @@
 //! not add a seventh stage or adapt linked v2 targets into legacy route data.
 
 pub mod event;
-pub mod executor;
 pub mod execution;
+pub mod executor;
 pub mod pipeline;
 pub mod profile;
 pub mod stages;

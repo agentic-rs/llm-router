@@ -108,6 +108,7 @@ fn with_decompression(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder
     .deflate(true)
     .zstd(true)
 }
+
 fn build_client_with_options(
   mut builder: reqwest::ClientBuilder,
   options: &HttpClientOptions,
@@ -325,6 +326,7 @@ mod tests {
     assert!(!request.headers().contains_key(http::header::CONTENT_LENGTH));
     assert_eq!(request.body().and_then(reqwest::Body::as_bytes), Some(body.as_ref()));
   }
+
   #[tokio::test]
   async fn managed_client_does_not_follow_redirects() {
     let address = serve_redirect_then_ok().await;
@@ -392,6 +394,7 @@ mod tests {
     });
     address
   }
+
   async fn serve_once(content_encoding: &'static str, body: &'static [u8]) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
