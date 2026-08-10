@@ -28,11 +28,19 @@ impl Registry {
     self.descriptors.get(id).copied()
   }
 
+  /// Resolve a reusable driver implementation by id.
+  ///
+  /// `resolve` remains the legacy provider-facing spelling; v2 linking uses
+  /// this name to keep configured providers distinct from their driver.
+  pub fn resolve_driver(&self, id: &str) -> Option<&'static ProviderDescriptor> {
+    self.resolve(id)
+  }
+
   pub fn iter(&self) -> impl Iterator<Item = &'static ProviderDescriptor> + '_ {
     self.descriptors.values().copied()
   }
 
-  /// All known provider ids in registration order.
+  /// All known driver ids in registration order.
   pub fn ids(&self) -> Vec<&'static str> {
     self.descriptors.values().map(|d| d.id).collect()
   }
@@ -80,7 +88,7 @@ impl Registry {
   ///
   /// The supplied target is authoritative: a legacy `base_url` stored on the
   /// account is deliberately ignored. Clone one target when several accounts
-  /// belong to the same configured upstream so their model cache is shared.
+  /// belong to the same configured provider so their model cache is shared.
   pub fn build_at(&self, account: Arc<AccountConfig>, target: ProviderTarget) -> Result<Arc<dyn Provider>> {
     self.validate(&account)?;
     let descriptor = self.resolve(&account.provider).expect("validated provider descriptor");

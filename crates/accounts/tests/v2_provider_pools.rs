@@ -19,18 +19,17 @@ route = "default"
 [routes.default]
 kind = "managed"
 account_pool = "primary"
-upstream = { kind = "fixed", upstream = "local" }
+provider = { kind = "fixed", provider = "local" }
 model = { kind = "capability" }
 operation = "translate_compatible"
 
 [account_pools.primary]
 accounts = ["first", "second"]
-providers = ["llama-cpp"]
+providers = ["local"]
 strategy = "round_robin"
 
-[upstreams.local]
-provider = "llama-cpp"
-accounts = ["first", "second"]
+[providers.local]
+driver = "llama-cpp"
 base_url = "http://127.0.0.1:11434/v1"
 "#;
 
@@ -38,7 +37,7 @@ fn account(id: &str) -> AccountConfig {
   let mut account: AccountConfig = toml::from_str(
     r#"
       id = "fixture"
-      provider = "llama-cpp"
+      provider = "local"
     "#,
   )
   .unwrap();
@@ -47,7 +46,7 @@ fn account(id: &str) -> AccountConfig {
 }
 
 #[test]
-fn compiled_v2_plan_builds_upstream_specific_round_robin_pool() {
+fn compiled_v2_plan_builds_named_provider_round_robin_pool() {
   let plan = tokn_config::v2::parse(CONFIG, Path::new("gateway.toml")).unwrap();
   let accounts = [account("first"), account("second")];
   let registry = Registry::builtin();
@@ -56,7 +55,7 @@ fn compiled_v2_plan_builds_upstream_specific_round_robin_pool() {
   assert_eq!(providers.target_count(), 1);
   assert_eq!(providers.binding_count(), 2);
 
-  let pools = link_account_pools(&plan, &providers, &registry).unwrap();
+  let pools = link_account_pools(&plan, &providers).unwrap();
   let runtimes = build_account_pool_runtimes(&pools);
   let pool = runtimes.runtime(&AccountPoolId::new("primary").unwrap()).unwrap();
 
@@ -64,7 +63,7 @@ fn compiled_v2_plan_builds_upstream_specific_round_robin_pool() {
     .map(|_| match pool.acquire(None, |_| true) {
       PoolAcquire::Selected(binding) => (
         binding.account_id().to_string(),
-        binding.upstream_id().as_str().to_string(),
+        binding.provider_id().as_str().to_string(),
       ),
       outcome => panic!("expected an eligible binding, got {outcome:?}"),
     })

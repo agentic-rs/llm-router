@@ -15,17 +15,17 @@ pub use authority::{
   InvalidHost, ResolvedAuthority,
 };
 pub use id::{
-  AccountPoolId, BindingId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId, ProfileId,
-  ProviderId, RetryPolicyId, RouteId, UpstreamId, WireIdentityId,
+  AccountPoolId, BindingId, DriverId, HeaderPatchSetId, InvalidIdentifier, ListenerId, ModelGroupId, OperationId,
+  ProfileId, ProviderId, RetryPolicyId, RouteId, WireIdentityId,
 };
 pub use route::{
   CredentialPolicy, DestinationPolicy, FallbackSelector, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget,
-  ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, QualificationNamespace, RelayRetry, RelayRoute,
-  RelayTarget, RouteKind, RoutePlan, UpstreamSelector, WireIdentity,
+  ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, ProviderSelector, QualificationNamespace, RelayRetry,
+  RelayRoute, RelayTarget, RouteKind, RoutePlan, WireIdentity,
 };
 pub use topology::{
   AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
   ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, HttpAction,
   HttpBindingPlan, HttpMatch, InvalidSubdomainSuffix, ListenerKind, ListenerPlan, LlmApiListenerPlan, ModelCandidate,
-  ModelGroupPlan, SessionAffinityPlan, TlsPlan, UpstreamOrigin, UpstreamPlan,
+  ModelGroupPlan, ProviderOrigin, ProviderPlan, SessionAffinityPlan, TlsPlan,
 };

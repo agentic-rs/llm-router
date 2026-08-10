@@ -18,7 +18,7 @@ pub(super) fn compile_plan(raw: &RawConfig, source: &Path) -> Result<GatewayPlan
     resources.profiles,
     resources.routes,
     resources.account_pools,
-    resources.upstreams,
+    resources.providers,
     resources.model_groups,
   ))
 }

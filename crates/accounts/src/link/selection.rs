@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokn_policy::{AccountPoolId, UpstreamId};
+use tokn_policy::{AccountPoolId, ProviderId};
 
 const MAX_COOLDOWN_EXPONENT: u32 = 5;
 
@@ -31,11 +31,11 @@ pub enum PoolAcquire {
 #[snafu(visibility(pub))]
 pub enum PoolRuntimeError {
   #[snafu(display(
-    "account pool '{pool}' does not contain binding for upstream '{upstream}' and account '{account_id}'"
+    "account pool '{pool}' does not contain binding for provider '{provider}' and account '{account_id}'"
   ))]
   UnknownBinding {
     pool: AccountPoolId,
-    upstream: UpstreamId,
+    provider: ProviderId,
     account_id: SmolStr,
   },
 }
@@ -97,7 +97,7 @@ impl AccountPoolRuntime {
       .active()
       .iter()
       .chain(pool.fallback())
-      .flat_map(|account| account.bindings().values())
+      .map(LinkedPoolAccount::binding)
     {
       let previous = bindings.insert(binding.key().clone(), binding.clone());
       debug_assert!(previous.is_none(), "linked pool contains a duplicate provider binding");
@@ -174,7 +174,7 @@ impl AccountPoolRuntime {
   ///
   /// Success clears this pool's cooldown history for the exact tuple and, if
   /// configured, creates or refreshes affinity only after the caller confirms
-  /// the upstream operation succeeded.
+  /// the provider operation succeeded.
   pub fn record_success(&self, session_id: Option<&str>, key: &ProviderBindingKey) -> PoolRuntimeResult<()> {
     {
       let mut cooldowns = self.cooldowns.lock();
@@ -188,7 +188,7 @@ impl AccountPoolRuntime {
     Ok(())
   }
 
-  /// Record one failure and cool only this pool's exact account/upstream
+  /// Record one failure and cool only this pool's exact account/provider
   /// tuple. Returns the new retry deadline for logging or scheduling.
   pub fn record_failure(&self, key: &ProviderBindingKey) -> PoolRuntimeResult<Instant> {
     let mut cooldowns = self.cooldowns.lock();
@@ -217,17 +217,13 @@ impl AccountPoolRuntime {
 
     let mut candidates = Vec::new();
     for account in accounts {
-      for binding in account.bindings().values() {
-        if !eligible(binding) {
-          continue;
-        }
-        match cooling_bindings.get(binding.key()).copied() {
-          Some(retry_at) => retain_earliest(earliest_retry, retry_at),
-          None => {
-            candidates.push(binding.clone());
-            break;
-          }
-        }
+      let binding = account.binding();
+      if !eligible(binding) {
+        continue;
+      }
+      match cooling_bindings.get(binding.key()).copied() {
+        Some(retry_at) => retain_earliest(earliest_retry, retry_at),
+        None => candidates.push(binding.clone()),
       }
     }
 
@@ -255,7 +251,7 @@ impl AccountPoolRuntime {
   fn unknown_binding(&self, key: &ProviderBindingKey) -> PoolRuntimeError {
     PoolRuntimeError::UnknownBinding {
       pool: self.pool.id().clone(),
-      upstream: key.upstream_id().clone(),
+      provider: key.provider_id().clone(),
       account_id: SmolStr::new(key.account_id()),
     }
   }
@@ -317,27 +313,31 @@ mod tests {
   use crate::link::{link_account_pools, link_provider_graph};
   use crate::registry::Registry;
   use smol_str::SmolStr;
-  use std::collections::{BTreeMap, BTreeSet};
+  use std::collections::BTreeMap;
   use tokn_core::account::{AccountConfig, AccountTier};
   use tokn_core::provider::ID_LLAMA_CPP;
   use tokn_policy::{
-    AccountPoolPlan, AccountSelectionStrategy, AccountSelector, GatewayPlan, ProviderId, SessionAffinityPlan,
-    UpstreamPlan,
+    AccountPoolPlan, AccountSelectionStrategy, AccountSelector, DriverId, GatewayPlan, ProviderPlan,
+    SessionAffinityPlan,
   };
 
   fn pool_id(value: &str) -> AccountPoolId {
     AccountPoolId::new(value).unwrap()
   }
 
-  fn upstream_id(value: &str) -> UpstreamId {
-    UpstreamId::new(value).unwrap()
-  }
-
   fn provider_id(value: &str) -> ProviderId {
     ProviderId::new(value).unwrap()
   }
 
+  fn driver_id(value: &str) -> DriverId {
+    DriverId::new(value).unwrap()
+  }
+
   fn account(id: &str, tier: AccountTier) -> AccountConfig {
+    account_at(id, "local", tier)
+  }
+
+  fn account_at(id: &str, provider: &str, tier: AccountTier) -> AccountConfig {
     let mut account: AccountConfig = toml::from_str(
       r#"
         id = "fixture"
@@ -346,19 +346,17 @@ mod tests {
     )
     .unwrap();
     account.id = id.to_string();
+    account.provider = provider.to_string();
     account.tier = tier;
     account
   }
 
-  fn upstream(eligible_accounts: &[&str]) -> UpstreamPlan {
-    UpstreamPlan::new(
-      provider_id(ID_LLAMA_CPP),
+  fn provider() -> ProviderPlan {
+    ProviderPlan::new(
+      driver_id(ID_LLAMA_CPP),
       Some("https://gateway.example/v1/".into()),
       Box::default(),
       false,
-    )
-    .with_eligible_accounts(
-      (!eligible_accounts.is_empty()).then(|| eligible_accounts.iter().map(SmolStr::new).collect::<BTreeSet<_>>()),
     )
   }
 
@@ -376,7 +374,7 @@ mod tests {
 
   fn runtimes(
     pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
-    upstreams: BTreeMap<UpstreamId, UpstreamPlan>,
+    providers: BTreeMap<ProviderId, ProviderPlan>,
     accounts: &[AccountConfig],
   ) -> AccountPoolRuntimes {
     let plan = GatewayPlan::new(
@@ -384,12 +382,12 @@ mod tests {
       BTreeMap::new(),
       BTreeMap::new(),
       pools,
-      upstreams,
+      providers,
       BTreeMap::new(),
     );
     let registry = Registry::builtin();
     let providers = link_provider_graph(&plan, accounts, &registry).unwrap();
-    let pools = link_account_pools(&plan, &providers, &registry).unwrap();
+    let pools = link_account_pools(&plan, &providers).unwrap();
     build_account_pool_runtimes(&pools)
   }
 
@@ -401,13 +399,10 @@ mod tests {
   }
 
   #[test]
-  fn round_robin_weights_logical_accounts_and_uses_typed_binding_order() {
+  fn round_robin_weights_logical_accounts() {
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, None))]),
-      BTreeMap::from([
-        (upstream_id("z-upstream"), upstream(&["first", "second"])),
-        (upstream_id("a-upstream"), upstream(&["first"])),
-      ]),
+      BTreeMap::from([(provider_id("local"), provider())]),
       &[
         account("first", AccountTier::Active),
         account("second", AccountTier::Active),
@@ -423,15 +418,15 @@ mod tests {
       selected.iter().map(|binding| binding.account_id()).collect::<Vec<_>>(),
       ["first", "second", "first", "second"]
     );
-    assert_eq!(selected[0].upstream_id().as_str(), "a-upstream");
-    assert_eq!(selected[2].upstream_id().as_str(), "a-upstream");
+    assert_eq!(selected[0].provider_id().as_str(), "local");
+    assert_eq!(selected[2].provider_id().as_str(), "local");
   }
 
   #[test]
-  fn round_robin_is_fair_across_eligible_accounts_with_ineligible_gaps() {
+  fn round_robin_is_fair_across_matching_accounts_with_filtered_gaps() {
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, None))]),
-      BTreeMap::from([(upstream_id("local"), upstream(&[]))]),
+      BTreeMap::from([(provider_id("local"), provider())]),
       &[
         account("first", AccountTier::Active),
         account("ineligible-one", AccountTier::Active),
@@ -453,7 +448,7 @@ mod tests {
   fn active_tier_precedes_fallback_until_active_binding_is_cooled() {
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, None))]),
-      BTreeMap::from([(upstream_id("local"), upstream(&[]))]),
+      BTreeMap::from([(provider_id("local"), provider())]),
       &[
         account("active", AccountTier::Active),
         account("fallback", AccountTier::Fallback),
@@ -474,10 +469,7 @@ mod tests {
     let affinity = SessionAffinityPlan::new(Duration::from_secs(300), Duration::from_secs(60));
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, Some(affinity)))]),
-      BTreeMap::from([
-        (upstream_id("a-upstream"), upstream(&[])),
-        (upstream_id("z-upstream"), upstream(&[])),
-      ]),
+      BTreeMap::from([(provider_id("local"), provider())]),
       &[
         account("first", AccountTier::Active),
         account("second", AccountTier::Active),
@@ -490,7 +482,7 @@ mod tests {
     let next = selected(runtime.acquire(Some("session"), |_| true));
     assert_eq!(next.account_id(), "second");
 
-    let exact_key = ProviderBindingKey::new(upstream_id("z-upstream"), "second");
+    let exact_key = ProviderBindingKey::new(provider_id("local"), "second");
     runtime.record_success(Some("session"), &exact_key).unwrap();
     let affinity_hit = selected(runtime.acquire(Some("session"), |_| true));
     assert_eq!(affinity_hit.key(), &exact_key);
@@ -512,7 +504,7 @@ mod tests {
     let immediately_expired = SessionAffinityPlan::new(Duration::ZERO, Duration::from_secs(60));
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, Some(immediately_expired)))]),
-      BTreeMap::from([(upstream_id("local"), upstream(&[]))]),
+      BTreeMap::from([(provider_id("local"), provider())]),
       &[
         account("first", AccountTier::Active),
         account("second", AccountTier::Active),
@@ -535,21 +527,20 @@ mod tests {
         (pool_id("first"), pool(None, None)),
         (pool_id("second"), pool(None, None)),
       ]),
-      BTreeMap::from([
-        (upstream_id("a-upstream"), upstream(&[])),
-        (upstream_id("z-upstream"), upstream(&[])),
-      ]),
+      BTreeMap::from([(provider_id("local"), provider())]),
       &[account("shared", AccountTier::Active)],
     );
     let first_runtime = runtimes.runtime(&pool_id("first")).unwrap();
     let second_runtime = runtimes.runtime(&pool_id("second")).unwrap();
-    let first_key = ProviderBindingKey::new(upstream_id("a-upstream"), "shared");
+    let first_key = ProviderBindingKey::new(provider_id("local"), "shared");
 
     first_runtime.record_failure(&first_key).unwrap();
-    let same_pool_alternative = selected(first_runtime.acquire(None, |_| true));
     let other_pool = selected(second_runtime.acquire(None, |_| true));
 
-    assert_eq!(same_pool_alternative.upstream_id().as_str(), "z-upstream");
+    assert!(matches!(
+      first_runtime.acquire(None, |_| true),
+      PoolAcquire::CoolingDown { .. }
+    ));
     assert_eq!(other_pool.key(), &first_key);
   }
 
@@ -557,15 +548,15 @@ mod tests {
   fn all_cooled_returns_the_globally_earliest_retry() {
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, None))]),
-      BTreeMap::from([
-        (upstream_id("first"), upstream(&[])),
-        (upstream_id("second"), upstream(&[])),
-      ]),
-      &[account("only", AccountTier::Active)],
+      BTreeMap::from([(provider_id("first"), provider()), (provider_id("second"), provider())]),
+      &[
+        account_at("first-account", "first", AccountTier::Active),
+        account_at("second-account", "second", AccountTier::Active),
+      ],
     );
     let runtime = runtimes.runtime(&pool_id("default")).unwrap();
-    let first_key = ProviderBindingKey::new(upstream_id("first"), "only");
-    let second_key = ProviderBindingKey::new(upstream_id("second"), "only");
+    let first_key = ProviderBindingKey::new(provider_id("first"), "first-account");
+    let second_key = ProviderBindingKey::new(provider_id("second"), "second-account");
     runtime.record_failure(&first_key).unwrap();
     let later_retry = runtime.record_failure(&first_key).unwrap();
     let earliest_retry = runtime.record_failure(&second_key).unwrap();
@@ -581,15 +572,15 @@ mod tests {
   fn success_clears_only_the_exact_binding_cooldown() {
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, None))]),
-      BTreeMap::from([
-        (upstream_id("first"), upstream(&[])),
-        (upstream_id("second"), upstream(&[])),
-      ]),
-      &[account("only", AccountTier::Active)],
+      BTreeMap::from([(provider_id("first"), provider()), (provider_id("second"), provider())]),
+      &[
+        account_at("first-account", "first", AccountTier::Active),
+        account_at("second-account", "second", AccountTier::Active),
+      ],
     );
     let runtime = runtimes.runtime(&pool_id("default")).unwrap();
-    let first_key = ProviderBindingKey::new(upstream_id("first"), "only");
-    let second_key = ProviderBindingKey::new(upstream_id("second"), "only");
+    let first_key = ProviderBindingKey::new(provider_id("first"), "first-account");
+    let second_key = ProviderBindingKey::new(provider_id("second"), "second-account");
     runtime.record_failure(&first_key).unwrap();
     let second_retry = runtime.record_failure(&second_key).unwrap();
 
@@ -609,7 +600,7 @@ mod tests {
   fn no_matching_binding_returns_no_eligible() {
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, None))]),
-      BTreeMap::from([(upstream_id("local"), upstream(&[]))]),
+      BTreeMap::from([(provider_id("local"), provider())]),
       &[account("only", AccountTier::Active)],
     );
     let runtime = runtimes.runtime(&pool_id("default")).unwrap();
@@ -621,12 +612,12 @@ mod tests {
   fn unknown_keys_never_mutate_runtime_state() {
     let runtimes = runtimes(
       BTreeMap::from([(pool_id("default"), pool(None, None))]),
-      BTreeMap::from([(upstream_id("known"), upstream(&[]))]),
-      &[account("known", AccountTier::Active)],
+      BTreeMap::from([(provider_id("known"), provider())]),
+      &[account_at("known", "known", AccountTier::Active)],
     );
     let runtime = runtimes.runtime(&pool_id("default")).unwrap();
-    let known = ProviderBindingKey::new(upstream_id("known"), "known");
-    let unknown = ProviderBindingKey::new(upstream_id("missing"), "missing");
+    let known = ProviderBindingKey::new(provider_id("known"), "known");
+    let unknown = ProviderBindingKey::new(provider_id("missing"), "missing");
     let known_retry = runtime.record_failure(&known).unwrap();
 
     assert!(matches!(

@@ -17,7 +17,7 @@ route = "default"
 [routes.default]
 kind = "managed"
 account_pool = "default"
-upstream = { kind = "any" }
+provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "translate_compatible"
 
@@ -25,8 +25,8 @@ operation = "translate_compatible"
 accounts = ["*"]
 providers = ["*"]
 
-[upstreams.default]
-provider = "openai"
+[providers.default]
+driver = "openai"
 "#;
 
 fn unwrap_compile_error(error: Error) -> Box<CompileError> {
@@ -205,7 +205,7 @@ hosts = ["*.internal.example"]
   assert!(plan.profiles().is_empty());
   assert!(plan.routes().is_empty());
   assert!(plan.account_pools().is_empty());
-  assert!(plan.upstreams().is_empty());
+  assert!(plan.providers().is_empty());
   assert!(plan.model_groups().is_empty());
 
   let ListenerPlan::ForwardProxy(proxy) = plan.listeners().get("proxy").unwrap() else {
@@ -257,13 +257,13 @@ route = "default"
 
 [routes.default]
 kind = "relay"
-target = { kind = "upstream_from_origin", account_pool = "default" }
+target = { kind = "provider_from_origin", account_pool = "default" }
 
 [account_pools.default]
 providers = ["openai"]
 
-[upstreams.openai]
-provider = "openai"
+[providers.openai]
+driver = "openai"
 origins = ["https://api.example.com"]
 "#
   .into()

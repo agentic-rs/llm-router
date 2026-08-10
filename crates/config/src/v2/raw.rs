@@ -36,7 +36,7 @@ pub struct RawConfig {
   #[serde(default)]
   pub account_pools: BTreeMap<String, RawAccountPool>,
   #[serde(default)]
-  pub upstreams: BTreeMap<String, RawUpstream>,
+  pub providers: BTreeMap<String, RawProvider>,
   /// Each group value is directly an ordered list of fallback candidates.
   #[serde(default)]
   pub model_groups: BTreeMap<String, Vec<RawModelCandidate>>,
@@ -167,7 +167,7 @@ pub enum RawWireIdentity {
 pub enum RawRoute {
   Managed {
     account_pool: String,
-    upstream: RawUpstreamSelector,
+    provider: RawProviderSelector,
     model: RawModelSelector,
     operation: RawOperationPolicy,
   },
@@ -179,9 +179,9 @@ pub enum RawRoute {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RawUpstreamSelector {
+pub enum RawProviderSelector {
   Any {},
-  Fixed { upstream: String },
+  Fixed { provider: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -195,8 +195,8 @@ pub enum RawModelSelector {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawQualificationNamespace {
+  Driver,
   Provider,
-  Upstream,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -216,8 +216,8 @@ pub enum RawOperationPolicy {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawRelayTarget {
-  UpstreamFromOrigin { account_pool: String },
-  FixedUpstream { upstream: String, account_pool: String },
+  ProviderFromOrigin { account_pool: String },
+  FixedProvider { provider: String, account_pool: String },
 }
 
 /// Account selection and affinity settings for one independently managed
@@ -257,25 +257,20 @@ const fn default_session_ttl_secs() -> u64 {
 }
 
 /// A configured provider endpoint. An omitted `base_url` is retained so the
-/// runtime linker can resolve the provider's catalogue default. The compiler
+/// runtime linker can resolve the driver's official default. The compiler
 /// canonicalizes an explicit base URL as a trailing-slash path prefix;
 /// managed endpoint paths and fixed-relay inbound paths append to that prefix.
 /// Additional origins let an origin-preserving relay identify the same
-/// upstream through aliases.
+/// provider through aliases.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RawUpstream {
-  pub provider: String,
-  /// Accounts permitted to send credentials to this endpoint. Omitted or
-  /// `["*"]` means every matching-provider account; explicit ids prevent a
-  /// linker from creating an unsafe account-by-upstream Cartesian product.
-  #[serde(default)]
-  pub accounts: Option<Vec<String>>,
+pub struct RawProvider {
+  pub driver: String,
   #[serde(default)]
   pub base_url: Option<String>,
   #[serde(default)]
   pub origins: Vec<String>,
-  /// Explicitly acknowledge that this upstream may send account credentials
+  /// Explicitly acknowledge that this provider may send account credentials
   /// over non-loopback cleartext HTTP. Loopback HTTP never needs the escape.
   #[serde(default)]
   pub allow_insecure_http: bool,
@@ -287,7 +282,7 @@ pub struct RawUpstream {
 pub struct RawModelCandidate {
   pub model: String,
   #[serde(default)]
-  pub upstream: Option<String>,
+  pub provider: Option<String>,
 }
 
 #[cfg(test)]
@@ -310,7 +305,7 @@ wire_identity = "auto"
 [routes.default]
 kind = "managed"
 account_pool = "default"
-upstream = { kind = "any" }
+provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "translate_compatible"
 
@@ -319,8 +314,8 @@ accounts = ["*"]
 providers = ["*"]
 strategy = "round_robin"
 
-[upstreams.default]
-provider = "openai"
+[providers.default]
+driver = "openai"
 "#;
 
   #[test]
@@ -374,7 +369,7 @@ ports = [443]
 
 [[model_groups.coding]]
 model = "claude-sonnet-4"
-upstream = "anthropic-public"
+provider = "anthropic-public"
 
 [[model_groups.coding]]
 model = "gpt-5"
@@ -412,8 +407,8 @@ wire_identity = { named = "codex-cli" }
     assert!(toml::from_str::<RawConfig>(&listener).is_err());
 
     let selector = MINIMAL_MANAGED.replace(
-      "upstream = { kind = \"any\" }",
-      "upstream = { kind = \"any\", unknown = true }",
+      "provider = { kind = \"any\" }",
+      "provider = { kind = \"any\", unknown = true }",
     );
     assert!(toml::from_str::<RawConfig>(&selector).is_err());
   }
