@@ -1,6 +1,6 @@
 use crate::{
-  AccountPoolId, BindingId, CanonicalHost, ListenerId, ModelGroupId, OperationId, ProfileId, ProfilePlan, ProviderId,
-  RouteId, RoutePlan, UpstreamId,
+  AccountPoolId, BindingId, CanonicalHost, DriverId, ListenerId, ModelGroupId, OperationId, ProfileId, ProfilePlan,
+  ProviderId, RouteId, RoutePlan,
 };
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +13,7 @@ use std::time::Duration;
 ///
 /// References within the configuration and all raw syntax are validated
 /// before this value is constructed. A runtime linker must still resolve
-/// provider catalogue defaults and runtime-owned names (such as operations
+/// driver catalogue defaults and runtime-owned names (such as operations
 /// and wire identities), then reject an unusable plan before listeners bind.
 /// Runtime crates consume this graph without knowing how it was represented
 /// on disk.
@@ -23,7 +23,7 @@ pub struct GatewayPlan {
   profiles: BTreeMap<ProfileId, ProfilePlan>,
   routes: BTreeMap<RouteId, RoutePlan>,
   account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
-  upstreams: BTreeMap<UpstreamId, UpstreamPlan>,
+  providers: BTreeMap<ProviderId, ProviderPlan>,
   model_groups: BTreeMap<ModelGroupId, ModelGroupPlan>,
 }
 
@@ -33,7 +33,7 @@ impl GatewayPlan {
     profiles: BTreeMap<ProfileId, ProfilePlan>,
     routes: BTreeMap<RouteId, RoutePlan>,
     account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
-    upstreams: BTreeMap<UpstreamId, UpstreamPlan>,
+    providers: BTreeMap<ProviderId, ProviderPlan>,
     model_groups: BTreeMap<ModelGroupId, ModelGroupPlan>,
   ) -> Self {
     Self {
@@ -41,7 +41,7 @@ impl GatewayPlan {
       profiles,
       routes,
       account_pools,
-      upstreams,
+      providers,
       model_groups,
     }
   }
@@ -78,12 +78,12 @@ impl GatewayPlan {
     self.account_pools.get(id)
   }
 
-  pub fn upstreams(&self) -> &BTreeMap<UpstreamId, UpstreamPlan> {
-    &self.upstreams
+  pub fn providers(&self) -> &BTreeMap<ProviderId, ProviderPlan> {
+    &self.providers
   }
 
-  pub fn upstream(&self, id: &UpstreamId) -> Option<&UpstreamPlan> {
-    self.upstreams.get(id)
+  pub fn provider(&self, id: &ProviderId) -> Option<&ProviderPlan> {
+    self.providers.get(id)
   }
 
   pub fn model_groups(&self) -> &BTreeMap<ModelGroupId, ModelGroupPlan> {
@@ -605,11 +605,11 @@ impl AccountPoolPlan {
   }
 }
 
-/// Canonical origin claimed by an upstream for origin-based relay selection.
+/// Canonical origin claimed by a provider for origin-based relay selection.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct UpstreamOrigin(SmolStr);
+pub struct ProviderOrigin(SmolStr);
 
-impl UpstreamOrigin {
+impl ProviderOrigin {
   pub fn new(origin: impl AsRef<str>) -> Self {
     Self(SmolStr::new(origin.as_ref()))
   }
@@ -619,54 +619,43 @@ impl UpstreamOrigin {
   }
 }
 
-impl AsRef<str> for UpstreamOrigin {
+impl AsRef<str> for ProviderOrigin {
   fn as_ref(&self) -> &str {
     self.as_str()
   }
 }
 
-impl fmt::Display for UpstreamOrigin {
+impl fmt::Display for ProviderOrigin {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter.write_str(self.as_str())
   }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpstreamPlan {
-  provider: ProviderId,
+pub struct ProviderPlan {
+  driver: DriverId,
   base_url: Option<SmolStr>,
-  origins: Box<[UpstreamOrigin]>,
+  origins: Box<[ProviderOrigin]>,
   allow_insecure_http: bool,
-  eligible_accounts: Option<BTreeSet<SmolStr>>,
 }
 
-impl UpstreamPlan {
+impl ProviderPlan {
   pub fn new(
-    provider: ProviderId,
+    driver: DriverId,
     base_url: Option<SmolStr>,
-    origins: Box<[UpstreamOrigin]>,
+    origins: Box<[ProviderOrigin]>,
     allow_insecure_http: bool,
   ) -> Self {
     Self {
-      provider,
+      driver,
       base_url,
       origins,
       allow_insecure_http,
-      eligible_accounts: None,
     }
   }
 
-  /// Restrict this endpoint to named accounts. `None` permits every account
-  /// whose provider matches. Runtime linking intersects this constraint with
-  /// the selected account pool before constructing any credential-bearing
-  /// provider binding.
-  pub fn with_eligible_accounts(mut self, eligible_accounts: Option<BTreeSet<SmolStr>>) -> Self {
-    self.eligible_accounts = eligible_accounts;
-    self
-  }
-
-  pub fn provider(&self) -> &ProviderId {
-    &self.provider
+  pub fn driver(&self) -> &DriverId {
+    &self.driver
   }
 
   /// Canonical trailing-slash URL prefix. Runtime linking fills catalogue
@@ -675,45 +664,34 @@ impl UpstreamPlan {
     self.base_url.as_deref()
   }
 
-  pub fn origins(&self) -> &[UpstreamOrigin] {
+  pub fn origins(&self) -> &[ProviderOrigin] {
     &self.origins
   }
 
-  /// Whether runtime linking may accept a non-loopback `http://` catalogue
-  /// default for this upstream. Explicit URLs are checked by the config
+  /// Whether runtime linking may accept a non-loopback `http://` driver
+  /// default for this provider. Explicit URLs are checked by the config
   /// compiler; defaults must receive the same check after resolution.
   pub fn allow_insecure_http(&self) -> bool {
     self.allow_insecure_http
-  }
-
-  pub fn eligible_accounts(&self) -> Option<&BTreeSet<SmolStr>> {
-    self.eligible_accounts.as_ref()
-  }
-
-  pub fn permits_account(&self, account_id: &str) -> bool {
-    self
-      .eligible_accounts
-      .as_ref()
-      .is_none_or(|accounts| accounts.contains(account_id))
   }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelCandidate {
-  upstream: Option<UpstreamId>,
+  provider: Option<ProviderId>,
   model: SmolStr,
 }
 
 impl ModelCandidate {
-  pub fn new(upstream: Option<UpstreamId>, model: impl AsRef<str>) -> Self {
+  pub fn new(provider: Option<ProviderId>, model: impl AsRef<str>) -> Self {
     Self {
-      upstream,
+      provider,
       model: SmolStr::new(model.as_ref()),
     }
   }
 
-  pub fn upstream(&self) -> Option<&UpstreamId> {
-    self.upstream.as_ref()
+  pub fn provider(&self) -> Option<&ProviderId> {
+    self.provider.as_ref()
   }
 
   pub fn model(&self) -> &str {
@@ -741,7 +719,7 @@ impl ModelGroupPlan {
 mod tests {
   use super::*;
   use crate::{
-    ManagedRetry, ManagedRoute, ManagedTarget, ModelSelector, OperationPolicy, UpstreamSelector, WireIdentity,
+    ManagedRetry, ManagedRoute, ManagedTarget, ModelSelector, OperationPolicy, ProviderSelector, WireIdentity,
   };
 
   fn id<T>(value: &str) -> T
@@ -918,18 +896,17 @@ mod tests {
   }
 
   #[test]
-  fn upstream_and_model_group_keep_distinct_ordered_facts() {
-    let upstream = UpstreamPlan::new(
-      id("openai"),
+  fn provider_and_model_group_keep_distinct_ordered_facts() {
+    let provider = ProviderPlan::new(
+      id("openai-driver"),
       Some(SmolStr::new("https://gateway.example/v1")),
       vec![
-        UpstreamOrigin::new("https://api.openai.com"),
-        UpstreamOrigin::new("https://chatgpt.com"),
+        ProviderOrigin::new("https://api.openai.com"),
+        ProviderOrigin::new("https://chatgpt.com"),
       ]
       .into_boxed_slice(),
       false,
-    )
-    .with_eligible_accounts(Some(BTreeSet::from([SmolStr::new("work")])));
+    );
     let group = ModelGroupPlan::new(
       vec![
         ModelCandidate::new(Some(id("openai-public")), "gpt-5"),
@@ -938,12 +915,10 @@ mod tests {
       .into_boxed_slice(),
     );
 
-    assert_eq!(upstream.provider().as_str(), "openai");
-    assert_eq!(upstream.origins()[1].as_str(), "https://chatgpt.com");
-    assert!(upstream.permits_account("work"));
-    assert!(!upstream.permits_account("personal"));
+    assert_eq!(provider.driver().as_str(), "openai-driver");
+    assert_eq!(provider.origins()[1].as_str(), "https://chatgpt.com");
     assert_eq!(group.candidates()[0].model(), "gpt-5");
-    assert_eq!(group.candidates()[1].upstream(), None);
+    assert_eq!(group.candidates()[1].provider(), None);
   }
 
   #[test]
@@ -952,7 +927,7 @@ mod tests {
     let profile_id: ProfileId = id("default");
     let route_id: RouteId = id("managed");
     let pool_id: AccountPoolId = id("default");
-    let upstream_id: UpstreamId = id("openai-public");
+    let provider_id: ProviderId = id("openai-public");
     let group_id: ModelGroupId = id("flagship");
 
     let listener = ListenerPlan::LlmApi(LlmApiListenerPlan::new(
@@ -963,7 +938,7 @@ mod tests {
     ));
     let profile = ProfilePlan::new(route_id.clone(), WireIdentity::ProviderDefault);
     let route = RoutePlan::Managed(ManagedRoute::new(
-      ManagedTarget::new(pool_id.clone(), UpstreamSelector::Any, ModelSelector::Capability),
+      ManagedTarget::new(pool_id.clone(), ProviderSelector::Any, ModelSelector::Capability),
       OperationPolicy::TranslateCompatible,
       None,
       ManagedRetry::Never,
@@ -983,8 +958,8 @@ mod tests {
         ),
       )]),
       BTreeMap::from([(
-        upstream_id.clone(),
-        UpstreamPlan::new(id("openai"), None, Box::default(), false),
+        provider_id.clone(),
+        ProviderPlan::new(id("openai"), None, Box::default(), false),
       )]),
       BTreeMap::from([(
         group_id.clone(),
@@ -996,7 +971,7 @@ mod tests {
     assert_eq!(gateway.profile(&profile_id).unwrap().route(), &route_id);
     assert!(gateway.route(&route_id).is_some());
     assert!(gateway.account_pool(&pool_id).is_some());
-    assert!(gateway.upstream(&upstream_id).is_some());
+    assert!(gateway.provider(&provider_id).is_some());
     assert!(gateway.model_group(&group_id).is_some());
   }
 }

@@ -441,7 +441,7 @@ fn compile_http_action(
         target_kind: "route",
         target: profile.route().to_string(),
       })?;
-    if route.destination_policy() != DestinationPolicy::SelectedUpstream {
+    if route.destination_policy() != DestinationPolicy::SelectedProvider {
       return Err(invalid_value(
         context.location,
         format!(

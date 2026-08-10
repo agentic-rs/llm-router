@@ -1,18 +1,16 @@
 //! Immutable account-pool views over the v2 provider graph.
 //!
-//! A pool selects logical accounts, not individual provider bindings. One
-//! account can therefore expose several eligible upstream bindings without
-//! receiving extra weight in later round-robin selection.
+//! Each account already owns exactly one configured-provider binding. Pools
+//! only filter and tier those logical accounts.
 
 use super::{ProviderBinding, ProviderGraph};
-use crate::registry::Registry;
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokn_core::account::AccountTier;
-use tokn_policy::{AccountPoolId, AccountSelectionStrategy, GatewayPlan, ProviderId, SessionAffinityPlan, UpstreamId};
+use tokn_policy::{AccountPoolId, AccountSelectionStrategy, GatewayPlan, SessionAffinityPlan};
 
 /// Every account pool linked from one compiled gateway plan.
 pub struct LinkedAccountPools {
@@ -99,11 +97,11 @@ impl std::fmt::Debug for LinkedAccountPool {
   }
 }
 
-/// One logical account slot and all of its eligible upstream bindings.
+/// One logical account slot and its configured-provider binding.
 pub struct LinkedPoolAccount {
   account_id: SmolStr,
   account_order: usize,
-  bindings: BTreeMap<UpstreamId, Arc<ProviderBinding>>,
+  binding: Arc<ProviderBinding>,
 }
 
 impl LinkedPoolAccount {
@@ -116,13 +114,8 @@ impl LinkedPoolAccount {
     self.account_order
   }
 
-  /// Bindings ordered by typed upstream id.
-  pub fn bindings(&self) -> &BTreeMap<UpstreamId, Arc<ProviderBinding>> {
-    &self.bindings
-  }
-
-  pub fn binding(&self, upstream_id: &UpstreamId) -> Option<&Arc<ProviderBinding>> {
-    self.bindings.get(upstream_id)
+  pub fn binding(&self) -> &Arc<ProviderBinding> {
+    &self.binding
   }
 }
 
@@ -132,7 +125,7 @@ impl std::fmt::Debug for LinkedPoolAccount {
       .debug_struct("LinkedPoolAccount")
       .field("account_id", &self.account_id)
       .field("account_order", &self.account_order)
-      .field("bindings", &self.bindings)
+      .field("binding", &self.binding)
       .finish()
   }
 }
@@ -140,9 +133,6 @@ impl std::fmt::Debug for LinkedPoolAccount {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum PoolLinkError {
-  #[snafu(display("account pool '{pool}' references unknown provider '{provider}'"))]
-  UnknownProvider { pool: AccountPoolId, provider: ProviderId },
-
   #[snafu(display("account pool '{pool}' references unknown account '{account_id}'"))]
   UnknownAccount { pool: AccountPoolId, account_id: SmolStr },
 }
@@ -153,28 +143,26 @@ pub type PoolLinkResult<T> = std::result::Result<T, PoolLinkError>;
 /// graph.
 ///
 /// Selector dimensions are intersected. Disabled accounts and enabled
-/// accounts without a viable upstream binding are intentionally omitted, but
+/// accounts without a viable provider binding are intentionally omitted, but
 /// an explicitly named disabled account is still a valid reference.
-pub fn link_account_pools(
-  plan: &GatewayPlan,
-  providers: &ProviderGraph,
-  registry: &Registry,
-) -> PoolLinkResult<LinkedAccountPools> {
+pub fn link_account_pools(plan: &GatewayPlan, providers: &ProviderGraph) -> PoolLinkResult<LinkedAccountPools> {
   let mut pools = BTreeMap::new();
 
   for (pool_id, pool_plan) in plan.account_pools() {
-    validate_selector(pool_id, pool_plan.selector(), providers, registry)?;
+    validate_selector(pool_id, pool_plan.selector(), providers)?;
 
     let mut active = Vec::new();
     let mut fallback = Vec::new();
     for account in providers.accounts() {
       let config = account.config();
       let selector = pool_plan.selector();
+      let Some(binding) = account.binding() else {
+        continue;
+      };
       if !config.enabled
-        || account.bindings().is_empty()
         || !selector
           .providers()
-          .is_none_or(|provider_ids| provider_ids.contains(config.provider.as_str()))
+          .is_none_or(|provider_ids| provider_ids.contains(binding.provider_id()))
         || !selector
           .accounts()
           .is_none_or(|account_ids| account_ids.contains(config.id.as_str()))
@@ -182,18 +170,10 @@ pub fn link_account_pools(
         continue;
       }
 
-      let mut bindings = BTreeMap::new();
-      for binding in account.bindings() {
-        let previous = bindings.insert(binding.upstream_id().clone(), binding.clone());
-        debug_assert!(
-          previous.is_none(),
-          "provider graph contains duplicate account/upstream binding"
-        );
-      }
       let linked = LinkedPoolAccount {
         account_id: SmolStr::new(&config.id),
         account_order: account.input_order(),
-        bindings,
+        binding: binding.clone(),
       };
 
       match config.tier {
@@ -220,19 +200,7 @@ fn validate_selector(
   pool_id: &AccountPoolId,
   selector: &tokn_policy::AccountSelector,
   providers: &ProviderGraph,
-  registry: &Registry,
 ) -> PoolLinkResult<()> {
-  if let Some(provider_ids) = selector.providers() {
-    for provider_id in provider_ids {
-      if registry.resolve(provider_id.as_str()).is_none() {
-        return Err(PoolLinkError::UnknownProvider {
-          pool: pool_id.clone(),
-          provider: provider_id.clone(),
-        });
-      }
-    }
-  }
-
   if let Some(account_ids) = selector.accounts() {
     for account_id in account_ids {
       if providers.account(account_id.as_str()).is_none() {
@@ -251,21 +219,22 @@ fn validate_selector(
 mod tests {
   use super::*;
   use crate::link::link_provider_graph;
+  use crate::registry::Registry;
   use std::collections::BTreeMap;
   use tokn_core::account::AccountConfig;
   use tokn_core::provider::{ID_LLAMA_CPP, ID_OPENAI};
-  use tokn_policy::{AccountPoolPlan, AccountSelector, UpstreamPlan};
+  use tokn_policy::{AccountPoolPlan, AccountSelector, ProviderPlan};
 
   fn pool_id(value: &str) -> AccountPoolId {
     AccountPoolId::new(value).unwrap()
   }
 
-  fn provider_id(value: &str) -> ProviderId {
-    ProviderId::new(value).unwrap()
+  fn driver_id(value: &str) -> tokn_policy::DriverId {
+    tokn_policy::DriverId::new(value).unwrap()
   }
 
-  fn upstream_id(value: &str) -> UpstreamId {
-    UpstreamId::new(value).unwrap()
+  fn provider_id(value: &str) -> tokn_policy::ProviderId {
+    tokn_policy::ProviderId::new(value).unwrap()
   }
 
   fn account(id: &str, provider: &str, tier: AccountTier) -> AccountConfig {
@@ -285,14 +254,13 @@ mod tests {
     account
   }
 
-  fn upstream(provider: &str, eligible_accounts: Option<&[&str]>) -> UpstreamPlan {
-    UpstreamPlan::new(
-      provider_id(provider),
+  fn provider(driver: &str) -> ProviderPlan {
+    ProviderPlan::new(
+      driver_id(driver),
       Some("https://gateway.example/v1/".into()),
       Box::default(),
       false,
     )
-    .with_eligible_accounts(eligible_accounts.map(|ids| ids.iter().map(SmolStr::new).collect()))
   }
 
   fn pool(providers: Option<&[&str]>, accounts: Option<&[&str]>) -> AccountPoolPlan {
@@ -312,14 +280,14 @@ mod tests {
 
   fn plan(
     pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
-    upstreams: BTreeMap<UpstreamId, UpstreamPlan>,
+    providers: BTreeMap<tokn_policy::ProviderId, ProviderPlan>,
   ) -> GatewayPlan {
     GatewayPlan::new(
       BTreeMap::new(),
       BTreeMap::new(),
       BTreeMap::new(),
       pools,
-      upstreams,
+      providers,
       BTreeMap::new(),
     )
   }
@@ -327,25 +295,25 @@ mod tests {
   fn link(plan: &GatewayPlan, accounts: &[AccountConfig]) -> PoolLinkResult<(ProviderGraph, LinkedAccountPools)> {
     let registry = Registry::builtin();
     let providers = link_provider_graph(plan, accounts, &registry).unwrap();
-    let pools = link_account_pools(plan, &providers, &registry)?;
+    let pools = link_account_pools(plan, &providers)?;
     Ok((providers, pools))
   }
 
   #[test]
-  fn groups_upstreams_by_logical_account_and_preserves_account_and_tier_order() {
-    let primary = upstream_id("z-primary");
-    let secondary = upstream_id("a-secondary");
+  fn preserves_account_and_tier_order_with_one_provider_per_account() {
+    let primary = provider_id("z-primary");
+    let secondary = provider_id("a-secondary");
     let plan = plan(
       BTreeMap::from([(pool_id("all"), pool(None, None))]),
       BTreeMap::from([
-        (primary.clone(), upstream(ID_LLAMA_CPP, None)),
-        (secondary.clone(), upstream(ID_LLAMA_CPP, None)),
+        (primary.clone(), provider(ID_LLAMA_CPP)),
+        (secondary.clone(), provider(ID_LLAMA_CPP)),
       ]),
     );
     let accounts = [
-      account("fallback-first", ID_LLAMA_CPP, AccountTier::Fallback),
-      account("active-second", ID_LLAMA_CPP, AccountTier::Active),
-      account("active-third", ID_LLAMA_CPP, AccountTier::Active),
+      account("fallback-first", primary.as_str(), AccountTier::Fallback),
+      account("active-second", secondary.as_str(), AccountTier::Active),
+      account("active-third", primary.as_str(), AccountTier::Active),
     ];
 
     let (_, linked) = link(&plan, &accounts).unwrap();
@@ -369,14 +337,8 @@ mod tests {
       ["fallback-first"]
     );
     assert_eq!(pool.fallback()[0].account_order(), 0);
-    assert_eq!(
-      pool.active()[0]
-        .bindings()
-        .keys()
-        .map(UpstreamId::as_str)
-        .collect::<Vec<_>>(),
-      ["a-secondary", "z-primary"]
-    );
+    assert_eq!(pool.active()[0].binding().provider_id(), &secondary);
+    assert_eq!(pool.active()[1].binding().provider_id(), &primary);
     assert_eq!(pool.strategy(), AccountSelectionStrategy::RoundRobin);
     assert_eq!(pool.failure_cooldown(), Duration::from_secs(17));
     assert_eq!(pool.session_affinity().unwrap().ttl(), Duration::from_secs(23));
@@ -384,17 +346,17 @@ mod tests {
 
   #[test]
   fn intersects_provider_and_account_selectors() {
-    let selected = account("selected", ID_LLAMA_CPP, AccountTier::Active);
-    let omitted_by_account = account("omitted-account", ID_LLAMA_CPP, AccountTier::Active);
-    let omitted_by_provider = account("omitted-provider", ID_OPENAI, AccountTier::Active);
+    let selected = account("selected", "llama", AccountTier::Active);
+    let omitted_by_account = account("omitted-account", "llama", AccountTier::Active);
+    let omitted_by_provider = account("omitted-provider", "openai", AccountTier::Active);
     let plan = plan(
       BTreeMap::from([(
         pool_id("selected"),
-        pool(Some(&[ID_LLAMA_CPP]), Some(&["selected", "omitted-provider"])),
+        pool(Some(&["llama"]), Some(&["selected", "omitted-provider"])),
       )]),
       BTreeMap::from([
-        (upstream_id("llama"), upstream(ID_LLAMA_CPP, None)),
-        (upstream_id("openai"), upstream(ID_OPENAI, None)),
+        (provider_id("llama"), provider(ID_LLAMA_CPP)),
+        (provider_id("openai"), provider(ID_OPENAI)),
       ]),
     );
 
@@ -408,41 +370,26 @@ mod tests {
 
   #[test]
   fn pools_share_binding_arcs_without_sharing_logical_slots() {
-    let upstream_id = upstream_id("local");
+    let provider_id = provider_id("local");
     let plan = plan(
       BTreeMap::from([
         (pool_id("first"), pool(None, None)),
         (pool_id("second"), pool(None, Some(&["shared"]))),
       ]),
-      BTreeMap::from([(upstream_id.clone(), upstream(ID_LLAMA_CPP, None))]),
+      BTreeMap::from([(provider_id.clone(), provider(ID_LLAMA_CPP))]),
     );
 
-    let (providers, linked) = link(&plan, &[account("shared", ID_LLAMA_CPP, AccountTier::Active)]).unwrap();
-    let graph_binding = providers.binding(&upstream_id, "shared").unwrap();
-    let first = linked.pool(&pool_id("first")).unwrap().active()[0]
-      .binding(&upstream_id)
-      .unwrap();
-    let second = linked.pool(&pool_id("second")).unwrap().active()[0]
-      .binding(&upstream_id)
-      .unwrap();
+    let (providers, linked) = link(&plan, &[account("shared", "local", AccountTier::Active)]).unwrap();
+    let graph_binding = providers.binding(&provider_id, "shared").unwrap();
+    let first = linked.pool(&pool_id("first")).unwrap().active()[0].binding();
+    let second = linked.pool(&pool_id("second")).unwrap().active()[0].binding();
 
     assert!(Arc::ptr_eq(graph_binding, first));
     assert!(Arc::ptr_eq(first, second));
   }
 
   #[test]
-  fn validates_explicit_provider_and_account_names() {
-    let unknown_provider_plan = plan(
-      BTreeMap::from([(pool_id("invalid-provider"), pool(Some(&["not-installed"]), None))]),
-      BTreeMap::new(),
-    );
-    let provider_error = link(&unknown_provider_plan, &[]).err().unwrap();
-    assert!(matches!(
-      provider_error,
-      PoolLinkError::UnknownProvider { pool, provider }
-        if pool.as_str() == "invalid-provider" && provider.as_str() == "not-installed"
-    ));
-
+  fn validates_explicit_account_names() {
     let unknown_account_plan = plan(
       BTreeMap::from([(pool_id("invalid-account"), pool(None, Some(&["missing"])))]),
       BTreeMap::new(),
@@ -456,48 +403,43 @@ mod tests {
   }
 
   #[test]
-  fn known_disabled_or_unbound_accounts_are_valid_but_omitted() {
-    let mut disabled = account("disabled", ID_LLAMA_CPP, AccountTier::Active);
+  fn known_disabled_accounts_are_valid_but_omitted() {
+    let mut disabled = account("disabled", "llama", AccountTier::Active);
     disabled.enabled = false;
-    let unbound = account("unbound", ID_OPENAI, AccountTier::Active);
     let plan = plan(
-      BTreeMap::from([(pool_id("empty"), pool(None, Some(&["disabled", "unbound"])))]),
-      BTreeMap::from([(upstream_id("llama"), upstream(ID_LLAMA_CPP, None))]),
+      BTreeMap::from([(pool_id("empty"), pool(None, Some(&["disabled"])))]),
+      BTreeMap::from([(provider_id("llama"), provider(ID_LLAMA_CPP))]),
     );
 
-    let (_, linked) = link(&plan, &[disabled, unbound]).unwrap();
+    let (_, linked) = link(&plan, &[disabled]).unwrap();
     let empty = linked.pool(&pool_id("empty")).unwrap();
 
     assert!(empty.is_empty());
   }
 
   #[test]
-  fn upstream_eligibility_remains_enforced_in_pool_bindings() {
-    let unrestricted = upstream_id("unrestricted");
-    let restricted = upstream_id("restricted");
+  fn provider_selector_filters_account_bindings() {
+    let first = provider_id("first");
+    let second = provider_id("second");
     let plan = plan(
-      BTreeMap::from([(pool_id("all"), pool(None, None))]),
+      BTreeMap::from([(pool_id("first-only"), pool(Some(&["first"]), None))]),
       BTreeMap::from([
-        (unrestricted.clone(), upstream(ID_LLAMA_CPP, None)),
-        (restricted.clone(), upstream(ID_LLAMA_CPP, Some(&["eligible"]))),
+        (first.clone(), provider(ID_LLAMA_CPP)),
+        (second, provider(ID_LLAMA_CPP)),
       ]),
     );
 
     let (_, linked) = link(
       &plan,
       &[
-        account("eligible", ID_LLAMA_CPP, AccountTier::Active),
-        account("ineligible", ID_LLAMA_CPP, AccountTier::Active),
+        account("selected", "first", AccountTier::Active),
+        account("omitted", "second", AccountTier::Active),
       ],
     )
     .unwrap();
-    let pool = linked.pool(&pool_id("all")).unwrap();
-    let eligible = &pool.active()[0];
-    let ineligible = &pool.active()[1];
-
-    assert!(eligible.binding(&unrestricted).is_some());
-    assert!(eligible.binding(&restricted).is_some());
-    assert!(ineligible.binding(&unrestricted).is_some());
-    assert!(ineligible.binding(&restricted).is_none());
+    let pool = linked.pool(&pool_id("first-only")).unwrap();
+    assert_eq!(pool.active().len(), 1);
+    assert_eq!(pool.active()[0].account_id(), "selected");
+    assert_eq!(pool.active()[0].binding().provider_id(), &first);
   }
 }
