@@ -1,16 +1,16 @@
 use crate::v2::{
   CompileError, RawAccountPool, RawConfig, RawFallbackSelector, RawModelCandidate, RawModelSelector,
-  RawOperationPolicy, RawPoolStrategy, RawProfile, RawQualificationNamespace, RawRelayTarget, RawRoute, RawUpstream,
-  RawUpstreamSelector, RawWireIdentity,
+  RawOperationPolicy, RawPoolStrategy, RawProfile, RawProvider, RawProviderSelector, RawQualificationNamespace,
+  RawRelayTarget, RawRoute, RawWireIdentity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_policy::{
-  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, FallbackSelector, ManagedRetry,
+  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, DriverId, FallbackSelector, ManagedRetry,
   ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan, ModelSelector, OperationPolicy, ProfileId,
-  ProfilePlan, ProviderId, QualificationNamespace, RelayRetry, RelayRoute, RelayTarget, RouteId, RouteKind, RoutePlan,
-  SessionAffinityPlan, UpstreamId, UpstreamOrigin, UpstreamPlan, UpstreamSelector, WireIdentity, WireIdentityId,
+  ProfilePlan, ProviderId, ProviderOrigin, ProviderPlan, ProviderSelector, QualificationNamespace, RelayRetry,
+  RelayRoute, RelayTarget, RouteId, RouteKind, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
 };
 
 const MAX_FAILURE_COOLDOWN_SECS: u64 = 86_400;
@@ -21,28 +21,29 @@ pub(super) struct CompiledResources {
   pub(super) profiles: BTreeMap<ProfileId, ProfilePlan>,
   pub(super) routes: BTreeMap<RouteId, RoutePlan>,
   pub(super) account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
-  pub(super) upstreams: BTreeMap<UpstreamId, UpstreamPlan>,
+  pub(super) providers: BTreeMap<ProviderId, ProviderPlan>,
   pub(super) model_groups: BTreeMap<ModelGroupId, ModelGroupPlan>,
 }
 
 pub(super) fn compile_resources(raw: &RawConfig) -> Result<CompiledResources, CompileError> {
-  let account_pools = compile_account_pools(&raw.account_pools)?;
-  let upstreams = compile_upstreams(&raw.upstreams)?;
-  let model_groups = compile_model_groups(&raw.model_groups, &upstreams)?;
-  let routes = compile_routes(&raw.routes, &account_pools, &upstreams, &model_groups)?;
+  let providers = compile_providers(&raw.providers)?;
+  let account_pools = compile_account_pools(&raw.account_pools, &providers)?;
+  let model_groups = compile_model_groups(&raw.model_groups, &providers)?;
+  let routes = compile_routes(&raw.routes, &account_pools, &providers, &model_groups)?;
   let profiles = compile_profiles(&raw.profiles, &routes)?;
 
   Ok(CompiledResources {
     profiles,
     routes,
     account_pools,
-    upstreams,
+    providers,
     model_groups,
   })
 }
 
 fn compile_account_pools(
   raw_pools: &BTreeMap<String, RawAccountPool>,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<BTreeMap<AccountPoolId, AccountPoolPlan>, CompileError> {
   raw_pools
     .iter()
@@ -68,7 +69,7 @@ fn compile_account_pools(
       )?;
       let accounts = compile_account_filter(raw_pool.accounts.as_deref(), format!("account_pools.{raw_id}.accounts"))?
         .map(|accounts| accounts.into_iter().map(Into::into).collect());
-      let providers = compile_provider_filter(raw_pool.providers.as_deref(), raw_id)?;
+      let providers = compile_provider_filter(raw_pool.providers.as_deref(), raw_id, providers)?;
 
       let session_affinity = if raw_pool.session_ttl_secs == 0 {
         if raw_pool.session_expired_retention_secs != 0 {
@@ -139,6 +140,7 @@ fn compile_account_filter(
 fn compile_provider_filter(
   raw_values: Option<&[String]>,
   pool_id: &str,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<Option<BTreeSet<ProviderId>>, CompileError> {
   let Some(raw_values) = raw_values else {
     return Ok(None);
@@ -151,6 +153,15 @@ fn compile_provider_filter(
   let mut values = BTreeSet::new();
   for value in raw_values {
     let provider = parse_id::<ProviderId>("provider selector", value)?;
+    require_reference(
+      providers,
+      &provider,
+      "account pool",
+      pool_id,
+      "providers",
+      "provider",
+      value,
+    )?;
     if !values.insert(provider) {
       return Err(duplicate_value(format!("account_pools.{pool_id}.providers"), value));
     }
@@ -171,25 +182,22 @@ fn validate_selector_shape(raw_values: &[String], location: String) -> Result<()
   Ok(())
 }
 
-fn compile_upstreams(
-  raw_upstreams: &BTreeMap<String, RawUpstream>,
-) -> Result<BTreeMap<UpstreamId, UpstreamPlan>, CompileError> {
+fn compile_providers(
+  raw_providers: &BTreeMap<String, RawProvider>,
+) -> Result<BTreeMap<ProviderId, ProviderPlan>, CompileError> {
   let mut plans = BTreeMap::new();
 
-  for (raw_id, raw_upstream) in raw_upstreams {
-    let id = parse_id::<UpstreamId>("upstream id", raw_id)?;
-    let provider = parse_id::<ProviderId>("upstream provider", &raw_upstream.provider)?;
-    let eligible_accounts =
-      compile_account_filter(raw_upstream.accounts.as_deref(), format!("upstreams.{raw_id}.accounts"))?
-        .map(|accounts| accounts.into_iter().map(Into::into).collect());
-    let (base_url, base_origin) = raw_upstream
+  for (raw_id, raw_provider) in raw_providers {
+    let id = parse_id::<ProviderId>("provider id", raw_id)?;
+    let driver = parse_id::<DriverId>("provider driver", &raw_provider.driver)?;
+    let (base_url, base_origin) = raw_provider
       .base_url
       .as_deref()
       .map(|value| {
         canonical_base_url(
           value,
-          format!("upstreams.{raw_id}.base_url"),
-          raw_upstream.allow_insecure_http,
+          format!("providers.{raw_id}.base_url"),
+          raw_provider.allow_insecure_http,
         )
       })
       .transpose()?
@@ -200,22 +208,21 @@ fn compile_upstreams(
     if let Some(origin) = base_origin {
       claim_origin(&mut own_origins, &mut origins, raw_id, origin)?;
     }
-    for raw_origin in &raw_upstream.origins {
+    for raw_origin in &raw_provider.origins {
       let origin = canonical_origin(
         raw_origin,
-        format!("upstreams.{raw_id}.origins"),
-        raw_upstream.allow_insecure_http,
+        format!("providers.{raw_id}.origins"),
+        raw_provider.allow_insecure_http,
       )?;
       claim_origin(&mut own_origins, &mut origins, raw_id, origin)?;
     }
 
-    let plan = UpstreamPlan::new(
-      provider,
+    let plan = ProviderPlan::new(
+      driver,
       base_url.map(Into::into),
       origins.into_boxed_slice(),
-      raw_upstream.allow_insecure_http,
-    )
-    .with_eligible_accounts(eligible_accounts);
+      raw_provider.allow_insecure_http,
+    );
     plans.insert(id, plan);
   }
 
@@ -224,18 +231,18 @@ fn compile_upstreams(
 
 fn claim_origin(
   own_origins: &mut BTreeSet<String>,
-  compiled: &mut Vec<UpstreamOrigin>,
-  upstream: &str,
+  compiled: &mut Vec<ProviderOrigin>,
+  provider: &str,
   origin: String,
 ) -> Result<(), CompileError> {
   if !own_origins.insert(origin.clone()) {
     return Err(invalid_value(
-      format!("upstreams.{upstream}.origins"),
+      format!("providers.{provider}.origins"),
       format!("contains duplicate canonical origin `{origin}`"),
     ));
   }
 
-  compiled.push(UpstreamOrigin::new(origin));
+  compiled.push(ProviderOrigin::new(origin));
   Ok(())
 }
 
@@ -266,7 +273,7 @@ fn cleartext_policy(allow_insecure_http: bool) -> CleartextHttpPolicy {
 
 fn compile_model_groups(
   raw_groups: &BTreeMap<String, Vec<RawModelCandidate>>,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<BTreeMap<ModelGroupId, ModelGroupPlan>, CompileError> {
   raw_groups
     .iter()
@@ -282,8 +289,8 @@ fn compile_model_groups(
       let mut candidates = Vec::with_capacity(raw_candidates.len());
       let mut seen = BTreeSet::new();
       for (index, raw_candidate) in raw_candidates.iter().enumerate() {
-        let candidate = compile_model_candidate(raw_id, index, raw_candidate, upstreams)?;
-        let key = (candidate.upstream().cloned(), candidate.model().to_string());
+        let candidate = compile_model_candidate(raw_id, index, raw_candidate, providers)?;
+        let key = (candidate.provider().cloned(), candidate.model().to_string());
         if !seen.insert(key) {
           return Err(invalid_value(
             format!("model_groups.{raw_id}[{index}]"),
@@ -302,7 +309,7 @@ fn compile_model_candidate(
   group_id: &str,
   index: usize,
   raw: &RawModelCandidate,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<ModelCandidate, CompileError> {
   if raw.model.trim().is_empty() || raw.model.trim() != raw.model {
     return Err(invalid_value(
@@ -311,31 +318,31 @@ fn compile_model_candidate(
     ));
   }
 
-  let upstream = raw
-    .upstream
+  let provider = raw
+    .provider
     .as_deref()
-    .map(|raw_upstream| {
-      let upstream = parse_id::<UpstreamId>("model candidate upstream reference", raw_upstream)?;
+    .map(|raw_provider| {
+      let provider = parse_id::<ProviderId>("model candidate provider reference", raw_provider)?;
       require_reference(
-        upstreams,
-        &upstream,
+        providers,
+        &provider,
         "model group",
         group_id,
-        "upstream",
-        "upstream",
-        raw_upstream,
+        "provider",
+        "provider",
+        raw_provider,
       )?;
-      Ok(upstream)
+      Ok(provider)
     })
     .transpose()?;
 
-  Ok(ModelCandidate::new(upstream, &raw.model))
+  Ok(ModelCandidate::new(provider, &raw.model))
 }
 
 fn compile_routes(
   raw_routes: &BTreeMap<String, RawRoute>,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
   groups: &BTreeMap<ModelGroupId, ModelGroupPlan>,
 ) -> Result<BTreeMap<RouteId, RoutePlan>, CompileError> {
   raw_routes
@@ -345,29 +352,29 @@ fn compile_routes(
       let plan = match raw_route {
         RawRoute::Managed {
           account_pool,
-          upstream,
+          provider,
           model,
           operation,
         } => {
           let pool_id = resolve_pool(raw_id, "account_pool", account_pool, pools)?;
-          let upstream_selector = match upstream {
-            RawUpstreamSelector::Any {} => {
-              ensure_any_upstream_viable(raw_id, &pool_id, pools, upstreams)?;
-              UpstreamSelector::Any
+          let provider_selector = match provider {
+            RawProviderSelector::Any {} => {
+              ensure_any_provider_viable(raw_id, &pool_id, pools, providers)?;
+              ProviderSelector::Any
             }
-            RawUpstreamSelector::Fixed { upstream } => {
-              let upstream_id = resolve_upstream("route", raw_id, "upstream", upstream, upstreams)?;
-              ensure_fixed_upstream_compatible(raw_id, "upstream", &pool_id, &upstream_id, pools, upstreams)?;
-              UpstreamSelector::Fixed(upstream_id)
+            RawProviderSelector::Fixed { provider } => {
+              let provider_id = resolve_provider("route", raw_id, "provider", provider, providers)?;
+              ensure_fixed_provider_compatible(raw_id, "provider", &pool_id, &provider_id, pools)?;
+              ProviderSelector::Fixed(provider_id)
             }
           };
-          let model = compile_model_selector(raw_id, model, &pool_id, &upstream_selector, pools, upstreams, groups)?;
+          let model = compile_model_selector(raw_id, model, &pool_id, &provider_selector, pools, groups)?;
           let operation = match operation {
             RawOperationPolicy::Preserve => OperationPolicy::Preserve,
             RawOperationPolicy::TranslateCompatible => OperationPolicy::TranslateCompatible,
           };
           RoutePlan::Managed(ManagedRoute::new(
-            ManagedTarget::new(pool_id, upstream_selector, model),
+            ManagedTarget::new(pool_id, provider_selector, model),
             operation,
             None,
             ManagedRetry::Never,
@@ -375,17 +382,17 @@ fn compile_routes(
         }
         RawRoute::Relay { target } => {
           let target = match target {
-            RawRelayTarget::UpstreamFromOrigin { account_pool } => {
+            RawRelayTarget::ProviderFromOrigin { account_pool } => {
               let pool_id = resolve_pool(raw_id, "target.account_pool", account_pool, pools)?;
-              ensure_origin_relay_viable(raw_id, &pool_id, pools, upstreams)?;
-              RelayTarget::UpstreamFromOrigin { account_pool: pool_id }
+              ensure_origin_relay_viable(raw_id, &pool_id, pools, providers)?;
+              RelayTarget::ProviderFromOrigin { account_pool: pool_id }
             }
-            RawRelayTarget::FixedUpstream { upstream, account_pool } => {
+            RawRelayTarget::FixedProvider { provider, account_pool } => {
               let pool_id = resolve_pool(raw_id, "target.account_pool", account_pool, pools)?;
-              let upstream_id = resolve_upstream("route", raw_id, "target.upstream", upstream, upstreams)?;
-              ensure_fixed_upstream_compatible(raw_id, "target.upstream", &pool_id, &upstream_id, pools, upstreams)?;
-              RelayTarget::FixedUpstream {
-                upstream: upstream_id,
+              let provider_id = resolve_provider("route", raw_id, "target.provider", provider, providers)?;
+              ensure_fixed_provider_compatible(raw_id, "target.provider", &pool_id, &provider_id, pools)?;
+              RelayTarget::FixedProvider {
+                provider: provider_id,
                 account_pool: pool_id,
               }
             }
@@ -411,33 +418,32 @@ fn resolve_pool(
   Ok(pool)
 }
 
-fn resolve_upstream(
+fn resolve_provider(
   owner_kind: &'static str,
   owner: &str,
   field: &'static str,
-  raw_upstream: &str,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
-) -> Result<UpstreamId, CompileError> {
-  let upstream = parse_id::<UpstreamId>("upstream reference", raw_upstream)?;
-  require_reference(upstreams, &upstream, owner_kind, owner, field, "upstream", raw_upstream)?;
-  Ok(upstream)
+  raw_provider: &str,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
+) -> Result<ProviderId, CompileError> {
+  let provider = parse_id::<ProviderId>("provider reference", raw_provider)?;
+  require_reference(providers, &provider, owner_kind, owner, field, "provider", raw_provider)?;
+  Ok(provider)
 }
 
 fn compile_model_selector(
   route_id: &str,
   raw: &RawModelSelector,
   pool_id: &AccountPoolId,
-  route_upstream: &UpstreamSelector,
+  route_provider: &ProviderSelector,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
   groups: &BTreeMap<ModelGroupId, ModelGroupPlan>,
 ) -> Result<ModelSelector, CompileError> {
   match raw {
     RawModelSelector::Capability {} => Ok(ModelSelector::Capability),
     RawModelSelector::Qualified { namespace } => {
       let namespace = match namespace {
+        RawQualificationNamespace::Driver => QualificationNamespace::Driver,
         RawQualificationNamespace::Provider => QualificationNamespace::Provider,
-        RawQualificationNamespace::Upstream => QualificationNamespace::Upstream,
       };
       Ok(ModelSelector::Qualified { namespace })
     }
@@ -445,7 +451,7 @@ fn compile_model_selector(
       let selector = match selector {
         RawFallbackSelector::Fixed { group } => {
           let group_id = resolve_group(route_id, "model.selector.group", group, groups)?;
-          validate_group_compatibility(route_id, &group_id, pool_id, route_upstream, pools, upstreams, groups)?;
+          validate_group_compatibility(route_id, &group_id, pool_id, route_provider, pools, groups)?;
           FallbackSelector::Fixed(group_id)
         }
         RawFallbackSelector::ByRequested { groups: raw_groups } => {
@@ -466,7 +472,7 @@ fn compile_model_selector(
                 raw_group,
               ));
             }
-            validate_group_compatibility(route_id, &group, pool_id, route_upstream, pools, upstreams, groups)?;
+            validate_group_compatibility(route_id, &group, pool_id, route_provider, pools, groups)?;
             group_ids.push(group);
           }
           FallbackSelector::ByRequested(group_ids.into_boxed_slice())
@@ -492,43 +498,40 @@ fn validate_group_compatibility(
   route_id: &str,
   group_id: &ModelGroupId,
   pool_id: &AccountPoolId,
-  route_upstream: &UpstreamSelector,
+  route_provider: &ProviderSelector,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
   groups: &BTreeMap<ModelGroupId, ModelGroupPlan>,
 ) -> Result<(), CompileError> {
   let allowed_providers = pools[pool_id].selector().providers();
   let mut effective_candidates = BTreeSet::new();
   for (index, candidate) in groups[group_id].candidates().iter().enumerate() {
-    if let Some(candidate_upstream_id) = candidate.upstream() {
-      if let UpstreamSelector::Fixed(route_upstream_id) = route_upstream {
-        if candidate_upstream_id != route_upstream_id {
+    if let Some(candidate_provider_id) = candidate.provider() {
+      if let ProviderSelector::Fixed(route_provider_id) = route_provider {
+        if candidate_provider_id != route_provider_id {
           return Err(invalid_value(
             format!("routes.{route_id}.model"),
             format!(
-              "model group `{group_id}` candidate {index} pins upstream `{candidate_upstream_id}`, which conflicts with fixed route upstream `{route_upstream_id}`"
+              "model group `{group_id}` candidate {index} pins provider `{candidate_provider_id}`, which conflicts with fixed route provider `{route_provider_id}`"
             ),
           ));
         }
       }
 
-      let candidate_upstream = &upstreams[candidate_upstream_id];
-      if allowed_providers.is_some_and(|providers| !providers.contains(candidate_upstream.provider())) {
+      if allowed_providers.is_some_and(|providers| !providers.contains(candidate_provider_id)) {
         return Err(invalid_value(
           format!("routes.{route_id}.model"),
           format!(
-            "model group `{group_id}` candidate {index} pins upstream `{candidate_upstream_id}` with provider `{}`, which account pool `{pool_id}` excludes",
-            candidate_upstream.provider()
+            "model group `{group_id}` candidate {index} pins provider `{candidate_provider_id}`, which account pool `{pool_id}` excludes"
           ),
         ));
       }
     }
 
-    let effective_upstream = candidate.upstream().or(match route_upstream {
-      UpstreamSelector::Any => None,
-      UpstreamSelector::Fixed(upstream) => Some(upstream),
+    let effective_provider = candidate.provider().or(match route_provider {
+      ProviderSelector::Any => None,
+      ProviderSelector::Fixed(provider) => Some(provider),
     });
-    if !effective_candidates.insert((effective_upstream.cloned(), candidate.model())) {
+    if !effective_candidates.insert((effective_provider.cloned(), candidate.model())) {
       return Err(invalid_value(
         format!("routes.{route_id}.model"),
         format!("model group `{group_id}` candidate {index} duplicates an earlier effective candidate"),
@@ -538,49 +541,44 @@ fn validate_group_compatibility(
   Ok(())
 }
 
-fn ensure_fixed_upstream_compatible(
+fn ensure_fixed_provider_compatible(
   route_id: &str,
   field: &str,
   pool_id: &AccountPoolId,
-  upstream_id: &UpstreamId,
+  provider_id: &ProviderId,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
 ) -> Result<(), CompileError> {
   let pool = &pools[pool_id];
-  let upstream = &upstreams[upstream_id];
   if pool
     .selector()
     .providers()
-    .is_some_and(|providers| !providers.contains(upstream.provider()))
+    .is_some_and(|providers| !providers.contains(provider_id))
   {
     return Err(invalid_value(
       format!("routes.{route_id}.{field}"),
-      format!(
-        "upstream `{upstream_id}` uses provider `{}`, which account pool `{pool_id}` excludes",
-        upstream.provider()
-      ),
+      format!("provider `{provider_id}` is excluded by account pool `{pool_id}`"),
     ));
   }
   Ok(())
 }
 
-fn ensure_any_upstream_viable(
+fn ensure_any_provider_viable(
   route_id: &str,
   pool_id: &AccountPoolId,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<(), CompileError> {
   let allowed_providers = pools[pool_id].selector().providers();
-  if upstreams
-    .values()
-    .any(|upstream| allowed_providers.is_none_or(|providers| providers.contains(upstream.provider())))
+  if providers
+    .keys()
+    .any(|provider_id| allowed_providers.is_none_or(|providers| providers.contains(provider_id)))
   {
     return Ok(());
   }
 
   Err(invalid_value(
-    format!("routes.{route_id}.upstream"),
-    format!("no configured upstream is compatible with account pool `{pool_id}`"),
+    format!("routes.{route_id}.provider"),
+    format!("no configured provider is compatible with account pool `{pool_id}`"),
   ))
 }
 
@@ -588,37 +586,37 @@ fn ensure_origin_relay_viable(
   route_id: &str,
   pool_id: &AccountPoolId,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  upstreams: &BTreeMap<UpstreamId, UpstreamPlan>,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<(), CompileError> {
-  let providers = pools[pool_id].selector().providers();
-  let mut origin_owners = BTreeMap::<String, UpstreamId>::new();
-  let mut has_viable_upstream = false;
+  let allowed_providers = pools[pool_id].selector().providers();
+  let mut origin_owners = BTreeMap::<String, ProviderId>::new();
+  let mut has_viable_provider = false;
 
-  for (upstream_id, upstream) in upstreams {
-    if providers.is_some_and(|allowed_providers| !allowed_providers.contains(upstream.provider())) {
+  for (provider_id, provider) in providers {
+    if allowed_providers.is_some_and(|allowed_providers| !allowed_providers.contains(provider_id)) {
       continue;
     }
 
-    // With no configured base URL, the provider catalogue may supply a
+    // With no configured base URL, the driver catalogue may supply a
     // default origin during final runtime linking.
-    has_viable_upstream |= upstream.base_url().is_none() || !upstream.origins().is_empty();
-    for origin in upstream.origins() {
+    has_viable_provider |= provider.base_url().is_none() || !provider.origins().is_empty();
+    for origin in provider.origins() {
       if let Some(first) = origin_owners.get(origin.as_str()) {
         return Err(CompileError::DuplicateOrigin {
           origin: origin.to_string(),
-          first_upstream: first.to_string(),
-          second_upstream: upstream_id.to_string(),
+          first_provider: first.to_string(),
+          second_provider: provider_id.to_string(),
         });
       }
-      origin_owners.insert(origin.to_string(), upstream_id.clone());
+      origin_owners.insert(origin.to_string(), provider_id.clone());
     }
   }
 
-  if !has_viable_upstream {
+  if !has_viable_provider {
     return Err(invalid_value(
       format!("routes.{route_id}.target"),
       format!(
-        "origin-based relay requires an upstream with a configured or provider-default origin compatible with account pool `{pool_id}`"
+        "origin-based relay requires a provider with a configured or driver-default origin compatible with account pool `{pool_id}`"
       ),
     ));
   }

@@ -15,7 +15,7 @@ route = "default"
 [routes.default]
 kind = "managed"
 account_pool = "default"
-upstream = {{ kind = "any" }}
+provider = {{ kind = "any" }}
 model = {{ kind = "capability" }}
 operation = "translate_compatible"
 
@@ -23,8 +23,8 @@ operation = "translate_compatible"
 accounts = ["*"]
 providers = ["*"]
 
-[upstreams.default]
-provider = "openai"
+[providers.default]
+driver = "openai"
 
 {extra}
 "#
@@ -38,7 +38,7 @@ fn transport_only_gateway_may_have_no_routing_resources() {
   assert!(compiled.profiles.is_empty());
   assert!(compiled.routes.is_empty());
   assert!(compiled.account_pools.is_empty());
-  assert!(compiled.upstreams.is_empty());
+  assert!(compiled.providers.is_empty());
   assert!(compiled.model_groups.is_empty());
 }
 
@@ -56,38 +56,38 @@ fn compiles_wildcards_and_managed_auto_identity() {
 fn shared_origin_is_allowed_when_no_origin_route_needs_unique_ownership() {
   let config = base_config(
     r#"
-[upstreams.first]
-provider = "openai"
+[providers.first]
+driver = "openai"
 base_url = "https://EXAMPLE.com:443/v1"
 
-[upstreams.second]
-provider = "openai"
+[providers.second]
+driver = "openai"
 origins = ["https://example.com"]
 "#,
   );
 
   let compiled = compile_resources(&config).unwrap();
-  assert!(compiled.upstreams.contains_key("first"));
-  assert!(compiled.upstreams.contains_key("second"));
+  assert!(compiled.providers.contains_key("first"));
+  assert!(compiled.providers.contains_key("second"));
 }
 
 #[test]
 fn origin_route_rejects_ambiguous_compatible_claimants() {
   let mut config = base_config(
     r#"
-[upstreams.first]
-provider = "openai"
+[providers.first]
+driver = "openai"
 base_url = "https://EXAMPLE.com:443/v1"
 
-[upstreams.second]
-provider = "openai"
+[providers.second]
+driver = "openai"
 origins = ["https://example.com"]
 "#,
   );
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
-      target: RawRelayTarget::UpstreamFromOrigin {
+      target: RawRelayTarget::ProviderFromOrigin {
         account_pool: "default".into(),
       },
     },
@@ -100,29 +100,35 @@ origins = ["https://example.com"]
 }
 
 #[test]
-fn rejects_a_base_url_origin_repeated_by_the_same_upstream() {
+fn rejects_a_base_url_origin_repeated_by_the_same_provider() {
   let config = base_config(
     r#"
-[upstreams.public]
-provider = "openai"
+[providers.public]
+driver = "openai"
 base_url = "https://api.openai.com/v1"
 origins = ["https://API.OPENAI.com:443"]
+
+[providers.zai]
+driver = "zai"
 "#,
   );
 
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.public.origins"
+    Err(CompileError::InvalidValue { location, .. }) if location == "providers.public.origins"
   ));
 }
 
 #[test]
-fn rejects_fixed_upstream_excluded_by_pool() {
+fn rejects_fixed_provider_excluded_by_pool() {
   let mut config = base_config(
     r#"
-[upstreams.public]
-provider = "openai"
+[providers.public]
+driver = "openai"
 base_url = "https://api.openai.com/v1"
+
+[providers.zai]
+driver = "zai"
 "#,
   );
   config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
@@ -130,8 +136,8 @@ base_url = "https://api.openai.com/v1"
     "default".into(),
     RawRoute::Managed {
       account_pool: "default".into(),
-      upstream: RawUpstreamSelector::Fixed {
-        upstream: "public".into(),
+      provider: RawProviderSelector::Fixed {
+        provider: "public".into(),
       },
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::Preserve,
@@ -168,14 +174,14 @@ fn by_requested_fallback_is_nonempty_and_unique() {
     "coding".into(),
     vec![RawModelCandidate {
       model: "gpt-5".into(),
-      upstream: None,
+      provider: None,
     }],
   );
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
       account_pool: "default".into(),
-      upstream: RawUpstreamSelector::Any {},
+      provider: RawProviderSelector::Any {},
       model: RawModelSelector::Fallback {
         selector: RawFallbackSelector::ByRequested {
           groups: vec!["coding".into(), "coding".into()],
@@ -192,43 +198,22 @@ fn by_requested_fallback_is_nonempty_and_unique() {
 }
 
 #[test]
-fn origin_relay_requires_a_compatible_claimed_origin() {
+fn origin_relay_can_defer_to_the_selected_providers_driver_default() {
   let mut config = base_config(
     r#"
-[upstreams.public]
-provider = "openai"
+[providers.public]
+driver = "openai"
 origins = ["https://api.openai.com"]
+
+[providers.zai]
+driver = "zai"
 "#,
   );
   config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
-      target: RawRelayTarget::UpstreamFromOrigin {
-        account_pool: "default".into(),
-      },
-    },
-  );
-
-  assert!(matches!(
-    compile_resources(&config),
-    Err(CompileError::InvalidValue { .. })
-  ));
-}
-
-#[test]
-fn origin_relay_defers_provider_default_origin_resolution() {
-  let mut config = base_config(
-    r#"
-[upstreams.default-provider]
-provider = "openai"
-"#,
-  );
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["openai".into()]);
-  config.routes.insert(
-    "default".into(),
-    RawRoute::Relay {
-      target: RawRelayTarget::UpstreamFromOrigin {
+      target: RawRelayTarget::ProviderFromOrigin {
         account_pool: "default".into(),
       },
     },
@@ -238,25 +223,46 @@ provider = "openai"
 }
 
 #[test]
-fn fallback_pins_must_match_the_route_pool_and_fixed_upstream() {
+fn origin_relay_defers_provider_default_origin_resolution() {
   let mut config = base_config(
     r#"
-[upstreams.openai]
-provider = "openai"
+[providers.default-provider]
+driver = "openai"
+"#,
+  );
+  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["default-provider".into()]);
+  config.routes.insert(
+    "default".into(),
+    RawRoute::Relay {
+      target: RawRelayTarget::ProviderFromOrigin {
+        account_pool: "default".into(),
+      },
+    },
+  );
 
-[upstreams.zai]
-provider = "zai"
+  compile_resources(&config).unwrap();
+}
+
+#[test]
+fn fallback_pins_must_match_the_route_pool_and_fixed_provider() {
+  let mut config = base_config(
+    r#"
+[providers.openai]
+driver = "openai"
+
+[providers.zai]
+driver = "zai"
 
 [[model_groups.coding]]
 model = "gpt-5"
-upstream = "openai"
+provider = "openai"
 "#,
   );
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
       account_pool: "default".into(),
-      upstream: RawUpstreamSelector::Fixed { upstream: "zai".into() },
+      provider: RawProviderSelector::Fixed { provider: "zai".into() },
       model: RawModelSelector::Fallback {
         selector: RawFallbackSelector::Fixed { group: "coding".into() },
       },
@@ -273,7 +279,7 @@ upstream = "openai"
     "default".into(),
     RawRoute::Managed {
       account_pool: "default".into(),
-      upstream: RawUpstreamSelector::Any {},
+      provider: RawProviderSelector::Any {},
       model: RawModelSelector::Fallback {
         selector: RawFallbackSelector::Fixed { group: "coding".into() },
       },
@@ -289,19 +295,18 @@ upstream = "openai"
 }
 
 #[test]
-fn managed_any_requires_a_compatible_configured_upstream() {
+fn managed_any_requires_a_configured_provider_and_valid_pool_references() {
   let mut config = base_config("");
-  config.upstreams.clear();
+  config.providers.clear();
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "routes.default.upstream"
+    Err(CompileError::InvalidValue { location, .. }) if location == "routes.default.provider"
   ));
 
-  config.upstreams.insert(
+  config.providers.insert(
     "default".into(),
-    RawUpstream {
-      provider: "openai".into(),
-      accounts: None,
+    RawProvider {
+      driver: "openai".into(),
       base_url: None,
       origins: Vec::new(),
       allow_insecure_http: false,
@@ -310,70 +315,43 @@ fn managed_any_requires_a_compatible_configured_upstream() {
   config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "routes.default.upstream"
+    Err(CompileError::UnresolvedReference { field: "providers", target, .. }) if target == "zai"
   ));
 }
 
 #[test]
-fn upstream_account_filters_prevent_implicit_credential_cartesian_products() {
+fn provider_urls_reject_port_zero_and_normalize_base_prefixes() {
   let mut config = base_config("");
-  config.upstreams.get_mut("default").unwrap().accounts = Some(vec!["work".into()]);
-  let compiled = compile_resources(&config).unwrap();
-  let upstream = &compiled.upstreams[&UpstreamId::new("default").unwrap()];
-  assert!(upstream.permits_account("work"));
-  assert!(!upstream.permits_account("personal"));
-
-  config.upstreams.get_mut("default").unwrap().accounts = Some(vec!["*".into()]);
-  assert!(
-    compile_resources(&config).unwrap().upstreams[&UpstreamId::new("default").unwrap()].permits_account("personal")
-  );
-
-  for invalid in [
-    Vec::new(),
-    vec!["*".into(), "work".into()],
-    vec!["work".into(), "work".into()],
-  ] {
-    config.upstreams.get_mut("default").unwrap().accounts = Some(invalid);
-    assert!(matches!(
-      compile_resources(&config),
-      Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.default.accounts"
-    ));
-  }
-}
-
-#[test]
-fn upstream_urls_reject_port_zero_and_normalize_base_prefixes() {
-  let mut config = base_config("");
-  config.upstreams.get_mut("default").unwrap().base_url = Some("https://api.example.com:0/v1".into());
+  config.providers.get_mut("default").unwrap().base_url = Some("https://api.example.com:0/v1".into());
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.default.base_url"
+    Err(CompileError::InvalidValue { location, .. }) if location == "providers.default.base_url"
   ));
 
-  config.upstreams.get_mut("default").unwrap().base_url = Some("https://API.example.com:443/v1".into());
+  config.providers.get_mut("default").unwrap().base_url = Some("https://API.example.com:443/v1".into());
   let compiled = compile_resources(&config).unwrap();
   assert_eq!(
-    compiled.upstreams[&UpstreamId::new("default").unwrap()].base_url(),
+    compiled.providers[&ProviderId::new("default").unwrap()].base_url(),
     Some("https://api.example.com/v1/")
   );
 
-  config.upstreams.get_mut("default").unwrap().base_url = Some("http://api.example.com/v1".into());
+  config.providers.get_mut("default").unwrap().base_url = Some("http://api.example.com/v1".into());
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.default.base_url"
+    Err(CompileError::InvalidValue { location, .. }) if location == "providers.default.base_url"
   ));
 
-  config.upstreams.get_mut("default").unwrap().allow_insecure_http = true;
+  config.providers.get_mut("default").unwrap().allow_insecure_http = true;
   compile_resources(&config).unwrap();
 
-  config.upstreams.get_mut("default").unwrap().allow_insecure_http = false;
-  config.upstreams.get_mut("default").unwrap().base_url = Some("http://127.0.0.1:8080/v1".into());
+  config.providers.get_mut("default").unwrap().allow_insecure_http = false;
+  config.providers.get_mut("default").unwrap().base_url = Some("http://127.0.0.1:8080/v1".into());
   compile_resources(&config).unwrap();
 
-  config.upstreams.get_mut("default").unwrap().base_url = Some("https://api.example.com./v1".into());
+  config.providers.get_mut("default").unwrap().base_url = Some("https://api.example.com./v1".into());
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.default.base_url"
+    Err(CompileError::InvalidValue { location, .. }) if location == "providers.default.base_url"
   ));
 
   for invalid in [
@@ -386,20 +364,20 @@ fn upstream_urls_reject_port_zero_and_normalize_base_prefixes() {
     "https://example.0x10/v1",
     "https://example.123/v1",
   ] {
-    config.upstreams.get_mut("default").unwrap().base_url = Some(invalid.into());
+    config.providers.get_mut("default").unwrap().base_url = Some(invalid.into());
     assert!(matches!(
       compile_resources(&config),
-      Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.default.base_url"
+      Err(CompileError::InvalidValue { location, .. }) if location == "providers.default.base_url"
     ));
   }
 
-  config.upstreams.get_mut("default").unwrap().base_url = Some("http://localhost:8080/v1".into());
+  config.providers.get_mut("default").unwrap().base_url = Some("http://localhost:8080/v1".into());
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "upstreams.default.base_url"
+    Err(CompileError::InvalidValue { location, .. }) if location == "providers.default.base_url"
   ));
 
-  config.upstreams.get_mut("default").unwrap().base_url = Some("http://[::1]:8080/v1".into());
+  config.providers.get_mut("default").unwrap().base_url = Some("http://[::1]:8080/v1".into());
   compile_resources(&config).unwrap();
 }
 
@@ -429,11 +407,11 @@ fn fixed_route_rejects_effectively_duplicate_fallback_candidates() {
     vec![
       RawModelCandidate {
         model: "gpt-5".into(),
-        upstream: None,
+        provider: None,
       },
       RawModelCandidate {
         model: "gpt-5".into(),
-        upstream: Some("default".into()),
+        provider: Some("default".into()),
       },
     ],
   );
@@ -441,8 +419,8 @@ fn fixed_route_rejects_effectively_duplicate_fallback_candidates() {
     "default".into(),
     RawRoute::Managed {
       account_pool: "default".into(),
-      upstream: RawUpstreamSelector::Fixed {
-        upstream: "default".into(),
+      provider: RawProviderSelector::Fixed {
+        provider: "default".into(),
       },
       model: RawModelSelector::Fallback {
         selector: RawFallbackSelector::Fixed { group: "coding".into() },

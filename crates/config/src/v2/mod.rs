@@ -18,7 +18,7 @@ pub use raw::SCHEMA_VERSION;
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
   RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawPoolStrategy,
-  RawProfile, RawQualificationNamespace, RawRelayTarget, RawRoute, RawUpstream, RawUpstreamSelector, RawWireIdentity,
+  RawProfile, RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayTarget, RawRoute, RawWireIdentity,
 };
 
 /// Decode a version 2 document without compiling references.

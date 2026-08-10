@@ -1,4 +1,4 @@
-use crate::{AccountPoolId, HeaderPatchSetId, ModelGroupId, RetryPolicyId, RouteId, UpstreamId, WireIdentityId};
+use crate::{AccountPoolId, HeaderPatchSetId, ModelGroupId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
 
 /// The three coherent request-handling families supported by the gateway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,7 +27,7 @@ pub enum CredentialPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DestinationPolicy {
-  SelectedUpstream,
+  SelectedProvider,
   Original,
 }
 
@@ -52,11 +52,10 @@ pub enum HeaderStrategy {
 /// Namespace accepted before the slash in a qualified model name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QualificationNamespace {
-  /// Match a provider implementation, which may have multiple configured
-  /// upstream instances.
+  /// Match the reusable driver implementation.
+  Driver,
+  /// Match one named provider destination exactly.
   Provider,
-  /// Match one configured upstream instance exactly.
-  Upstream,
 }
 
 /// How an ordered model fallback group is chosen for a request.
@@ -72,7 +71,7 @@ pub enum FallbackSelector {
 /// How a managed route interprets the requested model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelSelector {
-  /// Select an account whose upstream advertises the requested model.
+  /// Select an account whose provider advertises the requested model.
   Capability,
   /// Parse a qualified model and constrain selection to its namespace.
   Qualified { namespace: QualificationNamespace },
@@ -82,32 +81,26 @@ pub enum ModelSelector {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UpstreamSelector {
-  /// Select from explicitly configured upstreams compatible with the route's
-  /// account pool. Provider catalogue defaults are resolved for those
-  /// upstreams during runtime linking; they do not create implicit entries.
-  ///
-  /// The account-pool strategy chooses an account first. Compatible upstreams
-  /// for that account are then considered in typed upstream-id order as
-  /// deterministic failover, not as an implicit load-balancing policy.
+pub enum ProviderSelector {
+  /// Select from named providers represented by the route's account pool.
   Any,
-  Fixed(UpstreamId),
+  Fixed(ProviderId),
 }
 
-/// Managed selection keeps its three inputs together so a fixed upstream does
+/// Managed selection keeps its three inputs together so a fixed provider does
 /// not accidentally discard model-selection behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedTarget {
   account_pool: AccountPoolId,
-  upstream: UpstreamSelector,
+  provider: ProviderSelector,
   model: ModelSelector,
 }
 
 impl ManagedTarget {
-  pub fn new(account_pool: AccountPoolId, upstream: UpstreamSelector, model: ModelSelector) -> Self {
+  pub fn new(account_pool: AccountPoolId, provider: ProviderSelector, model: ModelSelector) -> Self {
     Self {
       account_pool,
-      upstream,
+      provider,
       model,
     }
   }
@@ -116,8 +109,8 @@ impl ManagedTarget {
     &self.account_pool
   }
 
-  pub fn upstream(&self) -> &UpstreamSelector {
-    &self.upstream
+  pub fn provider(&self) -> &ProviderSelector {
+    &self.provider
   }
 
   pub fn model(&self) -> &ModelSelector {
@@ -127,12 +120,12 @@ impl ManagedTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelayTarget {
-  /// Match the original request authority to an upstream for account
+  /// Match the original request authority to a provider for account
   /// selection while preserving the original destination.
-  UpstreamFromOrigin { account_pool: AccountPoolId },
-  /// Send to a configured upstream instead of the inbound destination.
-  FixedUpstream {
-    upstream: UpstreamId,
+  ProviderFromOrigin { account_pool: AccountPoolId },
+  /// Send to a configured provider instead of the inbound destination.
+  FixedProvider {
+    provider: ProviderId,
     account_pool: AccountPoolId,
   },
 }
@@ -140,7 +133,7 @@ pub enum RelayTarget {
 impl RelayTarget {
   pub fn account_pool(&self) -> &AccountPoolId {
     match self {
-      Self::UpstreamFromOrigin { account_pool } | Self::FixedUpstream { account_pool, .. } => account_pool,
+      Self::ProviderFromOrigin { account_pool } | Self::FixedProvider { account_pool, .. } => account_pool,
     }
   }
 }
@@ -209,7 +202,7 @@ impl ManagedRoute {
 }
 
 /// A relay route keeps the payload opaque while selecting managed account
-/// credentials for either a fixed upstream or one detected from the origin.
+/// credentials for either a fixed provider or one detected from the origin.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayRoute {
   target: RelayTarget,
@@ -294,11 +287,11 @@ impl RoutePlan {
     match self {
       Self::Managed(_)
       | Self::Relay(RelayRoute {
-        target: RelayTarget::FixedUpstream { .. },
+        target: RelayTarget::FixedProvider { .. },
         ..
-      }) => DestinationPolicy::SelectedUpstream,
+      }) => DestinationPolicy::SelectedProvider,
       Self::Relay(RelayRoute {
-        target: RelayTarget::UpstreamFromOrigin { .. },
+        target: RelayTarget::ProviderFromOrigin { .. },
         ..
       })
       | Self::Transparent(_) => DestinationPolicy::Original,
@@ -316,11 +309,11 @@ impl RoutePlan {
     match self {
       Self::Managed(_) => HeaderStrategy::ProviderOwned,
       Self::Relay(RelayRoute {
-        target: RelayTarget::FixedUpstream { .. },
+        target: RelayTarget::FixedProvider { .. },
         ..
       }) => HeaderStrategy::CrossOriginSanitize,
       Self::Relay(RelayRoute {
-        target: RelayTarget::UpstreamFromOrigin { .. },
+        target: RelayTarget::ProviderFromOrigin { .. },
         ..
       }) => HeaderStrategy::SameOriginReplaceCredentials,
       Self::Transparent(_) => HeaderStrategy::SameOriginForward,
@@ -373,7 +366,7 @@ mod tests {
   #[test]
   fn managed_route_exposes_structured_account_owned_axes() {
     let route = RoutePlan::Managed(ManagedRoute::new(
-      ManagedTarget::new(id("default"), UpstreamSelector::Any, ModelSelector::Capability),
+      ManagedTarget::new(id("default"), ProviderSelector::Any, ModelSelector::Capability),
       OperationPolicy::TranslateCompatible,
       None,
       ManagedRetry::Recoverable(id("standard")),
@@ -383,7 +376,7 @@ mod tests {
     assert_eq!(route.request_transform(), PayloadTransform::Structured);
     assert_eq!(route.response_transform(), PayloadTransform::Structured);
     assert_eq!(route.credential_policy(), CredentialPolicy::Account);
-    assert_eq!(route.destination_policy(), DestinationPolicy::SelectedUpstream);
+    assert_eq!(route.destination_policy(), DestinationPolicy::SelectedProvider);
     assert_eq!(route.operation_policy(), OperationPolicy::TranslateCompatible);
     assert_eq!(route.header_strategy(), HeaderStrategy::ProviderOwned);
   }
@@ -391,8 +384,8 @@ mod tests {
   #[test]
   fn fixed_relay_exposes_cross_origin_account_owned_axes() {
     let route = RoutePlan::Relay(RelayRoute::new(
-      RelayTarget::FixedUpstream {
-        upstream: id("openai-public"),
+      RelayTarget::FixedProvider {
+        provider: id("openai-public"),
         account_pool: id("default"),
       },
       None,
@@ -402,7 +395,7 @@ mod tests {
     assert_eq!(route.kind(), RouteKind::Relay);
     assert_eq!(route.request_transform(), PayloadTransform::Opaque);
     assert_eq!(route.credential_policy(), CredentialPolicy::Account);
-    assert_eq!(route.destination_policy(), DestinationPolicy::SelectedUpstream);
+    assert_eq!(route.destination_policy(), DestinationPolicy::SelectedProvider);
     assert_eq!(route.operation_policy(), OperationPolicy::Preserve);
     assert_eq!(route.header_strategy(), HeaderStrategy::CrossOriginSanitize);
   }
@@ -410,7 +403,7 @@ mod tests {
   #[test]
   fn origin_relay_preserves_destination_and_replaces_credentials() {
     let route = RoutePlan::Relay(RelayRoute::new(
-      RelayTarget::UpstreamFromOrigin {
+      RelayTarget::ProviderFromOrigin {
         account_pool: id("default"),
       },
       None,

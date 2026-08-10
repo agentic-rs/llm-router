@@ -75,8 +75,8 @@ pub enum CompileError {
   },
   DuplicateOrigin {
     origin: String,
-    first_upstream: String,
-    second_upstream: String,
+    first_provider: String,
+    second_provider: String,
   },
   UnresolvedReference {
     owner_kind: &'static str,
@@ -108,11 +108,11 @@ impl fmt::Display for CompileError {
       ),
       Self::DuplicateOrigin {
         origin,
-        first_upstream,
-        second_upstream,
+        first_provider,
+        second_provider,
       } => write!(
         formatter,
-        "upstreams `{first_upstream}` and `{second_upstream}` both own origin `{origin}`"
+        "providers `{first_provider}` and `{second_provider}` both own origin `{origin}`"
       ),
       Self::UnresolvedReference {
         owner_kind,
