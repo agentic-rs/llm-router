@@ -114,7 +114,7 @@ pub fn build_states(
 
   let registry = Registry::builtin();
   let providers = link_provider_graph(&plan, accounts, &registry)?;
-  let pools = link_account_pools(&plan, &providers, &registry)?;
+  let pools = link_account_pools(&plan, &providers)?;
   let pools = build_account_pool_runtimes(&pools);
   let managed_http = tokn_core::util::http::build_managed_client(&Default::default())?;
   let opaque_http = tokn_core::util::http::build_opaque_client(&Default::default())?;
@@ -400,5 +400,102 @@ fn wire_agent(identity: &WireIdentity) -> Option<AgentId> {
   match identity {
     WireIdentity::None | WireIdentity::ProviderDefault => None,
     WireIdentity::Named(identity) => Some(AgentId::from(identity.as_str())),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tokn_policy::{HostPattern, OperationId, WireIdentityId};
+
+  fn canonical_host(value: &str) -> tokn_policy::CanonicalHost {
+    CanonicalAuthority::parse(value).unwrap().host().clone()
+  }
+
+  #[test]
+  fn request_host_prefers_uri_authority_and_validates_host_header() {
+    let uri = "https://api.example.com/v1/responses".parse::<Uri>().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::HOST, "ignored.example.com".parse().unwrap());
+    assert_eq!(
+      request_host(&uri, &headers).unwrap(),
+      Some(canonical_host("api.example.com"))
+    );
+
+    let relative = "/v1/responses".parse::<Uri>().unwrap();
+    assert_eq!(
+      request_host(&relative, &headers).unwrap(),
+      Some(canonical_host("ignored.example.com"))
+    );
+    headers.insert(axum::http::header::HOST, "bad host".parse().unwrap());
+    assert!(request_host(&relative, &headers).is_err());
+    assert_eq!(request_host(&relative, &HeaderMap::new()).unwrap(), None);
+  }
+
+  #[test]
+  fn http_binding_match_combines_dimensions() {
+    let matcher = HttpMatch::new(
+      vec![HostPattern::exact(canonical_host("api.example.com"))].into_boxed_slice(),
+      vec![SmolStr::new("/v1")].into_boxed_slice(),
+      vec![SmolStr::new("POST")].into_boxed_slice(),
+      vec![OperationId::new("responses").unwrap()].into_boxed_slice(),
+    )
+    .unwrap();
+    let host = canonical_host("api.example.com");
+    assert!(http_matches(
+      &matcher,
+      Some(&host),
+      &Method::POST,
+      "/v1/responses",
+      "responses"
+    ));
+    assert!(!http_matches(
+      &matcher,
+      Some(&canonical_host("other.example.com")),
+      &Method::POST,
+      "/v1/responses",
+      "responses"
+    ));
+    assert!(!http_matches(
+      &matcher,
+      Some(&host),
+      &Method::GET,
+      "/v1/responses",
+      "responses"
+    ));
+    assert!(!http_matches(
+      &matcher,
+      Some(&host),
+      &Method::POST,
+      "/other",
+      "responses"
+    ));
+    assert!(!http_matches(
+      &matcher,
+      Some(&host),
+      &Method::POST,
+      "/v1/responses",
+      "messages"
+    ));
+  }
+
+  #[test]
+  fn operation_names_and_wire_identity_match_runtime_contracts() {
+    assert_eq!(operation_name(Endpoint::ChatCompletions), "chat_completions");
+    assert_eq!(operation_name(Endpoint::Responses), "responses");
+    assert_eq!(operation_name(Endpoint::Messages), "messages");
+    assert_eq!(wire_agent(&WireIdentity::None), None);
+    assert_eq!(wire_agent(&WireIdentity::ProviderDefault), None);
+    assert_eq!(
+      wire_agent(&WireIdentity::Named(WireIdentityId::new("codex_cli").unwrap())),
+      Some(AgentId::from("codex_cli"))
+    );
+
+    let profile = ProfileId::new("default").unwrap();
+    let mut profiles = BTreeSet::new();
+    collect_profile(&HttpAction::Reject, &mut profiles);
+    assert!(profiles.is_empty());
+    collect_profile(&HttpAction::Route(profile.clone()), &mut profiles);
+    assert_eq!(profiles, BTreeSet::from([profile]));
   }
 }

@@ -6,8 +6,8 @@ use tokn_accounts::link::{AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, 
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::Endpoint;
 use tokn_policy::{
-  AccountPoolId, FallbackSelector, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProviderId,
-  QualificationNamespace, RelayRoute, RelayTarget, RouteId, RoutePlan, UpstreamId, UpstreamSelector,
+  AccountPoolId, DriverId, FallbackSelector, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProviderId,
+  ProviderSelector, QualificationNamespace, RelayRoute, RelayTarget, RouteId, RoutePlan,
 };
 use tokn_requests::event::Stage;
 use tokn_requests::pipeline::ctx::PipelineCtx;
@@ -29,7 +29,7 @@ impl SelectionState {
       .active()
       .iter()
       .chain(pool.pool().fallback())
-      .flat_map(|account| account.bindings().values().cloned())
+      .map(|account| account.binding().clone())
       .collect::<Vec<_>>()
       .into_boxed_slice();
     Self { pool, bindings }
@@ -98,12 +98,12 @@ impl V2AccountSelector {
     for candidate in candidates {
       for operation in operations.iter().copied() {
         denied |= self.state.bindings.iter().any(|binding| {
-          managed_binding_matches(&self.plan, route, &candidate, operation, binding)
-            && !provider_allowed(binding.provider().info().id.as_str(), allowed.as_ref())
+          managed_binding_matches(route, &candidate, operation, binding)
+            && !provider_allowed(binding.provider_id().as_str(), allowed.as_ref())
         });
         match self.state.pool.acquire(extracted.session_id.as_deref(), |binding| {
-          managed_binding_matches(&self.plan, route, &candidate, operation, binding)
-            && provider_allowed(binding.provider().info().id.as_str(), allowed.as_ref())
+          managed_binding_matches(route, &candidate, operation, binding)
+            && provider_allowed(binding.provider_id().as_str(), allowed.as_ref())
         }) {
           PoolAcquire::Selected(binding) => {
             return Ok(selected(binding, operation, candidate.model.clone()));
@@ -127,23 +127,18 @@ impl V2AccountSelector {
     route: &RelayRoute,
   ) -> Result<SelectorOutcome, PipelineError> {
     let endpoint = resolved_endpoint(ctx)?;
-    let RelayTarget::FixedUpstream { upstream, .. } = route.target() else {
+    let RelayTarget::FixedProvider { provider, .. } = route.target() else {
       return Err(invalid_route_request(
         "origin-based relay cannot run on an LLM API listener",
       ));
     };
     let allowed = allowed_provider_ids(ctx)?;
-    let provider_id = self
-      .plan
-      .upstream(upstream)
-      .expect("compiled route upstream must exist")
-      .provider();
-    if !provider_allowed(provider_id.as_str(), allowed.as_ref()) {
+    if !provider_allowed(provider.as_str(), allowed.as_ref()) {
       return Ok(SelectorOutcome::ProviderAccessDenied);
     }
     Ok(
       match self.state.pool.acquire(extracted.session_id.as_deref(), |binding| {
-        binding.upstream_id() == upstream
+        binding.provider_id() == provider
       }) {
         PoolAcquire::Selected(binding) => selected(binding, endpoint, extracted.model.clone()),
         PoolAcquire::CoolingDown { .. } | PoolAcquire::NoEligible => SelectorOutcome::NoAccount,
@@ -196,18 +191,18 @@ impl SendStage for PoolAwareSend {
     let result = self.inner.send(ctx, extracted, resolved, headers, body).await;
     match &result {
       Ok(_) => {
-        self
+        if let Err(error) = self
           .state
           .pool
           .record_success(extracted.session_id.as_deref(), binding.key())
-          .map_err(|error| invalid_route_request(error.to_string()))?;
+        {
+          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 account-pool success");
+        }
       }
       Err(error) if error.recoverable => {
-        self
-          .state
-          .pool
-          .record_failure(binding.key())
-          .map_err(|error| invalid_route_request(error.to_string()))?;
+        if let Err(error) = self.state.pool.record_failure(binding.key()) {
+          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 account-pool failure");
+        }
       }
       Err(_) => {}
     }
@@ -219,8 +214,8 @@ fn route_pool(route: &RoutePlan) -> Option<&AccountPoolId> {
   match route {
     RoutePlan::Managed(route) => Some(route.target().account_pool()),
     RoutePlan::Relay(route) => match route.target() {
-      RelayTarget::FixedUpstream { account_pool, .. } => Some(account_pool),
-      RelayTarget::UpstreamFromOrigin { .. } => None,
+      RelayTarget::FixedProvider { account_pool, .. } => Some(account_pool),
+      RelayTarget::ProviderFromOrigin { .. } => None,
     },
     RoutePlan::Transparent(_) => None,
   }
@@ -229,7 +224,10 @@ fn route_pool(route: &RoutePlan) -> Option<&AccountPoolId> {
 fn selected(binding: Arc<ProviderBinding>, operation: Endpoint, model: SmolStr) -> SelectorOutcome {
   SelectorOutcome::Selected {
     account_id: SmolStr::new(binding.account_id()),
-    provider_id: SmolStr::new(binding.provider().info().id.as_str()),
+    // The six-stage pipeline still consumes the reusable driver id for
+    // protocol conversion and provider-owned header behavior. Named-provider
+    // policy has already been enforced against `binding.provider_id()`.
+    provider_id: SmolStr::new(binding.driver().info().id.as_str()),
     upstream_endpoint: Some(operation),
     upstream_model: model,
     account_handle: binding.handle().clone(),
@@ -239,26 +237,22 @@ fn selected(binding: Arc<ProviderBinding>, operation: Endpoint, model: SmolStr) 
 #[derive(Clone)]
 struct ModelCandidate {
   model: SmolStr,
-  constraint: UpstreamConstraint,
+  constraint: ProviderConstraint,
 }
 
 #[derive(Clone)]
-enum UpstreamConstraint {
+enum ProviderConstraint {
   Any,
+  Driver(DriverId),
   Provider(ProviderId),
-  Upstream(UpstreamId),
-  OneOf(Box<[UpstreamId]>),
 }
 
-impl UpstreamConstraint {
-  fn matches(&self, plan: &GatewayPlan, upstream_id: &UpstreamId) -> bool {
+impl ProviderConstraint {
+  fn matches(&self, binding: &ProviderBinding) -> bool {
     match self {
       Self::Any => true,
-      Self::Provider(provider) => plan
-        .upstream(upstream_id)
-        .is_some_and(|upstream| upstream.provider() == provider),
-      Self::Upstream(expected) => upstream_id == expected,
-      Self::OneOf(upstreams) => upstreams.binary_search(upstream_id).is_ok(),
+      Self::Driver(driver) => binding.driver().info().id.as_str() == driver.as_str(),
+      Self::Provider(provider) => binding.provider_id() == provider,
     }
   }
 }
@@ -271,7 +265,7 @@ fn model_candidates(
   match route.target().model() {
     ModelSelector::Capability => Ok(vec![ModelCandidate {
       model: SmolStr::new(requested_model),
-      constraint: UpstreamConstraint::Any,
+      constraint: ProviderConstraint::Any,
     }]),
     ModelSelector::Qualified { namespace } => {
       let (qualifier, model) = requested_model.split_once('/').ok_or_else(|| {
@@ -284,11 +278,11 @@ fn model_candidates(
         return Err(invalid_route_request("qualified model name is empty or non-canonical"));
       }
       let constraint = match namespace {
-        QualificationNamespace::Provider => UpstreamConstraint::Provider(
-          ProviderId::new(qualifier).map_err(|error| invalid_route_request(error.to_string()))?,
+        QualificationNamespace::Driver => ProviderConstraint::Driver(
+          DriverId::new(qualifier).map_err(|error| invalid_route_request(error.to_string()))?,
         ),
-        QualificationNamespace::Upstream => UpstreamConstraint::Upstream(
-          UpstreamId::new(qualifier).map_err(|error| invalid_route_request(error.to_string()))?,
+        QualificationNamespace::Provider => ProviderConstraint::Provider(
+          ProviderId::new(qualifier).map_err(|error| invalid_route_request(error.to_string()))?,
         ),
       };
       Ok(vec![ModelCandidate {
@@ -315,15 +309,16 @@ fn model_candidates(
       };
       let mut candidates = Vec::new();
       for group_id in group_ids {
-        let group = plan.model_group(group_id).expect("compiled fallback group must exist");
+        let group = plan.model_group(group_id).ok_or_else(|| {
+          invalid_route_request(format!("fallback selector references missing model group '{group_id}'"))
+        })?;
         for candidate in group.candidates() {
-          let upstreams = match candidate.upstream() {
-            Some(upstream) => vec![upstream.clone()],
-            None => route_upstream_ids(plan, route.target().upstream()),
-          };
           candidates.push(ModelCandidate {
             model: SmolStr::new(candidate.model()),
-            constraint: UpstreamConstraint::OneOf(upstreams.into_boxed_slice()),
+            constraint: candidate
+              .provider()
+              .cloned()
+              .map_or(ProviderConstraint::Any, ProviderConstraint::Provider),
           });
         }
       }
@@ -332,27 +327,19 @@ fn model_candidates(
   }
 }
 
-fn route_upstream_ids(plan: &GatewayPlan, selector: &UpstreamSelector) -> Vec<UpstreamId> {
-  match selector {
-    UpstreamSelector::Any => plan.upstreams().keys().cloned().collect(),
-    UpstreamSelector::Fixed(upstream) => vec![upstream.clone()],
-  }
-}
-
 fn managed_binding_matches(
-  plan: &GatewayPlan,
   route: &ManagedRoute,
   candidate: &ModelCandidate,
   operation: Endpoint,
   binding: &ProviderBinding,
 ) -> bool {
-  let route_upstream_matches = match route.target().upstream() {
-    UpstreamSelector::Any => true,
-    UpstreamSelector::Fixed(upstream) => binding.upstream_id() == upstream,
+  let route_provider_matches = match route.target().provider() {
+    ProviderSelector::Any => true,
+    ProviderSelector::Fixed(provider) => binding.provider_id() == provider,
   };
-  route_upstream_matches
-    && candidate.constraint.matches(plan, binding.upstream_id())
-    && binding.provider().supports(candidate.model.as_str(), operation)
+  route_provider_matches
+    && candidate.constraint.matches(binding)
+    && binding.driver().supports(candidate.model.as_str(), operation)
 }
 
 fn operation_candidates(policy: OperationPolicy, requested: Endpoint) -> Vec<Endpoint> {
@@ -403,8 +390,8 @@ fn resolved_endpoint(ctx: &PipelineCtx) -> Result<Endpoint, PipelineError> {
 
 fn qualification_name(namespace: QualificationNamespace) -> &'static str {
   match namespace {
+    QualificationNamespace::Driver => "driver",
     QualificationNamespace::Provider => "provider",
-    QualificationNamespace::Upstream => "upstream",
   }
 }
 
@@ -415,4 +402,130 @@ fn invalid_route_request(message: impl Into<String>) -> PipelineError {
       message: SmolStr::new(message.into()),
     },
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::path::Path;
+
+  fn managed_plan(model: &str, groups: &str) -> GatewayPlan {
+    let config = format!(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "default" }}
+
+[profiles.default]
+route = "default"
+
+[routes.default]
+kind = "managed"
+account_pool = "default"
+provider = {{ kind = "any" }}
+model = {model}
+operation = "translate_compatible"
+
+[account_pools.default]
+accounts = ["*"]
+providers = ["*"]
+
+[providers.local]
+driver = "openai"
+
+{groups}
+"#
+    );
+    tokn_config::v2::parse(&config, Path::new("selector-test.toml")).unwrap()
+  }
+
+  fn managed_route(plan: &GatewayPlan) -> &ManagedRoute {
+    match plan.route(&RouteId::new("default").unwrap()).unwrap() {
+      RoutePlan::Managed(route) => route,
+      _ => panic!("expected managed route"),
+    }
+  }
+
+  #[test]
+  fn builds_driver_and_provider_qualified_model_candidates() {
+    for (namespace, requested, expected_qualifier) in [
+      ("driver", "openai/gpt-5", "openai"),
+      ("provider", "local/gpt-5", "local"),
+    ] {
+      let plan = managed_plan(&format!(r#"{{ kind = "qualified", namespace = "{namespace}" }}"#), "");
+      let candidates = model_candidates(&plan, managed_route(&plan), requested).unwrap();
+      assert_eq!(candidates.len(), 1);
+      assert_eq!(candidates[0].model, "gpt-5");
+      match &candidates[0].constraint {
+        ProviderConstraint::Driver(id) => assert_eq!(id.as_str(), expected_qualifier),
+        ProviderConstraint::Provider(id) => assert_eq!(id.as_str(), expected_qualifier),
+        ProviderConstraint::Any => panic!("expected qualified constraint"),
+      }
+      assert!(model_candidates(&plan, managed_route(&plan), "gpt-5").is_err());
+      assert!(model_candidates(&plan, managed_route(&plan), &format!("{expected_qualifier}/ ")).is_err());
+    }
+  }
+
+  #[test]
+  fn builds_fixed_and_requested_fallback_candidates_in_order() {
+    let groups = r#"
+[[model_groups.coding]]
+model = "gpt-5"
+provider = "local"
+
+[[model_groups.coding]]
+model = "gpt-4o"
+"#;
+    let fixed = managed_plan(
+      r#"{ kind = "fallback", selector = { kind = "fixed", group = "coding" } }"#,
+      groups,
+    );
+    let candidates = model_candidates(&fixed, managed_route(&fixed), "ignored").unwrap();
+    assert_eq!(
+      candidates
+        .iter()
+        .map(|candidate| candidate.model.as_str())
+        .collect::<Vec<_>>(),
+      ["gpt-5", "gpt-4o"]
+    );
+    assert!(matches!(candidates[0].constraint, ProviderConstraint::Provider(_)));
+    assert!(matches!(candidates[1].constraint, ProviderConstraint::Any));
+
+    let requested = managed_plan(
+      r#"{ kind = "fallback", selector = { kind = "by_requested", groups = ["coding"] } }"#,
+      groups,
+    );
+    assert_eq!(
+      model_candidates(&requested, managed_route(&requested), "gpt-4o")
+        .unwrap()
+        .len(),
+      2
+    );
+    assert!(model_candidates(&requested, managed_route(&requested), "unknown")
+      .unwrap()
+      .is_empty());
+  }
+
+  #[test]
+  fn operation_and_access_candidates_preserve_policy_order() {
+    assert_eq!(
+      operation_candidates(OperationPolicy::Preserve, Endpoint::Responses),
+      [Endpoint::Responses]
+    );
+    assert_eq!(
+      operation_candidates(OperationPolicy::TranslateCompatible, Endpoint::Responses),
+      [Endpoint::Responses, Endpoint::ChatCompletions, Endpoint::Messages]
+    );
+
+    let allowed = BTreeSet::from(["local".to_string()]);
+    assert!(provider_allowed("local", Some(&allowed)));
+    assert!(!provider_allowed("openai", Some(&allowed)));
+    assert!(provider_allowed("anything", None));
+    assert_eq!(qualification_name(QualificationNamespace::Driver), "driver");
+    assert_eq!(qualification_name(QualificationNamespace::Provider), "provider");
+  }
 }

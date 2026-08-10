@@ -58,7 +58,7 @@ schema_version = 2
 [listeners.api]
 kind = "llm_api"
 bind = "127.0.0.1:4141"
-client_auth = "none"
+client_auth = "local_keys"
 default_http_action = {{ kind = "route", profile = "managed" }}
 
 [[bindings]]
@@ -66,6 +66,12 @@ id = "relay-responses"
 listener = "api"
 action = {{ kind = "route", profile = "relay" }}
 operations = ["responses"]
+
+[[bindings]]
+id = "reject-messages"
+listener = "api"
+action = {{ kind = "reject" }}
+operations = ["messages"]
 
 [profiles.managed]
 route = "managed"
@@ -76,40 +82,75 @@ route = "relay"
 [routes.managed]
 kind = "managed"
 account_pool = "primary"
-upstream = {{ kind = "fixed", upstream = "local" }}
+provider = {{ kind = "fixed", provider = "local" }}
 model = {{ kind = "capability" }}
 operation = "preserve"
 
 [routes.relay]
 kind = "relay"
-target = {{ kind = "fixed_upstream", upstream = "local", account_pool = "primary" }}
+target = {{ kind = "fixed_provider", provider = "local", account_pool = "primary" }}
 
 [account_pools.primary]
 accounts = ["acct"]
-providers = ["openai"]
+providers = ["local"]
 
-[upstreams.local]
-provider = "openai"
-accounts = ["acct"]
+[providers.local]
+driver = "openai"
 base_url = "http://{upstream_addr}/v1"
 "#
   );
   let plan = tokn_config::v2::parse(&config, Path::new("v2-test.toml")).unwrap();
-  let states = tokn_router::v2::build_states(
-    plan,
-    &[account()],
-    Arc::new(AccessStore::disabled()),
-    Arc::new(EventBus::noop()),
-  )
-  .unwrap();
+  let access = Arc::new(AccessStore::disabled());
+  let allowed_key = access.create_key("local provider", vec!["local".into()]).unwrap();
+  let driver_only_key = access.create_key("driver only", vec!["openai".into()]).unwrap();
+  let states = tokn_router::v2::build_states(plan, &[account()], access, Arc::new(EventBus::noop())).unwrap();
   let app = tokn_router::v2::router(states.into_iter().next().unwrap());
 
   let managed_body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+  let missing_key = app
+    .clone()
+    .oneshot(
+      Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(managed_body.as_slice()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(missing_key.status(), StatusCode::UNAUTHORIZED);
+
+  let rejected = app
+    .clone()
+    .oneshot(
+      Request::post("/v1/messages")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", allowed_key.token))
+        .body(Body::from(br#"{"model":"gpt-4o","messages":[]}"#.as_slice()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+  let denied = app
+    .clone()
+    .oneshot(
+      Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", driver_only_key.token))
+        .body(Body::from(managed_body.as_slice()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
   let managed = app
     .clone()
     .oneshot(
       Request::post("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", allowed_key.token))
         .body(Body::from(managed_body.as_slice()))
         .unwrap(),
     )
@@ -141,7 +182,7 @@ base_url = "http://{upstream_addr}/v1"
     .oneshot(
       Request::post("/v1/responses")
         .header("content-type", "application/json")
-        .header("authorization", "Bearer client-secret")
+        .header("authorization", format!("Bearer {}", allowed_key.token))
         .body(Body::from(relay_body.clone()))
         .unwrap(),
     )
@@ -161,7 +202,6 @@ base_url = "http://{upstream_addr}/v1"
   assert_eq!(captured_relay.uri.path(), "/v1/responses");
   assert_eq!(captured_relay.headers["authorization"], "Bearer sk-v2-test");
   assert_eq!(captured_relay.body, relay_body);
-  assert!(!String::from_utf8_lossy(&captured_relay.body).contains("client-secret"));
 
   server.abort();
 }
@@ -169,7 +209,7 @@ base_url = "http://{upstream_addr}/v1"
 fn account() -> AccountConfig {
   AccountConfig {
     id: "acct".into(),
-    provider: "openai".into(),
+    provider: "local".into(),
     enabled: true,
     tier: AccountTier::Active,
     tags: Vec::new(),

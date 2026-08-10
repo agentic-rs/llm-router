@@ -155,6 +155,8 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
     .values()
     .any(|listener| listener.client_auth() == tokn_policy::ClientAuthPlan::LocalKeys);
   let access = crate::server_runtime::load_access_store(needs_access)?;
+  // V2 does not expose operational event/database settings yet. Keep the
+  // existing defaults, including the default app-data database path.
   let operational = Config::default();
   let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&operational)?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
@@ -337,6 +339,30 @@ mod tests {
     assert!(is_v2_config(&v2_path).unwrap());
     assert!(!is_v2_config(&legacy_path).unwrap());
     assert!(!is_v2_config(&directory.path().join("missing.toml")).unwrap());
+  }
+
+  #[test]
+  fn invalid_toml_is_not_silently_treated_as_legacy() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("invalid.toml");
+    std::fs::write(&path, "schema_version = [").unwrap();
+
+    assert!(is_v2_config(&path).is_err());
+  }
+
+  #[tokio::test]
+  async fn v2_rejects_proxy_flags_before_loading_config() {
+    let args = ServeArgs {
+      host: None,
+      port: None,
+      with_proxy: true,
+      proxy_route_mode: None,
+      insecure_allow_remote: false,
+      no_proxy: false,
+    };
+
+    let error = run_v2(PathBuf::from("missing.toml"), args).await.unwrap_err();
+    assert!(error.to_string().contains("v2 forward-proxy serving is not available"));
   }
 
   #[test]
