@@ -161,17 +161,30 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
   let operational = Config::default();
   let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&operational)?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let proxy_states = tokn_router::v2::build_forward_proxy_states(&plan, access.clone())?;
-  let states = tokn_router::v2::build_states(plan, &accounts, access, events.clone())?;
-  let listener_count = states.len() + proxy_states.len();
-  if listener_count == 0 {
-    anyhow::bail!("v2 config contains no runnable listeners");
+  let result = serve_v2_plan(plan, &accounts, access, events.clone(), args, shutdown_channel()).await;
+
+  if let Some(archive_runtime) = archive_runtime {
+    archive_runtime.shutdown().await;
   }
+  events.shutdown().await;
+  result
+}
+
+async fn serve_v2_plan(
+  plan: tokn_policy::GatewayPlan,
+  accounts: &[tokn_core::account::AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+  args: ServeArgs,
+  shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+  let proxy_states = tokn_router::v2::build_forward_proxy_states(&plan, access.clone())?;
+  let states = tokn_router::v2::build_states(plan, accounts, access, events)?;
+  let listener_count = states.len() + proxy_states.len();
   if listener_count != 1 && (args.host.is_some() || args.port.is_some()) {
     anyhow::bail!("--host and --port can only override a v2 config with exactly one listener");
   }
 
-  let shutdown = shutdown_channel();
   let mut servers = Vec::<BoxFuture<'static, Result<()>>>::with_capacity(listener_count);
   for state in states {
     let configured = state.bind();
@@ -206,13 +219,7 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
       tokn_router::v2::serve_forward_proxy(state, addr, wait_for_shutdown(shutdown)).await
     }));
   }
-  let result = futures::future::try_join_all(servers).await.map(|_| ());
-
-  if let Some(archive_runtime) = archive_runtime {
-    archive_runtime.shutdown().await;
-  }
-  events.shutdown().await;
-  result
+  futures::future::try_join_all(servers).await.map(|_| ())
 }
 
 fn is_v2_config(path: &Path) -> Result<bool> {
@@ -348,6 +355,67 @@ fn route_mode_name(mode: RouteMode) -> &'static str {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::net::TcpStream;
+
+  fn unused_loopback_addr() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+  }
+
+  fn v2_serve_args() -> ServeArgs {
+    ServeArgs {
+      host: None,
+      port: None,
+      with_proxy: false,
+      proxy_route_mode: None,
+      insecure_allow_remote: false,
+      no_proxy: false,
+    }
+  }
+
+  fn v2_listener_plan(api_addr: std::net::SocketAddr, proxy_addr: std::net::SocketAddr) -> tokn_policy::GatewayPlan {
+    let config = format!(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "{api_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+default_connect = "reject"
+"#
+    );
+    tokn_config::v2::parse(&config, Path::new("v2-serve-test.toml")).unwrap()
+  }
+
+  async fn wait_for_listener(addr: std::net::SocketAddr) {
+    for _ in 0..50 {
+      if TcpStream::connect(addr).await.is_ok() {
+        return;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("listener did not start at {addr}");
+  }
+
+  async fn assert_connect_rejected(addr: std::net::SocketAddr) {
+    let mut proxy = TcpStream::connect(addr).await.unwrap();
+    proxy
+      .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+      .await
+      .unwrap();
+    let mut response = Vec::new();
+    proxy.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 403 Forbidden"));
+  }
 
   #[test]
   fn detects_v2_config_without_treating_legacy_as_v2() {
@@ -384,6 +452,98 @@ mod tests {
 
     let error = run_v2(PathBuf::from("missing.toml"), args).await.unwrap_err();
     assert!(error.to_string().contains("v2 listeners are declared in config"));
+  }
+
+  #[tokio::test]
+  async fn v2_serves_llm_api_and_forward_proxy_listeners_together() {
+    let api_addr = unused_loopback_addr();
+    let proxy_addr = unused_loopback_addr();
+    let plan = v2_listener_plan(api_addr, proxy_addr);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(serve_v2_plan(
+      plan,
+      &[],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+      v2_serve_args(),
+      shutdown_rx,
+    ));
+
+    wait_for_listener(api_addr).await;
+    wait_for_listener(proxy_addr).await;
+
+    let mut api = TcpStream::connect(api_addr).await.unwrap();
+    api
+      .write_all(
+        b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+      )
+      .await
+      .unwrap();
+    let mut api_response = Vec::new();
+    api.read_to_end(&mut api_response).await.unwrap();
+    assert!(api_response.starts_with(b"HTTP/1.1 403 Forbidden"));
+
+    assert_connect_rejected(proxy_addr).await;
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn v2_listener_override_requires_exactly_one_listener() {
+    let plan = v2_listener_plan(unused_loopback_addr(), unused_loopback_addr());
+    let mut args = v2_serve_args();
+    args.port = Some(4141);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let error = serve_v2_plan(
+      plan,
+      &[],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+      args,
+      shutdown_rx,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("exactly one listener"));
+  }
+
+  #[tokio::test]
+  async fn v2_applies_bind_override_to_single_forward_proxy_listener() {
+    let configured_addr = unused_loopback_addr();
+    let override_addr = unused_loopback_addr();
+    let config = format!(
+      r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{configured_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+default_connect = "reject"
+"#
+    );
+    let plan = tokn_config::v2::parse(&config, Path::new("v2-proxy-override.toml")).unwrap();
+    let mut args = v2_serve_args();
+    args.host = Some(override_addr.ip().to_string());
+    args.port = Some(override_addr.port());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(serve_v2_plan(
+      plan,
+      &[],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+      args,
+      shutdown_rx,
+    ));
+
+    wait_for_listener(override_addr).await;
+    assert_connect_rejected(override_addr).await;
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
   }
 
   #[test]

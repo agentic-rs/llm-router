@@ -68,6 +68,20 @@ hosts = ["blocked.example"]
   let unauthenticated = connect(proxy_addr, "blocked.example:443", None).await;
   assert!(unauthenticated.starts_with("HTTP/1.1 407 Proxy Authentication Required"));
 
+  let invalid = connect(proxy_addr, "blocked.example:443", Some("not-a-key")).await;
+  assert!(invalid.starts_with("HTTP/1.1 407 Proxy Authentication Required"));
+
+  let malformed = connect_with_authorization(proxy_addr, "blocked.example:443", &["Basic invalid"]).await;
+  assert!(malformed.starts_with("HTTP/1.1 407 Proxy Authentication Required"));
+
+  let duplicate = connect_with_authorization(
+    proxy_addr,
+    "blocked.example:443",
+    &["Bearer duplicate-one", "Bearer duplicate-two"],
+  )
+  .await;
+  assert!(duplicate.starts_with("HTTP/1.1 407 Proxy Authentication Required"));
+
   let rejected = connect(proxy_addr, "blocked.example:443", Some(&key.token)).await;
   assert!(rejected.starts_with("HTTP/1.1 403 Forbidden"));
 
@@ -118,10 +132,21 @@ ca_dir = "certificates"
 }
 
 async fn connect(proxy_addr: std::net::SocketAddr, authority: &str, token: Option<&str>) -> String {
+  let authorization = token.map(|token| format!("Bearer {token}"));
+  let authorization = authorization.iter().map(String::as_str).collect::<Vec<_>>();
+  connect_with_authorization(proxy_addr, authority, &authorization).await
+}
+
+async fn connect_with_authorization(
+  proxy_addr: std::net::SocketAddr,
+  authority: &str,
+  authorization: &[&str],
+) -> String {
   let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
-  let authorization = token
-    .map(|token| format!("Proxy-Authorization: Bearer {token}\r\n"))
-    .unwrap_or_default();
+  let authorization = authorization
+    .iter()
+    .map(|value| format!("Proxy-Authorization: {value}\r\n"))
+    .collect::<String>();
   stream
     .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{authorization}\r\n").as_bytes())
     .await

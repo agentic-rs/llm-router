@@ -110,10 +110,6 @@ impl ForwardProxyState {
     self.listener.bind()
   }
 
-  pub fn client_auth(&self) -> ClientAuthPlan {
-    self.listener.client_auth()
-  }
-
   fn connect_action(&self, host: &CanonicalHost, port: u16) -> ConnectAction {
     self
       .listener
