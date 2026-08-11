@@ -93,14 +93,17 @@ impl V2AccountSelector {
     let allowed = allowed_provider_ids(ctx)?;
     let candidates = model_candidates(&self.plan, route, extracted.model.as_str())?;
     let operations = operation_candidates(route.operation(), endpoint);
-    let mut denied = false;
+    let mut matching_binding_exists = false;
+    let mut allowed_matching_binding_exists = false;
 
     for candidate in candidates {
       for operation in operations.iter().copied() {
-        denied |= self.state.bindings.iter().any(|binding| {
-          managed_binding_matches(route, &candidate, operation, binding)
-            && !provider_allowed(binding.provider_id().as_str(), allowed.as_ref())
-        });
+        for binding in &self.state.bindings {
+          if managed_binding_matches(route, &candidate, operation, binding) {
+            matching_binding_exists = true;
+            allowed_matching_binding_exists |= provider_allowed(binding.provider_id().as_str(), allowed.as_ref());
+          }
+        }
         match self.state.pool.acquire(extracted.session_id.as_deref(), |binding| {
           managed_binding_matches(route, &candidate, operation, binding)
             && provider_allowed(binding.provider_id().as_str(), allowed.as_ref())
@@ -113,11 +116,10 @@ impl V2AccountSelector {
       }
     }
 
-    if denied {
-      Ok(SelectorOutcome::ProviderAccessDenied)
-    } else {
-      Ok(SelectorOutcome::NoAccount)
-    }
+    Ok(managed_unavailable_outcome(
+      matching_binding_exists,
+      allowed_matching_binding_exists,
+    ))
   }
 
   fn select_relay(
@@ -342,6 +344,17 @@ fn managed_binding_matches(
     && binding.driver().supports(candidate.model.as_str(), operation)
 }
 
+fn managed_unavailable_outcome(
+  matching_binding_exists: bool,
+  allowed_matching_binding_exists: bool,
+) -> SelectorOutcome {
+  if matching_binding_exists && !allowed_matching_binding_exists {
+    SelectorOutcome::ProviderAccessDenied
+  } else {
+    SelectorOutcome::NoAccount
+  }
+}
+
 fn operation_candidates(policy: OperationPolicy, requested: Endpoint) -> Vec<Endpoint> {
   if policy == OperationPolicy::Preserve {
     return vec![requested];
@@ -527,5 +540,21 @@ model = "gpt-4o"
     assert!(provider_allowed("anything", None));
     assert_eq!(qualification_name(QualificationNamespace::Driver), "driver");
     assert_eq!(qualification_name(QualificationNamespace::Provider), "provider");
+  }
+
+  #[test]
+  fn allowed_but_unavailable_managed_binding_is_not_access_denied() {
+    assert!(matches!(
+      managed_unavailable_outcome(true, true),
+      SelectorOutcome::NoAccount
+    ));
+    assert!(matches!(
+      managed_unavailable_outcome(true, false),
+      SelectorOutcome::ProviderAccessDenied
+    ));
+    assert!(matches!(
+      managed_unavailable_outcome(false, false),
+      SelectorOutcome::NoAccount
+    ));
   }
 }
