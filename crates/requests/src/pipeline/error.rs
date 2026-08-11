@@ -46,6 +46,9 @@ pub enum RequestsError {
   #[snafu(display("invalid API-key provider policy"))]
   InvalidAccessPolicy,
 
+  #[snafu(display("invalid routed request: {message}"))]
+  InvalidRouteRequest { message: SmolStr },
+
   #[snafu(display("invalid `{key}` endpoint `{value}`"))]
   InvalidConfiguredEndpoint { key: &'static str, value: SmolStr },
 

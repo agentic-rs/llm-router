@@ -3,7 +3,7 @@ use crate::cli::lan_bootstrap;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::Args;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tokn_config::{RouteMode, DEFAULT_HOST};
@@ -30,6 +30,17 @@ pub struct ServeArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
+  let resolved_cfg_path = cfg_path
+    .clone()
+    .map(Ok)
+    .unwrap_or_else(tokn_config::paths::config_path)?;
+  if is_v2_config(&resolved_cfg_path)? {
+    return run_v2(resolved_cfg_path, args).await;
+  }
+  run_legacy(cfg_path, args).await
+}
+
+async fn run_legacy(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   let (mut cfg, resolved_cfg_path) = Config::load(cfg_path.as_deref())?;
   if args.no_proxy {
     cfg.proxy = crate::config::ProxyConfig::default();
@@ -128,6 +139,68 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   }
   events.shutdown().await;
   result
+}
+
+async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
+  if args.with_proxy || args.proxy_route_mode.is_some() {
+    anyhow::bail!(
+      "v2 forward-proxy serving is not available yet; remove --with-proxy and configure an llm_api listener"
+    );
+  }
+
+  let plan = tokn_config::v2::load(&config_path)?;
+  let accounts = crate::server_runtime::load_accounts(Some(&config_path))?;
+  let needs_access = plan
+    .listeners()
+    .values()
+    .any(|listener| listener.client_auth() == tokn_policy::ClientAuthPlan::LocalKeys);
+  let access = crate::server_runtime::load_access_store(needs_access)?;
+  // V2 does not expose operational event/database settings yet. Keep the
+  // existing defaults, including the default app-data database path.
+  let operational = Config::default();
+  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&operational)?;
+  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
+  let states = tokn_router::v2::build_states(plan, &accounts, access, events.clone())?;
+  if states.is_empty() {
+    anyhow::bail!("v2 config contains no llm_api listeners");
+  }
+  if states.len() != 1 && (args.host.is_some() || args.port.is_some()) {
+    anyhow::bail!("--host and --port can only override a v2 config with exactly one listener");
+  }
+
+  let shutdown = shutdown_channel();
+  let servers = states.into_iter().map(|state| {
+    let configured = state.bind();
+    let addr = if args.host.is_some() || args.port.is_some() {
+      let host = args.host.clone().unwrap_or_else(|| configured.ip().to_string());
+      let port = args.port.unwrap_or(configured.port());
+      crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
+        .with_context(|| format!("parse v2 bind address {host}:{port}"))?
+    } else {
+      configured
+    };
+    tracing::info!(listener = %state.listener_id(), %addr, "tokn-router v2 listener starting");
+    let app = tokn_router::v2::router(state);
+    let shutdown = shutdown.clone();
+    Ok(async move { crate::server_runtime::serve_http(app, addr, wait_for_shutdown(shutdown)).await })
+  });
+  let servers = servers.collect::<Result<Vec<_>>>()?;
+  let result = futures::future::try_join_all(servers).await.map(|_| ());
+
+  if let Some(archive_runtime) = archive_runtime {
+    archive_runtime.shutdown().await;
+  }
+  events.shutdown().await;
+  result
+}
+
+fn is_v2_config(path: &Path) -> Result<bool> {
+  if !path.exists() {
+    return Ok(false);
+  }
+  let contents = std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+  let document: toml::Value = toml::from_str(&contents).with_context(|| format!("parse config {}", path.display()))?;
+  Ok(document.get("schema_version").and_then(toml::Value::as_integer) == Some(2))
 }
 
 struct ReloadState {
@@ -254,6 +327,43 @@ fn route_mode_name(mode: RouteMode) -> &'static str {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn detects_v2_config_without_treating_legacy_as_v2() {
+    let directory = tempfile::tempdir().unwrap();
+    let v2_path = directory.path().join("v2.toml");
+    let legacy_path = directory.path().join("legacy.toml");
+    std::fs::write(&v2_path, "schema_version = 2\n").unwrap();
+    std::fs::write(&legacy_path, "[server]\nport = 4141\n").unwrap();
+
+    assert!(is_v2_config(&v2_path).unwrap());
+    assert!(!is_v2_config(&legacy_path).unwrap());
+    assert!(!is_v2_config(&directory.path().join("missing.toml")).unwrap());
+  }
+
+  #[test]
+  fn invalid_toml_is_not_silently_treated_as_legacy() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("invalid.toml");
+    std::fs::write(&path, "schema_version = [").unwrap();
+
+    assert!(is_v2_config(&path).is_err());
+  }
+
+  #[tokio::test]
+  async fn v2_rejects_proxy_flags_before_loading_config() {
+    let args = ServeArgs {
+      host: None,
+      port: None,
+      with_proxy: true,
+      proxy_route_mode: None,
+      insecure_allow_remote: false,
+      no_proxy: false,
+    };
+
+    let error = run_v2(PathBuf::from("missing.toml"), args).await.unwrap_err();
+    assert!(error.to_string().contains("v2 forward-proxy serving is not available"));
+  }
 
   #[test]
   fn shared_mode_prefers_non_passthrough_listener_when_needed() {
