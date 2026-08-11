@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokn_accounts::registry::Registry;
 use tokn_auth::descriptor::RewriteTarget;
 use tokn_core::util::http::HttpClientOptions;
+use tokn_policy::{CanonicalHost, ConnectAction};
 use transport::handle_client;
 
 fn is_benign_disconnect(err: &anyhow::Error) -> bool {
@@ -67,6 +68,8 @@ pub struct ProxyOptions {
 pub type ProxyPlainHttpHandler =
   Arc<dyn Fn(ProxyPlainHttpRequest) -> Option<ProxyPlainHttpResponse> + Send + Sync + 'static>;
 
+pub(crate) type ProxyConnectPolicy = Arc<dyn Fn(&CanonicalHost, u16) -> ConnectAction + Send + Sync + 'static>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyPlainHttpRequest {
   pub method: String,
@@ -92,17 +95,80 @@ pub async fn serve_live<F>(state: LiveAppState, options: ProxyOptions, shutdown:
 where
   F: Future<Output = ()> + Send,
 {
-  let listener = TcpListener::bind(options.addr)
-    .await
-    .with_context(|| format!("bind {}", options.addr))?;
   let ca = Arc::new(load_or_generate_ca(&options.ca_dir, false)?);
   let state = Arc::new(state);
   let router = proxy_router((*state).clone());
   let host_policy = HostPolicy::new(&options);
-  let outbound_proxy = Arc::new(connect_proxy::ConnectProxy::from_options(&options.outbound_proxy));
-  let plain_http_handler = options.plain_http_handler.clone();
+  serve_runtime(
+    options,
+    transport::ProxyRuntime::Legacy {
+      state,
+      router,
+      ca,
+      host_policy,
+    },
+    shutdown,
+  )
+  .await
+}
 
-  tracing::info!(addr = %options.addr, ca_dir = %options.ca_dir.display(), "tokn-router proxy listening");
+pub(crate) async fn serve_connect_policy<F>(
+  addr: SocketAddr,
+  outbound_proxy: HttpClientOptions,
+  connect_policy: ProxyConnectPolicy,
+  client_auth: Option<Arc<tokn_access::AccessStore>>,
+  shutdown: F,
+) -> Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  serve_runtime(
+    TransportOptions {
+      addr,
+      outbound_proxy,
+      plain_http_handler: None,
+    },
+    transport::ProxyRuntime::Policy {
+      connect_policy,
+      client_auth,
+    },
+    shutdown,
+  )
+  .await
+}
+
+struct TransportOptions {
+  addr: SocketAddr,
+  outbound_proxy: HttpClientOptions,
+  plain_http_handler: Option<ProxyPlainHttpHandler>,
+}
+
+impl From<ProxyOptions> for TransportOptions {
+  fn from(options: ProxyOptions) -> Self {
+    Self {
+      addr: options.addr,
+      outbound_proxy: options.outbound_proxy,
+      plain_http_handler: options.plain_http_handler,
+    }
+  }
+}
+
+async fn serve_runtime<F>(
+  options: impl Into<TransportOptions>,
+  runtime: transport::ProxyRuntime,
+  shutdown: F,
+) -> Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  let options = options.into();
+  let listener = TcpListener::bind(options.addr)
+    .await
+    .with_context(|| format!("bind {}", options.addr))?;
+  let outbound_proxy = Arc::new(connect_proxy::ConnectProxy::from_options(&options.outbound_proxy));
+  let plain_http_handler = options.plain_http_handler;
+
+  tracing::info!(addr = %options.addr, "tokn-router proxy listening");
 
   tokio::pin!(shutdown);
 
@@ -111,14 +177,11 @@ where
       _ = &mut shutdown => break,
       accept = listener.accept() => {
         let (stream, peer) = accept?;
-        let router = router.clone();
-        let ca = ca.clone();
-        let state = state.clone();
-        let host_policy = host_policy.clone();
+        let runtime = runtime.clone();
         let outbound_proxy = outbound_proxy.clone();
         let plain_http_handler = plain_http_handler.clone();
         tokio::spawn(async move {
-          if let Err(err) = handle_client(stream, peer, state, router, ca, host_policy, outbound_proxy, plain_http_handler).await {
+          if let Err(err) = handle_client(stream, peer, runtime, outbound_proxy, plain_http_handler).await {
             if is_benign_disconnect(&err) {
               tracing::debug!(%peer, error = %err, "proxy connection closed by peer");
             } else {

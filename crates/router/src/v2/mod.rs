@@ -11,6 +11,8 @@ use axum::Router;
 use selector::{PoolAwareSend, V2AccountSelector};
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokn_access::AccessContext;
 use tokn_accounts::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph};
@@ -20,8 +22,9 @@ use tokn_core::event::EventBus;
 use tokn_core::provider::Endpoint;
 use tokn_core::AgentId;
 use tokn_policy::{
-  CanonicalAuthority, ClientAuthPlan, GatewayPlan, HttpAction, HttpMatch, ListenerId, ListenerPlan, LlmApiListenerPlan,
-  ManagedRetry, ProfileId, RelayRetry, RouteKind, RoutePlan, WireIdentity,
+  CanonicalAuthority, CanonicalHost, ClientAuthPlan, ConnectAction, ForwardProxyListenerPlan, GatewayPlan, HttpAction,
+  HttpMatch, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ProfileId, RelayRetry, RouteKind, RoutePlan,
+  WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
@@ -91,9 +94,82 @@ impl AppState {
   }
 }
 
+#[derive(Clone)]
+pub struct ForwardProxyState {
+  listener_id: ListenerId,
+  listener: ForwardProxyListenerPlan,
+  access: Arc<tokn_access::AccessStore>,
+}
+
+impl ForwardProxyState {
+  pub fn listener_id(&self) -> &ListenerId {
+    &self.listener_id
+  }
+
+  pub fn bind(&self) -> SocketAddr {
+    self.listener.bind()
+  }
+
+  pub fn client_auth(&self) -> ClientAuthPlan {
+    self.listener.client_auth()
+  }
+
+  fn connect_action(&self, host: &CanonicalHost, port: u16) -> ConnectAction {
+    self
+      .listener
+      .connect_rules()
+      .iter()
+      .find(|rule| {
+        let matcher = rule.matcher();
+        (matcher.hosts().is_empty() || matcher.hosts().iter().any(|pattern| pattern.matches(host)))
+          && (matcher.ports().is_empty() || matcher.ports().contains(&port))
+      })
+      .map(|rule| rule.action())
+      .unwrap_or_else(|| self.listener.default_connect_action())
+  }
+}
+
+pub fn build_forward_proxy_states(
+  plan: &GatewayPlan,
+  access: Arc<tokn_access::AccessStore>,
+) -> anyhow::Result<Vec<ForwardProxyState>> {
+  let mut states = Vec::new();
+  for (listener_id, listener) in plan.listeners() {
+    let ListenerPlan::ForwardProxy(listener) = listener else {
+      continue;
+    };
+    let intercept = listener.default_connect_action() == ConnectAction::Intercept
+      || listener
+        .connect_rules()
+        .iter()
+        .any(|rule| rule.action() == ConnectAction::Intercept);
+    if intercept {
+      anyhow::bail!("v2 forward-proxy listener '{listener_id}' uses CONNECT interception, which is not supported yet");
+    }
+    states.push(ForwardProxyState {
+      listener_id: listener_id.clone(),
+      listener: listener.clone(),
+      access: access.clone(),
+    });
+  }
+  Ok(states)
+}
+
+pub async fn serve_forward_proxy<F>(state: ForwardProxyState, bind: SocketAddr, shutdown: F) -> anyhow::Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  let policy_state = state.clone();
+  let connect_policy: crate::proxy::ProxyConnectPolicy =
+    Arc::new(move |host, port| policy_state.connect_action(host, port));
+  let client_auth = match state.listener.client_auth() {
+    ClientAuthPlan::None => None,
+    ClientAuthPlan::LocalKeys => Some(state.access.clone()),
+  };
+  crate::proxy::serve_connect_policy(bind, Default::default(), connect_policy, client_auth, shutdown).await
+}
+
 /// Build one independent Axum state per configured v2 LLM API listener.
-/// Forward-proxy listeners are rejected until their CONNECT transport can be
-/// hosted without bypassing the six-stage request path.
 pub fn build_states(
   plan: GatewayPlan,
   accounts: &[AccountConfig],
@@ -102,14 +178,20 @@ pub fn build_states(
 ) -> anyhow::Result<Vec<AppState>> {
   let plan = Arc::new(plan);
   let mut reachable_profiles = BTreeSet::new();
-  for (listener_id, listener) in plan.listeners() {
+  let mut has_llm_listener = false;
+  for listener in plan.listeners().values() {
     let ListenerPlan::LlmApi(listener) = listener else {
-      anyhow::bail!("v2 forward-proxy listener '{listener_id}' is not supported by the six-stage LLM API runtime yet");
+      continue;
     };
+    has_llm_listener = true;
     collect_profile(listener.default_http_action(), &mut reachable_profiles);
     for binding in listener.http_bindings() {
       collect_profile(binding.action(), &mut reachable_profiles);
     }
+  }
+
+  if !has_llm_listener {
+    return Ok(Vec::new());
   }
 
   let registry = Registry::builtin();
@@ -195,7 +277,7 @@ pub fn build_states(
         profiles: profiles.clone(),
         access: access.clone(),
       }),
-      ListenerPlan::ForwardProxy(_) => unreachable!("forward-proxy listeners were rejected before runtime linking"),
+      ListenerPlan::ForwardProxy(_) => {}
     }
   }
   Ok(states)

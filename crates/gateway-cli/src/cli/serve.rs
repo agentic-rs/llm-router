@@ -3,6 +3,7 @@ use crate::cli::lan_bootstrap;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::Args;
+use futures::future::BoxFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
@@ -144,7 +145,7 @@ async fn run_legacy(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
 async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
   if args.with_proxy || args.proxy_route_mode.is_some() {
     anyhow::bail!(
-      "v2 forward-proxy serving is not available yet; remove --with-proxy and configure an llm_api listener"
+      "v2 listeners are declared in config; remove --with-proxy/--proxy-route-mode and configure a forward_proxy listener"
     );
   }
 
@@ -160,16 +161,19 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
   let operational = Config::default();
   let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&operational)?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
+  let proxy_states = tokn_router::v2::build_forward_proxy_states(&plan, access.clone())?;
   let states = tokn_router::v2::build_states(plan, &accounts, access, events.clone())?;
-  if states.is_empty() {
-    anyhow::bail!("v2 config contains no llm_api listeners");
+  let listener_count = states.len() + proxy_states.len();
+  if listener_count == 0 {
+    anyhow::bail!("v2 config contains no runnable listeners");
   }
-  if states.len() != 1 && (args.host.is_some() || args.port.is_some()) {
+  if listener_count != 1 && (args.host.is_some() || args.port.is_some()) {
     anyhow::bail!("--host and --port can only override a v2 config with exactly one listener");
   }
 
   let shutdown = shutdown_channel();
-  let servers = states.into_iter().map(|state| {
+  let mut servers = Vec::<BoxFuture<'static, Result<()>>>::with_capacity(listener_count);
+  for state in states {
     let configured = state.bind();
     let addr = if args.host.is_some() || args.port.is_some() {
       let host = args.host.clone().unwrap_or_else(|| configured.ip().to_string());
@@ -182,9 +186,26 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
     tracing::info!(listener = %state.listener_id(), %addr, "tokn-router v2 listener starting");
     let app = tokn_router::v2::router(state);
     let shutdown = shutdown.clone();
-    Ok(async move { crate::server_runtime::serve_http(app, addr, wait_for_shutdown(shutdown)).await })
-  });
-  let servers = servers.collect::<Result<Vec<_>>>()?;
+    servers.push(Box::pin(async move {
+      crate::server_runtime::serve_http(app, addr, wait_for_shutdown(shutdown)).await
+    }));
+  }
+  for state in proxy_states {
+    let configured = state.bind();
+    let addr = if args.host.is_some() || args.port.is_some() {
+      let host = args.host.clone().unwrap_or_else(|| configured.ip().to_string());
+      let port = args.port.unwrap_or(configured.port());
+      crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
+        .with_context(|| format!("parse v2 bind address {host}:{port}"))?
+    } else {
+      configured
+    };
+    tracing::info!(listener = %state.listener_id(), %addr, "tokn-router v2 forward proxy starting");
+    let shutdown = shutdown.clone();
+    servers.push(Box::pin(async move {
+      tokn_router::v2::serve_forward_proxy(state, addr, wait_for_shutdown(shutdown)).await
+    }));
+  }
   let result = futures::future::try_join_all(servers).await.map(|_| ());
 
   if let Some(archive_runtime) = archive_runtime {
@@ -351,7 +372,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn v2_rejects_proxy_flags_before_loading_config() {
+  async fn v2_rejects_legacy_proxy_flags_before_loading_config() {
     let args = ServeArgs {
       host: None,
       port: None,
@@ -362,7 +383,7 @@ mod tests {
     };
 
     let error = run_v2(PathBuf::from("missing.toml"), args).await.unwrap_err();
-    assert!(error.to_string().contains("v2 forward-proxy serving is not available"));
+    assert!(error.to_string().contains("v2 listeners are declared in config"));
   }
 
   #[test]

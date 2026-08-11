@@ -1,8 +1,8 @@
 use super::connect_proxy::{connect_upstream, ConnectProxy};
 
 use super::{
-  extract_proxy_auth_mode, rewrite_target, split_authority, HostPolicy, ProxyCa, ProxyPlainHttpHandler,
-  ProxyPlainHttpRequest, ProxyPlainHttpResponse,
+  extract_proxy_auth_mode, rewrite_target, split_authority, HostPolicy, ProxyCa, ProxyConnectPolicy,
+  ProxyPlainHttpHandler, ProxyPlainHttpRequest, ProxyPlainHttpResponse,
 };
 use crate::api::{error::ApiError, AppState, LiveAppState};
 use crate::pipeline::request_header_extract;
@@ -27,22 +27,39 @@ use tokn_auth::descriptor::RewriteTarget;
 use tokn_config::RouteMode;
 use tokn_core::event::Event as CoreEvent;
 use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEvent, RequestEventPayload, Stage, StageEvent};
-use tokn_policy::CanonicalHost;
+use tokn_policy::{CanonicalHost, ConnectAction};
 
 const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const BAD_CONNECT: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n";
+const CONNECT_FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+const CONNECT_INTERCEPT_UNAVAILABLE: &[u8] =
+  b"HTTP/1.1 501 Not Implemented\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+const PROXY_AUTH_REQUIRED: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Bearer\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+const PROXY_AUTH_UNAVAILABLE: &[u8] =
+  b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 const UPGRADE_REQUIRED_WEBSOCKET: &[u8] =
   b"HTTP/1.1 426 Upgrade Required\r\nconnection: Upgrade\r\nupgrade: websocket\r\ncontent-length: 0\r\n\r\n";
 const PROXY_GET_HELP: &str = "tokn-router proxy is running. Configure HTTP_PROXY/HTTPS_PROXY to this address.\n";
+
+#[derive(Clone)]
+pub(super) enum ProxyRuntime {
+  Legacy {
+    state: Arc<LiveAppState>,
+    router: Router,
+    ca: Arc<ProxyCa>,
+    host_policy: HostPolicy,
+  },
+  Policy {
+    connect_policy: ProxyConnectPolicy,
+    client_auth: Option<Arc<tokn_access::AccessStore>>,
+  },
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_client(
   stream: TcpStream,
   peer: SocketAddr,
-  state: Arc<LiveAppState>,
-  router: Router,
-  ca: Arc<ProxyCa>,
-  host_policy: HostPolicy,
+  runtime: ProxyRuntime,
   outbound_proxy: Arc<ConnectProxy>,
   plain_http_handler: Option<ProxyPlainHttpHandler>,
 ) -> Result<()> {
@@ -58,6 +75,7 @@ pub(super) async fn handle_client(
   let _version = parts.next().unwrap_or_default();
 
   let mut proxy_route_mode: Option<String> = None;
+  let mut proxy_authorization = Vec::new();
   let mut host_header: Option<String> = None;
   let mut websocket_upgrade = false;
   loop {
@@ -72,7 +90,9 @@ pub(super) async fn handle_client(
       .strip_prefix("Proxy-Authorization:")
       .or_else(|| header_line.strip_prefix("proxy-authorization:"))
     {
-      if let Some(mode) = extract_proxy_auth_mode(value.trim().trim_end_matches(['\r', '\n'])) {
+      let value = value.trim().trim_end_matches(['\r', '\n']);
+      proxy_authorization.push(value.to_string());
+      if let Some(mode) = extract_proxy_auth_mode(value) {
         proxy_route_mode = Some(mode);
       }
     }
@@ -97,6 +117,19 @@ pub(super) async fn handle_client(
   let local = stream
     .local_addr()
     .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+  if let ProxyRuntime::Policy { client_auth, .. } = &runtime {
+    match authenticate_proxy_client(client_auth.clone(), &proxy_authorization).await {
+      Ok(()) => {}
+      Err(ProxyClientAuthError::Rejected) => {
+        stream.write_all(PROXY_AUTH_REQUIRED).await?;
+        return Ok(());
+      }
+      Err(ProxyClientAuthError::Unavailable) => {
+        stream.write_all(PROXY_AUTH_UNAVAILABLE).await?;
+        return Ok(());
+      }
+    }
+  }
   if websocket_upgrade {
     tracing::debug!("rejecting websocket upgrade request from {}", peer);
     stream.write_all(UPGRADE_REQUIRED_WEBSOCKET).await?;
@@ -115,29 +148,77 @@ pub(super) async fn handle_client(
   }
 
   let (host, port) = split_authority(authority)?;
-  let intercept = port == 443 && host_policy.should_intercept(&host);
-  tracing::debug!(%peer, host = %host, port, intercept, proxy_route_mode = ?proxy_route_mode, "proxy_connect");
+  let canonical_host = CanonicalHost::parse(&host).context("canonicalize CONNECT host")?;
+  let action = match &runtime {
+    ProxyRuntime::Legacy { host_policy, .. }
+      if port == 443 && host_policy.should_intercept(canonical_host.as_str()) =>
+    {
+      ConnectAction::Intercept
+    }
+    ProxyRuntime::Legacy { .. } => ConnectAction::Tunnel,
+    ProxyRuntime::Policy { connect_policy, .. } => connect_policy(&canonical_host, port),
+  };
+  tracing::debug!(%peer, host = %canonical_host, port, ?action, proxy_route_mode = ?proxy_route_mode, "proxy_connect");
 
-  if intercept {
-    let host = CanonicalHost::parse(&host).context("canonicalize intercepted CONNECT host")?;
-    let tls_config = ca.pinned_server_config(&host)?;
-    stream.write_all(CONNECT_OK).await?;
-    stream.flush().await?;
-    intercept_tls(
-      stream,
-      peer,
-      local,
-      host.as_str(),
-      port,
-      state,
-      router,
-      tls_config,
-      proxy_route_mode,
-    )
-    .await
-  } else {
-    tunnel(stream, &host, port, outbound_proxy.as_ref()).await
+  match action {
+    ConnectAction::Tunnel => tunnel(stream, canonical_host.as_str(), port, outbound_proxy.as_ref()).await,
+    ConnectAction::Reject => {
+      stream.write_all(CONNECT_FORBIDDEN).await?;
+      Ok(())
+    }
+    ConnectAction::Intercept => {
+      let ProxyRuntime::Legacy { state, router, ca, .. } = runtime else {
+        stream.write_all(CONNECT_INTERCEPT_UNAVAILABLE).await?;
+        return Ok(());
+      };
+      let tls_config = ca.pinned_server_config(&canonical_host)?;
+      stream.write_all(CONNECT_OK).await?;
+      stream.flush().await?;
+      intercept_tls(
+        stream,
+        peer,
+        local,
+        canonical_host.as_str(),
+        port,
+        state,
+        router,
+        tls_config,
+        proxy_route_mode,
+      )
+      .await
+    }
   }
+}
+
+#[derive(Clone, Copy)]
+enum ProxyClientAuthError {
+  Rejected,
+  Unavailable,
+}
+
+async fn authenticate_proxy_client(
+  client_auth: Option<Arc<tokn_access::AccessStore>>,
+  proxy_authorization: &[String],
+) -> std::result::Result<(), ProxyClientAuthError> {
+  let Some(access) = client_auth else {
+    return Ok(());
+  };
+  let [value] = proxy_authorization else {
+    return Err(ProxyClientAuthError::Rejected);
+  };
+  let mut parts = value.split_ascii_whitespace();
+  let token = match (parts.next(), parts.next(), parts.next()) {
+    (Some(scheme), Some(token), None) if scheme.eq_ignore_ascii_case("bearer") => token.to_string(),
+    _ => return Err(ProxyClientAuthError::Rejected),
+  };
+  tokio::task::spawn_blocking(move || access.authenticate(Some(&token)))
+    .await
+    .map_err(|error| {
+      tracing::error!(%error, "proxy client authentication task failed");
+      ProxyClientAuthError::Unavailable
+    })?
+    .map(|_| ())
+    .map_err(|_| ProxyClientAuthError::Rejected)
 }
 
 fn response_for_plain_get(target: &str, host: Option<String>, handler: Option<ProxyPlainHttpHandler>) -> Vec<u8> {
