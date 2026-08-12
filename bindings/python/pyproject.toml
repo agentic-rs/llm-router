@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tokn-sdk"
-version = "0.2.1"
+version = "0.2.2"
 description = "Embedded Python SDK for routing LLM requests through tokn providers"
 requires-python = ">=3.10"
 license = "MIT"
