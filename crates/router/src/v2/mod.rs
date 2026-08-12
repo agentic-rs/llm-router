@@ -342,6 +342,12 @@ pub struct RuntimeStates {
   pub forward_proxy: Vec<ForwardProxyState>,
 }
 
+#[derive(Clone, Copy)]
+enum PipelineMode {
+  Full,
+  DryRun,
+}
+
 /// Build one shared v2 runtime generation for every configured listener.
 pub fn build_runtime_states(
   plan: GatewayPlan,
@@ -350,7 +356,7 @@ pub fn build_runtime_states(
   events: Arc<EventBus>,
 ) -> anyhow::Result<RuntimeStates> {
   let plan = Arc::new(plan);
-  let profiles = build_profile_runtimes(plan.clone(), accounts, events)?;
+  let profiles = build_profile_runtimes(plan.clone(), accounts, events, PipelineMode::Full)?;
   let mut llm_api = Vec::new();
   let mut forward_proxy = Vec::new();
   for (listener_id, listener) in plan.listeners() {
@@ -387,13 +393,52 @@ pub fn build_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<Vec<AppState>> {
-  build_runtime_states(plan, accounts, access, events).map(|states| states.llm_api)
+  build_api_states(plan, accounts, access, events, PipelineMode::Full)
+}
+
+/// Build v2 LLM listener states whose pipelines stop immediately before the
+/// upstream send stage. Listener bindings, profiles, routes, account pools,
+/// headers, and request conversion remain identical to the live runtime.
+pub fn build_dry_run_states(
+  plan: GatewayPlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+) -> anyhow::Result<Vec<AppState>> {
+  build_api_states(plan, accounts, access, events, PipelineMode::DryRun)
+}
+
+fn build_api_states(
+  plan: GatewayPlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+  mode: PipelineMode,
+) -> anyhow::Result<Vec<AppState>> {
+  let plan = Arc::new(plan);
+  let profiles = build_profile_runtimes(plan.clone(), accounts, events, mode)?;
+  Ok(
+    plan
+      .listeners()
+      .iter()
+      .filter_map(|(listener_id, listener)| match listener {
+        ListenerPlan::LlmApi(listener) => Some(AppState {
+          listener_id: listener_id.clone(),
+          listener: listener.clone(),
+          profiles: profiles.clone(),
+          access: access.clone(),
+        }),
+        ListenerPlan::ForwardProxy(_) => None,
+      })
+      .collect(),
+  )
 }
 
 fn build_profile_runtimes(
   plan: Arc<GatewayPlan>,
   accounts: &[AccountConfig],
   events: Arc<EventBus>,
+  mode: PipelineMode,
 ) -> anyhow::Result<Arc<BTreeMap<ProfileId, ProfileRuntime>>> {
   let mut reachable_profiles = BTreeSet::new();
   for listener in plan.listeners().values() {
@@ -428,15 +473,23 @@ fn build_profile_runtimes(
           anyhow::bail!("profile '{profile_id}' uses unsupported managed patches or retry policy");
         }
         let (selector, selection_state) = V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
-        let profile = Profile::full(
-          format!("v2-{profile_id}"),
-          Arc::new(DefaultExtract),
-          Arc::new(PoolResolve::new(Arc::new(selector))),
-          Arc::new(DefaultBuildHeaders::with_provider_defaults()),
-          Arc::new(DefaultConvertRequest),
-          Arc::new(PoolAwareSend::new(managed_http.clone(), selection_state)),
-          Arc::new(DefaultConvertResponse::new()),
-        );
+        let name = format!("v2-{profile_id}");
+        let extract = Arc::new(DefaultExtract);
+        let resolve = Arc::new(PoolResolve::new(Arc::new(selector)));
+        let build_headers = Arc::new(DefaultBuildHeaders::with_provider_defaults());
+        let convert_request = Arc::new(DefaultConvertRequest);
+        let profile = match mode {
+          PipelineMode::Full => Profile::full(
+            name,
+            extract,
+            resolve,
+            build_headers,
+            convert_request,
+            Arc::new(PoolAwareSend::new(managed_http.clone(), selection_state)),
+            Arc::new(DefaultConvertResponse::new()),
+          ),
+          PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
+        };
         let service = RequestService::http_from_pipeline(Arc::new(Pipeline::new(Arc::new(profile), events.clone())));
         (Some(service.clone()), Some(service), ProxyDestination::Managed)
       }
@@ -457,15 +510,23 @@ fn build_profile_runtimes(
           RelayTarget::FixedProvider { provider, .. } => {
             let (selector, selection_state) =
               V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
-            let profile = Profile::full(
-              format!("v2-{profile_id}-api"),
-              Arc::new(PassthroughExtract),
-              Arc::new(PoolResolve::new(Arc::new(selector))),
-              Arc::new(PassthroughBuildHeaders::router_auth()),
-              Arc::new(PassthroughConvertRequest),
-              Arc::new(PoolAwareSend::new(opaque_http.clone(), selection_state)),
-              Arc::new(PassthroughConvertResponse::new()),
-            );
+            let name = format!("v2-{profile_id}-api");
+            let extract = Arc::new(PassthroughExtract);
+            let resolve = Arc::new(PoolResolve::new(Arc::new(selector)));
+            let build_headers = Arc::new(PassthroughBuildHeaders::router_auth());
+            let convert_request = Arc::new(PassthroughConvertRequest);
+            let profile = match mode {
+              PipelineMode::Full => Profile::full(
+                name,
+                extract,
+                resolve,
+                build_headers,
+                convert_request,
+                Arc::new(PoolAwareSend::new(opaque_http.clone(), selection_state)),
+                Arc::new(PassthroughConvertResponse::new()),
+              ),
+              PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
+            };
             let target = providers
               .target(provider)
               .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' references missing provider '{provider}'"))?;
@@ -859,7 +920,11 @@ fn wire_agent(identity: &WireIdentity) -> Option<AgentId> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use axum::body::Body;
+  use tokn_core::account::{AccountTier, AuthType, Secret};
+  use tokn_core::request_event::StageEvent;
   use tokn_policy::{HostPattern, OperationId, WireIdentityId};
+  use tower::ServiceExt;
 
   fn canonical_host(value: &str) -> tokn_policy::CanonicalHost {
     CanonicalAuthority::parse(value).unwrap().host().clone()
@@ -957,5 +1022,97 @@ mod tests {
     assert!(profiles.is_empty());
     collect_profile(&HttpAction::Route(profile.clone()), &mut profiles);
     assert_eq!(profiles, BTreeSet::from([profile]));
+  }
+
+  #[tokio::test]
+  async fn dry_run_listener_executes_v2_policy_without_sending_upstream() {
+    let plan = tokn_config::v2::parse(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "managed" }
+
+[profiles.managed]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = { kind = "fixed", provider = "local" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+
+[account_pools.primary]
+accounts = ["acct"]
+providers = ["local"]
+
+[providers.local]
+driver = "openai"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+      std::path::Path::new("dry-run.toml"),
+    )
+    .unwrap();
+    let account = AccountConfig {
+      id: "acct".into(),
+      provider: "local".into(),
+      enabled: true,
+      tier: AccountTier::Active,
+      tags: Vec::new(),
+      label: None,
+      base_url: None,
+      headers: Default::default(),
+      auth_type: Some(AuthType::Bearer),
+      username: None,
+      api_key: Some(Secret::new("test-key".into())),
+      api_key_expires_at: None,
+      access_token: None,
+      access_token_expires_at: None,
+      id_token: None,
+      refresh_token: None,
+      provider_account_id: None,
+      extra: Default::default(),
+      refresh_url: None,
+      last_refresh: None,
+      settings: Default::default(),
+    };
+    let events = Arc::new(EventBus::new(32));
+    let mut receiver = events.subscribe();
+    let mut states =
+      build_dry_run_states(plan, &[account], Arc::new(tokn_access::AccessStore::disabled()), events).unwrap();
+    let app = router(states.pop().unwrap());
+
+    let response = app
+      .oneshot(
+        Request::post("/v1/responses")
+          .header("content-type", "application/json")
+          .body(Body::from(r#"{"model":"gpt-4o","input":"hello"}"#))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+    let mut converted = false;
+    let mut sent = false;
+    let mut stopped = false;
+    while let Ok(event) = receiver.try_recv() {
+      let tokn_core::event::Event::Requests(event) = &*event else {
+        continue;
+      };
+      match &event.payload {
+        tokn_core::request_event::RequestEventPayload::Stage(StageEvent::ConvertRequest(_)) => converted = true,
+        tokn_core::request_event::RequestEventPayload::Stage(StageEvent::Send(_)) => sent = true,
+        tokn_core::request_event::RequestEventPayload::Stage(StageEvent::Error { stop, .. }) => stopped = *stop,
+        _ => {}
+      }
+    }
+    assert!(converted);
+    assert!(stopped);
+    assert!(!sent);
   }
 }

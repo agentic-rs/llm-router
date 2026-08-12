@@ -67,7 +67,7 @@ pub enum Cmd {
   Update(update::UpdateArgs),
   /// Apply pending DB migrations (or restore from `.bak` with --rollback)
   Migration(migration::MigrationArgs),
-  /// Smoke-test commands (send a request, inspect a provider, …)
+  /// Smoke-test the v2 request runtime or inspect catalogue metadata
   #[command(subcommand)]
   Smoke(smoke::SmokeCmd),
 }
@@ -76,7 +76,8 @@ impl Cli {
   pub async fn run(self) -> Result<()> {
     let cfg_path = self.config.clone();
     let is_inspect = matches!(&self.cmd, Cmd::Inspect(_));
-    if !is_inspect {
+    let uses_v2_config = matches!(&self.cmd, Cmd::Smoke(_));
+    if !is_inspect && !uses_v2_config {
       prepare_default_config_home(cfg_path.as_deref())?;
     }
 
