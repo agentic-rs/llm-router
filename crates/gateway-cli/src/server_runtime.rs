@@ -23,6 +23,19 @@ type EventBusParts = (
 
 /// Build the event bus and its persistence/progress handlers.
 pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
+  build_event_bus_with_request_options(
+    cfg,
+    tokn_persistence::requests::RequestPersistenceOptions {
+      record_request_bodies: cfg.db.record_request_bodies,
+      body_max_bytes: cfg.db.body_max_bytes,
+    },
+  )
+}
+
+fn build_event_bus_with_request_options(
+  cfg: &Config,
+  request_options: tokn_persistence::requests::RequestPersistenceOptions,
+) -> Result<EventBusParts> {
   let capacity = cfg.db.write_queue_capacity.max(256);
   let bus = EventBus::new(capacity);
   let receiver = bus.subscribe();
@@ -32,7 +45,7 @@ pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
 
   if cfg.db.enabled {
     let paths = cfg.db.resolve_paths()?;
-    let request_handler = tokn_persistence::RequestEventHandler::new(paths.requests_dir)?;
+    let request_handler = tokn_persistence::RequestEventHandler::with_options(paths.requests_dir, request_options)?;
     let usage_handler = tokn_persistence::UsageEventHandler::new(paths.usage_db)?;
     handlers.push(Box::new(request_handler));
     handlers.push(Box::new(usage_handler));
@@ -67,6 +80,27 @@ pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
   };
 
   Ok((Arc::new(bus), receiver, handlers, archive_runtime))
+}
+
+/// Build the existing event bus from v2 persistence settings.
+///
+/// This adapter remains in the CLI so the config and router crates stay free
+/// of database and progress-handler dependencies.
+pub fn build_v2_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Result<EventBusParts> {
+  let mut cfg = Config::default();
+  cfg.db.enabled = persistence.enabled();
+  cfg.db.record_sessions = persistence.record_sessions();
+  cfg.db.record_request_bodies = persistence.record_request_bodies();
+  cfg.db.body_max_bytes = persistence.body_max_bytes();
+  cfg.db.write_queue_capacity = persistence.write_queue_capacity();
+  cfg.db.archive_extension = persistence.archive_extension().map(str::to_string);
+  if persistence.enabled() {
+    let paths = persistence.resolve_paths()?;
+    cfg.db.usage_db_path = Some(paths.usage_db);
+    cfg.db.sessions_db_path = Some(paths.sessions_db);
+    cfg.db.requests_dir = Some(paths.requests_dir);
+  }
+  build_event_bus(&cfg)
 }
 
 /// Load accounts from the root `auth.yaml` and any `auth.d` fragments.

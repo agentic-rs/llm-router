@@ -5,6 +5,7 @@
 //! migration command are complete.
 
 mod compile;
+mod compiled;
 mod error;
 mod raw;
 
@@ -13,12 +14,17 @@ use tokn_policy::GatewayPlan;
 
 use crate::schema::{ConfigSchema, SchemaMarkerError};
 
+pub use compiled::{CompiledConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan, ServicePlan};
 pub use error::{CompileError, Error, Result};
-pub use raw::SCHEMA_VERSION;
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
-  RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawPoolStrategy,
-  RawProfile, RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayTarget, RawRoute, RawWireIdentity,
+  RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawOutbound,
+  RawPersistence, RawPoolStrategy, RawProfile, RawProvider, RawProviderSelector, RawQualificationNamespace,
+  RawRelayTarget, RawRequestLimits, RawRoute, RawService, RawWireIdentity,
+};
+pub use raw::{
+  DEFAULT_BODY_MAX_BYTES, DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, DEFAULT_WRITE_QUEUE_CAPACITY,
+  SCHEMA_VERSION,
 };
 
 /// Decode a version 2 document without compiling references.
@@ -67,8 +73,7 @@ pub fn load_raw(path: &Path) -> Result<RawConfig> {
   decode(&contents, path)
 }
 
-/// Compile a decoded version 2 document into the representation consumed by
-/// runtime crates.
+/// Compile a decoded version 2 document into its routing graph.
 ///
 /// This is the semantic boundary: identifiers are canonicalized, references
 /// are resolved, matcher precedence is preserved, and invalid combinations
@@ -76,6 +81,11 @@ pub fn load_raw(path: &Path) -> Result<RawConfig> {
 /// provider catalogue defaults and runtime/plugin-owned names; it must also
 /// succeed before any listener starts.
 pub fn compile(raw: &RawConfig, source: &Path) -> Result<GatewayPlan> {
+  compile_config(raw, source).map(|config| config.into_parts().0)
+}
+
+/// Compile both the routing graph and process-wide service settings.
+pub fn compile_config(raw: &RawConfig, source: &Path) -> Result<CompiledConfig> {
   if raw.schema_version != SCHEMA_VERSION {
     return Err(Error::UnsupportedSchemaVersion {
       path: source.to_path_buf(),
@@ -83,7 +93,7 @@ pub fn compile(raw: &RawConfig, source: &Path) -> Result<GatewayPlan> {
     });
   }
 
-  compile::compile_plan(raw, source).map_err(|source_error| Error::Compile {
+  compile::compile_config(raw, source).map_err(|source_error| Error::Compile {
     path: source.to_path_buf(),
     source: Box::new(source_error),
   })
@@ -91,16 +101,26 @@ pub fn compile(raw: &RawConfig, source: &Path) -> Result<GatewayPlan> {
 
 /// Strictly decode and semantically compile a version 2 document.
 pub fn parse(contents: &str, source: &Path) -> Result<GatewayPlan> {
+  parse_config(contents, source).map(|config| config.into_parts().0)
+}
+
+/// Strictly decode and compile the routing graph and service settings.
+pub fn parse_config(contents: &str, source: &Path) -> Result<CompiledConfig> {
   let raw = decode(contents, source)?;
-  compile(&raw, source)
+  compile_config(&raw, source)
 }
 
 /// Read, strictly decode, and semantically compile a version 2 document.
 ///
 /// Unlike the legacy loader, a missing file is always an error.
 pub fn load(path: &Path) -> Result<GatewayPlan> {
+  load_config(path).map(|config| config.into_parts().0)
+}
+
+/// Read and compile the routing graph and process-wide service settings.
+pub fn load_config(path: &Path) -> Result<CompiledConfig> {
   let raw = load_raw(path)?;
-  compile(&raw, path)
+  compile_config(&raw, path)
 }
 
 #[cfg(test)]

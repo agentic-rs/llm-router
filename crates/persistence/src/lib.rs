@@ -7,7 +7,7 @@ pub mod usage;
 pub mod viewer;
 
 pub use access::{AccessDb, ApiKeyRecord, ApiKeySummaryRecord, NewApiKeyRecord};
-pub use requests::{read_request_row, RequestEventHandler};
+pub use requests::{read_request_row, RequestEventHandler, RequestPersistenceOptions};
 pub use sessions::SessionEventHandler;
 pub use viewer::{
   get_request, get_request_llm_message, get_request_llm_summary, get_request_llm_tool_definition, get_session,

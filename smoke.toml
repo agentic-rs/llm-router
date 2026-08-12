@@ -2,6 +2,25 @@
 # Credentials remain in ~/.tokn/router/auth.yaml; this file contains no secrets.
 schema_version = 2
 
+# These process-wide defaults are optional. Uncomment only the settings you
+# want to override.
+#
+# [service.outbound]
+# proxy_url = "http://127.0.0.1:8080"
+# no_proxy = ["localhost", "127.0.0.1"]
+# use_system_proxy = false
+#
+# [service.request_limits]
+# max_wire_bytes = 10485760
+# max_decoded_bytes = 10485760
+#
+# [service.persistence]
+# enabled = true
+# record_sessions = true
+# record_request_bodies = true
+# body_max_bytes = 10485760
+# write_queue_capacity = 4096
+
 [listeners.api]
 kind = "llm_api"
 bind = "127.0.0.1:4141"

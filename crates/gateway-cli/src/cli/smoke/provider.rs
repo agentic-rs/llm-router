@@ -23,13 +23,14 @@ pub struct ProviderArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ProviderArgs) -> Result<()> {
-  let (plan, resolved_cfg_path) = super::load_v2_plan(cfg_path.as_deref())?;
+  let (compiled, resolved_cfg_path) = super::load_v2_config(cfg_path.as_deref())?;
+  let plan = compiled.gateway();
   let registry = Registry::builtin();
-  let (provider_id, provider, descriptor) = resolve_provider(&plan, &registry, &args.provider_id)?;
+  let (provider_id, provider, descriptor) = resolve_provider(plan, &registry, &args.provider_id)?;
 
   let static_models = tokn_catalogue::default_models_for(descriptor.id);
   let live_models: Option<Vec<String>> = if args.live {
-    Some(fetch_live_models(&plan, &resolved_cfg_path, provider_id).await?)
+    Some(fetch_live_models(plan, &resolved_cfg_path, provider_id, compiled.service().outbound()).await?)
   } else {
     None
   };
@@ -224,6 +225,7 @@ async fn fetch_live_models(
   plan: &GatewayPlan,
   config_path: &std::path::Path,
   provider_id: &ProviderId,
+  outbound: &tokn_config::v2::OutboundPlan,
 ) -> Result<Vec<String>> {
   let accounts = crate::server_runtime::load_accounts(Some(config_path))?;
   let registry = Registry::builtin();
@@ -235,7 +237,7 @@ async fn fetch_live_models(
   if bindings.is_empty() {
     anyhow::bail!("configured provider '{provider_id}' has no enabled account");
   }
-  let http = tokn_core::util::http::build_client(&Default::default())?;
+  let http = tokn_core::util::http::build_client(&outbound.to_http_client_options())?;
 
   let mut ids: Vec<String> = Vec::new();
   let mut seen: HashSet<String> = HashSet::new();

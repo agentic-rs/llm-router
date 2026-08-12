@@ -2,6 +2,7 @@ mod selector;
 
 use crate::api::error::ApiError;
 use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Request, State};
 use axum::http::{HeaderMap, Method, Uri};
 use axum::middleware::{self, Next};
@@ -66,6 +67,7 @@ pub struct AppState {
   listener: LlmApiListenerPlan,
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   access: Arc<tokn_access::AccessStore>,
+  request_limits: tokn_config::v2::RequestLimitsPlan,
 }
 
 impl AppState {
@@ -114,6 +116,8 @@ pub struct ForwardProxyState {
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   access: Arc<tokn_access::AccessStore>,
   ca: Option<Arc<crate::proxy::ProxyCa>>,
+  outbound: tokn_core::util::http::HttpClientOptions,
+  request_limits: tokn_config::v2::RequestLimitsPlan,
 }
 
 impl ForwardProxyState {
@@ -236,8 +240,11 @@ impl ForwardProxyState {
       .ok_or_else(|| ApiError::internal("selected profile cannot run on a forward-proxy listener"))?;
     let path_and_query = parts.uri.path_and_query().map_or("/", |value| value.as_str());
     let request_endpoint = tokn_core::request_event::RequestEndpoint::infer_from_path(parts.uri.path());
-    let raw_body = match axum::body::to_bytes(axum::body::Body::new(body), self.listener.request_body_max_bytes()).await
-    {
+    let max_wire_bytes = self
+      .listener
+      .request_body_max_bytes()
+      .min(self.request_limits.max_wire_bytes());
+    let raw_body = match axum::body::to_bytes(axum::body::Body::new(body), max_wire_bytes).await {
       Ok(body) => body,
       Err(error)
         if error
@@ -246,7 +253,7 @@ impl ForwardProxyState {
       {
         return Err(ApiError::payload_too_large(format!(
           "proxy request body exceeds the configured {} byte limit",
-          self.listener.request_body_max_bytes()
+          max_wire_bytes
         )));
       }
       Err(error) => return Err(ApiError::bad_request(format!("read proxy request body: {error}"))),
@@ -256,16 +263,19 @@ impl ForwardProxyState {
       let endpoint = request_endpoint
         .resolved()
         .ok_or_else(|| ApiError::bad_request("managed proxy routes require a supported LLM operation path"))?;
-      let mut decoded = crate::api::codec::decode_json_request(&parts.headers, raw_body.clone())?;
+      let mut decoded = crate::api::codec::decode_json_request_with_limit(
+        &parts.headers,
+        raw_body.clone(),
+        self.request_limits.max_decoded_bytes(),
+      )?;
       crate::api::endpoints::apply_endpoint_compat_defaults(endpoint, &parts.headers, &mut decoded)?;
       (decoded.decoded_body, decoded.value)
     } else {
-      let decoded = tokn_requests::utils::codec::request_content_encoding(&headers)
-        .and_then(|encoding| tokn_requests::utils::codec::decode_body_bytes(raw_body.clone(), encoding))
-        .unwrap_or_else(|error| {
-          tracing::debug!(%error, "could not decode opaque proxy body for inspection");
-          raw_body.clone()
-        });
+      let decoded = decode_opaque_body_for_inspection(
+        &parts.headers,
+        raw_body.clone(),
+        self.request_limits.max_decoded_bytes(),
+      )?;
       (decoded, serde_json::Value::Null)
     };
     let (destination_scheme, destination_authority, destination_path) =
@@ -334,7 +344,7 @@ pub async fn serve_forward_proxy<F>(state: ForwardProxyState, bind: SocketAddr, 
 where
   F: Future<Output = ()> + Send,
 {
-  crate::proxy::serve_v2_policy(bind, Default::default(), Arc::new(state), shutdown).await
+  crate::proxy::serve_v2_policy(bind, state.outbound.clone(), Arc::new(state), shutdown).await
 }
 
 pub struct RuntimeStates {
@@ -355,8 +365,20 @@ pub fn build_runtime_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<RuntimeStates> {
+  build_runtime_states_with_service(plan, tokn_config::v2::ServicePlan::default(), accounts, access, events)
+}
+
+pub fn build_runtime_states_with_service(
+  plan: GatewayPlan,
+  service: tokn_config::v2::ServicePlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+) -> anyhow::Result<RuntimeStates> {
   let plan = Arc::new(plan);
-  let profiles = build_profile_runtimes(plan.clone(), accounts, events, PipelineMode::Full)?;
+  let outbound = service.outbound().to_http_client_options();
+  let request_limits = service.request_limits();
+  let profiles = build_profile_runtimes(plan.clone(), accounts, events, &outbound, PipelineMode::Full)?;
   let mut llm_api = Vec::new();
   let mut forward_proxy = Vec::new();
   for (listener_id, listener) in plan.listeners() {
@@ -366,6 +388,7 @@ pub fn build_runtime_states(
         listener: listener.clone(),
         profiles: profiles.clone(),
         access: access.clone(),
+        request_limits,
       }),
       ListenerPlan::ForwardProxy(listener) => {
         let ca = listener
@@ -379,6 +402,8 @@ pub fn build_runtime_states(
           profiles: profiles.clone(),
           access: access.clone(),
           ca,
+          outbound: outbound.clone(),
+          request_limits,
         });
       }
     }
@@ -393,7 +418,17 @@ pub fn build_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<Vec<AppState>> {
-  build_api_states(plan, accounts, access, events, PipelineMode::Full)
+  build_states_with_service(plan, tokn_config::v2::ServicePlan::default(), accounts, access, events)
+}
+
+pub fn build_states_with_service(
+  plan: GatewayPlan,
+  service: tokn_config::v2::ServicePlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+) -> anyhow::Result<Vec<AppState>> {
+  build_api_states(plan, service, accounts, access, events, PipelineMode::Full)
 }
 
 /// Build v2 LLM listener states whose pipelines stop immediately before the
@@ -405,18 +440,31 @@ pub fn build_dry_run_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<Vec<AppState>> {
-  build_api_states(plan, accounts, access, events, PipelineMode::DryRun)
+  build_dry_run_states_with_service(plan, tokn_config::v2::ServicePlan::default(), accounts, access, events)
+}
+
+pub fn build_dry_run_states_with_service(
+  plan: GatewayPlan,
+  service: tokn_config::v2::ServicePlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+) -> anyhow::Result<Vec<AppState>> {
+  build_api_states(plan, service, accounts, access, events, PipelineMode::DryRun)
 }
 
 fn build_api_states(
   plan: GatewayPlan,
+  service: tokn_config::v2::ServicePlan,
   accounts: &[AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
   mode: PipelineMode,
 ) -> anyhow::Result<Vec<AppState>> {
   let plan = Arc::new(plan);
-  let profiles = build_profile_runtimes(plan.clone(), accounts, events, mode)?;
+  let outbound = service.outbound().to_http_client_options();
+  let request_limits = service.request_limits();
+  let profiles = build_profile_runtimes(plan.clone(), accounts, events, &outbound, mode)?;
   Ok(
     plan
       .listeners()
@@ -427,6 +475,7 @@ fn build_api_states(
           listener: listener.clone(),
           profiles: profiles.clone(),
           access: access.clone(),
+          request_limits,
         }),
         ListenerPlan::ForwardProxy(_) => None,
       })
@@ -438,6 +487,7 @@ fn build_profile_runtimes(
   plan: Arc<GatewayPlan>,
   accounts: &[AccountConfig],
   events: Arc<EventBus>,
+  outbound: &tokn_core::util::http::HttpClientOptions,
   mode: PipelineMode,
 ) -> anyhow::Result<Arc<BTreeMap<ProfileId, ProfileRuntime>>> {
   let mut reachable_profiles = BTreeSet::new();
@@ -452,8 +502,8 @@ fn build_profile_runtimes(
   let providers = link_provider_graph(&plan, accounts, &registry)?;
   let pools = link_account_pools(&plan, &providers)?;
   let pools = build_account_pool_runtimes(&pools);
-  let managed_http = tokn_core::util::http::build_managed_client(&Default::default())?;
-  let opaque_http = tokn_core::util::http::build_opaque_client(&Default::default())?;
+  let managed_http = tokn_core::util::http::build_managed_client(outbound)?;
+  let opaque_http = tokn_core::util::http::build_opaque_client(outbound)?;
 
   let mut profiles = BTreeMap::new();
   for profile_id in reachable_profiles {
@@ -719,7 +769,25 @@ fn proxy_operation(method: &Method, path: &str) -> Option<Endpoint> {
   }
 }
 
+fn decode_opaque_body_for_inspection(
+  headers: &HeaderMap,
+  raw_body: Bytes,
+  max_decoded_bytes: usize,
+) -> Result<Bytes, ApiError> {
+  let decoded = crate::api::codec::request_content_encoding(headers).and_then(|encoding| {
+    crate::api::codec::decode_body_bytes_with_limit(raw_body.clone(), encoding, max_decoded_bytes)
+  });
+  match decoded {
+    Ok(body) => Ok(body),
+    Err(error) => {
+      tracing::debug!(%error, "could not decode opaque request body for inspection");
+      Ok(raw_body)
+    }
+  }
+}
+
 pub fn router(state: AppState) -> Router {
+  let max_wire_bytes = state.request_limits.max_wire_bytes();
   let state = Arc::new(state);
   let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
   Router::new()
@@ -730,6 +798,7 @@ pub fn router(state: AppState) -> Router {
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
     .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+    .layer(DefaultBodyLimit::max(max_wire_bytes))
     .with_state(state)
 }
 
@@ -827,12 +896,12 @@ async fn handle(
 ) -> Result<Response, ApiError> {
   let runtime = state.select_profile(&method, &uri, &headers, endpoint)?;
   let (raw_body, decoded_body, body_json) = if runtime.route_kind == RouteKind::Managed {
-    let mut decoded = crate::api::codec::decode_json_request(&headers, body)?;
+    let mut decoded =
+      crate::api::codec::decode_json_request_with_limit(&headers, body, state.request_limits.max_decoded_bytes())?;
     crate::api::endpoints::apply_endpoint_compat_defaults(endpoint, &headers, &mut decoded)?;
     (decoded.raw_body, decoded.decoded_body, decoded.value)
   } else {
-    let encoding = crate::api::codec::request_content_encoding(&headers)?;
-    let decoded = crate::api::codec::decode_body_bytes(body.clone(), encoding)?;
+    let decoded = decode_opaque_body_for_inspection(&headers, body.clone(), state.request_limits.max_decoded_bytes())?;
     (body, decoded, serde_json::Value::Null)
   };
   let request_id = headers
@@ -1122,5 +1191,183 @@ base_url = "http://127.0.0.1:1/v1"
     assert!(converted);
     assert!(stopped);
     assert!(!sent);
+  }
+
+  #[tokio::test]
+  async fn configured_wire_limit_rejects_large_llm_request() {
+    let compiled = tokn_config::v2::parse_config(
+      r#"
+schema_version = 2
+
+[service.request_limits]
+max_wire_bytes = 4
+max_decoded_bytes = 1024
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "managed" }
+
+[profiles.managed]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = { kind = "fixed", provider = "local" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+
+[account_pools.primary]
+accounts = ["missing"]
+providers = ["local"]
+
+[providers.local]
+driver = "openai"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+      std::path::Path::new("wire-limit.toml"),
+    )
+    .unwrap();
+    let (plan, service) = compiled.into_parts();
+    let account = account_for_provider("local");
+    let mut states = build_states_with_service(
+      plan,
+      service,
+      &[account],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+
+    let response = router(states.pop().unwrap())
+      .oneshot(
+        Request::post("/v1/responses")
+          .header("content-type", "application/json")
+          .body(Body::from(r#"{"model":"gpt-5"}"#))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+  }
+
+  #[tokio::test]
+  async fn configured_decoded_limit_rejects_compressed_llm_request() {
+    let compiled = tokn_config::v2::parse_config(
+      r#"
+schema_version = 2
+
+[service.request_limits]
+max_wire_bytes = 1024
+max_decoded_bytes = 8
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "managed" }
+
+[profiles.managed]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = { kind = "fixed", provider = "local" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+
+[account_pools.primary]
+accounts = ["missing"]
+providers = ["local"]
+
+[providers.local]
+driver = "openai"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+      std::path::Path::new("decoded-limit.toml"),
+    )
+    .unwrap();
+    let (plan, service) = compiled.into_parts();
+    let account = account_for_provider("local");
+    let mut states = build_states_with_service(
+      plan,
+      service,
+      &[account],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+    let body = br#"{"model":"gpt-5","input":"compressible compressible"}"#;
+    let encoded =
+      crate::api::codec::encode_body_bytes(body, Some(crate::api::codec::ContentEncodingKind::Gzip)).unwrap();
+
+    let response = router(states.pop().unwrap())
+      .oneshot(
+        Request::post("/v1/responses")
+          .header("content-type", "application/json")
+          .header("content-encoding", "gzip")
+          .body(Body::from(encoded))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+  }
+
+  #[test]
+  fn opaque_body_inspection_falls_back_to_wire_bytes_on_decode_errors() {
+    let mut headers = HeaderMap::new();
+    headers.insert("content-encoding", "gzip".parse().unwrap());
+    let raw = Bytes::from_static(b"not gzip");
+
+    assert_eq!(
+      decode_opaque_body_for_inspection(&headers, raw.clone(), 1024).unwrap(),
+      raw
+    );
+  }
+
+  #[test]
+  fn opaque_body_inspection_limit_does_not_reject_passthrough() {
+    let mut headers = HeaderMap::new();
+    headers.insert("content-encoding", "gzip".parse().unwrap());
+    let body = b"more than four bytes";
+    let encoded =
+      crate::api::codec::encode_body_bytes(body, Some(crate::api::codec::ContentEncodingKind::Gzip)).unwrap();
+
+    assert_eq!(
+      decode_opaque_body_for_inspection(&headers, encoded.clone(), 4).unwrap(),
+      encoded
+    );
+  }
+
+  fn account_for_provider(provider: &str) -> AccountConfig {
+    AccountConfig {
+      id: "missing".into(),
+      provider: provider.into(),
+      enabled: true,
+      tier: AccountTier::Active,
+      tags: Vec::new(),
+      label: None,
+      base_url: None,
+      headers: Default::default(),
+      auth_type: Some(AuthType::Bearer),
+      username: None,
+      api_key: Some(Secret::new("test-key".into())),
+      api_key_expires_at: None,
+      access_token: None,
+      access_token_expires_at: None,
+      id_token: None,
+      refresh_token: None,
+      provider_account_id: None,
+      extra: Default::default(),
+      refresh_url: None,
+      last_refresh: None,
+      settings: Default::default(),
+    }
   }
 }

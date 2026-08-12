@@ -19,7 +19,7 @@ use crate::Result;
 
 pub mod stages;
 
-pub use stages::RequestEventHandler;
+pub use stages::{RequestEventHandler, RequestPersistenceOptions};
 
 const CACHE_CAP: usize = 3;
 pub(crate) const BOOTSTRAP: &str = include_str!("../../schemas/snapshot/requests/v0.2.0.sql");

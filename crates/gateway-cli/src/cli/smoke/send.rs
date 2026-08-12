@@ -1,7 +1,6 @@
 //! `smoke send` executes one request through a configured v2 LLM listener.
 
 use super::OutputFormat;
-use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
 use axum::body::Body;
 use bytes::Bytes;
@@ -79,7 +78,8 @@ pub struct SendArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
-  let (plan, config_path) = super::load_v2_plan(cfg_path.as_deref())?;
+  let (compiled, config_path) = super::load_v2_config(cfg_path.as_deref())?;
+  let (plan, service) = compiled.into_parts();
   let accounts = crate::server_runtime::load_accounts(Some(&config_path))?;
   let access = Arc::new(tokn_access::AccessStore::disabled());
 
@@ -89,10 +89,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     );
   }
 
-  // V2 does not yet expose operational event/database settings. Match `serve`
-  // by using the existing defaults until those settings move into v2.
-  let operational = Config::default();
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&operational)?;
+  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_v2_event_bus(service.persistence())?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
   let captured = Captured::install(&events);
   if args.format == OutputFormat::Text {
@@ -100,9 +97,9 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
   }
 
   let states = if args.dry_run {
-    tokn_router::v2::build_dry_run_states(plan, &accounts, access.clone(), events.clone())?
+    tokn_router::v2::build_dry_run_states_with_service(plan, service, &accounts, access.clone(), events.clone())?
   } else {
-    tokn_router::v2::build_states(plan, &accounts, access.clone(), events.clone())?
+    tokn_router::v2::build_states_with_service(plan, service, &accounts, access.clone(), events.clone())?
   };
   let state = select_listener(states, args.listener.as_deref())?;
   let listener_id = state.listener_id().to_string();

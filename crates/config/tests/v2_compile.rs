@@ -1,5 +1,8 @@
 use std::path::Path;
-use tokn_config::v2::{compile, decode, load, parse, CompileError, Error};
+use tokn_config::v2::{
+  compile, decode, load, parse, parse_config, CompileError, Error, DEFAULT_BODY_MAX_BYTES, DEFAULT_MAX_DECODED_BYTES,
+  DEFAULT_MAX_WIRE_BYTES, DEFAULT_WRITE_QUEUE_CAPACITY,
+};
 use tokn_policy::{ConnectAction, HttpAction, ListenerPlan, RouteKind};
 
 const MINIMAL_MANAGED: &str = r#"
@@ -48,6 +51,116 @@ fn minimal_managed_llm_listener_compiles() {
   ));
   assert_eq!(plan.routes().get("default").unwrap().kind(), RouteKind::Managed);
   assert_eq!(plan.account_pools().len(), 1);
+}
+
+#[test]
+fn service_defaults_match_v2_operational_defaults() {
+  let compiled = parse_config(MINIMAL_MANAGED, Path::new("config.toml")).unwrap();
+  let service = compiled.service();
+
+  assert_eq!(service.outbound().proxy_url(), None);
+  assert!(service.outbound().no_proxy().is_empty());
+  assert!(!service.outbound().use_system_proxy());
+  assert_eq!(
+    service.request_limits().max_wire_bytes(),
+    DEFAULT_MAX_WIRE_BYTES as usize
+  );
+  assert_eq!(
+    service.request_limits().max_decoded_bytes(),
+    DEFAULT_MAX_DECODED_BYTES as usize
+  );
+  let persistence = service.persistence();
+  assert!(persistence.enabled());
+  assert!(persistence.record_sessions());
+  assert!(persistence.record_request_bodies());
+  assert_eq!(persistence.body_max_bytes(), DEFAULT_BODY_MAX_BYTES as usize);
+  assert_eq!(
+    persistence.write_queue_capacity(),
+    DEFAULT_WRITE_QUEUE_CAPACITY as usize
+  );
+  assert_eq!(persistence.archive_extension(), None);
+}
+
+#[test]
+fn service_settings_compile_and_normalize() {
+  let config = MINIMAL_MANAGED.replacen(
+    "[listeners.api]",
+    r#"[service.outbound]
+proxy_url = "socks5h://proxy.example:1080"
+no_proxy = [" localhost ", "localhost", "", " 10.0.0.0/8 "]
+
+[service.request_limits]
+max_wire_bytes = 1048576
+max_decoded_bytes = 4194304
+
+[service.persistence]
+usage_db_path = "state/custom-usage.db"
+sessions_db_path = "state/custom-sessions.db"
+requests_dir = "state/custom-requests"
+record_sessions = false
+record_request_bodies = false
+body_max_bytes = 12345
+write_queue_capacity = 17
+archive_extension = "db.zstd"
+
+[listeners.api]"#,
+    1,
+  );
+
+  let compiled = parse_config(&config, Path::new("config.toml")).unwrap();
+  let service = compiled.service();
+  assert_eq!(service.outbound().proxy_url(), Some("socks5h://proxy.example:1080"));
+  assert_eq!(service.outbound().no_proxy(), ["localhost", "10.0.0.0/8"]);
+  assert_eq!(service.request_limits().max_wire_bytes(), 1_048_576);
+  assert_eq!(service.request_limits().max_decoded_bytes(), 4_194_304);
+
+  let persistence = service.persistence();
+  assert!(!persistence.record_sessions());
+  assert!(!persistence.record_request_bodies());
+  assert_eq!(persistence.body_max_bytes(), 12_345);
+  assert_eq!(persistence.write_queue_capacity(), 256);
+  assert_eq!(persistence.archive_extension(), Some("db.zstd"));
+  let paths = persistence.resolve_paths().unwrap();
+  assert_eq!(paths.usage_db, Path::new("state/custom-usage.db"));
+  assert_eq!(paths.sessions_db, Path::new("state/custom-sessions.db"));
+  assert_eq!(paths.requests_dir, Path::new("state/custom-requests"));
+}
+
+#[test]
+fn service_rejects_invalid_proxy_and_request_limits() {
+  for (settings, location) in [
+    ("proxy_url = \"ftp://proxy.example\"", "service.outbound.proxy_url"),
+    (
+      "proxy_url = \"http://proxy.example\"\nuse_system_proxy = true",
+      "service.outbound",
+    ),
+    ("no_proxy = [\"localhost\"]", "service.outbound.no_proxy"),
+  ] {
+    let config = MINIMAL_MANAGED.replacen(
+      "[listeners.api]",
+      &format!("[service.outbound]\n{settings}\n\n[listeners.api]"),
+      1,
+    );
+    let error = unwrap_compile_error(parse_config(&config, Path::new("config.toml")).unwrap_err());
+    assert!(matches!(
+      *error,
+      CompileError::InvalidValue { location: actual, .. } if actual == location
+    ));
+  }
+
+  for field in ["max_wire_bytes", "max_decoded_bytes"] {
+    let config = MINIMAL_MANAGED.replacen(
+      "[listeners.api]",
+      &format!("[service.request_limits]\n{field} = 0\n\n[listeners.api]"),
+      1,
+    );
+    let error = unwrap_compile_error(parse_config(&config, Path::new("config.toml")).unwrap_err());
+    assert!(matches!(
+      *error,
+      CompileError::InvalidValue { location, .. }
+        if location == format!("service.request_limits.{field}")
+    ));
+  }
 }
 
 #[test]
@@ -150,6 +263,23 @@ fn parse_rejects_unknown_fields() {
     parse(&config, Path::new("config.toml")),
     Err(Error::Parse { .. })
   ));
+
+  for section in [
+    "service",
+    "service.outbound",
+    "service.request_limits",
+    "service.persistence",
+  ] {
+    let config = MINIMAL_MANAGED.replacen(
+      "[listeners.api]",
+      &format!("[{section}]\nunknown = true\n\n[listeners.api]"),
+      1,
+    );
+    assert!(matches!(
+      parse_config(&config, Path::new("config.toml")),
+      Err(Error::Parse { .. })
+    ));
+  }
 }
 
 #[test]
