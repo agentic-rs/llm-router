@@ -1,3 +1,4 @@
+use http::uri::PathAndQuery;
 use reqwest::Url;
 use smol_str::SmolStr;
 use std::fmt;
@@ -80,6 +81,25 @@ impl CanonicalUpstreamUrl {
     drop(path);
     Ok(url)
   }
+
+  /// Append an opaque relay request target beneath this configured prefix.
+  pub fn relay_url(&self, target: &PathAndQuery) -> Result<Url, InvalidRequestUrl> {
+    let path = validated_request_path(target)?;
+    let relative_path = path.strip_prefix('/').expect("validated HTTP paths start with '/'");
+    let raw = compose_request_url(self.as_str(), relative_path, target.query());
+    let url = parse_composed_request_url(&raw)?;
+    let expected_origin = self.url.origin().ascii_serialization();
+    ensure_origin(&url, &expected_origin)?;
+    if !url.path().starts_with(self.url.path()) {
+      return Err(InvalidRequestUrl::DiscardedPrefix {
+        expected: SmolStr::new(self.url.path()),
+        found: SmolStr::new(url.path()),
+      });
+    }
+    let expected_path = format!("{}{}", self.url.path(), relative_path);
+    ensure_path_and_query(&url, &expected_path, target.query())?;
+    Ok(url)
+  }
 }
 
 impl AsRef<str> for CanonicalUpstreamUrl {
@@ -111,6 +131,16 @@ impl CanonicalHttpOrigin {
 
   pub fn as_str(&self) -> &str {
     self.0.as_str()
+  }
+
+  /// Build a request URL at this exact admitted origin.
+  pub fn request_url(&self, target: &PathAndQuery) -> Result<Url, InvalidRequestUrl> {
+    let path = validated_request_path(target)?;
+    let raw = compose_request_url(self.as_str(), &path, target.query());
+    let url = parse_composed_request_url(&raw)?;
+    ensure_origin(&url, self.as_str())?;
+    ensure_path_and_query(&url, &path, target.query())?;
+    Ok(url)
   }
 }
 
@@ -195,6 +225,156 @@ impl fmt::Display for InvalidOperationPath {
 }
 
 impl std::error::Error for InvalidOperationPath {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvalidRequestUrl {
+  InvalidPath(String),
+  InvalidUrl(InvalidUpstreamUrl),
+  ChangedOrigin {
+    expected: SmolStr,
+    found: SmolStr,
+  },
+  DiscardedPrefix {
+    expected: SmolStr,
+    found: SmolStr,
+  },
+  ChangedPath {
+    expected: SmolStr,
+    found: SmolStr,
+  },
+  ChangedQuery {
+    expected: Option<SmolStr>,
+    found: Option<SmolStr>,
+  },
+}
+
+impl fmt::Display for InvalidRequestUrl {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::InvalidPath(message) => write!(formatter, "invalid HTTP request path: {message}"),
+      Self::InvalidUrl(source) => write!(formatter, "invalid composed request URL: {source}"),
+      Self::ChangedOrigin { expected, found } => {
+        write!(
+          formatter,
+          "request target changed origin from '{expected}' to '{found}'"
+        )
+      }
+      Self::DiscardedPrefix { expected, found } => {
+        write!(
+          formatter,
+          "request target discarded prefix '{expected}', producing '{found}'"
+        )
+      }
+      Self::ChangedPath { expected, found } => {
+        write!(
+          formatter,
+          "URL parsing changed request path from '{expected}' to '{found}'"
+        )
+      }
+      Self::ChangedQuery { expected, found } => {
+        write!(
+          formatter,
+          "URL parsing changed request query from {expected:?} to {found:?}"
+        )
+      }
+    }
+  }
+}
+
+impl std::error::Error for InvalidRequestUrl {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::InvalidUrl(source) => Some(source),
+      _ => None,
+    }
+  }
+}
+
+fn validated_request_path(target: &PathAndQuery) -> Result<String, InvalidRequestUrl> {
+  let raw = target.path();
+  if raw.is_empty() || !raw.starts_with('/') || !raw.is_ascii() {
+    return Err(InvalidRequestUrl::InvalidPath(
+      "path must be non-empty ASCII and start with '/'".into(),
+    ));
+  }
+  if raw
+    .split('/')
+    .any(|segment| matches!(canonical_dot_segment(segment).as_deref(), Some(".") | Some("..")))
+  {
+    return Err(InvalidRequestUrl::InvalidPath("dot segments are not allowed".into()));
+  }
+  Ok(raw.to_string())
+}
+
+fn canonical_dot_segment(segment: &str) -> Option<String> {
+  let bytes = segment.as_bytes();
+  let mut dots = String::new();
+  let mut index = 0;
+  while index < bytes.len() {
+    if bytes[index] == b'.' {
+      dots.push('.');
+      index += 1;
+    } else if bytes
+      .get(index..index + 3)
+      .is_some_and(|value| value[0] == b'%' && value[1] == b'2' && value[2].eq_ignore_ascii_case(&b'e'))
+    {
+      dots.push('.');
+      index += 3;
+    } else {
+      return None;
+    }
+  }
+  Some(dots)
+}
+
+fn compose_request_url(base: &str, path: &str, query: Option<&str>) -> String {
+  let mut raw = String::with_capacity(base.len() + path.len() + query.map_or(0, |query| query.len() + 1));
+  raw.push_str(base);
+  raw.push_str(path);
+  if let Some(query) = query {
+    raw.push('?');
+    raw.push_str(query);
+  }
+  raw
+}
+
+fn parse_composed_request_url(raw: &str) -> Result<Url, InvalidRequestUrl> {
+  parse_http_url(raw)
+    .map(|(url, _)| url)
+    .map_err(InvalidRequestUrl::InvalidUrl)
+}
+
+fn ensure_origin(url: &Url, expected: &str) -> Result<(), InvalidRequestUrl> {
+  let found = url.origin().ascii_serialization();
+  if found == expected {
+    Ok(())
+  } else {
+    Err(InvalidRequestUrl::ChangedOrigin {
+      expected: SmolStr::new(expected),
+      found: SmolStr::new(found),
+    })
+  }
+}
+
+fn ensure_path_and_query(
+  url: &Url,
+  expected_path: &str,
+  expected_query: Option<&str>,
+) -> Result<(), InvalidRequestUrl> {
+  if url.path() != expected_path {
+    return Err(InvalidRequestUrl::ChangedPath {
+      expected: SmolStr::new(expected_path),
+      found: SmolStr::new(url.path()),
+    });
+  }
+  if url.query() != expected_query {
+    return Err(InvalidRequestUrl::ChangedQuery {
+      expected: expected_query.map(SmolStr::new),
+      found: url.query().map(SmolStr::new),
+    });
+  }
+  Ok(())
+}
 
 fn parse_http_url(raw: &str) -> Result<(Url, CanonicalAuthority), InvalidUpstreamUrl> {
   if !raw.is_ascii() {
@@ -408,6 +588,47 @@ mod tests {
       url.as_str(),
       "https://api.example.com/backend/models?client_version=0.130.0%2Bdev"
     );
+  }
+
+  #[test]
+  fn relay_urls_preserve_prefix_path_and_query() {
+    let base = CanonicalUpstreamUrl::parse(
+      "https://api.example.com/proxy/openai/v1",
+      CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+    let target = "/chat/completions?stream=true".parse::<PathAndQuery>().unwrap();
+    assert_eq!(
+      base.relay_url(&target).unwrap().as_str(),
+      "https://api.example.com/proxy/openai/v1/chat/completions?stream=true"
+    );
+
+    let root = "/".parse::<PathAndQuery>().unwrap();
+    assert_eq!(
+      base.relay_url(&root).unwrap().as_str(),
+      "https://api.example.com/proxy/openai/v1/"
+    );
+  }
+
+  #[test]
+  fn origin_request_urls_preserve_exact_origin() {
+    let origin = CanonicalHttpOrigin::parse("https://api.example.com:8443", CleartextHttpPolicy::LoopbackOnly).unwrap();
+    let target = "/models?limit=10".parse::<PathAndQuery>().unwrap();
+    assert_eq!(
+      origin.request_url(&target).unwrap().as_str(),
+      "https://api.example.com:8443/models?limit=10"
+    );
+  }
+
+  #[test]
+  fn request_urls_reject_dot_segments() {
+    let base = CanonicalUpstreamUrl::parse("https://api.example.com/v1", CleartextHttpPolicy::LoopbackOnly).unwrap();
+    let origin = CanonicalHttpOrigin::parse("https://api.example.com", CleartextHttpPolicy::LoopbackOnly).unwrap();
+    for raw in ["/../models", "/%2e%2e/models", "/.%2E/models"] {
+      let target = raw.parse::<PathAndQuery>().unwrap();
+      assert!(base.relay_url(&target).is_err(), "accepted {raw:?}");
+      assert!(origin.request_url(&target).is_err(), "accepted {raw:?}");
+    }
   }
 
   #[test]

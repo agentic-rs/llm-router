@@ -46,8 +46,9 @@ hosts = ["blocked.example"]
       .unwrap()
       .is_empty()
   );
-  let state = tokn_router::v2::build_forward_proxy_states(&plan, access)
+  let state = tokn_router::v2::build_runtime_states(plan, &[], access, Arc::new(EventBus::noop()))
     .unwrap()
+    .forward_proxy
     .pop()
     .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -58,7 +59,7 @@ hosts = ["blocked.example"]
 
   let mut unauthenticated_get = TcpStream::connect(proxy_addr).await.unwrap();
   unauthenticated_get
-    .write_all(b"GET / HTTP/1.1\r\nHost: proxy\r\n\r\n")
+    .write_all(b"GET http://blocked.example/ HTTP/1.1\r\nHost: blocked.example\r\n\r\n")
     .await
     .unwrap();
   assert!(read_response_head(&mut unauthenticated_get)
@@ -97,7 +98,10 @@ hosts = ["blocked.example"]
     .await
     .unwrap();
   let response = read_response_head(&mut tunnel).await;
-  assert!(response.starts_with("HTTP/1.1 200 Connection Established"));
+  assert!(
+    response.starts_with("HTTP/1.1 200"),
+    "unexpected CONNECT response: {response:?}"
+  );
   tunnel.write_all(b"ping").await.unwrap();
   let mut reply = [0_u8; 4];
   tunnel.read_exact(&mut reply).await.unwrap();
@@ -109,26 +113,373 @@ hosts = ["blocked.example"]
 }
 
 #[test]
-fn v2_forward_proxy_rejects_interception_until_http_dispatch_is_adapted() {
+fn v2_forward_proxy_materializes_interception_ca() {
+  let ca = tempfile::tempdir().unwrap();
   let plan = tokn_config::v2::parse(
-    r#"
+    &format!(
+      r#"
 schema_version = 2
 
 [listeners.proxy]
 kind = "forward_proxy"
 bind = "127.0.0.1:8080"
 client_auth = "none"
-default_http_action = { kind = "reject" }
+default_http_action = {{ kind = "reject" }}
 default_connect = "intercept"
-ca_dir = "certificates"
+ca_dir = "{}"
 "#,
+      ca.path().display()
+    ),
     Path::new("v2-forward-proxy.toml"),
   )
   .unwrap();
-  let error = tokn_router::v2::build_forward_proxy_states(&plan, Arc::new(AccessStore::disabled()))
-    .err()
+  let state =
+    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+      .unwrap()
+      .forward_proxy
+      .pop()
+      .unwrap();
+  assert_eq!(state.listener_id().as_str(), "proxy");
+  assert!(ca.path().join("ca.crt").exists());
+}
+
+#[tokio::test]
+async fn v2_forward_proxy_routes_absolute_http_transparently() {
+  let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let upstream_addr = upstream.local_addr().unwrap();
+  let received = tokio::spawn(async move {
+    let (mut stream, _) = upstream.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+      let read = stream.read(&mut buffer).await.unwrap();
+      assert!(read > 0);
+      request.extend_from_slice(&buffer[..read]);
+      if request.windows(4).any(|window| window == b"\r\n\r\n") && request.ends_with(b"hello") {
+        break;
+      }
+    }
+    stream
+      .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close\r\n\r\nworld")
+      .await
+      .unwrap();
+    request
+  });
+
+  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = probe.local_addr().unwrap();
+  drop(probe);
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "transparent" }}
+default_connect = "reject"
+
+[profiles.transparent]
+route = "transparent"
+
+[routes.transparent]
+kind = "transparent"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
+  let state =
+    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+      .unwrap()
+      .forward_proxy
+      .pop()
+      .unwrap();
+  let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let _ = shutdown_rx.await;
+  }));
+  wait_for_listener(proxy_addr).await;
+
+  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  client
+    .write_all(
+      format!(
+        "POST http://{upstream_addr}/opaque?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+      )
+      .as_bytes(),
+    )
+    .await
     .unwrap();
-  assert!(error.to_string().contains("CONNECT interception"));
+  let mut response = Vec::new();
+  client.read_to_end(&mut response).await.unwrap();
+  assert!(
+    response.starts_with(b"HTTP/1.1 201 Created"),
+    "unexpected response: {}",
+    String::from_utf8_lossy(&response)
+  );
+  assert!(String::from_utf8_lossy(&response)
+    .to_ascii_lowercase()
+    .contains("content-length: 5\r\n"));
+  assert!(response.windows(5).any(|window| window == b"world"));
+
+  let request = String::from_utf8(received.await.unwrap()).unwrap();
+  assert!(request.starts_with("POST /opaque?x=1 HTTP/1.1\r\n"));
+  assert!(request.contains("authorization: Bearer client\r\n"));
+  assert!(!request.to_ascii_lowercase().contains("proxy-authorization"));
+  assert!(request.ends_with("hello"));
+
+  shutdown_tx.send(()).unwrap();
+  proxy_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn v2_forward_proxy_intercepts_tls_and_reuses_http_policy() {
+  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = probe.local_addr().unwrap();
+  drop(probe);
+  let ca = tempfile::tempdir().unwrap();
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+default_connect = "intercept"
+ca_dir = "{}"
+"#,
+    ca.path().display()
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
+  let state =
+    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+      .unwrap()
+      .forward_proxy
+      .pop()
+      .unwrap();
+  let cert_path = ca.path().join("ca.crt");
+  let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let _ = shutdown_rx.await;
+  }));
+  wait_for_listener(proxy_addr).await;
+
+  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  client
+    .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
+    .await
+    .unwrap();
+  let head = read_response_head(&mut client).await;
+  assert!(head.starts_with("HTTP/1.1 200"));
+
+  let cert_file = std::fs::File::open(cert_path).unwrap();
+  let mut cert_reader = std::io::BufReader::new(cert_file);
+  let certs = rustls_pemfile::certs(&mut cert_reader)
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(certs[0].clone()).unwrap();
+  let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+  let server_name = rustls::pki_types::ServerName::try_from("api.example.test")
+    .unwrap()
+    .to_owned();
+  let mut tls = tokio_rustls::TlsConnector::from(Arc::new(tls))
+    .connect(server_name, client)
+    .await
+    .unwrap();
+  tls
+    .write_all(
+      b"POST /v1/responses HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+  let mut response = Vec::new();
+  tls.read_to_end(&mut response).await.unwrap();
+  assert!(response.starts_with(b"HTTP/1.1 403 Forbidden"));
+
+  shutdown_tx.send(()).unwrap();
+  proxy_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn v2_forward_proxy_relay_selects_provider_from_original_origin() {
+  let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let upstream_addr = upstream.local_addr().unwrap();
+  let received = tokio::spawn(async move {
+    let (mut stream, _) = upstream.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+      let read = stream.read(&mut buffer).await.unwrap();
+      assert!(read > 0);
+      request.extend_from_slice(&buffer[..read]);
+      if request.windows(4).any(|window| window == b"\r\n\r\n") && request.ends_with(b"hello") {
+        break;
+      }
+    }
+    stream
+      .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nretry")
+      .await
+      .unwrap();
+    request
+  });
+
+  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = probe.local_addr().unwrap();
+  drop(probe);
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "relay" }}
+default_connect = "reject"
+
+[profiles.relay]
+route = "relay"
+
+[routes.relay]
+kind = "relay"
+target = {{ kind = "provider_from_origin", account_pool = "primary" }}
+
+[account_pools.primary]
+accounts = ["acct"]
+providers = ["local"]
+
+[providers.local]
+driver = "llama-cpp"
+base_url = "http://{upstream_addr}/v1"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
+  let account = toml::from_str(
+    r#"
+id = "acct"
+provider = "local"
+api_key = "router-secret"
+"#,
+  )
+  .unwrap();
+  let state = tokn_router::v2::build_runtime_states(
+    plan,
+    &[account],
+    Arc::new(AccessStore::disabled()),
+    Arc::new(EventBus::noop()),
+  )
+  .unwrap()
+  .forward_proxy
+  .pop()
+  .unwrap();
+  let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let _ = shutdown_rx.await;
+  }));
+  wait_for_listener(proxy_addr).await;
+
+  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  client
+    .write_all(
+      format!(
+        "POST http://{upstream_addr}/custom?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client-secret\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+      )
+      .as_bytes(),
+    )
+    .await
+    .unwrap();
+  let mut response = Vec::new();
+  client.read_to_end(&mut response).await.unwrap();
+  assert!(
+    response.starts_with(b"HTTP/1.1 503 Service Unavailable"),
+    "unexpected response: {}",
+    String::from_utf8_lossy(&response)
+  );
+  assert!(response.windows(5).any(|window| window == b"retry"));
+
+  let request = String::from_utf8(received.await.unwrap()).unwrap();
+  assert!(request.starts_with("POST /custom?x=1 HTTP/1.1\r\n"));
+  assert!(!request.contains("client-secret"));
+  assert!(request
+    .to_ascii_lowercase()
+    .contains("authorization: bearer router-secret"));
+  assert!(request.ends_with("hello"));
+
+  shutdown_tx.send(()).unwrap();
+  proxy_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn v2_forward_proxy_shutdown_cancels_an_active_tunnel() {
+  let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let upstream_addr = upstream.local_addr().unwrap();
+  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = probe.local_addr().unwrap();
+  drop(probe);
+  let plan = tokn_config::v2::parse(
+    &format!(
+      r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+default_connect = "tunnel"
+"#
+    ),
+    Path::new("v2-forward-proxy.toml"),
+  )
+  .unwrap();
+  let state =
+    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+      .unwrap()
+      .forward_proxy
+      .pop()
+      .unwrap();
+  let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let _ = shutdown_rx.await;
+  }));
+  wait_for_listener(proxy_addr).await;
+
+  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  client
+    .write_all(format!("CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  assert!(read_response_head(&mut client).await.starts_with("HTTP/1.1 200"));
+  let (mut upstream_stream, _) = upstream.accept().await.unwrap();
+
+  shutdown_tx.send(()).unwrap();
+  tokio::time::timeout(std::time::Duration::from_secs(1), proxy_task)
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+  let mut byte = [0_u8; 1];
+  assert_eq!(
+    tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut byte))
+      .await
+      .unwrap()
+      .unwrap(),
+    0
+  );
+  assert_eq!(
+    tokio::time::timeout(std::time::Duration::from_secs(1), upstream_stream.read(&mut byte))
+      .await
+      .unwrap()
+      .unwrap(),
+    0
+  );
 }
 
 async fn connect(proxy_addr: std::net::SocketAddr, authority: &str, token: Option<&str>) -> String {

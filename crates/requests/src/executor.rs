@@ -12,7 +12,7 @@
 //! [`PipelineRunner`]: crate::PipelineRunner
 
 use crate::pipeline::error::PipelineError;
-use crate::pipeline::stages::ConvertedBody;
+use crate::pipeline::stages::{ConvertedBody, ConvertedResponseKind};
 use crate::pipeline::{ConvertedResponse, PipelineRunner, RawInbound, RunConfig};
 use bytes::Bytes;
 use http::{Method, Uri};
@@ -56,7 +56,10 @@ struct PreparedBody {
 /// Compatibility response-body classification retained in HTTP extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineResponseKind {
+  /// Managed response whose downstream headers are rebuilt for JSON.
   Buffered,
+  /// Opaque response whose upstream status, headers, and body stay aligned.
+  Opaque,
   Stream,
 }
 
@@ -291,12 +294,25 @@ async fn execution_from_http(request: tokn_service::Request) -> Result<Execution
 }
 
 fn converted_to_http(response: ConvertedResponse) -> Result<tokn_service::Response, RequestError> {
-  let ConvertedResponse { status, headers, body } = response;
-  let (body, kind) = match body {
-    ConvertedBody::Buffered { body_bytes, .. } => {
+  let ConvertedResponse {
+    status,
+    headers,
+    kind,
+    body,
+  } = response;
+  let (body, kind) = match (kind, body) {
+    (ConvertedResponseKind::Managed, ConvertedBody::Buffered { body_bytes, .. }) => {
       (tokn_service::body::full(body_bytes), PipelineResponseKind::Buffered)
     }
-    ConvertedBody::Stream { body } => (tokn_service::body::stream(body), PipelineResponseKind::Stream),
+    (ConvertedResponseKind::Managed, ConvertedBody::Stream { body }) => {
+      (tokn_service::body::stream(body), PipelineResponseKind::Stream)
+    }
+    (ConvertedResponseKind::Opaque, ConvertedBody::Buffered { body_bytes, .. }) => {
+      (tokn_service::body::full(body_bytes), PipelineResponseKind::Opaque)
+    }
+    (ConvertedResponseKind::Opaque, ConvertedBody::Stream { body }) => {
+      (tokn_service::body::stream(body), PipelineResponseKind::Opaque)
+    }
   };
   let mut response = http::Response::builder()
     .status(status)
@@ -438,5 +454,30 @@ mod tests {
     assert_eq!(execution.config().get_str("custom.value"), Some("present"));
     assert_eq!(execution.inbound().request_id.as_deref(), Some("req-service-test"));
     assert_eq!(execution.inbound().body_json, serde_json::json!({}));
+  }
+
+  #[test]
+  fn native_response_classification_is_explicit() {
+    for (kind, body_json, expected) in [
+      (
+        ConvertedResponseKind::Managed,
+        Some(Arc::new(serde_json::json!({"ok": true}))),
+        PipelineResponseKind::Buffered,
+      ),
+      (ConvertedResponseKind::Managed, None, PipelineResponseKind::Buffered),
+      (ConvertedResponseKind::Opaque, None, PipelineResponseKind::Opaque),
+    ] {
+      let response = converted_to_http(ConvertedResponse {
+        status: 200,
+        headers: HeaderMap::new(),
+        kind,
+        body: ConvertedBody::Buffered {
+          body_json,
+          body_bytes: Bytes::from_static(b"body"),
+        },
+      })
+      .unwrap();
+      assert_eq!(response.extensions().get::<PipelineResponseKind>(), Some(&expected));
+    }
   }
 }

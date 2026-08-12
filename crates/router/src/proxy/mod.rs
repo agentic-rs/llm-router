@@ -14,11 +14,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokn_accounts::registry::Registry;
 use tokn_auth::descriptor::RewriteTarget;
 use tokn_core::util::http::HttpClientOptions;
-use tokn_policy::{CanonicalHost, ConnectAction};
 use transport::handle_client;
+use v2_transport::handle_v2_client;
+
+mod v2_transport;
 
 fn is_benign_disconnect(err: &anyhow::Error) -> bool {
   let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
@@ -67,8 +71,6 @@ pub struct ProxyOptions {
 
 pub type ProxyPlainHttpHandler =
   Arc<dyn Fn(ProxyPlainHttpRequest) -> Option<ProxyPlainHttpResponse> + Send + Sync + 'static>;
-
-pub(crate) type ProxyConnectPolicy = Arc<dyn Fn(&CanonicalHost, u16) -> ConnectAction + Send + Sync + 'static>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyPlainHttpRequest {
@@ -139,32 +141,10 @@ where
   Ok(())
 }
 
-pub(crate) async fn serve_connect_policy<F>(
+pub(crate) async fn serve_v2_policy<F>(
   addr: SocketAddr,
   outbound_proxy: HttpClientOptions,
-  connect_policy: ProxyConnectPolicy,
-  client_auth: Option<Arc<tokn_access::AccessStore>>,
-  shutdown: F,
-) -> Result<()>
-where
-  F: Future<Output = ()> + Send,
-{
-  serve_policy_runtime(
-    addr,
-    outbound_proxy,
-    transport::ProxyRuntime::Policy {
-      connect_policy,
-      client_auth,
-    },
-    shutdown,
-  )
-  .await
-}
-
-async fn serve_policy_runtime<F>(
-  addr: SocketAddr,
-  outbound_proxy: HttpClientOptions,
-  runtime: transport::ProxyRuntime,
+  state: Arc<crate::v2::ForwardProxyState>,
   shutdown: F,
 ) -> Result<()>
 where
@@ -172,31 +152,42 @@ where
 {
   let listener = TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
   let outbound_proxy = Arc::new(connect_proxy::ConnectProxy::from_options(&outbound_proxy));
-
-  tracing::info!(%addr, "tokn-router proxy listening");
-
+  tracing::info!(%addr, "tokn-router v2 proxy listening");
+  let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
+  let mut connections = JoinSet::new();
   tokio::pin!(shutdown);
-
   loop {
     tokio::select! {
+      biased;
       _ = &mut shutdown => break,
+      joined = connections.join_next(), if !connections.is_empty() => {
+        if let Err(error) = joined.expect("a nonempty connection set has one task to join") {
+          tracing::warn!(%error, "v2 proxy connection task failed");
+        }
+      }
       accept = listener.accept() => {
         let (stream, peer) = accept?;
-        let runtime = runtime.clone();
+        let state = state.clone();
         let outbound_proxy = outbound_proxy.clone();
-        tokio::spawn(async move {
-          if let Err(err) = handle_client(stream, peer, runtime, outbound_proxy, None).await {
-            if is_benign_disconnect(&err) {
-              tracing::debug!(%peer, error = %err, "proxy connection closed by peer");
+        let connection_shutdown = connection_shutdown_rx.clone();
+        connections.spawn(async move {
+          if let Err(error) = handle_v2_client(stream, peer, state, outbound_proxy, connection_shutdown).await {
+            if is_benign_disconnect(&error) {
+              tracing::debug!(%peer, %error, "v2 proxy connection closed by peer");
             } else {
-              tracing::warn!(%peer, error = %err, "proxy connection failed");
+              tracing::warn!(%peer, %error, "v2 proxy connection failed");
             }
           }
         });
       }
     }
   }
-
+  let _ = connection_shutdown_tx.send(true);
+  while let Some(joined) = connections.join_next().await {
+    if let Err(error) = joined {
+      tracing::warn!(%error, "v2 proxy connection task failed during shutdown");
+    }
+  }
   Ok(())
 }
 
@@ -277,8 +268,6 @@ fn split_authority(authority: &str) -> Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
   #[test]
   fn benign_disconnect_matches_unexpected_eof() {
     let err = anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended"));
@@ -295,44 +284,5 @@ mod tests {
   fn benign_disconnect_rejects_other_errors() {
     let err = anyhow::anyhow!("invalid CONNECT authority");
     assert!(!is_benign_disconnect(&err));
-  }
-
-  #[tokio::test]
-  async fn policy_transport_refuses_unadapted_interception() {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(serve_connect_policy(
-      addr,
-      HttpClientOptions::default(),
-      Arc::new(|_, _| ConnectAction::Intercept),
-      None,
-      async {
-        let _ = shutdown_rx.await;
-      },
-    ));
-    let mut stream = None;
-    for _ in 0..50 {
-      match tokio::net::TcpStream::connect(addr).await {
-        Ok(connected) => {
-          stream = Some(connected);
-          break;
-        }
-        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-      }
-    }
-    let mut stream = stream.expect("policy proxy listener should start");
-
-    stream
-      .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
-      .await
-      .unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
-    assert!(response.starts_with(b"HTTP/1.1 501 Not Implemented"));
-
-    shutdown_tx.send(()).unwrap();
-    server.await.unwrap().unwrap();
   }
 }

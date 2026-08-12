@@ -178,8 +178,9 @@ async fn serve_v2_plan(
   args: ServeArgs,
   shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-  let proxy_states = tokn_router::v2::build_forward_proxy_states(&plan, access.clone())?;
-  let states = tokn_router::v2::build_states(plan, accounts, access, events)?;
+  let states = tokn_router::v2::build_runtime_states(plan, accounts, access, events)?;
+  let proxy_states = states.forward_proxy;
+  let states = states.llm_api;
   let listener_count = states.len() + proxy_states.len();
   if listener_count != 1 && (args.host.is_some() || args.port.is_some()) {
     anyhow::bail!("--host and --port can only override a v2 config with exactly one listener");

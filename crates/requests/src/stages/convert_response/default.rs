@@ -17,7 +17,7 @@
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, RequestsError};
-use crate::pipeline::stages::{ConvertResponseStage, ConvertedBody, ConvertedResponse};
+use crate::pipeline::stages::{ConvertResponseStage, ConvertedBody, ConvertedResponse, ConvertedResponseKind};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
@@ -81,6 +81,7 @@ impl ConvertResponseStage for DefaultConvertResponse {
       return Ok(ConvertedResponse {
         status,
         headers,
+        kind: ConvertedResponseKind::Managed,
         body: ConvertedBody::Buffered {
           body_json: None,
           body_bytes: Bytes::new(),
@@ -124,6 +125,7 @@ impl ConvertResponseStage for DefaultConvertResponse {
     Ok(ConvertedResponse {
       status,
       headers,
+      kind: ConvertedResponseKind::Managed,
       body: ConvertedBody::Buffered {
         body_json: Some(Arc::new(body_json)),
         body_bytes,
@@ -203,6 +205,7 @@ impl ConvertResponseStage for DefaultConvertResponse {
     Ok(ConvertedResponse {
       status,
       headers,
+      kind: ConvertedResponseKind::Managed,
       body: ConvertedBody::Stream { body: pipeline.run() },
     })
   }

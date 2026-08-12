@@ -8,27 +8,30 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use selector::{PoolAwareSend, V2AccountSelector};
+use selector::{PoolAwareSend, ProxyPoolAwareSend, V2AccountSelector, V2ProxyResolve, V2_PROXY_ORIGIN_KEY};
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokn_access::AccessContext;
-use tokn_accounts::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph};
+use tokn_accounts::link::{
+  build_account_pool_runtimes, link_account_pools, link_provider_graph, AccountPoolRuntimes, ProviderGraph,
+};
 use tokn_accounts::registry::Registry;
 use tokn_core::account::AccountConfig;
 use tokn_core::event::EventBus;
 use tokn_core::provider::Endpoint;
+use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_core::AgentId;
 use tokn_policy::{
   CanonicalAuthority, CanonicalHost, ClientAuthPlan, ConnectAction, ForwardProxyListenerPlan, GatewayPlan, HttpAction,
-  HttpMatch, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ProfileId, RelayRetry, RouteKind, RoutePlan,
-  WireIdentity,
+  HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ProfileId, RelayRetry,
+  RelayTarget, RouteKind, RoutePlan, WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
-  PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve,
+  PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve, ProxyResolve, ProxySend,
 };
 use tokn_requests::{ExecutionRequest, Pipeline, Profile, RawInbound, RequestService, RunConfig};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -37,9 +40,18 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Clone)]
 struct ProfileRuntime {
-  service: tokn_service::HttpService,
+  api_service: Option<tokn_service::HttpService>,
+  proxy_service: Option<tokn_service::HttpService>,
   route_kind: RouteKind,
   agent_id: Option<AgentId>,
+  proxy_destination: ProxyDestination,
+}
+
+#[derive(Clone)]
+enum ProxyDestination {
+  Managed,
+  Fixed(CanonicalUpstreamUrl),
+  Original,
 }
 
 /// Router state for one compiled v2 LLM API listener.
@@ -81,7 +93,7 @@ impl AppState {
       .listener
       .http_bindings()
       .iter()
-      .find(|binding| http_matches(binding.matcher(), host.as_ref(), method, uri.path(), operation))
+      .find(|binding| http_matches(binding.matcher(), host.as_ref(), method, uri.path(), Some(operation)))
       .map(|binding| binding.action())
       .unwrap_or_else(|| self.listener.default_http_action());
     match action {
@@ -98,7 +110,9 @@ impl AppState {
 pub struct ForwardProxyState {
   listener_id: ListenerId,
   listener: ForwardProxyListenerPlan,
+  profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   access: Arc<tokn_access::AccessStore>,
+  ca: Option<Arc<crate::proxy::ProxyCa>>,
 }
 
 impl ForwardProxyState {
@@ -123,46 +137,234 @@ impl ForwardProxyState {
       .map(|rule| rule.action())
       .unwrap_or_else(|| self.listener.default_connect_action())
   }
+
+  fn select_profile(
+    &self,
+    ingress: &IngressAuthority,
+    method: &Method,
+    uri: &Uri,
+  ) -> Result<&ProfileRuntime, ApiError> {
+    let operation = proxy_operation(method, uri.path()).map(operation_name);
+    let action = self
+      .listener
+      .http_bindings()
+      .iter()
+      .find(|binding| http_matches(binding.matcher(), Some(ingress.host()), method, uri.path(), operation))
+      .map(|binding| binding.action())
+      .unwrap_or_else(|| self.listener.default_http_action());
+    match action {
+      HttpAction::Route(profile_id) => self
+        .profiles
+        .get(profile_id)
+        .ok_or_else(|| ApiError::internal(format!("listener selected missing profile '{profile_id}'"))),
+      HttpAction::Reject => Err(ApiError::forbidden("request rejected by v2 listener policy")),
+    }
+  }
+
+  pub(crate) fn connect_action_for(&self, ingress: &IngressAuthority) -> ConnectAction {
+    self.connect_action(ingress.host(), ingress.port())
+  }
+
+  pub(crate) fn pinned_tls_config(&self, ingress: &IngressAuthority) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    self
+      .ca
+      .as_ref()
+      .ok_or_else(|| anyhow::anyhow!("listener '{}' has no interception CA", self.listener_id))?
+      .pinned_server_config(ingress.host())
+  }
+
+  pub(crate) async fn authenticate_proxy(
+    &self,
+    headers: &mut HeaderMap,
+  ) -> Result<AccessContext, ProxyAuthenticationError> {
+    let authorization = headers
+      .get_all(axum::http::header::PROXY_AUTHORIZATION)
+      .iter()
+      .map(|value| value.to_str().ok())
+      .collect::<Option<Vec<_>>>();
+    let token = match (self.listener.client_auth(), authorization.as_deref()) {
+      (ClientAuthPlan::None, _) => None,
+      (ClientAuthPlan::LocalKeys, Some([value])) => {
+        let mut parts = value.split_ascii_whitespace();
+        match (parts.next(), parts.next(), parts.next()) {
+          (Some(scheme), Some(token), None) if scheme.eq_ignore_ascii_case("bearer") => Some(token.to_string()),
+          _ => return Err(ProxyAuthenticationError::Rejected),
+        }
+      }
+      (ClientAuthPlan::LocalKeys, _) => return Err(ProxyAuthenticationError::Rejected),
+    };
+    headers.remove(axum::http::header::PROXY_AUTHORIZATION);
+    let Some(token) = token else {
+      return Ok(AccessContext::unrestricted());
+    };
+    let access = self.access.clone();
+    tokio::task::spawn_blocking(move || access.authenticate(Some(&token)))
+      .await
+      .map_err(|error| {
+        tracing::error!(%error, "v2 proxy authentication task failed");
+        ProxyAuthenticationError::Unavailable
+      })?
+      .map_err(|_| ProxyAuthenticationError::Rejected)
+  }
+
+  pub(crate) async fn dispatch_http(
+    &self,
+    ingress: &IngressAuthority,
+    scheme: &'static str,
+    access: AccessContext,
+    request: Request<hyper::body::Incoming>,
+  ) -> Response {
+    match self.dispatch_http_inner(ingress, scheme, access, request).await {
+      Ok(response) => response,
+      Err(error) => error.into_response(),
+    }
+  }
+
+  async fn dispatch_http_inner(
+    &self,
+    ingress: &IngressAuthority,
+    scheme: &'static str,
+    access: AccessContext,
+    request: Request<hyper::body::Incoming>,
+  ) -> Result<Response, ApiError> {
+    let (parts, body) = request.into_parts();
+    let runtime = self.select_profile(ingress, &parts.method, &parts.uri)?;
+    let service = runtime
+      .proxy_service
+      .as_ref()
+      .ok_or_else(|| ApiError::internal("selected profile cannot run on a forward-proxy listener"))?;
+    let path_and_query = parts.uri.path_and_query().map_or("/", |value| value.as_str());
+    let request_endpoint = tokn_core::request_event::RequestEndpoint::infer_from_path(parts.uri.path());
+    let raw_body = axum::body::to_bytes(axum::body::Body::new(body), usize::MAX)
+      .await
+      .map_err(|error| ApiError::bad_request(format!("read proxy request body: {error}")))?;
+    let headers: tokn_headers::HeaderMap = (&parts.headers).into();
+    let (decoded_body, body_json) = if runtime.route_kind == RouteKind::Managed {
+      let endpoint = request_endpoint
+        .resolved()
+        .ok_or_else(|| ApiError::bad_request("managed proxy routes require a supported LLM operation path"))?;
+      let mut decoded = crate::api::codec::decode_json_request(&parts.headers, raw_body.clone())?;
+      crate::api::endpoints::apply_endpoint_compat_defaults(endpoint, &parts.headers, &mut decoded)?;
+      (decoded.decoded_body, decoded.value)
+    } else {
+      let decoded = tokn_requests::utils::codec::request_content_encoding(&headers)
+        .and_then(|encoding| tokn_requests::utils::codec::decode_body_bytes(raw_body.clone(), encoding))
+        .unwrap_or_else(|error| {
+          tracing::debug!(%error, "could not decode opaque proxy body for inspection");
+          raw_body.clone()
+        });
+      (decoded, serde_json::Value::Null)
+    };
+    let (destination_scheme, destination_authority, destination_path) =
+      proxy_destination(runtime, ingress, scheme, path_and_query)?;
+    let origin = canonical_origin(scheme, ingress);
+    let mut config = RunConfig::builder()
+      .with_agent_id_opt(runtime.agent_id.clone())
+      .with_str(
+        tokn_requests::stages::resolve::proxy::keys::HOST,
+        destination_authority.clone(),
+      )
+      .with_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID, origin.clone())
+      .with_str(
+        tokn_requests::stages::resolve::proxy::keys::PATH,
+        destination_path.clone(),
+      )
+      .with_str(tokn_requests::stages::send::proxy::send_keys::PATH, destination_path)
+      .with_str(
+        tokn_requests::stages::send::proxy::send_keys::METHOD,
+        parts.method.as_str(),
+      )
+      .with_str(
+        tokn_requests::stages::send::proxy::send_keys::SCHEME,
+        destination_scheme,
+      )
+      .with_str(V2_PROXY_ORIGIN_KEY, origin);
+    if runtime.route_kind == RouteKind::Relay {
+      config = config.with(tokn_requests::stages::send::proxy::send_keys::INJECT_AUTH, true);
+    }
+    if let Some(providers) = access.providers.provider_ids() {
+      config = config.with(
+        tokn_requests::stages::ACCESS_ALLOWED_PROVIDERS_KEY,
+        serde_json::Value::Array(providers.iter().cloned().map(serde_json::Value::String).collect()),
+      );
+    }
+    let request = ExecutionRequest::new(RawInbound {
+      request_endpoint,
+      headers,
+      raw_body,
+      decoded_body,
+      body_json,
+      request_id: parts
+        .headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(SmolStr::new),
+    })
+    .with_config(config.build())
+    .into_http(parts.method, parts.uri)
+    .map_err(|error| ApiError::internal(format!("building v2 proxy service message: {error}")))?;
+    service
+      .execute(request)
+      .await
+      .map(crate::api::response::converted_to_axum)
+      .map_err(crate::api::endpoints::request_error_to_api_error)
+  }
 }
 
-pub fn build_forward_proxy_states(
-  plan: &GatewayPlan,
-  access: Arc<tokn_access::AccessStore>,
-) -> anyhow::Result<Vec<ForwardProxyState>> {
-  let mut states = Vec::new();
-  for (listener_id, listener) in plan.listeners() {
-    let ListenerPlan::ForwardProxy(listener) = listener else {
-      continue;
-    };
-    let intercept = listener.default_connect_action() == ConnectAction::Intercept
-      || listener
-        .connect_rules()
-        .iter()
-        .any(|rule| rule.action() == ConnectAction::Intercept);
-    if intercept {
-      anyhow::bail!("v2 forward-proxy listener '{listener_id}' uses CONNECT interception, which is not supported yet");
-    }
-    states.push(ForwardProxyState {
-      listener_id: listener_id.clone(),
-      listener: listener.clone(),
-      access: access.clone(),
-    });
-  }
-  Ok(states)
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProxyAuthenticationError {
+  Rejected,
+  Unavailable,
 }
 
 pub async fn serve_forward_proxy<F>(state: ForwardProxyState, bind: SocketAddr, shutdown: F) -> anyhow::Result<()>
 where
   F: Future<Output = ()> + Send,
 {
-  let policy_state = state.clone();
-  let connect_policy: crate::proxy::ProxyConnectPolicy =
-    Arc::new(move |host, port| policy_state.connect_action(host, port));
-  let client_auth = match state.listener.client_auth() {
-    ClientAuthPlan::None => None,
-    ClientAuthPlan::LocalKeys => Some(state.access.clone()),
-  };
-  crate::proxy::serve_connect_policy(bind, Default::default(), connect_policy, client_auth, shutdown).await
+  crate::proxy::serve_v2_policy(bind, Default::default(), Arc::new(state), shutdown).await
+}
+
+pub struct RuntimeStates {
+  pub llm_api: Vec<AppState>,
+  pub forward_proxy: Vec<ForwardProxyState>,
+}
+
+/// Build one shared v2 runtime generation for every configured listener.
+pub fn build_runtime_states(
+  plan: GatewayPlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+) -> anyhow::Result<RuntimeStates> {
+  let plan = Arc::new(plan);
+  let profiles = build_profile_runtimes(plan.clone(), accounts, events)?;
+  let mut llm_api = Vec::new();
+  let mut forward_proxy = Vec::new();
+  for (listener_id, listener) in plan.listeners() {
+    match listener {
+      ListenerPlan::LlmApi(listener) => llm_api.push(AppState {
+        listener_id: listener_id.clone(),
+        listener: listener.clone(),
+        profiles: profiles.clone(),
+        access: access.clone(),
+      }),
+      ListenerPlan::ForwardProxy(listener) => {
+        let ca = listener
+          .tls()
+          .map(|tls| crate::proxy::load_or_generate_ca(tls.ca_dir(), false).map(Arc::new))
+          .transpose()
+          .map_err(|error| anyhow::anyhow!("load v2 proxy CA for listener '{listener_id}': {error}"))?;
+        forward_proxy.push(ForwardProxyState {
+          listener_id: listener_id.clone(),
+          listener: listener.clone(),
+          profiles: profiles.clone(),
+          access: access.clone(),
+          ca,
+        });
+      }
+    }
+  }
+  Ok(RuntimeStates { llm_api, forward_proxy })
 }
 
 /// Build one independent Axum state per configured v2 LLM API listener.
@@ -172,22 +374,20 @@ pub fn build_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<Vec<AppState>> {
-  let plan = Arc::new(plan);
+  build_runtime_states(plan, accounts, access, events).map(|states| states.llm_api)
+}
+
+fn build_profile_runtimes(
+  plan: Arc<GatewayPlan>,
+  accounts: &[AccountConfig],
+  events: Arc<EventBus>,
+) -> anyhow::Result<Arc<BTreeMap<ProfileId, ProfileRuntime>>> {
   let mut reachable_profiles = BTreeSet::new();
-  let mut has_llm_listener = false;
   for listener in plan.listeners().values() {
-    let ListenerPlan::LlmApi(listener) = listener else {
-      continue;
-    };
-    has_llm_listener = true;
     collect_profile(listener.default_http_action(), &mut reachable_profiles);
     for binding in listener.http_bindings() {
       collect_profile(binding.action(), &mut reachable_profiles);
     }
-  }
-
-  if !has_llm_listener {
-    return Ok(Vec::new());
   }
 
   let registry = Registry::builtin();
@@ -208,75 +408,233 @@ pub fn build_states(
         profile_plan.route()
       )
     })?;
-    let (selector, selection_state) = V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
-    let resolve = Arc::new(PoolResolve::new(Arc::new(selector)));
-    let send = Arc::new(PoolAwareSend::new(
-      match route.kind() {
-        RouteKind::Managed => managed_http.clone(),
-        RouteKind::Relay => opaque_http.clone(),
-        RouteKind::Transparent => {
-          anyhow::bail!(
-            "profile '{profile_id}' uses transparent route '{}' on an unsupported listener path",
-            profile_plan.route()
-          )
-        }
-      },
-      selection_state,
-    ));
-    let profile = match route {
+    let agent_id = wire_agent(profile_plan.wire_identity());
+    let (api_service, proxy_service, proxy_destination) = match route {
       RoutePlan::Managed(route) => {
         if route.header_patches().is_some() || !matches!(route.retry(), ManagedRetry::Never) {
           anyhow::bail!("profile '{profile_id}' uses unsupported managed patches or retry policy");
         }
-        Profile::full(
+        let (selector, selection_state) = V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
+        let profile = Profile::full(
           format!("v2-{profile_id}"),
           Arc::new(DefaultExtract),
-          resolve,
+          Arc::new(PoolResolve::new(Arc::new(selector))),
           Arc::new(DefaultBuildHeaders::with_provider_defaults()),
           Arc::new(DefaultConvertRequest),
-          send,
+          Arc::new(PoolAwareSend::new(managed_http.clone(), selection_state)),
           Arc::new(DefaultConvertResponse::new()),
-        )
+        );
+        let service = RequestService::http_from_pipeline(Arc::new(Pipeline::new(Arc::new(profile), events.clone())));
+        (Some(service.clone()), Some(service), ProxyDestination::Managed)
       }
       RoutePlan::Relay(route) => {
         if route.header_patches().is_some() || !matches!(route.retry(), RelayRetry::Never) {
           anyhow::bail!("profile '{profile_id}' uses unsupported relay patches or retry policy");
         }
-        Profile::full(
+        let proxy_service = build_proxy_relay_service(
+          &profile_id,
+          route,
+          &plan,
+          &providers,
+          &pools,
+          opaque_http.clone(),
+          events.clone(),
+        )?;
+        let (api_service, destination) = match route.target() {
+          RelayTarget::FixedProvider { provider, .. } => {
+            let (selector, selection_state) =
+              V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
+            let profile = Profile::full(
+              format!("v2-{profile_id}-api"),
+              Arc::new(PassthroughExtract),
+              Arc::new(PoolResolve::new(Arc::new(selector))),
+              Arc::new(PassthroughBuildHeaders::router_auth()),
+              Arc::new(PassthroughConvertRequest),
+              Arc::new(PoolAwareSend::new(opaque_http.clone(), selection_state)),
+              Arc::new(PassthroughConvertResponse::new()),
+            );
+            let target = providers
+              .target(provider)
+              .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' references missing provider '{provider}'"))?;
+            (
+              Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
+                Arc::new(profile),
+                events.clone(),
+              )))),
+              ProxyDestination::Fixed(target.base_url().clone()),
+            )
+          }
+          RelayTarget::ProviderFromOrigin { .. } => (None, ProxyDestination::Original),
+        };
+        (api_service, Some(proxy_service), destination)
+      }
+      RoutePlan::Transparent(route) => {
+        if route.header_patches().is_some() {
+          anyhow::bail!("profile '{profile_id}' uses unsupported transparent patches");
+        }
+        let profile = Profile::full(
           format!("v2-{profile_id}"),
           Arc::new(PassthroughExtract),
-          resolve,
-          Arc::new(PassthroughBuildHeaders::router_auth()),
+          Arc::new(ProxyResolve),
+          Arc::new(PassthroughBuildHeaders::preserve_host()),
           Arc::new(PassthroughConvertRequest),
-          send,
+          Arc::new(ProxySend::forward_all_statuses(opaque_http.clone())),
           Arc::new(PassthroughConvertResponse::new()),
+        );
+        (
+          None,
+          Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
+            Arc::new(profile),
+            events.clone(),
+          )))),
+          ProxyDestination::Original,
         )
       }
-      RoutePlan::Transparent(_) => unreachable!("transparent profiles were rejected above"),
     };
-    let pipeline = Arc::new(Pipeline::new(Arc::new(profile), events.clone()));
     let runtime = ProfileRuntime {
-      service: RequestService::http_from_pipeline(pipeline),
+      api_service,
+      proxy_service,
       route_kind: route.kind(),
-      agent_id: wire_agent(profile_plan.wire_identity()),
+      agent_id,
+      proxy_destination,
     };
     profiles.insert(profile_id, runtime);
   }
+  Ok(Arc::new(profiles))
+}
 
-  let profiles = Arc::new(profiles);
-  let mut states = Vec::new();
-  for (listener_id, listener) in plan.listeners() {
-    match listener {
-      ListenerPlan::LlmApi(listener) => states.push(AppState {
-        listener_id: listener_id.clone(),
-        listener: listener.clone(),
-        profiles: profiles.clone(),
-        access: access.clone(),
-      }),
-      ListenerPlan::ForwardProxy(_) => {}
+fn build_proxy_relay_service(
+  profile_id: &ProfileId,
+  route: &tokn_policy::RelayRoute,
+  plan: &GatewayPlan,
+  providers: &ProviderGraph,
+  pools: &AccountPoolRuntimes,
+  http: reqwest::Client,
+  events: Arc<EventBus>,
+) -> anyhow::Result<tokn_service::HttpService> {
+  let origins = match route.target() {
+    RelayTarget::FixedProvider { .. } => BTreeMap::new(),
+    RelayTarget::ProviderFromOrigin { account_pool } => provider_origins(plan, providers, pools, account_pool)?,
+  };
+  let (resolve, selection_state) = V2ProxyResolve::new(route, pools, origins)?;
+  let profile = Profile::full(
+    format!("v2-{profile_id}-proxy"),
+    Arc::new(PassthroughExtract),
+    Arc::new(resolve),
+    Arc::new(PassthroughBuildHeaders::preserve_host_with_router_auth()),
+    Arc::new(PassthroughConvertRequest),
+    Arc::new(ProxyPoolAwareSend::new(http, selection_state)),
+    Arc::new(PassthroughConvertResponse::new()),
+  );
+  Ok(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
+    Arc::new(profile),
+    events,
+  ))))
+}
+
+fn provider_origins(
+  plan: &GatewayPlan,
+  providers: &ProviderGraph,
+  pools: &AccountPoolRuntimes,
+  pool_id: &tokn_policy::AccountPoolId,
+) -> anyhow::Result<BTreeMap<String, tokn_policy::ProviderId>> {
+  pools
+    .runtime(pool_id)
+    .ok_or_else(|| anyhow::anyhow!("origin relay references missing account pool '{pool_id}'"))?;
+  let pool = plan
+    .account_pool(pool_id)
+    .ok_or_else(|| anyhow::anyhow!("origin relay references missing account-pool policy '{pool_id}'"))?;
+  let eligible = plan.providers().keys().filter(|provider_id| {
+    pool
+      .selector()
+      .providers()
+      .is_none_or(|allowed| allowed.contains(*provider_id))
+  });
+  let mut origins = BTreeMap::new();
+  for provider_id in eligible {
+    let provider = plan
+      .provider(provider_id)
+      .ok_or_else(|| anyhow::anyhow!("account pool '{pool_id}' references missing provider '{provider_id}'"))?;
+    let target = providers
+      .target(provider_id)
+      .ok_or_else(|| anyhow::anyhow!("account pool '{pool_id}' has no target for provider '{provider_id}'"))?;
+    let mut claimed = provider
+      .origins()
+      .iter()
+      .map(|origin| origin.as_str().to_string())
+      .collect::<BTreeSet<_>>();
+    claimed.insert(target.base_url().origin().to_string());
+    for origin in claimed {
+      if let Some(first) = origins.insert(origin.clone(), provider_id.clone()) {
+        anyhow::bail!("proxy origin '{origin}' maps to both provider '{first}' and provider '{provider_id}'");
+      }
     }
   }
-  Ok(states)
+  Ok(origins)
+}
+
+fn proxy_destination(
+  runtime: &ProfileRuntime,
+  ingress: &IngressAuthority,
+  scheme: &'static str,
+  path_and_query: &str,
+) -> Result<(String, String, String), ApiError> {
+  let path_and_query = path_and_query
+    .parse::<axum::http::uri::PathAndQuery>()
+    .map_err(|error| ApiError::bad_request(format!("invalid proxy request path: {error}")))?;
+  match &runtime.proxy_destination {
+    ProxyDestination::Managed | ProxyDestination::Original => {
+      let origin = CanonicalHttpOrigin::parse(&canonical_origin(scheme, ingress), CleartextHttpPolicy::Allow)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+      let url = origin
+        .request_url(&path_and_query)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+      Ok(url_destination(url))
+    }
+    ProxyDestination::Fixed(base) => {
+      let url = base
+        .relay_url(&path_and_query)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+      Ok(url_destination(url))
+    }
+  }
+}
+
+fn url_destination(url: reqwest::Url) -> (String, String, String) {
+  let authority = url.authority().to_string();
+  let mut path = url.path().to_string();
+  if let Some(query) = url.query() {
+    path.push('?');
+    path.push_str(query);
+  }
+  (url.scheme().to_string(), authority, path)
+}
+
+fn canonical_origin(scheme: &str, ingress: &IngressAuthority) -> String {
+  let authority = display_authority(ingress, scheme);
+  format!("{scheme}://{authority}")
+}
+
+fn display_authority(ingress: &IngressAuthority, scheme: &str) -> String {
+  let host = if ingress.host().is_ipv6() {
+    format!("[{}]", ingress.host())
+  } else {
+    ingress.host().to_string()
+  };
+  let default_port = if scheme == "https" { 443 } else { 80 };
+  if ingress.port() == default_port {
+    host
+  } else {
+    format!("{host}:{}", ingress.port())
+  }
+}
+
+fn proxy_operation(method: &Method, path: &str) -> Option<Endpoint> {
+  if method == Method::POST {
+    Endpoint::infer_from(path)
+  } else {
+    None
+  }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -419,7 +777,9 @@ async fn handle(
     .into_http(method, uri)
     .map_err(|error| ApiError::internal(format!("building v2 request service message: {error}")))?;
   runtime
-    .service
+    .api_service
+    .as_ref()
+    .ok_or_else(|| ApiError::internal("selected profile cannot run on an LLM API listener"))?
     .execute(request)
     .await
     .map(crate::api::response::converted_to_axum)
@@ -446,7 +806,7 @@ fn http_matches(
   host: Option<&tokn_policy::CanonicalHost>,
   method: &Method,
   path: &str,
-  operation: &str,
+  operation: Option<&str>,
 ) -> bool {
   (matcher.hosts().is_empty() || host.is_some_and(|host| matcher.hosts().iter().any(|pattern| pattern.matches(host))))
     && (matcher.path_prefixes().is_empty()
@@ -460,10 +820,12 @@ fn http_matches(
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(method.as_str())))
     && (matcher.operations().is_empty()
-      || matcher
-        .operations()
-        .iter()
-        .any(|candidate| candidate.as_str() == operation))
+      || operation.is_some_and(|operation| {
+        matcher
+          .operations()
+          .iter()
+          .any(|candidate| candidate.as_str() == operation)
+      }))
 }
 
 fn operation_name(endpoint: Endpoint) -> &'static str {
@@ -525,35 +887,42 @@ mod tests {
       Some(&host),
       &Method::POST,
       "/v1/responses",
-      "responses"
+      Some("responses")
     ));
     assert!(!http_matches(
       &matcher,
       Some(&canonical_host("other.example.com")),
       &Method::POST,
       "/v1/responses",
-      "responses"
+      Some("responses")
     ));
     assert!(!http_matches(
       &matcher,
       Some(&host),
       &Method::GET,
       "/v1/responses",
-      "responses"
+      Some("responses")
     ));
     assert!(!http_matches(
       &matcher,
       Some(&host),
       &Method::POST,
       "/other",
-      "responses"
+      Some("responses")
     ));
     assert!(!http_matches(
       &matcher,
       Some(&host),
       &Method::POST,
       "/v1/responses",
-      "messages"
+      Some("messages")
+    ));
+    assert!(!http_matches(
+      &matcher,
+      Some(&host),
+      &Method::POST,
+      "/v1/responses",
+      None
     ));
   }
 

@@ -15,6 +15,7 @@ pub(crate) fn converted_to_axum(response: tokn_service::Response) -> Response<Bo
   let (mut parts, body) = response.into_parts();
   match parts.extensions.get::<PipelineResponseKind>().copied() {
     Some(PipelineResponseKind::Buffered) => parts.headers = buffered_headers(),
+    Some(PipelineResponseKind::Opaque) => {}
     Some(PipelineResponseKind::Stream) => parts.headers = sse_headers(),
     None => {}
   }
@@ -38,4 +39,30 @@ fn sse_headers() -> HeaderMap {
   headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
   headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
   headers
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn opaque_buffered_responses_preserve_upstream_headers() {
+    let mut response = http::Response::builder()
+      .status(201)
+      .header(header::CONTENT_TYPE, "application/octet-stream")
+      .header("x-upstream", "preserved")
+      .body(tokn_service::body::full("opaque"))
+      .unwrap();
+    response.extensions_mut().insert(PipelineResponseKind::Opaque);
+
+    let response = converted_to_axum(response);
+
+    assert_eq!(response.status(), 201);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/octet-stream");
+    assert_eq!(response.headers()["x-upstream"], "preserved");
+    assert_eq!(
+      axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+      "opaque"
+    );
+  }
 }
