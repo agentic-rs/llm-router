@@ -626,7 +626,9 @@ async fn print_live_outcome(
   let upstream_endpoint = snapshot_endpoint_label(snap);
   let attempts = snap.attempts.unwrap_or(1);
 
-  let ConvertedResponse { status, headers, body } = converted;
+  let ConvertedResponse {
+    status, headers, body, ..
+  } = converted;
   match body {
     ConvertedBody::Buffered { body_json, .. } => match format {
       OutputFormat::Json => {

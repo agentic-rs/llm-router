@@ -26,7 +26,9 @@
 
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::PipelineError;
-use crate::pipeline::stages::{ConvertResponseStage, ConvertedBody, ConvertedResponse, SentResponse};
+use crate::pipeline::stages::{
+  ConvertResponseStage, ConvertedBody, ConvertedResponse, ConvertedResponseKind, SentResponse,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
@@ -84,6 +86,7 @@ impl ConvertResponseStage for PassthroughConvertResponse {
     Ok(ConvertedResponse {
       status,
       headers,
+      kind: ConvertedResponseKind::Opaque,
       body: ConvertedBody::Buffered {
         // Body intentionally not deserialized — passthrough preserves
         // wire bytes only.
@@ -186,6 +189,7 @@ impl ConvertResponseStage for PassthroughConvertResponse {
     Ok(ConvertedResponse {
       status,
       headers,
+      kind: ConvertedResponseKind::Opaque,
       body: ConvertedBody::Stream { body: forward_stream },
     })
   }

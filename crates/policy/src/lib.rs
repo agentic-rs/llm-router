@@ -28,4 +28,5 @@ pub use topology::{
   ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, HttpAction,
   HttpBindingPlan, HttpMatch, InvalidSubdomainSuffix, ListenerKind, ListenerPlan, LlmApiListenerPlan, ModelCandidate,
   ModelGroupPlan, ProviderOrigin, ProviderPlan, SessionAffinityPlan, TlsPlan,
+  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
 };

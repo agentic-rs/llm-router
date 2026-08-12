@@ -9,6 +9,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
+pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize =
+  tokn_policy::DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES;
+
+fn default_forward_proxy_request_body_max_bytes() -> usize {
+  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES
+}
 
 /// The complete on-disk version 2 configuration.
 ///
@@ -63,6 +69,9 @@ pub enum RawListener {
     /// non-loopback bind. Remote listeners must still use `local_keys`.
     #[serde(default)]
     allow_insecure_public: bool,
+    /// Maximum HTTP message-body bytes buffered before dispatch.
+    #[serde(default = "default_forward_proxy_request_body_max_bytes")]
+    request_body_max_bytes: usize,
     default_http_action: RawBindingAction,
     default_connect: RawConnectAction,
     #[serde(default)]

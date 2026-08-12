@@ -6,8 +6,11 @@ use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// A configuration-compiled gateway plan.
 ///
@@ -189,6 +192,7 @@ impl LlmApiListenerPlan {
 pub struct ForwardProxyListenerPlan {
   bind: SocketAddr,
   client_auth: ClientAuthPlan,
+  request_body_max_bytes: NonZeroUsize,
   http_bindings: Box<[HttpBindingPlan]>,
   default_http_action: HttpAction,
   connect_rules: Box<[ConnectRulePlan]>,
@@ -209,6 +213,8 @@ impl ForwardProxyListenerPlan {
     Self {
       bind,
       client_auth,
+      request_body_max_bytes: NonZeroUsize::new(DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES)
+        .expect("the default forward-proxy body limit is nonzero"),
       http_bindings,
       default_http_action,
       connect_rules,
@@ -223,6 +229,15 @@ impl ForwardProxyListenerPlan {
 
   pub fn client_auth(&self) -> ClientAuthPlan {
     self.client_auth
+  }
+
+  pub fn request_body_max_bytes(&self) -> usize {
+    self.request_body_max_bytes.get()
+  }
+
+  pub fn with_request_body_max_bytes(mut self, request_body_max_bytes: NonZeroUsize) -> Self {
+    self.request_body_max_bytes = request_body_max_bytes;
+    self
   }
 
   pub fn http_bindings(&self) -> &[HttpBindingPlan] {
@@ -811,6 +826,7 @@ mod tests {
     assert_eq!(proxy.connect_rules()[1].id().as_str(), "intercept-public");
     assert_eq!(proxy.connect_rules()[1].action(), ConnectAction::Intercept);
     assert_eq!(proxy.default_connect_action(), ConnectAction::Reject);
+    assert_eq!(proxy.request_body_max_bytes(), 10 * 1024 * 1024);
     assert_eq!(proxy.tls().unwrap().ca_dir(), Path::new("/tmp/tokn-ca"));
   }
 

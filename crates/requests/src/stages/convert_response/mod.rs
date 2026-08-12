@@ -5,7 +5,7 @@
 
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::PipelineError;
-use crate::pipeline::stages::{ConvertResponseStage, ConvertedBody, ConvertedResponse};
+use crate::pipeline::stages::{ConvertResponseStage, ConvertedBody, ConvertedResponse, ConvertedResponseKind};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
@@ -20,6 +20,7 @@ fn noop_buffered() -> ConvertedResponse {
   ConvertedResponse {
     status: 0,
     headers: HeaderMap::new(),
+    kind: ConvertedResponseKind::Managed,
     body: ConvertedBody::Buffered {
       body_json: None,
       body_bytes: Bytes::new(),

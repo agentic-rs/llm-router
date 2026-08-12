@@ -448,7 +448,14 @@ pub fn require_upstream_endpoint(
 pub struct ConvertedResponse {
   pub status: u16,
   pub headers: HeaderMap,
+  pub kind: ConvertedResponseKind,
   pub body: ConvertedBody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertedResponseKind {
+  Managed,
+  Opaque,
 }
 
 pub enum ConvertedBody {
@@ -510,7 +517,10 @@ impl ConvertedBody {
 impl std::fmt::Debug for ConvertedResponse {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     let mut dbg = f.debug_struct("ConvertedResponse");
-    dbg.field("status", &self.status).field("headers", &self.headers);
+    dbg
+      .field("status", &self.status)
+      .field("headers", &self.headers)
+      .field("response_kind", &self.kind);
     match &self.body {
       ConvertedBody::Buffered { body_bytes, .. } => {
         dbg
@@ -622,6 +632,7 @@ pub trait ConvertResponseStage: Send + Sync {
         return Ok(ConvertedResponse {
           status: converted.status,
           headers: converted.headers,
+          kind: converted.kind,
           body: ConvertedBody::Stream {
             body: stream::unfold((body, accum), |(mut body, accum)| async move {
               match body.next().await {

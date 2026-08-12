@@ -14,8 +14,9 @@
 //! ([`PassthroughConvertRequest`](super::super::convert_request::PassthroughConvertRequest)
 //! returns them verbatim).
 //!
-//! Failure classification mirrors [`DefaultSend`]: 5xx → recoverable,
-//! 4xx → permanent, transport errors → recoverable.
+//! By default, 5xx responses remain recoverable pipeline errors for legacy
+//! retry behavior. V2 account-pool callers opt into forwarding every received
+//! response verbatim and classify its status separately.
 
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
@@ -71,11 +72,22 @@ pub mod send_keys {
 
 pub struct ProxySend {
   http: reqwest::Client,
+  forward_server_errors: bool,
 }
 
 impl ProxySend {
   pub fn new(http: reqwest::Client) -> Self {
-    Self { http }
+    Self {
+      http,
+      forward_server_errors: false,
+    }
+  }
+
+  pub fn forward_all_statuses(http: reqwest::Client) -> Self {
+    Self {
+      http,
+      forward_server_errors: true,
+    }
   }
 }
 
@@ -198,7 +210,7 @@ impl SendStage for ProxySend {
       headers: resp_headers.clone(),
     });
 
-    if status >= 500 {
+    if status >= 500 && !self.forward_server_errors {
       let body_text = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
@@ -221,14 +233,7 @@ impl SendStage for ProxySend {
       ));
     }
     if status >= 400 {
-      // For 4xx we propagate the response upstream so the client sees
-      // the upstream's error envelope verbatim. The proxy contract is
-      // "transparent forwarding" — wrapping a 4xx in our own envelope
-      // would change semantics. Note: this differs from DefaultSend,
-      // which converts 4xx to PipelineError::permanent. The legacy
-      // proxy passthrough also forwarded 4xx bodies verbatim, and the
-      // later ConvertResponse path will persist the drained body.
-      warn!(%status, "proxy upstream 4xx — forwarding verbatim");
+      warn!(%status, "proxy upstream error response — forwarding verbatim");
     }
 
     Ok(SentResponse {
