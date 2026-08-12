@@ -1,0 +1,53 @@
+# Dogfood configuration for `tokn-gateway smoke provider` and `smoke send`.
+# Credentials remain in ~/.tokn/router/auth.yaml; this file contains no secrets.
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "default" }
+
+[profiles.default]
+route = "default"
+wire_identity = "auto"
+
+[routes.default]
+kind = "managed"
+account_pool = "default"
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+
+[account_pools.default]
+accounts = ["*"]
+providers = ["*"]
+strategy = "round_robin"
+
+# Provider names intentionally match the provider ids stored in auth.yaml.
+[providers.github-copilot]
+driver = "github-copilot"
+
+[providers.openai]
+driver = "openai"
+
+[providers.codex]
+driver = "codex"
+
+[providers.deepseek]
+driver = "deepseek"
+
+[providers.llama-cpp]
+driver = "llama-cpp"
+
+[providers.zai]
+driver = "zai"
+
+[providers.zai-coding-plan]
+driver = "zai-coding-plan"
+
+[providers.zhipuai]
+driver = "zhipuai"
+
+[providers.zhipuai-coding-plan]
+driver = "zhipuai-coding-plan"
