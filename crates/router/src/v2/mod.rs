@@ -11,6 +11,7 @@ use axum::Router;
 use selector::{PoolAwareSend, ProxyPoolAwareSend, V2AccountSelector, V2ProxyResolve, V2_PROXY_ORIGIN_KEY};
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as _;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -235,9 +236,21 @@ impl ForwardProxyState {
       .ok_or_else(|| ApiError::internal("selected profile cannot run on a forward-proxy listener"))?;
     let path_and_query = parts.uri.path_and_query().map_or("/", |value| value.as_str());
     let request_endpoint = tokn_core::request_event::RequestEndpoint::infer_from_path(parts.uri.path());
-    let raw_body = axum::body::to_bytes(axum::body::Body::new(body), usize::MAX)
-      .await
-      .map_err(|error| ApiError::bad_request(format!("read proxy request body: {error}")))?;
+    let raw_body = match axum::body::to_bytes(axum::body::Body::new(body), self.listener.request_body_max_bytes()).await
+    {
+      Ok(body) => body,
+      Err(error)
+        if error
+          .source()
+          .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
+      {
+        return Err(ApiError::payload_too_large(format!(
+          "proxy request body exceeds the configured {} byte limit",
+          self.listener.request_body_max_bytes()
+        )));
+      }
+      Err(error) => return Err(ApiError::bad_request(format!("read proxy request body: {error}"))),
+    };
     let headers: tokn_headers::HeaderMap = (&parts.headers).into();
     let (decoded_body, body_json) = if runtime.route_kind == RouteKind::Managed {
       let endpoint = request_endpoint

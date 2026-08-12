@@ -204,7 +204,7 @@ kind = "transparent"
   client
     .write_all(
       format!(
-        "POST http://{upstream_addr}/opaque?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        "POST http://{upstream_addr}/opaque?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client\r\nContent-Length: 5\r\nConnection: close, x-hop\r\nKeep-Alive: timeout=5\r\nX-Hop: remove-me\r\n\r\nhello"
       )
       .as_bytes(),
     )
@@ -225,8 +225,67 @@ kind = "transparent"
   let request = String::from_utf8(received.await.unwrap()).unwrap();
   assert!(request.starts_with("POST /opaque?x=1 HTTP/1.1\r\n"));
   assert!(request.contains("authorization: Bearer client\r\n"));
-  assert!(!request.to_ascii_lowercase().contains("proxy-authorization"));
+  let request_lower = request.to_ascii_lowercase();
+  for removed in ["proxy-authorization", "connection:", "keep-alive:", "x-hop:"] {
+    assert!(!request_lower.contains(removed), "forwarded request retained {removed}");
+  }
   assert!(request.ends_with("hello"));
+
+  shutdown_tx.send(()).unwrap();
+  proxy_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn v2_forward_proxy_rejects_bodies_over_the_configured_limit() {
+  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = probe.local_addr().unwrap();
+  drop(probe);
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+request_body_max_bytes = 4
+default_http_action = {{ kind = "route", profile = "transparent" }}
+default_connect = "reject"
+
+[profiles.transparent]
+route = "transparent"
+
+[routes.transparent]
+kind = "transparent"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
+  let state =
+    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+      .unwrap()
+      .forward_proxy
+      .pop()
+      .unwrap();
+  let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let _ = shutdown_rx.await;
+  }));
+  wait_for_listener(proxy_addr).await;
+
+  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  client
+    .write_all(
+      b"POST http://127.0.0.1:1/opaque HTTP/1.1\r\nHost: 127.0.0.1:1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await
+    .unwrap();
+  let mut response = Vec::new();
+  client.read_to_end(&mut response).await.unwrap();
+  assert!(
+    response.starts_with(b"HTTP/1.1 413 Payload Too Large"),
+    "unexpected response: {}",
+    String::from_utf8_lossy(&response)
+  );
 
   shutdown_tx.send(()).unwrap();
   proxy_task.await.unwrap().unwrap();

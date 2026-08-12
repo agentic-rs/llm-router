@@ -1,6 +1,7 @@
 use crate::v2::{CompileError, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawListener};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use tokn_policy::{
   BindingId, CanonicalHost, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan, DestinationPolicy,
@@ -18,6 +19,7 @@ struct ListenerDraft {
   flavor: ListenerFlavor,
   bind: SocketAddr,
   client_auth: ClientAuthPlan,
+  request_body_max_bytes: Option<NonZeroUsize>,
   default_http_action: HttpAction,
   default_connect_action: Option<ConnectAction>,
   ca_dir: Option<PathBuf>,
@@ -121,6 +123,7 @@ pub(super) fn compile_listeners(
       raw_bind,
       raw_client_auth,
       allow_insecure_public,
+      request_body_max_bytes,
       raw_default_http_action,
       default_connect_action,
       ca_dir,
@@ -135,6 +138,7 @@ pub(super) fn compile_listeners(
         bind,
         client_auth,
         *allow_insecure_public,
+        None,
         default_http_action,
         None,
         None,
@@ -143,6 +147,7 @@ pub(super) fn compile_listeners(
         bind,
         client_auth,
         allow_insecure_public,
+        request_body_max_bytes,
         default_http_action,
         default_connect,
         ca_dir,
@@ -151,6 +156,7 @@ pub(super) fn compile_listeners(
         bind,
         client_auth,
         *allow_insecure_public,
+        NonZeroUsize::new(*request_body_max_bytes),
         default_http_action,
         Some(compile_connect_action(*default_connect)),
         resolve_ca_dir(ca_dir.as_deref(), source, raw_id)?,
@@ -159,6 +165,12 @@ pub(super) fn compile_listeners(
 
     let bind = compile_bind(raw_bind, raw_id)?;
     let client_auth = compile_client_auth(*raw_client_auth);
+    if matches!(raw_listener, RawListener::ForwardProxy { .. }) && request_body_max_bytes.is_none() {
+      return Err(invalid_value(
+        format!("listeners.{raw_id}.request_body_max_bytes"),
+        "must be greater than zero",
+      ));
+    }
     if !bind.ip().is_loopback() {
       if client_auth == ClientAuthPlan::None {
         return Err(invalid_value(
@@ -204,6 +216,7 @@ pub(super) fn compile_listeners(
         flavor,
         bind,
         client_auth,
+        request_body_max_bytes,
         default_http_action,
         default_connect_action,
         ca_dir,
@@ -318,15 +331,22 @@ pub(super) fn compile_listeners(
               "ca_dir is required when the listener can intercept CONNECT requests",
             ));
           }
-          ListenerPlan::ForwardProxy(ForwardProxyListenerPlan::new(
-            draft.bind,
-            draft.client_auth,
-            listener_http_bindings,
-            draft.default_http_action,
-            listener_connect_rules,
-            default_connect_action,
-            draft.ca_dir.map(TlsPlan::new),
-          ))
+          ListenerPlan::ForwardProxy(
+            ForwardProxyListenerPlan::new(
+              draft.bind,
+              draft.client_auth,
+              listener_http_bindings,
+              draft.default_http_action,
+              listener_connect_rules,
+              default_connect_action,
+              draft.ca_dir.map(TlsPlan::new),
+            )
+            .with_request_body_max_bytes(
+              draft
+                .request_body_max_bytes
+                .expect("forward-proxy drafts have a request body limit"),
+            ),
+          )
         }
       };
       Ok((id, plan))

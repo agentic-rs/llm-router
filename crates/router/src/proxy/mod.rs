@@ -121,7 +121,13 @@ where
     tokio::select! {
       _ = &mut shutdown => break,
       accept = listener.accept() => {
-        let (stream, peer) = accept?;
+        let (stream, peer) = match accept {
+          Ok(connection) => connection,
+          Err(error) => {
+            tracing::warn!(%error, "proxy listener accept failed");
+            continue;
+          }
+        };
         let runtime = runtime.clone();
         let outbound_proxy = outbound_proxy.clone();
         let plain_http_handler = plain_http_handler.clone();
@@ -166,7 +172,13 @@ where
         }
       }
       accept = listener.accept() => {
-        let (stream, peer) = accept?;
+        let (stream, peer) = match accept {
+          Ok(connection) => connection,
+          Err(error) => {
+            tracing::warn!(%error, "v2 proxy listener accept failed");
+            continue;
+          }
+        };
         let state = state.clone();
         let outbound_proxy = outbound_proxy.clone();
         let connection_shutdown = connection_shutdown_rx.clone();

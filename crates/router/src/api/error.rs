@@ -42,6 +42,10 @@ pub enum Error {
   #[snafu(display("{message}"))]
   BadRequest { message: String },
 
+  /// Request body exceeded the listener's configured maximum. Maps to 413.
+  #[snafu(display("{message}"))]
+  PayloadTooLarge { message: String },
+
   /// Request body used an unsupported transport/content encoding. Maps to 415.
   #[snafu(display("{message}"))]
   UnsupportedMediaType { message: String },
@@ -94,6 +98,9 @@ impl Error {
   pub fn bad_request(msg: impl Into<String>) -> Self {
     Error::BadRequest { message: msg.into() }
   }
+  pub fn payload_too_large(msg: impl Into<String>) -> Self {
+    Error::PayloadTooLarge { message: msg.into() }
+  }
   pub fn bad_gateway(msg: impl Into<String>) -> Self {
     Error::BadGateway { message: msg.into() }
   }
@@ -133,6 +140,7 @@ impl Error {
       Error::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
       Error::Forbidden { .. } => StatusCode::FORBIDDEN,
       Error::BadRequest { .. } => StatusCode::BAD_REQUEST,
+      Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
       Error::UnsupportedMediaType { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
       Error::Upstream { status, .. } => *status,
       Error::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
@@ -147,6 +155,7 @@ impl Error {
       Error::Unauthorized { .. } => "authentication_error",
       Error::Forbidden { .. } => "permission_error",
       Error::BadRequest { .. } => "bad_request",
+      Error::PayloadTooLarge { .. } => "payload_too_large",
       Error::UnsupportedMediaType { .. } => "unsupported_media_type",
       Error::Upstream { .. } => "upstream_error",
       Error::NotImplemented { .. } => "not_implemented_error",
@@ -160,6 +169,7 @@ impl Error {
     match self {
       Error::Unauthorized { message } | Error::Forbidden { message } => message.clone(),
       Error::BadRequest { message } => message.clone(),
+      Error::PayloadTooLarge { message } => message.clone(),
       Error::UnsupportedMediaType { message } => message.clone(),
       Error::Upstream { status, body } => {
         if body.trim().is_empty() {
@@ -211,6 +221,7 @@ mod tests {
     assert_eq!(Error::unauthorized("x").status(), StatusCode::UNAUTHORIZED);
     assert_eq!(Error::forbidden("x").status(), StatusCode::FORBIDDEN);
     assert_eq!(Error::bad_request("x").status(), StatusCode::BAD_REQUEST);
+    assert_eq!(Error::payload_too_large("x").status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
       Error::unsupported_media_type("x").status(),
       StatusCode::UNSUPPORTED_MEDIA_TYPE
@@ -230,6 +241,7 @@ mod tests {
     assert_eq!(Error::unauthorized("x").kind(), "authentication_error");
     assert_eq!(Error::forbidden("x").kind(), "permission_error");
     assert_eq!(Error::bad_request("x").kind(), "bad_request");
+    assert_eq!(Error::payload_too_large("x").kind(), "payload_too_large");
     assert_eq!(Error::unsupported_media_type("x").kind(), "unsupported_media_type");
     assert_eq!(Error::upstream(StatusCode::BAD_GATEWAY, "x").kind(), "upstream_error");
     assert_eq!(Error::not_implemented("e", "m").kind(), "not_implemented_error");

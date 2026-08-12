@@ -3,7 +3,7 @@ use crate::api::error::ApiError;
 use crate::v2::{ForwardProxyState, ProxyAuthenticationError};
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::http::{header, HeaderMap, Method, Request, Response, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -101,7 +101,12 @@ async fn handle_request(
   };
 
   match admission {
-    Admission::Http(ingress) => state.dispatch_http(&ingress, "http", access, request).await,
+    Admission::Http(ingress) => {
+      if let Err(error) = strip_hop_by_hop_headers(request.headers_mut()) {
+        return ApiError::bad_request(error.to_string()).into_response();
+      }
+      state.dispatch_http(&ingress, "http", access, request).await
+    }
     Admission::Connect(ingress) => {
       let transport = match state.connect_action_for(&ingress) {
         ConnectAction::Reject => return response(StatusCode::FORBIDDEN, "CONNECT rejected by listener policy"),
@@ -197,7 +202,10 @@ async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> 
           Ok::<_, Infallible>(match admit_intercepted(&request, &ingress) {
             Ok(()) => {
               request.headers_mut().remove(header::PROXY_AUTHORIZATION);
-              state.dispatch_http(&ingress, "https", access, request).await
+              match strip_hop_by_hop_headers(request.headers_mut()) {
+                Ok(()) => state.dispatch_http(&ingress, "https", access, request).await,
+                Err(error) => ApiError::bad_request(error.to_string()).into_response(),
+              }
             }
             Err(error) => ApiError::bad_request(error.to_string()).into_response(),
           })
@@ -265,6 +273,36 @@ fn request_body_present(request: &Request<hyper::body::Incoming>) -> bool {
     || !hyper::body::Body::is_end_stream(request.body())
 }
 
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) -> Result<()> {
+  let nominated = headers
+    .get_all(header::CONNECTION)
+    .iter()
+    .map(|value| value.to_str().context("Connection header is not UTF-8"))
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .flat_map(|value| value.split(','))
+    .map(str::trim)
+    .filter(|name| !name.is_empty())
+    .map(|name| HeaderName::from_bytes(name.as_bytes()).context("Connection header names an invalid header"))
+    .collect::<Result<Vec<_>>>()?;
+
+  for name in [
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ] {
+    headers.remove(name);
+  }
+  for name in nominated {
+    headers.remove(name);
+  }
+  Ok(())
+}
+
 fn http1_builder() -> http1::Builder {
   let mut builder = http1::Builder::new();
   builder
@@ -298,4 +336,29 @@ async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
     return;
   }
   let _ = shutdown.changed().await;
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use axum::http::HeaderValue;
+
+  #[test]
+  fn strips_fixed_and_connection_nominated_hop_by_hop_headers() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive, x-remove-me"));
+    headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+    headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+    headers.insert(header::TE, HeaderValue::from_static("trailers"));
+    headers.insert(header::TRAILER, HeaderValue::from_static("x-checksum"));
+    headers.insert(header::TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+    headers.insert(header::UPGRADE, HeaderValue::from_static("h2c"));
+    headers.insert("x-remove-me", HeaderValue::from_static("secret"));
+    headers.insert("x-keep-me", HeaderValue::from_static("value"));
+
+    strip_hop_by_hop_headers(&mut headers).unwrap();
+
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers["x-keep-me"], "value");
+  }
 }

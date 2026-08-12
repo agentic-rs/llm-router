@@ -701,6 +701,68 @@ default_connect = "intercept"
 }
 
 #[test]
+fn forward_proxy_request_body_limit_has_a_default_and_must_be_positive() {
+  let defaulted = parse_config(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "127.0.0.1:8080"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+default_connect = "reject"
+"#,
+  );
+  let listeners = compile_config(&defaulted, Path::new("config.toml")).unwrap();
+  let ListenerPlan::ForwardProxy(listener) = &listeners["proxy"] else {
+    panic!("expected forward proxy listener");
+  };
+  assert_eq!(
+    listener.request_body_max_bytes(),
+    crate::v2::raw::DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES
+  );
+
+  let configured = parse_config(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "127.0.0.1:8080"
+client_auth = "none"
+request_body_max_bytes = 4096
+default_http_action = { kind = "reject" }
+default_connect = "reject"
+"#,
+  );
+  let listeners = compile_config(&configured, Path::new("config.toml")).unwrap();
+  let ListenerPlan::ForwardProxy(listener) = &listeners["proxy"] else {
+    panic!("expected forward proxy listener");
+  };
+  assert_eq!(listener.request_body_max_bytes(), 4096);
+
+  let zero = parse_config(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "127.0.0.1:8080"
+client_auth = "none"
+request_body_max_bytes = 0
+default_http_action = { kind = "reject" }
+default_connect = "reject"
+"#,
+  );
+  assert!(matches!(
+    compile_config(&zero, Path::new("config.toml")),
+    Err(CompileError::InvalidValue { location, .. })
+      if location == "listeners.proxy.request_body_max_bytes"
+  ));
+}
+
+#[test]
 fn binding_ids_are_global_and_connect_rules_require_forward_proxy() {
   let duplicate_id = parse_config(
     r#"
