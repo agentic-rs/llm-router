@@ -10,7 +10,7 @@ use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
-use tokn_core::provider::{Error as ProviderError, Provider, ProviderTarget};
+use tokn_core::provider::{official_provider_preset, Error as ProviderError, Provider, ProviderTarget};
 use tokn_core::upstream_url::{CleartextHttpPolicy, InvalidUpstreamUrl};
 use tokn_policy::{DriverId, GatewayPlan, ProviderId};
 
@@ -18,6 +18,7 @@ use tokn_policy::{DriverId, GatewayPlan, ProviderId};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderUrlSource {
   Configured,
+  ProviderDefault,
   DriverDefault,
 }
 
@@ -25,6 +26,7 @@ impl std::fmt::Display for ProviderUrlSource {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       Self::Configured => formatter.write_str("configured"),
+      Self::ProviderDefault => formatter.write_str("provider default"),
       Self::DriverDefault => formatter.write_str("driver default"),
     }
   }
@@ -57,6 +59,7 @@ impl ProviderBindingKey {
 /// A credential-bearing driver instance bound to one configured provider.
 pub struct ProviderBinding {
   key: ProviderBindingKey,
+  driver_id: DriverId,
   account: Arc<AccountConfig>,
   handle: Arc<AccountHandle>,
   account_order: usize,
@@ -73,6 +76,10 @@ impl ProviderBinding {
 
   pub fn account_id(&self) -> &str {
     self.key.account_id()
+  }
+
+  pub fn driver_id(&self) -> &DriverId {
+    &self.driver_id
   }
 
   pub fn handle(&self) -> &Arc<AccountHandle> {
@@ -98,7 +105,8 @@ impl std::fmt::Debug for ProviderBinding {
     formatter
       .debug_struct("ProviderBinding")
       .field("key", &self.key)
-      .field("driver", &self.handle.provider.info().id)
+      .field("driver_id", &self.driver_id)
+      .field("provider_dialect", &self.handle.provider.info().id)
       .field("account_order", &self.account_order)
       .finish()
   }
@@ -259,14 +267,23 @@ pub fn link_provider_graph(
   for (provider_id, provider) in plan.providers() {
     let driver_id = provider.driver();
     let descriptor = registry
-      .resolve_driver(driver_id.as_str())
+      .resolve_provider_descriptor(provider_id.as_str(), driver_id.as_str())
       .ok_or_else(|| LinkError::UnknownDriver {
         provider: provider_id.clone(),
         driver: driver_id.clone(),
       })?;
     let (base_url, url_source) = match provider.base_url() {
       Some(base_url) => (base_url, ProviderUrlSource::Configured),
-      None => (descriptor.base_url, ProviderUrlSource::DriverDefault),
+      None => {
+        let preset_destination =
+          official_provider_preset(provider_id.as_str()).is_some_and(|preset| preset.driver == driver_id.as_str());
+        let source = if preset_destination {
+          ProviderUrlSource::ProviderDefault
+        } else {
+          ProviderUrlSource::DriverDefault
+        };
+        (descriptor.base_url, source)
+      }
     };
     let cleartext_policy = if provider.allow_insecure_http() {
       CleartextHttpPolicy::Allow
@@ -286,12 +303,24 @@ pub fn link_provider_graph(
   for account in &mut accounts.entries {
     let provider_id = ProviderId::new(&account.config.provider).ok();
     let provider = provider_id.as_ref().and_then(|provider_id| plan.provider(provider_id));
-    let (provider_id, provider) = provider_id
-      .zip(provider)
-      .ok_or_else(|| LinkError::UnknownAccountProvider {
+    let Some(provider_id) = provider_id else {
+      return Err(LinkError::UnknownAccountProvider {
         account_id: SmolStr::new(&account.config.id),
         provider: SmolStr::new(&account.config.provider),
-      })?;
+      });
+    };
+    let Some(provider) = provider else {
+      // Official providers exist implicitly, so a built-in provider missing
+      // from the compiled plan was explicitly disabled. Keep its stored
+      // account visible to account management without binding it to routes.
+      if official_provider_preset(provider_id.as_str()).is_some() {
+        continue;
+      }
+      return Err(LinkError::UnknownAccountProvider {
+        account_id: SmolStr::new(&account.config.id),
+        provider: SmolStr::new(&account.config.provider),
+      });
+    };
     if !account.config.enabled {
       continue;
     }
@@ -302,14 +331,19 @@ pub fn link_provider_graph(
       .expect("every compiled provider target was linked")
       .clone();
 
-    // Existing driver implementations inspect `AccountConfig::provider` as
-    // their driver id. Keep the source config's named provider intact, while
-    // presenting a normalized clone at the legacy driver boundary.
+    // A driver may serve several named provider destinations. Preserve an
+    // official destination identity (for example `zhipuai`) so provider-owned
+    // catalogue and wire behavior stay correct; normalize custom providers to
+    // the reusable driver id at the legacy boundary.
     let mut driver_config = (*account.config).clone();
-    driver_config.provider = driver_id.to_string();
+    let preserves_official_identity =
+      official_provider_preset(provider_id.as_str()).is_some_and(|preset| preset.driver == driver_id.as_str());
+    if !preserves_official_identity {
+      driver_config.provider = driver_id.to_string();
+    }
     let driver_config = Arc::new(driver_config);
     let driver = registry
-      .build_at(driver_config.clone(), target)
+      .build_driver_at(driver_id.as_str(), driver_config.clone(), target)
       .map_err(|source| LinkError::BuildProvider {
         provider: provider_id.clone(),
         account_id: SmolStr::new(&account.config.id),
@@ -319,6 +353,7 @@ pub fn link_provider_graph(
     let key = ProviderBindingKey::new(provider_id, &account.config.id);
     let binding = Arc::new(ProviderBinding {
       key: key.clone(),
+      driver_id: driver_id.clone(),
       account: account.config.clone(),
       handle: Arc::new(AccountHandle::new(driver_config, driver)),
       account_order: account.input_order,
@@ -560,6 +595,58 @@ mod tests {
   }
 
   #[test]
+  fn official_provider_variants_use_their_own_destination_with_a_shared_driver() {
+    let providers = [
+      ("zai-coding-plan", "https://api.z.ai/api/coding/paas/v4/"),
+      ("zhipuai", "https://open.bigmodel.cn/api/paas/v4/"),
+      ("zhipuai-coding-plan", "https://open.bigmodel.cn/api/coding/paas/v4/"),
+    ];
+    let gateway = plan(
+      providers
+        .iter()
+        .map(|(provider_id, _)| {
+          (
+            id(provider_id),
+            ProviderPlan::new(driver_id("zai"), None, Box::default(), false),
+          )
+        })
+        .collect(),
+    );
+
+    let graph = link_provider_graph(&gateway, &[], &Registry::builtin()).unwrap();
+
+    for (provider_id, expected_url) in providers {
+      assert_eq!(
+        graph.target(&id(provider_id)).unwrap().base_url().as_str(),
+        expected_url
+      );
+    }
+  }
+
+  #[test]
+  fn official_provider_variants_keep_the_shared_driver_and_named_dialect() {
+    let provider_id = id("zhipuai");
+    let gateway = plan(BTreeMap::from([(
+      provider_id.clone(),
+      ProviderPlan::new(driver_id("zai"), None, Box::default(), false),
+    )]));
+    let mut zhipuai = account("zhipuai-account");
+    zhipuai.provider = "zhipuai".into();
+    zhipuai.api_key = Some("test-key".to_string().into());
+
+    let graph = link_provider_graph(&gateway, &[zhipuai], &Registry::builtin()).unwrap();
+    let binding = graph.binding(&provider_id, "zhipuai-account").unwrap();
+
+    assert_eq!(binding.driver_id().as_str(), "zai");
+    assert_eq!(binding.driver().info().id, "zhipuai");
+    assert_eq!(binding.handle().config.load().provider, "zhipuai");
+    assert_eq!(
+      binding.driver().info().upstream_url,
+      "https://open.bigmodel.cn/api/paas/v4/"
+    );
+  }
+
+  #[test]
   fn rejects_unknown_account_providers_even_when_disabled_and_unbound() {
     let mut unknown = account("unknown");
     unknown.provider = "not-installed".into();
@@ -592,6 +679,24 @@ mod tests {
     assert!(!linked.config().enabled);
     assert!(linked.binding().is_none());
     assert!(graph.binding(&provider_id, "disabled").is_none());
+  }
+
+  #[test]
+  fn retains_accounts_for_an_explicitly_disabled_official_provider() {
+    let mut disabled_provider_account = account("disabled-provider-account");
+    disabled_provider_account.provider = "openai".into();
+
+    let graph = link_provider_graph(
+      &plan(BTreeMap::new()),
+      &[disabled_provider_account],
+      &Registry::builtin(),
+    )
+    .unwrap();
+
+    let linked = graph.account("disabled-provider-account").unwrap();
+    assert_eq!(linked.config().provider, "openai");
+    assert!(linked.binding().is_none());
+    assert_eq!(graph.binding_count(), 0);
   }
 
   fn accept_account(_account: &AccountConfig) -> tokn_core::provider::Result<()> {
@@ -672,11 +777,11 @@ mod tests {
   }
 
   #[test]
-  fn rejects_accounts_owned_by_an_unknown_provider() {
+  fn rejects_accounts_owned_by_an_unconfigured_custom_provider() {
     let provider_id = id("local");
     let gateway = plan(BTreeMap::from([(provider_id, provider(None))]));
     let mut other = account("other");
-    other.provider = "openai".into();
+    other.provider = "unconfigured-custom".into();
 
     let error = link_provider_graph(&gateway, &[other], &Registry::builtin()).unwrap_err();
     assert!(matches!(error, LinkError::UnknownAccountProvider { .. }));

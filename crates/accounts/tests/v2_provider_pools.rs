@@ -52,7 +52,13 @@ fn compiled_v2_plan_builds_named_provider_round_robin_pool() {
   let registry = Registry::builtin();
 
   let providers = link_provider_graph(&plan, &accounts, &registry).unwrap();
-  assert_eq!(providers.target_count(), 1);
+  assert_eq!(
+    providers.target_count(),
+    tokn_core::provider::OFFICIAL_PROVIDER_PRESETS.len() + 1
+  );
+  assert!(providers
+    .target(&tokn_policy::ProviderId::new("local").unwrap())
+    .is_some());
   assert_eq!(providers.binding_count(), 2);
 
   let pools = link_account_pools(&plan, &providers).unwrap();

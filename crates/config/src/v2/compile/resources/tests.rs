@@ -38,7 +38,11 @@ fn transport_only_gateway_may_have_no_routing_resources() {
   assert!(compiled.profiles.is_empty());
   assert!(compiled.routes.is_empty());
   assert!(compiled.account_pools.is_empty());
-  assert!(compiled.providers.is_empty());
+  assert_eq!(
+    compiled.providers.len(),
+    tokn_core::provider::OFFICIAL_PROVIDER_PRESETS.len()
+  );
+  assert!(compiled.providers.contains_key("openai"));
   assert!(compiled.model_groups.is_empty());
 }
 
@@ -295,28 +299,166 @@ provider = "openai"
 }
 
 #[test]
-fn managed_any_requires_a_configured_provider_and_valid_pool_references() {
+fn managed_any_uses_official_presets_and_validates_pool_references() {
   let mut config = base_config("");
   config.providers.clear();
-  assert!(matches!(
-    compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "routes.default.provider"
-  ));
+  let compiled = compile_resources(&config).unwrap();
+  assert!(compiled.providers.contains_key("openai"));
 
   config.providers.insert(
     "default".into(),
     RawProvider {
-      driver: "openai".into(),
+      enable: true,
+      driver: Some("openai".into()),
       base_url: None,
       origins: Vec::new(),
       allow_insecure_http: false,
     },
   );
   config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
+  assert!(compile_resources(&config).is_ok());
+
+  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["not-installed".into()]);
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::UnresolvedReference { field: "providers", target, .. }) if target == "zai"
+    Err(CompileError::UnresolvedReference { field: "providers", target, .. }) if target == "not-installed"
   ));
+}
+
+#[test]
+fn official_provider_presets_are_implicit_and_overlayable() {
+  let mut config = parse_config(
+    r#"
+schema_version = 2
+
+[providers.openai]
+base_url = "https://gateway.example/v1"
+"#,
+  );
+  let compiled = compile_resources(&config).unwrap();
+  let openai = &compiled.providers[&ProviderId::new("openai").unwrap()];
+  assert_eq!(openai.driver().as_str(), "openai");
+  assert_eq!(openai.base_url(), Some("https://gateway.example/v1/"));
+
+  config.providers.get_mut("openai").unwrap().driver = Some("deepseek".into());
+  let compiled = compile_resources(&config).unwrap();
+  assert_eq!(
+    compiled.providers[&ProviderId::new("openai").unwrap()]
+      .driver()
+      .as_str(),
+    "deepseek"
+  );
+}
+
+#[test]
+fn fixed_routes_and_pools_can_reference_an_implicit_official_provider() {
+  let mut config = base_config("");
+  config.providers.clear();
+  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["openai".into()]);
+  config.routes.insert(
+    "default".into(),
+    RawRoute::Managed {
+      account_pool: "default".into(),
+      provider: RawProviderSelector::Fixed {
+        provider: "openai".into(),
+      },
+      model: RawModelSelector::Capability {},
+      operation: RawOperationPolicy::Preserve,
+    },
+  );
+
+  let compiled = compile_resources(&config).unwrap();
+  assert!(compiled.providers.contains_key("openai"));
+}
+
+#[test]
+fn official_destination_variants_defer_destinations_to_runtime_linking() {
+  let compiled = compile_resources(&parse_config("schema_version = 2\n")).unwrap();
+  for provider in ["zai-coding-plan", "zhipuai", "zhipuai-coding-plan"] {
+    let provider = &compiled.providers[&ProviderId::new(provider).unwrap()];
+    assert_eq!(provider.driver().as_str(), "zai");
+    assert_eq!(provider.base_url(), None);
+  }
+}
+
+#[test]
+fn official_providers_can_be_disabled_without_discarding_their_settings() {
+  let config = parse_config(
+    r#"
+schema_version = 2
+
+[providers.openai]
+enable = false
+"#,
+  );
+  let compiled = compile_resources(&config).unwrap();
+  assert!(!compiled.providers.contains_key("openai"));
+
+  let mut referenced = base_config("");
+  referenced.providers.clear();
+  referenced
+    .providers
+    .insert("openai".into(), config.providers["openai"].clone());
+  referenced.account_pools.get_mut("default").unwrap().providers = Some(vec!["openai".into()]);
+  assert!(matches!(
+    compile_resources(&referenced),
+    Err(CompileError::UnresolvedReference { target, .. }) if target == "openai"
+  ));
+
+  let configured = parse_config(
+    r#"
+schema_version = 2
+[providers.openai]
+enable = false
+driver = "openai"
+base_url = "https://gateway.example/v1"
+"#,
+  );
+  assert!(!compile_resources(&configured).unwrap().providers.contains_key("openai"));
+
+  let custom = parse_config(
+    r#"
+schema_version = 2
+[providers.custom]
+enable = false
+driver = "openai"
+base_url = "https://gateway.example/v1"
+"#,
+  );
+  assert!(matches!(
+    compile_resources(&custom),
+    Err(CompileError::InvalidValue { location, .. }) if location == "providers.custom.enable"
+  ));
+}
+
+#[test]
+fn custom_provider_still_requires_a_driver() {
+  let missing = parse_config(
+    r#"
+schema_version = 2
+[providers.company]
+base_url = "https://gateway.example/v1"
+"#,
+  );
+  assert!(matches!(
+    compile_resources(&missing),
+    Err(CompileError::InvalidValue { location, .. }) if location == "providers.company.driver"
+  ));
+
+  let configured = parse_config(
+    r#"
+schema_version = 2
+[providers.company]
+driver = "openai"
+base_url = "https://gateway.example/v1"
+"#,
+  );
+  assert_eq!(
+    compile_resources(&configured).unwrap().providers[&ProviderId::new("company").unwrap()]
+      .driver()
+      .as_str(),
+    "openai"
+  );
 }
 
 #[test]

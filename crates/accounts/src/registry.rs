@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokn_auth::descriptor::{ProviderDescriptor, RewriteTarget};
 use tokn_core::account::AccountConfig;
-use tokn_core::provider::{error, Endpoint, Provider, ProviderTarget, Result};
+use tokn_core::provider::{error, official_provider_preset, Endpoint, Provider, ProviderTarget, Result};
 use tokn_core::upstream_url::CleartextHttpPolicy;
 
 pub struct Registry {
@@ -34,6 +34,17 @@ impl Registry {
   /// this name to keep configured providers distinct from their driver.
   pub fn resolve_driver(&self, id: &str) -> Option<&'static ProviderDescriptor> {
     self.resolve(id)
+  }
+
+  /// Resolve the descriptor that supplies a configured provider's default
+  /// destination and metadata. An official provider keeps its named
+  /// destination while it uses the preset driver; custom mappings inherit
+  /// the selected driver's defaults.
+  pub fn resolve_provider_descriptor(&self, provider_id: &str, driver_id: &str) -> Option<&'static ProviderDescriptor> {
+    official_provider_preset(provider_id)
+      .filter(|preset| preset.driver == driver_id)
+      .and_then(|_| self.resolve(provider_id))
+      .or_else(|| self.resolve_driver(driver_id))
   }
 
   pub fn iter(&self) -> impl Iterator<Item = &'static ProviderDescriptor> + '_ {
@@ -92,6 +103,25 @@ impl Registry {
   pub fn build_at(&self, account: Arc<AccountConfig>, target: ProviderTarget) -> Result<Arc<dyn Provider>> {
     self.validate(&account)?;
     let descriptor = self.resolve(&account.provider).expect("validated provider descriptor");
+    (descriptor.build)(account, target)
+  }
+
+  /// Build a provider through its reusable driver while preserving the
+  /// configured provider identity when that driver's implementation supports
+  /// multiple named destinations.
+  pub fn build_driver_at(
+    &self,
+    driver_id: &str,
+    account: Arc<AccountConfig>,
+    target: ProviderTarget,
+  ) -> Result<Arc<dyn Provider>> {
+    let descriptor = self
+      .resolve_driver(driver_id)
+      .ok_or_else(|| error::Error::UnknownProvider {
+        id: driver_id.to_string(),
+        account: account.id.clone(),
+      })?;
+    (descriptor.validate)(&account)?;
     (descriptor.build)(account, target)
   }
 
@@ -278,6 +308,41 @@ mod tests {
       registry.provider_id_for_url("https://open.bigmodel.cn/api/paas/v4/chat/completions"),
       Some(ID_ZHIPUAI)
     );
+  }
+
+  #[test]
+  fn provider_descriptors_preserve_official_destinations_with_shared_drivers() {
+    let registry = Registry::builtin();
+
+    assert_eq!(
+      registry.resolve_provider_descriptor(ID_ZHIPUAI, ID_ZAI).unwrap().id,
+      ID_ZHIPUAI
+    );
+    assert_eq!(
+      registry.resolve_provider_descriptor(ID_ZHIPUAI, ID_OPENAI).unwrap().id,
+      ID_OPENAI
+    );
+    assert_eq!(
+      registry.resolve_provider_descriptor("custom-zai", ID_ZAI).unwrap().id,
+      ID_ZAI
+    );
+  }
+
+  #[test]
+  fn shared_driver_build_preserves_a_supported_named_provider_identity() {
+    let registry = Registry::builtin();
+    let mut account = (*llama_account("zhipuai-account", None)).clone();
+    account.provider = ID_ZHIPUAI.into();
+    account.api_key = Some("test-key".to_string().into());
+    let target = ProviderTarget::parse(
+      "https://open.bigmodel.cn/api/paas/v4",
+      CleartextHttpPolicy::LoopbackOnly,
+    )
+    .unwrap();
+
+    let provider = registry.build_driver_at(ID_ZAI, Arc::new(account), target).unwrap();
+
+    assert_eq!(provider.info().id, ID_ZHIPUAI);
   }
 
   #[test]

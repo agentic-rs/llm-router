@@ -393,9 +393,9 @@ fn route_pool(route: &RoutePlan) -> Option<&AccountPoolId> {
 fn selected(binding: Arc<ProviderBinding>, operation: Endpoint, model: SmolStr) -> SelectorOutcome {
   SelectorOutcome::Selected {
     account_id: SmolStr::new(binding.account_id()),
-    // The six-stage pipeline still consumes the reusable driver id for
-    // protocol conversion and provider-owned header behavior. Named-provider
-    // policy has already been enforced against `binding.provider_id()`.
+    // The six-stage pipeline consumes the provider dialect exposed by the
+    // reusable driver instance. Shared drivers may retain a more specific
+    // named-provider identity such as `zhipuai` here.
     provider_id: SmolStr::new(binding.driver().info().id.as_str()),
     upstream_endpoint: Some(operation),
     upstream_model: model,
@@ -420,7 +420,7 @@ impl ProviderConstraint {
   fn matches(&self, binding: &ProviderBinding) -> bool {
     match self {
       Self::Any => true,
-      Self::Driver(driver) => binding.driver().info().id.as_str() == driver.as_str(),
+      Self::Driver(driver) => binding.driver_id() == driver,
       Self::Provider(provider) => binding.provider_id() == provider,
     }
   }

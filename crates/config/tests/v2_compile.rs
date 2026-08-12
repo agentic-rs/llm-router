@@ -205,7 +205,10 @@ hosts = ["*.internal.example"]
   assert!(plan.profiles().is_empty());
   assert!(plan.routes().is_empty());
   assert!(plan.account_pools().is_empty());
-  assert!(plan.providers().is_empty());
+  assert_eq!(
+    plan.providers().len(),
+    tokn_core::provider::OFFICIAL_PROVIDER_PRESETS.len()
+  );
   assert!(plan.model_groups().is_empty());
 
   let ListenerPlan::ForwardProxy(proxy) = plan.listeners().get("proxy").unwrap() else {

@@ -412,7 +412,7 @@ target = {{ kind = "provider_from_origin", account_pool = "primary" }}
 
 [account_pools.primary]
 accounts = ["acct"]
-providers = ["local"]
+providers = ["*"]
 
 [providers.local]
 driver = "llama-cpp"
