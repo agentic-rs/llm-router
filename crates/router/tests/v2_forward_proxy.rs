@@ -115,6 +115,7 @@ hosts = ["blocked.example"]
 #[test]
 fn v2_forward_proxy_materializes_interception_ca() {
   let ca = tempfile::tempdir().unwrap();
+  let ca_dir = toml_string(&ca.path().to_string_lossy());
   let plan = tokn_config::v2::parse(
     &format!(
       r#"
@@ -126,9 +127,8 @@ bind = "127.0.0.1:8080"
 client_auth = "none"
 default_http_action = {{ kind = "reject" }}
 default_connect = "intercept"
-ca_dir = "{}"
-"#,
-      ca.path().display()
+ca_dir = {ca_dir}
+"#
     ),
     Path::new("v2-forward-proxy.toml"),
   )
@@ -238,6 +238,7 @@ async fn v2_forward_proxy_intercepts_tls_and_reuses_http_policy() {
   let proxy_addr = probe.local_addr().unwrap();
   drop(probe);
   let ca = tempfile::tempdir().unwrap();
+  let ca_dir = toml_string(&ca.path().to_string_lossy());
   let config = format!(
     r#"
 schema_version = 2
@@ -248,9 +249,8 @@ bind = "{proxy_addr}"
 client_auth = "none"
 default_http_action = {{ kind = "reject" }}
 default_connect = "intercept"
-ca_dir = "{}"
-"#,
-    ca.path().display()
+ca_dir = {ca_dir}
+"#
   );
   let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
   let state =
@@ -523,4 +523,15 @@ async fn wait_for_listener(addr: std::net::SocketAddr) {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
   }
   panic!("proxy listener did not start at {addr}");
+}
+
+fn toml_string(value: &str) -> String {
+  toml::Value::String(value.to_string()).to_string()
+}
+
+#[test]
+fn proxy_test_config_escapes_windows_paths() {
+  let path = r"C:\Users\runneradmin\AppData\Local\Temp\.tmp-ca";
+  let parsed = toml::from_str::<toml::Value>(&format!("ca_dir = {}", toml_string(path))).unwrap();
+  assert_eq!(parsed["ca_dir"].as_str(), Some(path));
 }
