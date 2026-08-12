@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokn_accounts::registry::Registry;
 use tokn_auth::descriptor::RewriteTarget;
 use tokn_core::util::http::HttpClientOptions;
+use tokn_policy::{CanonicalHost, ConnectAction};
 use transport::handle_client;
 
 fn is_benign_disconnect(err: &anyhow::Error) -> bool {
@@ -67,6 +68,8 @@ pub struct ProxyOptions {
 pub type ProxyPlainHttpHandler =
   Arc<dyn Fn(ProxyPlainHttpRequest) -> Option<ProxyPlainHttpResponse> + Send + Sync + 'static>;
 
+pub(crate) type ProxyConnectPolicy = Arc<dyn Fn(&CanonicalHost, u16) -> ConnectAction + Send + Sync + 'static>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyPlainHttpRequest {
   pub method: String,
@@ -99,6 +102,12 @@ where
   let state = Arc::new(state);
   let router = proxy_router((*state).clone());
   let host_policy = HostPolicy::new(&options);
+  let runtime = transport::ProxyRuntime::Legacy {
+    state,
+    router,
+    ca,
+    host_policy,
+  };
   let outbound_proxy = Arc::new(connect_proxy::ConnectProxy::from_options(&options.outbound_proxy));
   let plain_http_handler = options.plain_http_handler.clone();
 
@@ -111,14 +120,72 @@ where
       _ = &mut shutdown => break,
       accept = listener.accept() => {
         let (stream, peer) = accept?;
-        let router = router.clone();
-        let ca = ca.clone();
-        let state = state.clone();
-        let host_policy = host_policy.clone();
+        let runtime = runtime.clone();
         let outbound_proxy = outbound_proxy.clone();
         let plain_http_handler = plain_http_handler.clone();
         tokio::spawn(async move {
-          if let Err(err) = handle_client(stream, peer, state, router, ca, host_policy, outbound_proxy, plain_http_handler).await {
+          if let Err(err) = handle_client(stream, peer, runtime, outbound_proxy, plain_http_handler).await {
+            if is_benign_disconnect(&err) {
+              tracing::debug!(%peer, error = %err, "proxy connection closed by peer");
+            } else {
+              tracing::warn!(%peer, error = %err, "proxy connection failed");
+            }
+          }
+        });
+      }
+    }
+  }
+
+  Ok(())
+}
+
+pub(crate) async fn serve_connect_policy<F>(
+  addr: SocketAddr,
+  outbound_proxy: HttpClientOptions,
+  connect_policy: ProxyConnectPolicy,
+  client_auth: Option<Arc<tokn_access::AccessStore>>,
+  shutdown: F,
+) -> Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  serve_policy_runtime(
+    addr,
+    outbound_proxy,
+    transport::ProxyRuntime::Policy {
+      connect_policy,
+      client_auth,
+    },
+    shutdown,
+  )
+  .await
+}
+
+async fn serve_policy_runtime<F>(
+  addr: SocketAddr,
+  outbound_proxy: HttpClientOptions,
+  runtime: transport::ProxyRuntime,
+  shutdown: F,
+) -> Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  let listener = TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
+  let outbound_proxy = Arc::new(connect_proxy::ConnectProxy::from_options(&outbound_proxy));
+
+  tracing::info!(%addr, "tokn-router proxy listening");
+
+  tokio::pin!(shutdown);
+
+  loop {
+    tokio::select! {
+      _ = &mut shutdown => break,
+      accept = listener.accept() => {
+        let (stream, peer) = accept?;
+        let runtime = runtime.clone();
+        let outbound_proxy = outbound_proxy.clone();
+        tokio::spawn(async move {
+          if let Err(err) = handle_client(stream, peer, runtime, outbound_proxy, None).await {
             if is_benign_disconnect(&err) {
               tracing::debug!(%peer, error = %err, "proxy connection closed by peer");
             } else {
@@ -210,6 +277,7 @@ fn split_authority(authority: &str) -> Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
   #[test]
   fn benign_disconnect_matches_unexpected_eof() {
@@ -227,5 +295,44 @@ mod tests {
   fn benign_disconnect_rejects_other_errors() {
     let err = anyhow::anyhow!("invalid CONNECT authority");
     assert!(!is_benign_disconnect(&err));
+  }
+
+  #[tokio::test]
+  async fn policy_transport_refuses_unadapted_interception() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_connect_policy(
+      addr,
+      HttpClientOptions::default(),
+      Arc::new(|_, _| ConnectAction::Intercept),
+      None,
+      async {
+        let _ = shutdown_rx.await;
+      },
+    ));
+    let mut stream = None;
+    for _ in 0..50 {
+      match tokio::net::TcpStream::connect(addr).await {
+        Ok(connected) => {
+          stream = Some(connected);
+          break;
+        }
+        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+      }
+    }
+    let mut stream = stream.expect("policy proxy listener should start");
+
+    stream
+      .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+      .await
+      .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 501 Not Implemented"));
+
+    shutdown_tx.send(()).unwrap();
+    server.await.unwrap().unwrap();
   }
 }
