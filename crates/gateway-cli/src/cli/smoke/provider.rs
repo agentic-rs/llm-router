@@ -1,16 +1,15 @@
-use super::send::filter_accounts;
 use super::OutputFormat;
-use crate::config::Config;
 use anyhow::{anyhow, Result};
 use clap::Args;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tokn_core::provider::{match_endpoint_rule, Endpoint, ModelInfo};
+use tokn_policy::{GatewayPlan, ProviderId};
 use tokn_router::accounts::registry::Registry;
 
 #[derive(Args, Debug)]
 pub struct ProviderArgs {
-  /// Provider id (e.g. `github-copilot`, `openai`, `deepseek`, `zai`).
+  /// Configured v2 provider name.
   pub provider_id: String,
 
   /// Output format.
@@ -24,24 +23,66 @@ pub struct ProviderArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ProviderArgs) -> Result<()> {
+  let (plan, resolved_cfg_path) = super::load_v2_plan(cfg_path.as_deref())?;
   let registry = Registry::builtin();
-  let descriptor = registry.resolve(&args.provider_id).ok_or_else(|| {
-    let known = registry.ids().join(", ");
-    anyhow!("unknown provider '{}'; known: {}", args.provider_id, known)
-  })?;
+  let (provider_id, provider, descriptor) = resolve_provider(&plan, &registry, &args.provider_id)?;
 
   let static_models = tokn_catalogue::default_models_for(descriptor.id);
   let live_models: Option<Vec<String>> = if args.live {
-    Some(fetch_live_models(cfg_path.as_deref(), descriptor.id).await?)
+    Some(fetch_live_models(&plan, &resolved_cfg_path, provider_id).await?)
   } else {
     None
   };
 
   match args.format {
-    OutputFormat::Text => print_provider_text(descriptor, &static_models, live_models.as_deref()),
-    OutputFormat::Json => print_provider_json(descriptor, &static_models, live_models.as_deref())?,
+    OutputFormat::Text => print_provider_text(
+      provider_id,
+      provider,
+      descriptor,
+      &static_models,
+      live_models.as_deref(),
+    ),
+    OutputFormat::Json => print_provider_json(
+      provider_id,
+      provider,
+      descriptor,
+      &static_models,
+      live_models.as_deref(),
+    )?,
   }
   Ok(())
+}
+
+fn resolve_provider<'a>(
+  plan: &'a GatewayPlan,
+  registry: &Registry,
+  requested: &str,
+) -> Result<(
+  &'a ProviderId,
+  &'a tokn_policy::ProviderPlan,
+  &'static tokn_auth::descriptor::ProviderDescriptor,
+)> {
+  let (provider_id, provider) = plan
+    .providers()
+    .iter()
+    .find(|(provider_id, _)| provider_id.as_str() == requested)
+    .ok_or_else(|| {
+      let known = plan
+        .providers()
+        .keys()
+        .map(ProviderId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+      anyhow!("unknown configured provider '{requested}'; configured: {known}")
+    })?;
+  let descriptor = registry.resolve_driver(provider.driver().as_str()).ok_or_else(|| {
+    anyhow!(
+      "configured provider '{}' references unknown driver '{}'",
+      provider_id,
+      provider.driver()
+    )
+  })?;
+  Ok((provider_id, provider, descriptor))
 }
 
 pub(super) fn endpoints_for_model(
@@ -70,13 +111,16 @@ pub(super) fn endpoints_for_model(
 }
 
 fn print_provider_text(
+  provider_id: &ProviderId,
+  provider: &tokn_policy::ProviderPlan,
   descriptor: &'static tokn_auth::descriptor::ProviderDescriptor,
   static_models: &[ModelInfo],
   live_models: Option<&[String]>,
 ) {
-  println!("provider:     {}", descriptor.id);
+  println!("provider:     {provider_id}");
+  println!("driver:       {}", provider.driver());
   println!("display_name: {}", descriptor.display_name);
-  println!("base_url:     {}", descriptor.base_url);
+  println!("base_url:     {}", provider.base_url().unwrap_or(descriptor.base_url));
   if !descriptor.hosts.is_empty() {
     println!("hosts:        {}", descriptor.hosts.join(", "));
   }
@@ -123,6 +167,8 @@ fn print_provider_text(
 }
 
 fn print_provider_json(
+  provider_id: &ProviderId,
+  provider: &tokn_policy::ProviderPlan,
   descriptor: &'static tokn_auth::descriptor::ProviderDescriptor,
   static_models: &[ModelInfo],
   live_models: Option<&[String]>,
@@ -154,9 +200,10 @@ fn print_provider_json(
     .collect();
 
   let mut out = serde_json::json!({
-    "provider": descriptor.id,
+    "provider": provider_id.as_str(),
+    "driver": provider.driver().as_str(),
     "display_name": descriptor.display_name,
-    "base_url": descriptor.base_url,
+    "base_url": provider.base_url().unwrap_or(descriptor.base_url),
     "hosts": descriptor.hosts,
     "endpoints": endpoints,
     "models": models,
@@ -171,23 +218,28 @@ fn print_provider_json(
   Ok(())
 }
 
-async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str) -> Result<Vec<String>> {
-  let (cfg, resolved_cfg_path) = Config::load(cfg_path)?;
-  let mut accounts = crate::server_runtime::load_accounts(Some(&resolved_cfg_path))?;
-  filter_accounts(&mut accounts, Some(provider_id), None)?;
-
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&cfg)?;
-  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let state = crate::server_runtime::build_state(&cfg, &accounts, events.clone())?;
+async fn fetch_live_models(
+  plan: &GatewayPlan,
+  config_path: &std::path::Path,
+  provider_id: &ProviderId,
+) -> Result<Vec<String>> {
+  let accounts = crate::server_runtime::load_accounts(Some(config_path))?;
+  let registry = Registry::builtin();
+  let providers = tokn_router::accounts::link::link_provider_graph(plan, &accounts, &registry)?;
+  let bindings = providers
+    .bindings()
+    .filter(|binding| binding.provider_id() == provider_id)
+    .collect::<Vec<_>>();
+  if bindings.is_empty() {
+    anyhow::bail!("configured provider '{provider_id}' has no enabled account");
+  }
+  let http = tokn_core::util::http::build_client(&Default::default())?;
 
   let mut ids: Vec<String> = Vec::new();
   let mut seen: HashSet<String> = HashSet::new();
   let mut last_err: Option<String> = None;
-  for acct in state.pool.all() {
-    if acct.provider.info().id != provider_id {
-      continue;
-    }
-    match acct.provider.list_models(&state.http).await {
+  for binding in bindings {
+    match binding.driver().list_models(&http).await {
       Ok(v) => {
         if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
           for m in arr {
@@ -203,15 +255,45 @@ async fn fetch_live_models(cfg_path: Option<&std::path::Path>, provider_id: &str
     }
   }
 
-  if let Some(rt) = archive_runtime {
-    rt.shutdown().await;
-  }
-  events.shutdown().await;
-
   if ids.is_empty() {
     let msg = last_err.unwrap_or_else(|| format!("no live models returned for provider '{provider_id}'"));
     return Err(anyhow!("live model fetch failed: {msg}"));
   }
   ids.sort();
   Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::path::Path;
+
+  #[test]
+  fn configured_provider_resolves_its_driver_metadata() {
+    let plan = tokn_config::v2::parse(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+
+[providers.public]
+driver = "openai"
+base_url = "https://gateway.example/v1"
+"#,
+      Path::new("provider-smoke.toml"),
+    )
+    .unwrap();
+    let registry = Registry::builtin();
+
+    let (provider_id, provider, descriptor) = resolve_provider(&plan, &registry, "public").unwrap();
+
+    assert_eq!(provider_id.as_str(), "public");
+    assert_eq!(provider.driver().as_str(), "openai");
+    assert_eq!(descriptor.id, "openai");
+    assert!(resolve_provider(&plan, &registry, "openai").is_err());
+  }
 }

@@ -377,6 +377,12 @@ tokn-gateway update
 tokn-gateway smoke provider|model|send ...
 ```
 
+`smoke provider` and `smoke send` require a `schema_version = 2` config.
+`smoke provider` accepts a configured provider name, and `smoke send` runs a
+request through the selected `llm_api` listener in memory. Pass `--listener`
+when the config contains more than one LLM API listener. `smoke model` remains
+a catalogue-only lookup and does not load the gateway config.
+
 Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`. A
 fresh link defaults to `route`; a relink or sync preserves the binding's
 current mode when `--mode` is omitted. `exact` requires an agent that can
