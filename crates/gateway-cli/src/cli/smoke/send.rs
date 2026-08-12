@@ -506,10 +506,13 @@ fn print_event(event: &RequestEvent) {
 }
 
 fn parse_header_kv(raw: &str) -> std::result::Result<(String, String), String> {
-  let (name, value) = raw
-    .split_once('=')
-    .or_else(|| raw.split_once(':').map(|(name, value)| (name, value.trim_start())))
+  let (delimiter_index, delimiter) = raw
+    .char_indices()
+    .find(|(_, character)| matches!(character, '=' | ':'))
     .ok_or_else(|| format!("expected `name=value` or `name: value`, got `{raw}`"))?;
+  let (name, value) = raw.split_at(delimiter_index);
+  let value = &value[delimiter.len_utf8()..];
+  let value = if delimiter == ':' { value.trim_start() } else { value };
   let name = name.trim();
   if name.is_empty() {
     return Err("header name must not be empty".into());
@@ -652,6 +655,18 @@ mod tests {
     let captured = "HEADERS:\n{\"accept\":\"*/*\"}\n\nBODY:\n{\"model\":\"glm-5.1\"}\n";
     assert_eq!(extract_body_section(captured), Some("{\"model\":\"glm-5.1\"}\n"));
     assert_eq!(extract_body_section("{\"model\":\"glm-5.1\"}"), None);
+  }
+
+  #[test]
+  fn header_parser_uses_first_supported_delimiter() {
+    assert_eq!(
+      parse_header_kv(" x-trace: a=b ").unwrap(),
+      ("x-trace".into(), "a=b".into())
+    );
+    assert_eq!(
+      parse_header_kv("x-url=https://example.test").unwrap(),
+      ("x-url".into(), "https://example.test".into())
+    );
   }
 
   #[test]
