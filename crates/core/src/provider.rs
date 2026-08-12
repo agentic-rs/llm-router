@@ -24,6 +24,57 @@ pub const ID_ZHIPUAI_CODING_PLAN: &str = "zhipuai-coding-plan";
 pub const ID_ZHIPUAI: &str = "zhipuai";
 pub const ZAI_PROVIDERS: &[&str] = &[ID_ZAI_CODING_PLAN, ID_ZAI, ID_ZHIPUAI_CODING_PLAN, ID_ZHIPUAI];
 
+/// One built-in provider destination made available by v2 without an
+/// explicit `[providers.*]` table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfficialProviderPreset {
+  pub id: &'static str,
+  pub driver: &'static str,
+}
+
+pub const OFFICIAL_PROVIDER_PRESETS: &[OfficialProviderPreset] = &[
+  OfficialProviderPreset {
+    id: ID_CODEX,
+    driver: ID_CODEX,
+  },
+  OfficialProviderPreset {
+    id: ID_DEEPSEEK,
+    driver: ID_DEEPSEEK,
+  },
+  OfficialProviderPreset {
+    id: ID_GITHUB_COPILOT,
+    driver: ID_GITHUB_COPILOT,
+  },
+  OfficialProviderPreset {
+    id: ID_LLAMA_CPP,
+    driver: ID_LLAMA_CPP,
+  },
+  OfficialProviderPreset {
+    id: ID_OPENAI,
+    driver: ID_OPENAI,
+  },
+  OfficialProviderPreset {
+    id: ID_ZAI,
+    driver: ID_ZAI,
+  },
+  OfficialProviderPreset {
+    id: ID_ZAI_CODING_PLAN,
+    driver: ID_ZAI,
+  },
+  OfficialProviderPreset {
+    id: ID_ZHIPUAI,
+    driver: ID_ZAI,
+  },
+  OfficialProviderPreset {
+    id: ID_ZHIPUAI_CODING_PLAN,
+    driver: ID_ZAI,
+  },
+];
+
+pub fn official_provider_preset(id: &str) -> Option<&'static OfficialProviderPreset> {
+  OFFICIAL_PROVIDER_PRESETS.iter().find(|preset| preset.id == id)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthKind {

@@ -612,17 +612,25 @@ fn provider_origins(
   pools: &AccountPoolRuntimes,
   pool_id: &tokn_policy::AccountPoolId,
 ) -> anyhow::Result<BTreeMap<String, tokn_policy::ProviderId>> {
-  pools
-    .runtime(pool_id)
-    .ok_or_else(|| anyhow::anyhow!("origin relay references missing account pool '{pool_id}'"))?;
   let pool = plan
     .account_pool(pool_id)
     .ok_or_else(|| anyhow::anyhow!("origin relay references missing account-pool policy '{pool_id}'"))?;
+  let runtime = pools
+    .runtime(pool_id)
+    .ok_or_else(|| anyhow::anyhow!("origin relay references missing account pool '{pool_id}'"))?;
+  let bound_providers = runtime
+    .pool()
+    .active()
+    .iter()
+    .chain(runtime.pool().fallback())
+    .map(|account| account.binding().provider_id())
+    .collect::<BTreeSet<_>>();
   let eligible = plan.providers().keys().filter(|provider_id| {
-    pool
-      .selector()
-      .providers()
-      .is_none_or(|allowed| allowed.contains(*provider_id))
+    bound_providers.contains(provider_id)
+      && pool
+        .selector()
+        .providers()
+        .is_none_or(|allowed| allowed.contains(*provider_id))
   });
   let mut origins = BTreeMap::new();
   for provider_id in eligible {

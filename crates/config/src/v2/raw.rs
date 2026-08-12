@@ -274,7 +274,16 @@ const fn default_session_ttl_secs() -> u64 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawProvider {
-  pub driver: String,
+  /// Whether this provider is available to routes and account pools. Official
+  /// provider presets default to enabled and may be disabled with
+  /// `enable = false`. Custom providers cannot be disabled because removing
+  /// them would also remove the runtime metadata needed to identify them.
+  #[serde(default = "default_true")]
+  pub enable: bool,
+  /// Runtime driver implementation. Official provider presets supply this
+  /// automatically; custom providers must configure it explicitly.
+  #[serde(default)]
+  pub driver: Option<String>,
   #[serde(default)]
   pub base_url: Option<String>,
   #[serde(default)]
@@ -283,6 +292,10 @@ pub struct RawProvider {
   /// over non-loopback cleartext HTTP. Loopback HTTP never needs the escape.
   #[serde(default)]
   pub allow_insecure_http: bool,
+}
+
+const fn default_true() -> bool {
+  true
 }
 
 /// One ordered model fallback candidate.

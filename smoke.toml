@@ -24,30 +24,8 @@ accounts = ["*"]
 providers = ["*"]
 strategy = "round_robin"
 
-# Provider names intentionally match the provider ids stored in auth.yaml.
-[providers.github-copilot]
-driver = "github-copilot"
-
-[providers.openai]
-driver = "openai"
-
-[providers.codex]
-driver = "codex"
-
-[providers.deepseek]
-driver = "deepseek"
-
-[providers.llama-cpp]
-driver = "llama-cpp"
-
-[providers.zai]
-driver = "zai"
-
-[providers.zai-coding-plan]
-driver = "zai-coding-plan"
-
-[providers.zhipuai]
-driver = "zhipuai"
-
-[providers.zhipuai-coding-plan]
-driver = "zhipuai-coding-plan"
+# Official providers are available automatically. Override one only to change
+# its destination or disable it, for example:
+#
+# [providers.openai]
+# enable = false

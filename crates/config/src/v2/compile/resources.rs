@@ -5,6 +5,7 @@ use crate::v2::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+use tokn_core::provider::{official_provider_preset, OFFICIAL_PROVIDER_PRESETS};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_policy::{
   AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, DriverId, FallbackSelector, ManagedRetry,
@@ -185,14 +186,47 @@ fn validate_selector_shape(raw_values: &[String], location: String) -> Result<()
 fn compile_providers(
   raw_providers: &BTreeMap<String, RawProvider>,
 ) -> Result<BTreeMap<ProviderId, ProviderPlan>, CompileError> {
-  let mut plans = BTreeMap::new();
+  let mut plans = OFFICIAL_PROVIDER_PRESETS
+    .iter()
+    .map(|preset| {
+      Ok((
+        parse_id::<ProviderId>("provider id", preset.id)?,
+        ProviderPlan::new(
+          parse_id::<DriverId>("provider driver", preset.driver)?,
+          None,
+          Box::default(),
+          false,
+        ),
+      ))
+    })
+    .collect::<Result<BTreeMap<_, _>, CompileError>>()?;
 
   for (raw_id, raw_provider) in raw_providers {
     let id = parse_id::<ProviderId>("provider id", raw_id)?;
-    let driver = parse_id::<DriverId>("provider driver", &raw_provider.driver)?;
-    let (base_url, base_origin) = raw_provider
-      .base_url
+    let preset = official_provider_preset(raw_id);
+    if !raw_provider.enable {
+      if preset.is_none() {
+        return Err(invalid_value(
+          format!("providers.{raw_id}.enable"),
+          "only an official provider preset may be disabled",
+        ));
+      }
+      plans.remove(&id);
+      continue;
+    }
+    let raw_driver = raw_provider
+      .driver
       .as_deref()
+      .or_else(|| preset.map(|preset| preset.driver))
+      .ok_or_else(|| {
+        invalid_value(
+          format!("providers.{raw_id}.driver"),
+          "custom providers must configure a driver",
+        )
+      })?;
+    let driver = parse_id::<DriverId>("provider driver", raw_driver)?;
+    let effective_base_url = raw_provider.base_url.as_deref();
+    let (base_url, base_origin) = effective_base_url
       .map(|value| {
         canonical_base_url(
           value,

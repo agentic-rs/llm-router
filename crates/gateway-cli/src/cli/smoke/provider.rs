@@ -75,13 +75,15 @@ fn resolve_provider<'a>(
         .join(", ");
       anyhow!("unknown configured provider '{requested}'; configured: {known}")
     })?;
-  let descriptor = registry.resolve_driver(provider.driver().as_str()).ok_or_else(|| {
-    anyhow!(
-      "configured provider '{}' references unknown driver '{}'",
-      provider_id,
-      provider.driver()
-    )
-  })?;
+  let descriptor = registry
+    .resolve_provider_descriptor(provider_id.as_str(), provider.driver().as_str())
+    .ok_or_else(|| {
+      anyhow!(
+        "configured provider '{}' references unknown driver '{}'",
+        provider_id,
+        provider.driver()
+      )
+    })?;
   Ok((provider_id, provider, descriptor))
 }
 
@@ -294,6 +296,15 @@ base_url = "https://gateway.example/v1"
     assert_eq!(provider_id.as_str(), "public");
     assert_eq!(provider.driver().as_str(), "openai");
     assert_eq!(descriptor.id, "openai");
-    assert!(resolve_provider(&plan, &registry, "openai").is_err());
+    let (provider_id, provider, descriptor) = resolve_provider(&plan, &registry, "openai").unwrap();
+    assert_eq!(provider_id.as_str(), "openai");
+    assert_eq!(provider.driver().as_str(), "openai");
+    assert_eq!(descriptor.id, "openai");
+
+    let (provider_id, provider, descriptor) = resolve_provider(&plan, &registry, "zhipuai").unwrap();
+    assert_eq!(provider_id.as_str(), "zhipuai");
+    assert_eq!(provider.driver().as_str(), "zai");
+    assert_eq!(descriptor.id, "zhipuai");
+    assert_eq!(descriptor.base_url, "https://open.bigmodel.cn/api/paas/v4");
   }
 }
