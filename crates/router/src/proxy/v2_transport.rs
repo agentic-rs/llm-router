@@ -77,6 +77,22 @@ async fn handle_request(
   upgrades: mpsc::Sender<ConnectUpgrade>,
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
+  if request.method() != Method::CONNECT {
+    let request_id = crate::request_id::ensure_request_id(request.headers_mut());
+    let mut response = handle_request_inner(state, outbound_proxy, upgrades, request).await;
+    crate::request_id::set_response_request_id(&mut response, request_id);
+    return response;
+  }
+
+  handle_request_inner(state, outbound_proxy, upgrades, request).await
+}
+
+async fn handle_request_inner(
+  state: Arc<ForwardProxyState>,
+  outbound_proxy: Arc<ConnectProxy>,
+  upgrades: mpsc::Sender<ConnectUpgrade>,
+  mut request: Request<hyper::body::Incoming>,
+) -> Response<Body> {
   if is_websocket_upgrade(request.headers()) {
     return response(StatusCode::UPGRADE_REQUIRED, "websocket proxying is not supported");
   }
@@ -199,7 +215,8 @@ async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> 
         let ingress = ingress.clone();
         let access = access.clone();
         async move {
-          Ok::<_, Infallible>(match admit_intercepted(&request, &ingress) {
+          let request_id = crate::request_id::ensure_request_id(request.headers_mut());
+          let mut response = match admit_intercepted(&request, &ingress) {
             Ok(()) => {
               request.headers_mut().remove(header::PROXY_AUTHORIZATION);
               match strip_hop_by_hop_headers(request.headers_mut()) {
@@ -208,7 +225,9 @@ async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> 
               }
             }
             Err(error) => ApiError::bad_request(error.to_string()).into_response(),
-          })
+          };
+          crate::request_id::set_response_request_id(&mut response, request_id);
+          Ok::<_, Infallible>(response)
         }
       });
       let builder = http1_builder();

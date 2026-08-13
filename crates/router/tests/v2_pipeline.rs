@@ -156,6 +156,17 @@ base_url = "http://{upstream_addr}/v1"
     )
     .await
     .unwrap();
+  let managed_request_id = managed
+    .headers()
+    .get("x-request-id")
+    .expect("managed response missing generated request id")
+    .to_str()
+    .unwrap()
+    .to_string();
+  let managed_uuid = managed_request_id
+    .strip_prefix("req-")
+    .expect("managed request id missing req- prefix");
+  assert!(uuid::Uuid::parse_str(managed_uuid).is_ok());
   let managed_status = managed.status();
   let managed_response = to_bytes(managed.into_body(), usize::MAX).await.unwrap();
   assert_eq!(
@@ -172,6 +183,7 @@ base_url = "http://{upstream_addr}/v1"
   let captured_managed = capture_rx.recv().await.unwrap();
   assert_eq!(captured_managed.uri.path(), "/v1/chat/completions");
   assert_eq!(captured_managed.headers["authorization"], "Bearer sk-v2-test");
+  assert_eq!(captured_managed.headers["x-request-id"], managed_request_id);
   assert_eq!(
     serde_json::from_slice::<serde_json::Value>(&captured_managed.body).unwrap()["model"],
     "gpt-4o"
@@ -183,11 +195,13 @@ base_url = "http://{upstream_addr}/v1"
       Request::post("/v1/responses")
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {}", allowed_key.token))
+        .header("x-request-id", "client-v2-request")
         .body(Body::from(relay_body.clone()))
         .unwrap(),
     )
     .await
     .unwrap();
+  assert_eq!(relay.headers()["x-request-id"], "client-v2-request");
   let relay_status = relay.status();
   let relay_response = to_bytes(relay.into_body(), usize::MAX).await.unwrap();
   assert_eq!(
@@ -201,6 +215,7 @@ base_url = "http://{upstream_addr}/v1"
   let captured_relay = capture_rx.recv().await.unwrap();
   assert_eq!(captured_relay.uri.path(), "/v1/responses");
   assert_eq!(captured_relay.headers["authorization"], "Bearer sk-v2-test");
+  assert_eq!(captured_relay.headers["x-request-id"], "client-v2-request");
   assert_eq!(captured_relay.body, relay_body);
 
   server.abort();

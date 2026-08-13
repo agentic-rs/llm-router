@@ -23,7 +23,7 @@ pub(crate) struct BodyExtract {
 pub(crate) fn request_header_extract(headers: &HeaderMap) -> HeaderExtract {
   let request_id = first_header(headers, REQUEST_ID_HEADERS)
     .map(str::to_string)
-    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    .unwrap_or_else(crate::request_id::new_request_id);
   HeaderExtract { request_id }
 }
 

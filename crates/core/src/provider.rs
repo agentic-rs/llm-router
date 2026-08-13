@@ -526,9 +526,16 @@ pub trait Provider: Send + Sync {
   }
 
   fn patch_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+    // Correlation is chosen before provider-specific normalization. Some
+    // normalizers rebuild an allowlisted map, but they must not replace or
+    // discard the pipeline's authoritative request id.
+    let request_id = headers.get(&tokn_headers::keys::X_REQUEST_ID).cloned();
     self.inject_credentials(headers, ctx)?;
     if let Some(new_headers) = self.normalize_headers(headers, ctx)? {
       *headers = new_headers;
+    }
+    if let Some(request_id) = request_id {
+      headers.insert(&tokn_headers::keys::X_REQUEST_ID, request_id);
     }
     Ok(())
   }
@@ -673,6 +680,7 @@ mod tests {
   struct StubProvider {
     info: ProviderInfo,
     rules: Option<&'static [EndpointRule]>,
+    rebuild_headers: bool,
   }
 
   #[async_trait]
@@ -685,6 +693,9 @@ mod tests {
     }
     fn endpoint_rules(&self) -> Option<&'static [EndpointRule]> {
       self.rules
+    }
+    fn normalize_headers(&self, _headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
+      Ok(self.rebuild_headers.then(HeaderMap::new))
     }
     async fn list_models(&self, _http: &reqwest::Client) -> error::Result<Value> {
       Ok(Value::Null)
@@ -707,7 +718,42 @@ mod tests {
         model_cache: Arc::new(ModelCache::default()),
       },
       rules,
+      rebuild_headers: false,
     }
+  }
+
+  #[test]
+  fn patch_headers_preserves_request_id_when_normalizer_rebuilds_headers() {
+    let mut provider = stub(None, &[]);
+    provider.rebuild_headers = true;
+    let mut headers = HeaderMap::new();
+    headers.insert(&tokn_headers::keys::X_REQUEST_ID, "req-provider");
+    headers.insert("x-discarded", "discarded");
+
+    provider
+      .patch_headers(
+        &mut headers,
+        &HeaderPatchCtx {
+          request_kind: ProviderRequestKind::Operation(Endpoint::ChatCompletions),
+          body: &Value::Null,
+          bearer_token: None,
+          content_encoding: None,
+          stream: false,
+          initiator: "user",
+          inbound_headers: &HeaderMap::new(),
+          vars: &TemplateVars::default(),
+          agent_id: &AgentId::Opencode,
+        },
+      )
+      .unwrap();
+
+    assert_eq!(
+      headers
+        .get(&tokn_headers::keys::X_REQUEST_ID)
+        .map(|value| value.as_str()),
+      Some("req-provider")
+    );
+    assert!(!headers.contains_key("x-discarded"));
   }
 
   static CLAUDE_RULES: &[EndpointRule] = &[EndpointRule {
