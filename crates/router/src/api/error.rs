@@ -7,9 +7,9 @@
 //!
 //! `request_id` in the body envelope is intentionally always `null`: the
 //! authoritative request id is the `x-request-id` response header set by
-//! [`tower_http::request_id::PropagateRequestIdLayer`]. The body field
-//! exists for convenience only — populating it would require routing the
-//! id through every handler. Clients should prefer the header.
+//! the router's response propagation middleware. The body field exists for
+//! convenience only — populating it would require routing the id through
+//! every handler. Clients should prefer the header.
 //!
 //! `From<anyhow::Error>` is deliberately NOT implemented: every callsite that
 //! produces an error must classify it as one of the variants below, so we

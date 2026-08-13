@@ -129,7 +129,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     .and_then(Value::as_str)
     .ok_or_else(|| anyhow!("request body does not contain a string `model`; pass --model"))?
     .to_string();
-  let request_id = uuid::Uuid::new_v4().to_string();
+  let request_id = new_request_id();
   let mut request = http::Request::post(endpoint_path(endpoint))
     .header(http::header::CONTENT_TYPE, "application/json")
     .header("x-request-id", &request_id)
@@ -535,6 +535,10 @@ fn endpoint_path(endpoint: Endpoint) -> &'static str {
   }
 }
 
+fn new_request_id() -> String {
+  format!("req-{}", uuid::Uuid::new_v4())
+}
+
 fn build_request_body(endpoint: Endpoint, model: &str, message: &str, stream: bool) -> Value {
   match endpoint {
     Endpoint::ChatCompletions => serde_json::json!({
@@ -645,6 +649,13 @@ mod tests {
 
     let chat = build_request_body(Endpoint::ChatCompletions, "gpt-4.1", "hi", false);
     assert!(chat.get("max_tokens").is_none());
+  }
+
+  #[test]
+  fn generated_request_id_is_prefixed_uuid() {
+    let request_id = new_request_id();
+    let uuid = request_id.strip_prefix("req-").expect("missing req- prefix");
+    assert_eq!(uuid::Uuid::parse_str(uuid).unwrap().get_version_num(), 4);
   }
 
   #[test]

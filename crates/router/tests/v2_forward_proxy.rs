@@ -90,7 +90,7 @@ hosts = ["blocked.example"]
   tunnel
     .write_all(
       format!(
-        "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\nProxy-Authorization: Bearer {}\r\n\r\n",
+        "CONNECT {upstream_addr} HTTP/1.1\r\nHost: {upstream_addr}\r\nProxy-Authorization: Bearer {}\r\nX-Request-Id: outer-connect\r\n\r\n",
         key.token
       )
       .as_bytes(),
@@ -102,6 +102,7 @@ hosts = ["blocked.example"]
     response.starts_with("HTTP/1.1 200"),
     "unexpected CONNECT response: {response:?}"
   );
+  assert!(!response.to_ascii_lowercase().contains("x-request-id:"));
   tunnel.write_all(b"ping").await.unwrap();
   let mut reply = [0_u8; 4];
   tunnel.read_exact(&mut reply).await.unwrap();
@@ -222,10 +223,26 @@ kind = "transparent"
     .contains("content-length: 5\r\n"));
   assert!(response.windows(5).any(|window| window == b"world"));
 
+  let response_text = String::from_utf8_lossy(&response);
+  let generated_request_id = response_text
+    .lines()
+    .find_map(|line| {
+      line
+        .split_once(':')
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+    })
+    .map(|(_, value)| value.trim())
+    .expect("proxy response missing generated request id");
+  let generated_uuid = generated_request_id
+    .strip_prefix("req-")
+    .expect("proxy request id missing req- prefix");
+  assert!(uuid::Uuid::parse_str(generated_uuid).is_ok());
+
   let request = String::from_utf8(received.await.unwrap()).unwrap();
   assert!(request.starts_with("POST /opaque?x=1 HTTP/1.1\r\n"));
   assert!(request.contains("authorization: Bearer client\r\n"));
   let request_lower = request.to_ascii_lowercase();
+  assert!(request_lower.contains(&format!("x-request-id: {}\r\n", generated_request_id)));
   for removed in ["proxy-authorization", "connection:", "keep-alive:", "x-hop:"] {
     assert!(!request_lower.contains(removed), "forwarded request retained {removed}");
   }
@@ -361,6 +378,18 @@ ca_dir = {ca_dir}
   let mut response = Vec::new();
   tls.read_to_end(&mut response).await.unwrap();
   assert!(response.starts_with(b"HTTP/1.1 403 Forbidden"));
+  let response = String::from_utf8(response).unwrap();
+  let generated_request_id = response
+    .lines()
+    .find_map(|line| {
+      line
+        .split_once(':')
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+    })
+    .map(|(_, value)| value.trim())
+    .expect("intercepted response missing generated request id");
+  assert!(generated_request_id.starts_with("req-"));
+  assert!(uuid::Uuid::parse_str(&generated_request_id[4..]).is_ok());
 
   shutdown_tx.send(()).unwrap();
   proxy_task.await.unwrap().unwrap();
@@ -448,7 +477,7 @@ api_key = "router-secret"
   client
     .write_all(
       format!(
-        "POST http://{upstream_addr}/custom?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client-secret\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        "POST http://{upstream_addr}/custom?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client-secret\r\nX-Request-Id: client-proxy-request\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
       )
       .as_bytes(),
     )
@@ -462,6 +491,9 @@ api_key = "router-secret"
     String::from_utf8_lossy(&response)
   );
   assert!(response.windows(5).any(|window| window == b"retry"));
+  assert!(String::from_utf8_lossy(&response)
+    .to_ascii_lowercase()
+    .contains("x-request-id: client-proxy-request\r\n"));
 
   let request = String::from_utf8(received.await.unwrap()).unwrap();
   assert!(request.starts_with("POST /custom?x=1 HTTP/1.1\r\n"));
@@ -469,6 +501,9 @@ api_key = "router-secret"
   assert!(request
     .to_ascii_lowercase()
     .contains("authorization: bearer router-secret"));
+  assert!(request
+    .to_ascii_lowercase()
+    .contains("x-request-id: client-proxy-request\r\n"));
   assert!(request.ends_with("hello"));
 
   shutdown_tx.send(()).unwrap();

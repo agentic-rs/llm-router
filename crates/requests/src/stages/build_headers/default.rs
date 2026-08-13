@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use tokn_core::AgentId;
 use tokn_headers::inbound::build_template_vars;
 use tokn_headers::registry::build_wire_identity_headers;
+use tokn_headers::{keys, HeaderValue};
 
 /// Default BuildHeaders stage. See module docs for the resolution
 /// algorithm.
@@ -79,7 +80,7 @@ impl DefaultBuildHeaders {
 impl BuildHeadersStage for DefaultBuildHeaders {
   async fn build_headers(
     &self,
-    _ctx: &PipelineCtx,
+    ctx: &PipelineCtx,
     extracted: &Extracted,
     resolved: &Resolved,
   ) -> Result<BuiltHeaders, PipelineError> {
@@ -87,7 +88,11 @@ impl BuildHeadersStage for DefaultBuildHeaders {
     let vars = build_template_vars(inbound);
     let agent_id = self.effective_agent_id(extracted, resolved);
 
-    let headers = build_wire_identity_headers(resolved.provider_id.as_str(), agent_id.as_str(), &vars, inbound);
+    let mut headers = build_wire_identity_headers(resolved.provider_id.as_str(), agent_id.as_str(), &vars, inbound);
+    headers.insert(
+      &keys::X_REQUEST_ID,
+      HeaderValue::from_string(ctx.request_id.to_string()),
+    );
 
     Ok(BuiltHeaders {
       headers,
@@ -242,5 +247,23 @@ mod tests {
     assert_eq!(out.vars.request_id.as_deref(), Some("req_xyz"));
     assert_eq!(out.vars.project_cwd.as_deref(), Some("/home/me/proj"));
     assert_eq!(out.vars.account_id.as_deref(), Some("acct_42"));
+  }
+
+  #[tokio::test]
+  async fn pipeline_request_id_is_authoritative_upstream() {
+    let stage = DefaultBuildHeaders::with_provider_defaults();
+    let out = stage
+      .build_headers(
+        &ctx(),
+        &extracted(header_map(&[("x-request-id", "inbound-request")]), None),
+        &resolved("deepseek"),
+      )
+      .await
+      .unwrap();
+
+    assert_eq!(
+      out.headers.get(&keys::X_REQUEST_ID).map(HeaderValue::as_str),
+      Some("req-bh")
+    );
   }
 }
