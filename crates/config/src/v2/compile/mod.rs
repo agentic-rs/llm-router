@@ -1,11 +1,18 @@
 mod listeners;
 mod resources;
+mod service;
 
-use crate::v2::{CompileError, RawConfig};
+use crate::v2::{CompileError, CompiledConfig, RawConfig};
 use std::path::Path;
 use tokn_policy::GatewayPlan;
 
-pub(super) fn compile_plan(raw: &RawConfig, source: &Path) -> Result<GatewayPlan, CompileError> {
+pub(super) fn compile_config(raw: &RawConfig, source: &Path) -> Result<CompiledConfig, CompileError> {
+  let gateway = compile_gateway(raw, source)?;
+  let service = service::compile_service(&raw.service)?;
+  Ok(CompiledConfig::new(gateway, service))
+}
+
+fn compile_gateway(raw: &RawConfig, source: &Path) -> Result<GatewayPlan, CompileError> {
   if raw.listeners.is_empty() {
     return Err(CompileError::EmptyRegistry { resource: "listener" });
   }

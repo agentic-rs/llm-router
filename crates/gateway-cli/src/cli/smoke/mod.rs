@@ -40,8 +40,8 @@ fn resolve_v2_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
     .map_or_else(|| tokn_config::paths::config_path().map_err(Into::into), Ok)
 }
 
-fn load_v2_plan(explicit: Option<&Path>) -> Result<(tokn_policy::GatewayPlan, PathBuf)> {
+fn load_v2_config(explicit: Option<&Path>) -> Result<(tokn_config::v2::CompiledConfig, PathBuf)> {
   let path = resolve_v2_config_path(explicit)?;
-  let plan = tokn_config::v2::load(&path)?;
-  Ok((plan, path))
+  let config = tokn_config::v2::load_config(&path)?;
+  Ok((config, path))
 }

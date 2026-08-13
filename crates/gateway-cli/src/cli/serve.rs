@@ -149,19 +149,26 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
     );
   }
 
-  let plan = tokn_config::v2::load(&config_path)?;
+  let compiled = tokn_config::v2::load_config(&config_path)?;
+  let (plan, service) = compiled.into_parts();
   let accounts = crate::server_runtime::load_accounts(Some(&config_path))?;
   let needs_access = plan
     .listeners()
     .values()
     .any(|listener| listener.client_auth() == tokn_policy::ClientAuthPlan::LocalKeys);
   let access = crate::server_runtime::load_access_store(needs_access)?;
-  // V2 does not expose operational event/database settings yet. Keep the
-  // existing defaults, including the default app-data database path.
-  let operational = Config::default();
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&operational)?;
+  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_v2_event_bus(service.persistence())?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let result = serve_v2_plan(plan, &accounts, access, events.clone(), args, shutdown_channel()).await;
+  let result = serve_v2_plan(
+    plan,
+    service,
+    &accounts,
+    access,
+    events.clone(),
+    args,
+    shutdown_channel(),
+  )
+  .await;
 
   if let Some(archive_runtime) = archive_runtime {
     archive_runtime.shutdown().await;
@@ -172,13 +179,14 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
 
 async fn serve_v2_plan(
   plan: tokn_policy::GatewayPlan,
+  service: tokn_config::v2::ServicePlan,
   accounts: &[tokn_core::account::AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
   args: ServeArgs,
   shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-  let states = tokn_router::v2::build_runtime_states(plan, accounts, access, events)?;
+  let states = tokn_router::v2::build_runtime_states_with_service(plan, service, accounts, access, events)?;
   let proxy_states = states.forward_proxy;
   let states = states.llm_api;
   let listener_count = states.len() + proxy_states.len();
@@ -463,6 +471,7 @@ default_connect = "reject"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(serve_v2_plan(
       plan,
+      tokn_config::v2::ServicePlan::default(),
       &[],
       Arc::new(tokn_access::AccessStore::disabled()),
       Arc::new(EventBus::noop()),
@@ -499,6 +508,7 @@ default_connect = "reject"
 
     let error = serve_v2_plan(
       plan,
+      tokn_config::v2::ServicePlan::default(),
       &[],
       Arc::new(tokn_access::AccessStore::disabled()),
       Arc::new(EventBus::noop()),
@@ -533,6 +543,7 @@ default_connect = "reject"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(serve_v2_plan(
       plan,
+      tokn_config::v2::ServicePlan::default(),
       &[],
       Arc::new(tokn_access::AccessStore::disabled()),
       Arc::new(EventBus::noop()),

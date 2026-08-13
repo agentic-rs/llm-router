@@ -16,7 +16,7 @@ use tokn_core::request_event::stage::{
 use tokn_core::request_event::RecordEvent;
 use tokn_core::request_event::{RequestEndpoint, RequestEvent, RequestEventPayload};
 use tokn_headers::{HeaderMap, TemplateVars};
-use tokn_persistence::RequestEventHandler;
+use tokn_persistence::{RequestEventHandler, RequestPersistenceOptions};
 
 fn tempdir() -> PathBuf {
   let p = std::env::temp_dir().join(format!("tokn-router-r2-evt-{}", uuid::Uuid::new_v4()));
@@ -263,6 +263,84 @@ fn happy_path_persists_all_stages() {
   assert!(ctx(&row)["latency_header_ms"].as_i64().is_some());
   assert!(ctx(&row)["latency_ms"].as_i64().is_some());
   assert!(is_null(&row["request_error"]));
+}
+
+#[test]
+fn body_recording_can_be_disabled() {
+  let dir = tempdir();
+  let mut h = RequestEventHandler::with_options(
+    dir.clone(),
+    RequestPersistenceOptions {
+      record_request_bodies: false,
+      body_max_bytes: 4,
+    },
+  )
+  .unwrap();
+  let req = "req-no-bodies";
+  h.handle(&r2(
+    req,
+    0,
+    StageEvent::Started {
+      request_endpoint: RequestEndpoint::Known(Endpoint::Responses),
+    },
+  ));
+  h.handle(&r2(req, 0, extracted("model", false, None, b"inbound")));
+  h.handle(&r2(req, 0, converted_request(b"outbound")));
+  h.handle(&r2(
+    req,
+    0,
+    converted_response(200, Some(serde_json::json!({"response": true}))),
+  ));
+
+  let row = fetch_row(&dir, req);
+  assert!(is_null(&row["inbound_req_body"]));
+  assert!(is_null(&row["outbound_req_body"]));
+  assert!(is_null(&row["inbound_resp_body"]));
+}
+
+#[test]
+fn recorded_bodies_are_bounded() {
+  let dir = tempdir();
+  let mut h = RequestEventHandler::with_options(
+    dir.clone(),
+    RequestPersistenceOptions {
+      record_request_bodies: true,
+      body_max_bytes: 4,
+    },
+  )
+  .unwrap();
+  let req = "req-bounded-bodies";
+  h.handle(&r2(
+    req,
+    0,
+    StageEvent::Started {
+      request_endpoint: RequestEndpoint::Known(Endpoint::Responses),
+    },
+  ));
+  h.handle(&r2(req, 0, extracted("model", false, None, b"inbound")));
+  h.handle(&r2(req, 0, converted_request(b"outbound")));
+  h.handle(&rr(
+    req,
+    0,
+    RecordEvent::UpstreamBody {
+      body: Bytes::from_static(b"upstream"),
+      error: None,
+    },
+  ));
+  h.handle(&rr(
+    req,
+    0,
+    RecordEvent::ConvertedBody {
+      body: Bytes::from_static(b"converted"),
+      error: None,
+    },
+  ));
+
+  let row = fetch_row(&dir, req);
+  assert_eq!(as_text(&row["inbound_req_body"]).as_deref(), Some("inbo"));
+  assert_eq!(as_text(&row["outbound_req_body"]).as_deref(), Some("outb"));
+  assert_eq!(as_text(&row["outbound_resp_body"]).as_deref(), Some("upst"));
+  assert_eq!(as_text(&row["inbound_resp_body"]).as_deref(), Some("conv"));
 }
 
 #[test]

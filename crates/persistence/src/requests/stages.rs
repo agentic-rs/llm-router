@@ -24,6 +24,23 @@ use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEventPayload
 /// cache.
 pub struct RequestEventHandler {
   db: RequestsDb,
+  options: RequestPersistenceOptions,
+}
+
+/// Independent safety policy for projecting event bodies into SQLite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestPersistenceOptions {
+  pub record_request_bodies: bool,
+  pub body_max_bytes: usize,
+}
+
+impl Default for RequestPersistenceOptions {
+  fn default() -> Self {
+    Self {
+      record_request_bodies: true,
+      body_max_bytes: 10 * 1024 * 1024,
+    }
+  }
 }
 
 pub struct InboundConnectionUpdate<'a> {
@@ -39,8 +56,13 @@ pub struct InboundConnectionUpdate<'a> {
 
 impl RequestEventHandler {
   pub fn new(requests_dir: PathBuf) -> Result<Self> {
+    Self::with_options(requests_dir, RequestPersistenceOptions::default())
+  }
+
+  pub fn with_options(requests_dir: PathBuf, options: RequestPersistenceOptions) -> Result<Self> {
     Ok(Self {
       db: RequestsDb::new(requests_dir)?,
+      options,
     })
   }
 }
@@ -233,6 +255,7 @@ impl RequestEventHandler {
   ) -> Result<()> {
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(inbound_req_headers);
+    let persisted_body = persisted_body(self.options, inbound_req_body);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests Extract without prior Started");
       return Ok(());
@@ -252,7 +275,7 @@ impl RequestEventHandler {
        ON CONFLICT(request_id) DO UPDATE SET
          inbound_req_headers = excluded.inbound_req_headers,
          inbound_req_body = excluded.inbound_req_body",
-      params![id, hdr_json.as_ref(), inbound_req_body.as_ref()],
+      params![id, hdr_json.as_ref(), persisted_body],
     )?;
     Ok(())
   }
@@ -305,6 +328,7 @@ impl RequestEventHandler {
 
   pub fn on_convert_request(&mut self, request_id: &str, attempt: u32, outbound_req_body: &bytes::Bytes) -> Result<()> {
     let id = composite_request_id(request_id, attempt);
+    let persisted_body = persisted_body(self.options, outbound_req_body);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests ConvertRequest without prior Started");
       return Ok(());
@@ -314,7 +338,7 @@ impl RequestEventHandler {
        VALUES (?1, ?2)
        ON CONFLICT(request_id) DO UPDATE SET
          outbound_req_body = excluded.outbound_req_body",
-      params![id, outbound_req_body.as_ref()],
+      params![id, persisted_body],
     )?;
     Ok(())
   }
@@ -356,6 +380,7 @@ impl RequestEventHandler {
   ) -> Result<()> {
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(inbound_resp_headers);
+    let persisted_body = persisted_body(self.options, inbound_resp_body);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests ConvertResponse without prior Started");
       return Ok(());
@@ -367,7 +392,7 @@ impl RequestEventHandler {
          inbound_resp_status = excluded.inbound_resp_status,
          inbound_resp_headers = excluded.inbound_resp_headers,
          inbound_resp_body = excluded.inbound_resp_body",
-      params![id, status as i64, hdr_json.as_ref(), inbound_resp_body.as_ref()],
+      params![id, status as i64, hdr_json.as_ref(), persisted_body],
     )?;
     conn.execute(
       "UPDATE request_connection SET status = ?2 WHERE request_id = ?1",
@@ -420,6 +445,7 @@ impl RequestEventHandler {
   ) -> Result<()> {
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(headers);
+    let persisted_body = persisted_body(self.options, body);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests UpstreamReq without prior Started");
       return Ok(());
@@ -438,7 +464,7 @@ impl RequestEventHandler {
          outbound_req_url = excluded.outbound_req_url,
          outbound_req_headers = excluded.outbound_req_headers,
          outbound_req_body = excluded.outbound_req_body",
-      params![id, method, url, hdr_json.as_ref(), body.as_ref()],
+      params![id, method, url, hdr_json.as_ref(), persisted_body],
     )?;
     Ok(())
   }
@@ -481,6 +507,7 @@ impl RequestEventHandler {
   /// headers, so this update touches only the body column.
   pub fn on_upstream_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
     let id = composite_request_id(request_id, attempt);
+    let persisted_body = persisted_body(self.options, body);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests UpstreamBody without prior Started");
       return Ok(());
@@ -490,7 +517,7 @@ impl RequestEventHandler {
        VALUES (?1, ?2)
        ON CONFLICT(request_id) DO UPDATE SET
          outbound_resp_body = excluded.outbound_resp_body",
-      params![id, body.as_ref()],
+      params![id, persisted_body],
     )?;
     Ok(())
   }
@@ -501,6 +528,7 @@ impl RequestEventHandler {
   /// SSE output has been accumulated.
   pub fn on_converted_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
     let id = composite_request_id(request_id, attempt);
+    let persisted_body = persisted_body(self.options, body);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests ConvertedBody without prior Started");
       return Ok(());
@@ -510,7 +538,7 @@ impl RequestEventHandler {
        VALUES (?1, ?2)
        ON CONFLICT(request_id) DO UPDATE SET
          inbound_resp_body = excluded.inbound_resp_body",
-      params![id, body.as_ref()],
+      params![id, persisted_body],
     )?;
     Ok(())
   }
@@ -531,6 +559,12 @@ impl RequestEventHandler {
     )?;
     Ok(())
   }
+}
+
+fn persisted_body(options: RequestPersistenceOptions, body: &bytes::Bytes) -> Option<&[u8]> {
+  options
+    .record_request_bodies
+    .then(|| &body[..body.len().min(options.body_max_bytes)])
 }
 
 fn params_patch(initiator: Option<&str>, stream: bool) -> Map<String, Value> {

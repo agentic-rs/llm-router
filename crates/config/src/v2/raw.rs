@@ -9,6 +9,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
+pub const DEFAULT_MAX_WIRE_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_DECODED_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_BODY_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_WRITE_QUEUE_CAPACITY: u64 = 4_096;
 pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize =
   tokn_policy::DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES;
 
@@ -25,6 +29,8 @@ fn default_forward_proxy_request_body_max_bytes() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
   pub schema_version: u32,
+  #[serde(default)]
+  pub service: RawService,
   #[serde(default)]
   pub listeners: BTreeMap<String, RawListener>,
   /// Bindings are evaluated in source order. A map would silently destroy
@@ -46,6 +52,105 @@ pub struct RawConfig {
   /// Each group value is directly an ordered list of fallback candidates.
   #[serde(default)]
   pub model_groups: BTreeMap<String, Vec<RawModelCandidate>>,
+}
+
+/// Process-wide settings consumed while constructing one serving runtime.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawService {
+  #[serde(default)]
+  pub outbound: RawOutbound,
+  #[serde(default)]
+  pub request_limits: RawRequestLimits,
+  #[serde(default)]
+  pub persistence: RawPersistence,
+}
+
+/// Shared outbound proxy settings for managed, opaque, and tunnel clients.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawOutbound {
+  #[serde(default)]
+  pub proxy_url: Option<String>,
+  #[serde(default)]
+  pub no_proxy: Vec<String>,
+  #[serde(default)]
+  pub use_system_proxy: bool,
+}
+
+/// Independent bounds for bytes received on the wire and produced by decoding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRequestLimits {
+  #[serde(default = "default_max_wire_bytes")]
+  pub max_wire_bytes: u64,
+  #[serde(default = "default_max_decoded_bytes")]
+  pub max_decoded_bytes: u64,
+}
+
+impl Default for RawRequestLimits {
+  fn default() -> Self {
+    Self {
+      max_wire_bytes: default_max_wire_bytes(),
+      max_decoded_bytes: default_max_decoded_bytes(),
+    }
+  }
+}
+
+/// Existing persistence behavior without changing database schemas or paths.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPersistence {
+  #[serde(default = "default_true")]
+  pub enabled: bool,
+  #[serde(default, alias = "db_path")]
+  pub usage_db_path: Option<PathBuf>,
+  #[serde(default)]
+  pub sessions_db_path: Option<PathBuf>,
+  #[serde(default)]
+  pub requests_dir: Option<PathBuf>,
+  #[serde(default = "default_true")]
+  pub record_sessions: bool,
+  #[serde(default = "default_true")]
+  pub record_request_bodies: bool,
+  #[serde(default = "default_body_max_bytes")]
+  pub body_max_bytes: u64,
+  #[serde(default = "default_write_queue_capacity")]
+  pub write_queue_capacity: u64,
+  #[serde(default)]
+  pub archive_extension: Option<String>,
+}
+
+impl Default for RawPersistence {
+  fn default() -> Self {
+    Self {
+      enabled: true,
+      usage_db_path: None,
+      sessions_db_path: None,
+      requests_dir: None,
+      record_sessions: true,
+      record_request_bodies: true,
+      body_max_bytes: default_body_max_bytes(),
+      write_queue_capacity: default_write_queue_capacity(),
+      archive_extension: None,
+    }
+  }
+}
+
+const fn default_max_wire_bytes() -> u64 {
+  DEFAULT_MAX_WIRE_BYTES
+}
+
+const fn default_max_decoded_bytes() -> u64 {
+  DEFAULT_MAX_DECODED_BYTES
+}
+
+const fn default_body_max_bytes() -> u64 {
+  DEFAULT_BODY_MAX_BYTES
+}
+
+const fn default_write_queue_capacity() -> u64 {
+  DEFAULT_WRITE_QUEUE_CAPACITY
 }
 
 /// A network ingress and its listener-level fallback behavior.
