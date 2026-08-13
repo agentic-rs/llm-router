@@ -7,3 +7,4 @@
 - chatgpt-account-id: acct-from-provider
 - session_id: sess-opencode-1
 - X-Session-Affinity: sess-opencode-1
+- X-Request-Id: req-codex_responses_opencode-headers

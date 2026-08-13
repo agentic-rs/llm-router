@@ -4,3 +4,4 @@
 - Accept-Encoding: gzip, deflate, br, zstd
 - Connection: keep-alive
 - Content-Type: application/json
+- X-Request-Id: req-smoke-1

@@ -4,3 +4,4 @@
 - originator: codex_exec
 - version: 0.130.0
 - OpenAI-Beta: responses=v1
+- X-Request-Id: req-smoke-1
