@@ -8,7 +8,10 @@ use flate2::Compression;
 use serde_json::Value;
 use std::io::{Read, Write};
 
-const MIN_ZSTD_WINDOW_LOG: u32 = 23;
+// Zstd encodes window sizes as powers of two and rejects values below 2^10.
+// Keep decoder memory aligned with the configured output limit as closely as
+// the format permits; the decoded-output check below remains exact.
+const ZSTD_MIN_WINDOW_LOG: u32 = 10;
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,9 +163,9 @@ fn decoded_body_too_large(max_decoded_bytes: usize) -> ApiError {
 }
 
 fn zstd_window_log(max_decoded_bytes: usize) -> u32 {
-  let minimum_window = 1usize << MIN_ZSTD_WINDOW_LOG;
+  let minimum_window = 1usize << ZSTD_MIN_WINDOW_LOG;
   let ceiling_log = usize::BITS - max_decoded_bytes.max(minimum_window).saturating_sub(1).leading_zeros();
-  ceiling_log.clamp(MIN_ZSTD_WINDOW_LOG, MAX_ZSTD_WINDOW_LOG)
+  ceiling_log.clamp(ZSTD_MIN_WINDOW_LOG, MAX_ZSTD_WINDOW_LOG)
 }
 
 #[cfg(test)]
@@ -219,7 +222,10 @@ mod tests {
   #[test]
   fn decoded_limit_applies_to_zstd() {
     let body = br#"{"model":"gpt-5","input":"compressible compressible"}"#;
-    let encoded = encode_body_bytes(body, Some(ContentEncodingKind::Zstd)).unwrap();
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.window_log(ZSTD_MIN_WINDOW_LOG).unwrap();
+    encoder.write_all(body).unwrap();
+    let encoded = Bytes::from(encoder.finish().unwrap());
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
 
@@ -228,5 +234,14 @@ mod tests {
       error.into_response().status(),
       axum::http::StatusCode::PAYLOAD_TOO_LARGE
     );
+  }
+
+  #[test]
+  fn zstd_window_tracks_decoded_limit_without_a_compatibility_floor() {
+    assert_eq!(zstd_window_log(1), ZSTD_MIN_WINDOW_LOG);
+    assert_eq!(zstd_window_log(1 << 10), 10);
+    assert_eq!(zstd_window_log((1 << 10) + 1), 11);
+    assert_eq!(zstd_window_log(1 << 24), 24);
+    assert_eq!(zstd_window_log(usize::MAX), MAX_ZSTD_WINDOW_LOG);
   }
 }
