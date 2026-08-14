@@ -8,3 +8,4 @@
 - chatgpt-account-id: acct-from-provider
 - session_id: 019e271b-4023-7081-be3e-7a69d97138a2
 - x-codex-turn-metadata: '{"session_id":"019e271b-4023-7081-be3e-7a69d97138a2","thread_id":"019e271b-4023-7081-be3e-7a69d97138a2","turn_id":"019e271b-403e-7be0-b4ed-457537b803a2","sandbox":"none","turn_started_at_unix_ms":1778772557890}'
+- X-Request-Id: req-codex_responses_codex-cli-headers

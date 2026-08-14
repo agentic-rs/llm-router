@@ -36,9 +36,9 @@ use tokn_requests::stages::{
   PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve, ProxyResolve, ProxySend,
 };
 use tokn_requests::{ExecutionRequest, Pipeline, Profile, RawInbound, RequestService, RunConfig};
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::request_id::SetRequestIdLayer;
 
-const REQUEST_ID_HEADER: &str = "x-request-id";
+use crate::request_id::REQUEST_ID_HEADER;
 
 #[derive(Clone)]
 struct ProfileRuntime {
@@ -796,8 +796,11 @@ pub fn router(state: AppState) -> Router {
     .route("/v1/messages", post(messages))
     .route("/healthz", get(health))
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
-    .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
-    .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+    .layer(middleware::from_fn(crate::request_id::propagate_request_id))
+    .layer(SetRequestIdLayer::new(
+      request_id_header,
+      crate::request_id::MakeRouterRequestId,
+    ))
     .layer(DefaultBodyLimit::max(max_wire_bytes))
     .with_state(state)
 }

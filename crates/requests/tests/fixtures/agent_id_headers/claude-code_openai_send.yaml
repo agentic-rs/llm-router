@@ -12,3 +12,4 @@
 - X-Stainless-Timeout: "600"
 - X-App: cli
 - Anthropic-Dangerous-Direct-Browser-Access: "true"
+- X-Request-Id: req-smoke-1

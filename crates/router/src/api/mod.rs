@@ -36,7 +36,7 @@ use tokn_core::event::EventBus;
 const PIPELINE_RETRY_POLICY: tokn_requests::RetryPolicy =
   tokn_requests::RetryPolicy::new(2, Duration::from_millis(100));
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::request_id::SetRequestIdLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{Level, Span};
 
@@ -211,7 +211,7 @@ struct PolicySpec {
 }
 
 /// Header name used for request ids. Honors inbound `x-request-id` if present.
-pub const REQUEST_ID_HEADER: &str = "x-request-id";
+pub use crate::request_id::REQUEST_ID_HEADER;
 pub const SESSION_ID_HEADER: &str = "x-session-id";
 
 pub(crate) fn is_router_owned_header(name: &axum::http::HeaderName) -> bool {
@@ -353,13 +353,16 @@ pub fn router_live(state: LiveAppState) -> Router {
     .route("/healthz", get(health))
     .with_state(state.clone())
     // Layers run outermost-first on request, innermost-first on response.
-    // SetRequestIdLayer with MakeRequestUuid only assigns a fresh UUID when
+    // SetRequestIdLayer only assigns a router-prefixed UUID when
     // the inbound request lacks the header, so client-supplied ids pass
-    // through unchanged. PropagateRequestIdLayer copies it onto the
-    // response so clients can correlate.
-    .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
+    // through unchanged. The response middleware copies that authoritative
+    // value onto the response so clients can correlate.
+    .layer(middleware::from_fn(crate::request_id::propagate_request_id))
     .layer(trace)
-    .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+    .layer(SetRequestIdLayer::new(
+      request_id_header,
+      crate::request_id::MakeRouterRequestId,
+    ))
     .layer(middleware::from_fn(track_request))
 }
 
@@ -1474,8 +1477,8 @@ mod tests {
     let header = HeaderName::from_static(REQUEST_ID_HEADER);
     Router::new()
       .route("/probe", get(|| async { "ok" }))
-      .layer(PropagateRequestIdLayer::new(header.clone()))
-      .layer(SetRequestIdLayer::new(header, MakeRequestUuid))
+      .layer(middleware::from_fn(crate::request_id::propagate_request_id))
+      .layer(SetRequestIdLayer::new(header, crate::request_id::MakeRouterRequestId))
   }
 
   #[tokio::test]
@@ -1509,8 +1512,8 @@ mod tests {
       .expect("response missing generated x-request-id")
       .to_str()
       .unwrap();
-    // MakeRequestUuid emits a hyphenated uuid v4.
-    assert!(uuid::Uuid::parse_str(id).is_ok(), "not a uuid: {id}");
+    let uuid = id.strip_prefix("req-").expect("generated id missing req- prefix");
+    assert!(uuid::Uuid::parse_str(uuid).is_ok(), "not a prefixed uuid: {id}");
   }
 
   #[test]

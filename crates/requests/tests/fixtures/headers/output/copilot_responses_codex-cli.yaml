@@ -5,7 +5,7 @@
 - version: 0.130.0
 - session_id: sess-opencode-1
 - x-client-request-id: req-opencode-1
-- X-Request-Id: req-opencode-1
+- X-Request-Id: req-copilot_responses_codex-cli-headers
 - Editor-Version: vscode/1.95.0
 - Editor-Plugin-Version: copilot-chat/0.23.0
 - Copilot-Integration-Id: vscode-chat

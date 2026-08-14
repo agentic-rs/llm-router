@@ -13,3 +13,4 @@
 - X-Interaction-Type: conversation-user
 - X-Client-Session-Id: 00000000-0000-0000-0000-000000000000
 - X-Agent-Task-Id: 00000000-0000-0000-0000-000000000000
+- X-Request-Id: req-smoke-1

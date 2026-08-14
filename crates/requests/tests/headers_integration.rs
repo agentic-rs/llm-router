@@ -294,10 +294,18 @@ async fn full_pipeline_codex_headers_are_captured_after_build_and_patch() {
     .expect("mock server should capture the upstream request");
   assert_eq!(captured.path, "/responses");
   for HeaderFixtureEntry { name, value } in load_header_fixture(HEADERS_OUTPUT_CODEX_RESPONSES_CODEX_CLI_YAML) {
+    if name.eq_ignore_ascii_case("x-request-id") {
+      continue;
+    }
     assert_eq!(
       captured.header(&name),
       Some(value.as_str()),
       "captured Codex output header mismatch for {name}"
     );
   }
+  assert_eq!(
+    captured.header("x-request-id"),
+    Some("req-headers"),
+    "captured Codex request id should come from this pipeline run"
+  );
 }
