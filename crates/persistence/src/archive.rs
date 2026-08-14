@@ -51,6 +51,31 @@ pub enum PruneOutcome {
   },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PruneProgressEvent {
+  Started {
+    files_total: usize,
+  },
+  FileStarted {
+    path: PathBuf,
+    file_index: usize,
+    files_total: usize,
+    bytes_total: u64,
+  },
+  FileProgress {
+    bytes_processed: u64,
+    bytes_total: u64,
+  },
+  FileFinished {
+    path: PathBuf,
+    file_index: usize,
+    files_total: usize,
+  },
+  Finished {
+    files_total: usize,
+  },
+}
+
 struct RequestMaintenanceLock {
   _file: File,
 }
@@ -397,15 +422,26 @@ async fn wait_cancelled(cancelled: Arc<AtomicBool>) {
 /// `.db` files. Archive bytes are decompressed before hashing so the digest is
 /// compared against the original database content.
 pub fn prune_request_dbs(dir: &Path, archive_extension: Option<&str>, commit: bool) -> io::Result<PruneReport> {
-  prune_request_dbs_once(
+  prune_request_dbs_with_progress(dir, archive_extension, commit, |_| {})
+}
+
+pub fn prune_request_dbs_with_progress(
+  dir: &Path,
+  archive_extension: Option<&str>,
+  commit: bool,
+  mut progress: impl FnMut(PruneProgressEvent),
+) -> io::Result<PruneReport> {
+  prune_request_dbs_once_with_progress(
     dir,
     OffsetDateTime::now_utc().date(),
     RETENTION_DAYS,
     ArchiveFormat::resolve(archive_extension),
     commit,
+    &mut progress,
   )
 }
 
+#[cfg(test)]
 fn prune_request_dbs_once(
   dir: &Path,
   today: Date,
@@ -413,12 +449,32 @@ fn prune_request_dbs_once(
   format: ArchiveFormat,
   commit: bool,
 ) -> io::Result<PruneReport> {
+  prune_request_dbs_once_with_progress(
+    dir,
+    today,
+    retention_days,
+    format,
+    commit,
+    &mut |_: PruneProgressEvent| {},
+  )
+}
+
+fn prune_request_dbs_once_with_progress(
+  dir: &Path,
+  today: Date,
+  retention_days: i64,
+  format: ArchiveFormat,
+  commit: bool,
+  progress: &mut impl FnMut(PruneProgressEvent),
+) -> io::Result<PruneReport> {
   let cutoff = today - Duration::days(retention_days);
   let mut report = PruneReport {
     cutoff,
     entries: Vec::new(),
   };
   if !dir.exists() {
+    progress(PruneProgressEvent::Started { files_total: 0 });
+    progress(PruneProgressEvent::Finished { files_total: 0 });
     return Ok(report);
   }
 
@@ -432,15 +488,45 @@ fn prune_request_dbs_once(
   }
   paths.sort();
 
-  for path in paths {
+  let files_total = paths.len();
+  progress(PruneProgressEvent::Started { files_total });
+  for (file_index, path) in paths.into_iter().enumerate() {
     let archive = archive_path(&path, format);
-    let outcome = prune_request_db(&path, &archive, format, commit);
+    let bytes_per_pass = fs::symlink_metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+    let bytes_total = bytes_per_pass.saturating_mul(if commit { 3 } else { 2 });
+    progress(PruneProgressEvent::FileStarted {
+      path: path.clone(),
+      file_index,
+      files_total,
+      bytes_total,
+    });
+    let mut bytes_processed = 0u64;
+    let mut report_bytes = |bytes: u64| {
+      bytes_processed = bytes_processed.saturating_add(bytes);
+      progress(PruneProgressEvent::FileProgress {
+        bytes_processed,
+        bytes_total,
+      });
+    };
+    let outcome = prune_request_db(&path, &archive, format, commit, &mut report_bytes);
+    progress(PruneProgressEvent::FileFinished {
+      path: path.clone(),
+      file_index,
+      files_total,
+    });
     report.entries.push(PruneEntry { path, archive, outcome });
   }
+  progress(PruneProgressEvent::Finished { files_total });
   Ok(report)
 }
 
-fn prune_request_db(db: &Path, archive: &Path, format: ArchiveFormat, commit: bool) -> PruneOutcome {
+fn prune_request_db(
+  db: &Path,
+  archive: &Path,
+  format: ArchiveFormat,
+  commit: bool,
+  progress: &mut impl FnMut(u64),
+) -> PruneOutcome {
   match fs::symlink_metadata(archive) {
     Err(error) if error.kind() == io::ErrorKind::NotFound => return PruneOutcome::MissingArchive,
     Err(error) => {
@@ -456,7 +542,7 @@ fn prune_request_db(db: &Path, archive: &Path, format: ArchiveFormat, commit: bo
     Ok(_) => {}
   }
 
-  let archived_digest = match hash_archive(archive, format) {
+  let archived_digest = match hash_archive(archive, format, progress) {
     Ok(digest) => digest,
     Err(error) => {
       return PruneOutcome::Failed {
@@ -464,7 +550,7 @@ fn prune_request_db(db: &Path, archive: &Path, format: ArchiveFormat, commit: bo
       };
     }
   };
-  let source_digest = match hash_file(db) {
+  let source_digest = match hash_file(db, progress) {
     Ok(digest) => digest,
     Err(error) => {
       return PruneOutcome::Failed {
@@ -483,7 +569,7 @@ fn prune_request_db(db: &Path, archive: &Path, format: ArchiveFormat, commit: bo
     return PruneOutcome::Verified { sha256: source_sha256 };
   }
 
-  match hash_file(db) {
+  match hash_file(db, progress) {
     Ok(current_digest) if current_digest == source_digest => {}
     Ok(_) => {
       return PruneOutcome::Failed {
@@ -504,14 +590,14 @@ fn prune_request_db(db: &Path, archive: &Path, format: ArchiveFormat, commit: bo
   }
 }
 
-fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
-  with_stable_file(path, hash_reader)
+fn hash_file(path: &Path, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
+  with_stable_file(path, |file| hash_reader(file, progress))
 }
 
-fn hash_archive(path: &Path, format: ArchiveFormat) -> io::Result<[u8; 32]> {
+fn hash_archive(path: &Path, format: ArchiveFormat, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
   with_stable_file(path, |file| match format {
-    ArchiveFormat::Zstd => hash_reader(zstd::stream::read::Decoder::new(file)?),
-    ArchiveFormat::Xz => hash_xz_archive(file),
+    ArchiveFormat::Zstd => hash_reader(zstd::stream::read::Decoder::new(file)?, progress),
+    ArchiveFormat::Xz => hash_xz_archive(file, progress),
   })
 }
 
@@ -523,7 +609,7 @@ fn with_stable_file<T>(path: &Path, read: impl FnOnce(File) -> io::Result<T>) ->
   Ok(value)
 }
 
-fn hash_reader(mut reader: impl Read) -> io::Result<[u8; 32]> {
+fn hash_reader(mut reader: impl Read, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
   let mut digest = Sha256::new();
   let mut buffer = [0u8; 64 * 1024];
   loop {
@@ -532,6 +618,7 @@ fn hash_reader(mut reader: impl Read) -> io::Result<[u8; 32]> {
       break;
     }
     digest.update(&buffer[..read]);
+    progress(read as u64);
   }
   Ok(digest.finalize().into())
 }
@@ -545,12 +632,12 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 }
 
 #[cfg(feature = "lzma")]
-fn hash_xz_archive(file: File) -> io::Result<[u8; 32]> {
-  hash_reader(lzma_rust2::XzReader::new(file, false))
+fn hash_xz_archive(file: File, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
+  hash_reader(lzma_rust2::XzReader::new(file, false), progress)
 }
 
 #[cfg(not(feature = "lzma"))]
-fn hash_xz_archive(_file: File) -> io::Result<[u8; 32]> {
+fn hash_xz_archive(_file: File, _progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
   Err(io::Error::new(
     io::ErrorKind::Unsupported,
     "xz archive decompression requires the lzma feature",
@@ -915,6 +1002,56 @@ mod tests {
       PruneOutcome::Verified { ref sha256 } if sha256.len() == 64
     ));
     assert!(db.exists());
+  }
+
+  #[test]
+  fn prune_reports_file_and_byte_progress() {
+    let dir = tempdir();
+    let contents = b"verified request database";
+    write_db(&dir, "2026-05-01.db", contents);
+    let format = archive_format();
+    archive_requests_once(&dir, date!(2026 - 05 - 09), 7, format).unwrap();
+    let mut events = Vec::new();
+
+    let report = prune_request_dbs_once_with_progress(&dir, date!(2026 - 05 - 09), 7, format, false, &mut |event| {
+      events.push(event)
+    })
+    .unwrap();
+
+    assert_eq!(report.entries.len(), 1);
+    assert!(matches!(
+      events.first(),
+      Some(PruneProgressEvent::Started { files_total: 1 })
+    ));
+    assert!(matches!(
+      events.get(1),
+      Some(PruneProgressEvent::FileStarted {
+        file_index: 0,
+        files_total: 1,
+        bytes_total,
+        ..
+      }) if *bytes_total == (contents.len() * 2) as u64
+    ));
+    assert!(events.iter().any(|event| matches!(
+      event,
+      PruneProgressEvent::FileProgress {
+        bytes_processed,
+        bytes_total,
+        ..
+      } if bytes_processed == bytes_total && *bytes_total == (contents.len() * 2) as u64
+    )));
+    assert!(matches!(
+      events.get(events.len() - 2),
+      Some(PruneProgressEvent::FileFinished {
+        file_index: 0,
+        files_total: 1,
+        ..
+      })
+    ));
+    assert!(matches!(
+      events.last(),
+      Some(PruneProgressEvent::Finished { files_total: 1 })
+    ));
   }
 
   #[test]

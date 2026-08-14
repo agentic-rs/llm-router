@@ -1,7 +1,9 @@
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use tokn_persistence::archive::{PruneOutcome, PruneReport};
+use tokn_persistence::archive::{PruneOutcome, PruneProgressEvent, PruneReport};
 
 #[derive(Subcommand, Debug)]
 pub enum RequestsCmd {
@@ -30,8 +32,15 @@ fn prune(explicit_config: Option<&Path>, args: PruneArgs) -> Result<()> {
   let compiled = tokn_config::v2::load_config(&config_path)?;
   let persistence = compiled.service().persistence();
   let paths = persistence.resolve_paths()?;
-  let report =
-    tokn_persistence::archive::prune_request_dbs(&paths.requests_dir, persistence.archive_extension(), args.commit)?;
+  let mut progress = PruneProgressDisplay::new(std::io::stdout().is_terminal());
+  let result = tokn_persistence::archive::prune_request_dbs_with_progress(
+    &paths.requests_dir,
+    persistence.archive_extension(),
+    args.commit,
+    |event| progress.on_event(event),
+  );
+  progress.finish();
+  let report = result?;
 
   print_report(&paths.requests_dir, &report, args.commit);
   let failures = report
@@ -48,6 +57,124 @@ fn prune(explicit_config: Option<&Path>, args: PruneArgs) -> Result<()> {
     bail!("{failures} request database(s) could not be verified; unverified source files were retained");
   }
   Ok(())
+}
+
+struct PruneProgressDisplay {
+  enabled: bool,
+  multi: MultiProgress,
+  file_bar: Option<ProgressBar>,
+  global_bar: Option<ProgressBar>,
+  file_style: ProgressStyle,
+  global_style: ProgressStyle,
+}
+
+impl PruneProgressDisplay {
+  fn new(enabled: bool) -> Self {
+    Self::with_multi(enabled, crate::progress::multi().clone())
+  }
+
+  fn with_multi(enabled: bool, multi: MultiProgress) -> Self {
+    Self {
+      enabled,
+      multi,
+      file_bar: None,
+      global_bar: None,
+      file_style: ProgressStyle::with_template("{spinner:.cyan} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes}")
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> "),
+      global_style: ProgressStyle::with_template("{spinner:.green} {msg} [{wide_bar:.green/blue}] {pos}/{len}")
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> "),
+    }
+  }
+
+  fn on_event(&mut self, event: PruneProgressEvent) {
+    if !self.enabled {
+      return;
+    }
+    match event {
+      PruneProgressEvent::Started { files_total } => {
+        let bar = self.multi.add(ProgressBar::new(files_total as u64));
+        bar.set_style(self.global_style.clone());
+        bar.set_message("request databases");
+        self.global_bar = Some(bar);
+      }
+      PruneProgressEvent::FileStarted {
+        path,
+        file_index,
+        files_total,
+        bytes_total,
+      } => {
+        if let Some(bar) = self.file_bar.take() {
+          bar.finish_and_clear();
+        }
+        let bar = if let Some(global_bar) = &self.global_bar {
+          self.multi.insert_before(global_bar, ProgressBar::new(bytes_total))
+        } else {
+          self.multi.add(ProgressBar::new(bytes_total))
+        };
+        bar.set_style(self.file_style.clone());
+        bar.set_message(format!(
+          "verify {} {}/{}",
+          prune_filename(&path),
+          file_index + 1,
+          files_total
+        ));
+        self.file_bar = Some(bar);
+      }
+      PruneProgressEvent::FileProgress {
+        bytes_processed,
+        bytes_total,
+      } => {
+        if let Some(bar) = &self.file_bar {
+          bar.set_length(bytes_total.max(bytes_processed));
+          bar.set_position(bytes_processed);
+          bar.tick();
+        }
+      }
+      PruneProgressEvent::FileFinished {
+        path,
+        file_index,
+        files_total,
+      } => {
+        if let Some(bar) = self.file_bar.take() {
+          bar.finish_and_clear();
+        }
+        if let Some(bar) = &self.global_bar {
+          bar.set_position((file_index + 1) as u64);
+          bar.set_message(format!(
+            "processed {} {}/{}",
+            prune_filename(&path),
+            file_index + 1,
+            files_total
+          ));
+          bar.tick();
+        }
+      }
+      PruneProgressEvent::Finished { files_total } => {
+        if let Some(bar) = &self.global_bar {
+          bar.set_position(files_total as u64);
+          bar.set_message("request databases processed");
+        }
+      }
+    }
+  }
+
+  fn finish(&mut self) {
+    if let Some(bar) = self.file_bar.take() {
+      bar.finish_and_clear();
+    }
+    if let Some(bar) = self.global_bar.take() {
+      bar.finish_and_clear();
+    }
+  }
+}
+
+fn prune_filename(path: &Path) -> String {
+  path
+    .file_name()
+    .map(|name| name.to_string_lossy().into_owned())
+    .unwrap_or_else(|| path.display().to_string())
 }
 
 fn print_report(requests_dir: &Path, report: &PruneReport, commit: bool) {
@@ -117,6 +244,7 @@ mod tests {
   use super::*;
   use crate::cli::{Cli, Cmd};
   use clap::Parser;
+  use indicatif::ProgressDrawTarget;
 
   #[test]
   fn parses_prune_as_dry_run_by_default() {
@@ -134,6 +262,37 @@ mod tests {
       panic!("expected requests prune command");
     };
     assert!(args.commit);
+  }
+
+  #[test]
+  fn progress_display_tracks_file_and_global_progress() {
+    let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+    let mut display = PruneProgressDisplay::with_multi(true, multi);
+    let path = PathBuf::from("2026-05-01.db");
+
+    display.on_event(PruneProgressEvent::Started { files_total: 1 });
+    assert_eq!(display.global_bar.as_ref().and_then(ProgressBar::length), Some(1));
+    display.on_event(PruneProgressEvent::FileStarted {
+      path: path.clone(),
+      file_index: 0,
+      files_total: 1,
+      bytes_total: 20,
+    });
+    display.on_event(PruneProgressEvent::FileProgress {
+      bytes_processed: 10,
+      bytes_total: 20,
+    });
+    assert_eq!(display.file_bar.as_ref().map(ProgressBar::position), Some(10));
+    display.on_event(PruneProgressEvent::FileFinished {
+      path,
+      file_index: 0,
+      files_total: 1,
+    });
+    assert!(display.file_bar.is_none());
+    assert_eq!(display.global_bar.as_ref().map(ProgressBar::position), Some(1));
+    display.on_event(PruneProgressEvent::Finished { files_total: 1 });
+    display.finish();
+    assert!(display.global_bar.is_none());
   }
 
   #[tokio::test]
