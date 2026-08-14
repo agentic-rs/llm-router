@@ -1,4 +1,6 @@
-use std::fs::{self, File};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,12 +11,48 @@ use tokio::sync::{mpsc, oneshot};
 
 const RETENTION_DAYS: i64 = 7;
 const SCAN_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
+const MAINTENANCE_LOCK_FILE: &str = ".tokn-requests-maintenance.lock";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArchiveStats {
   pub archived: usize,
   pub skipped_existing: usize,
   pub failed: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PruneReport {
+  pub cutoff: Date,
+  pub entries: Vec<PruneEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PruneEntry {
+  pub path: PathBuf,
+  pub archive: PathBuf,
+  pub outcome: PruneOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PruneOutcome {
+  Verified {
+    sha256: String,
+  },
+  Deleted {
+    sha256: String,
+  },
+  MissingArchive,
+  HashMismatch {
+    source_sha256: String,
+    archived_sha256: String,
+  },
+  Failed {
+    error: String,
+  },
+}
+
+struct RequestMaintenanceLock {
+  _file: File,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +103,82 @@ impl Default for ArchiveFormat {
       Self::Zstd
     }
   }
+}
+
+impl RequestMaintenanceLock {
+  fn acquire(dir: &Path) -> io::Result<Self> {
+    let lock_path = dir.join(MAINTENANCE_LOCK_FILE);
+    let file = open_maintenance_lock(&lock_path)?;
+    match file.try_lock() {
+      Ok(()) => {
+        revalidate_opened_file(&lock_path, &file, true)?;
+        Ok(Self { _file: file })
+      }
+      Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+          "request database maintenance is already running for {}; retry the command",
+          dir.display()
+        ),
+      )),
+      Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+  }
+}
+
+fn open_maintenance_lock(path: &Path) -> io::Result<File> {
+  validate_regular_file_path(path, true)?;
+  let mut options = OpenOptions::new();
+  options.create(true).truncate(false).read(true).write(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+  }
+  let file = options.open(path)?;
+  revalidate_opened_file(path, &file, true)?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+  }
+  Ok(file)
+}
+
+fn validate_regular_file_path(path: &Path, allow_missing: bool) -> io::Result<()> {
+  match fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid_file(path, "must not be a symlink")),
+    Ok(metadata) if !metadata.is_file() => Err(invalid_file(path, "must be a regular file")),
+    Ok(_) => Ok(()),
+    Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error),
+  }
+}
+
+fn revalidate_opened_file(path: &Path, file: &File, require_single_link: bool) -> io::Result<()> {
+  validate_regular_file_path(path, false)?;
+  #[cfg(any(unix, windows))]
+  {
+    let opened = same_file::Handle::from_file(file.try_clone()?)?;
+    let linked = same_file::Handle::from_path(path)?;
+    if opened != linked {
+      return Err(invalid_file(path, "changed while it was being opened or used"));
+    }
+  }
+  #[cfg(unix)]
+  if require_single_link {
+    use std::os::unix::fs::MetadataExt;
+    if file.metadata()?.nlink() != 1 {
+      return Err(invalid_file(path, "must not have multiple hard links"));
+    }
+  }
+  #[cfg(not(unix))]
+  let _ = require_single_link;
+  Ok(())
+}
+
+fn invalid_file(path: &Path, reason: &str) -> io::Error {
+  io::Error::new(io::ErrorKind::InvalidInput, format!("{} {reason}", path.display()))
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +393,170 @@ async fn wait_cancelled(cancelled: Arc<AtomicBool>) {
   }
 }
 
+/// Verify old request database archives and optionally remove their source
+/// `.db` files. Archive bytes are decompressed before hashing so the digest is
+/// compared against the original database content.
+pub fn prune_request_dbs(dir: &Path, archive_extension: Option<&str>, commit: bool) -> io::Result<PruneReport> {
+  prune_request_dbs_once(
+    dir,
+    OffsetDateTime::now_utc().date(),
+    RETENTION_DAYS,
+    ArchiveFormat::resolve(archive_extension),
+    commit,
+  )
+}
+
+fn prune_request_dbs_once(
+  dir: &Path,
+  today: Date,
+  retention_days: i64,
+  format: ArchiveFormat,
+  commit: bool,
+) -> io::Result<PruneReport> {
+  let cutoff = today - Duration::days(retention_days);
+  let mut report = PruneReport {
+    cutoff,
+    entries: Vec::new(),
+  };
+  if !dir.exists() {
+    return Ok(report);
+  }
+
+  let _lock = RequestMaintenanceLock::acquire(dir)?;
+  let mut paths = Vec::new();
+  for entry in fs::read_dir(dir)? {
+    let path = entry?.path();
+    if is_archivable_request_db(&path, cutoff) {
+      paths.push(path);
+    }
+  }
+  paths.sort();
+
+  for path in paths {
+    let archive = archive_path(&path, format);
+    let outcome = prune_request_db(&path, &archive, format, commit);
+    report.entries.push(PruneEntry { path, archive, outcome });
+  }
+  Ok(report)
+}
+
+fn prune_request_db(db: &Path, archive: &Path, format: ArchiveFormat, commit: bool) -> PruneOutcome {
+  match fs::symlink_metadata(archive) {
+    Err(error) if error.kind() == io::ErrorKind::NotFound => return PruneOutcome::MissingArchive,
+    Err(error) => {
+      return PruneOutcome::Failed {
+        error: format!("inspect archive {}: {error}", archive.display()),
+      };
+    }
+    Ok(metadata) if !metadata.is_file() => {
+      return PruneOutcome::Failed {
+        error: format!("archive {} is not a regular file", archive.display()),
+      };
+    }
+    Ok(_) => {}
+  }
+
+  let archived_digest = match hash_archive(archive, format) {
+    Ok(digest) => digest,
+    Err(error) => {
+      return PruneOutcome::Failed {
+        error: format!("verify archive {}: {error}", archive.display()),
+      };
+    }
+  };
+  let source_digest = match hash_file(db) {
+    Ok(digest) => digest,
+    Err(error) => {
+      return PruneOutcome::Failed {
+        error: format!("hash request database {}: {error}", db.display()),
+      };
+    }
+  };
+  let source_sha256 = hex_digest(&source_digest);
+  if source_digest != archived_digest {
+    return PruneOutcome::HashMismatch {
+      source_sha256,
+      archived_sha256: hex_digest(&archived_digest),
+    };
+  }
+  if !commit {
+    return PruneOutcome::Verified { sha256: source_sha256 };
+  }
+
+  match hash_file(db) {
+    Ok(current_digest) if current_digest == source_digest => {}
+    Ok(_) => {
+      return PruneOutcome::Failed {
+        error: format!("request database {} changed during verification", db.display()),
+      };
+    }
+    Err(error) => {
+      return PruneOutcome::Failed {
+        error: format!("recheck request database {}: {error}", db.display()),
+      };
+    }
+  }
+  match fs::remove_file(db) {
+    Ok(()) => PruneOutcome::Deleted { sha256: source_sha256 },
+    Err(error) => PruneOutcome::Failed {
+      error: format!("delete verified request database {}: {error}", db.display()),
+    },
+  }
+}
+
+fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
+  with_stable_file(path, hash_reader)
+}
+
+fn hash_archive(path: &Path, format: ArchiveFormat) -> io::Result<[u8; 32]> {
+  with_stable_file(path, |file| match format {
+    ArchiveFormat::Zstd => hash_reader(zstd::stream::read::Decoder::new(file)?),
+    ArchiveFormat::Xz => hash_xz_archive(file),
+  })
+}
+
+fn with_stable_file<T>(path: &Path, read: impl FnOnce(File) -> io::Result<T>) -> io::Result<T> {
+  let file = File::open(path)?;
+  revalidate_opened_file(path, &file, false)?;
+  let value = read(file.try_clone()?)?;
+  revalidate_opened_file(path, &file, false)?;
+  Ok(value)
+}
+
+fn hash_reader(mut reader: impl Read) -> io::Result<[u8; 32]> {
+  let mut digest = Sha256::new();
+  let mut buffer = [0u8; 64 * 1024];
+  loop {
+    let read = reader.read(&mut buffer)?;
+    if read == 0 {
+      break;
+    }
+    digest.update(&buffer[..read]);
+  }
+  Ok(digest.finalize().into())
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+  let mut encoded = String::with_capacity(digest.len() * 2);
+  for byte in digest {
+    write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+  }
+  encoded
+}
+
+#[cfg(feature = "lzma")]
+fn hash_xz_archive(file: File) -> io::Result<[u8; 32]> {
+  hash_reader(lzma_rust2::XzReader::new(file, false))
+}
+
+#[cfg(not(feature = "lzma"))]
+fn hash_xz_archive(_file: File) -> io::Result<[u8; 32]> {
+  Err(io::Error::new(
+    io::ErrorKind::Unsupported,
+    "xz archive decompression requires the lzma feature",
+  ))
+}
+
 #[cfg(test)]
 pub fn archive_requests_once(
   dir: &Path,
@@ -290,6 +568,21 @@ pub fn archive_requests_once(
 }
 
 fn archive_requests_once_with_events(
+  dir: &Path,
+  today: Date,
+  retention_days: i64,
+  format: ArchiveFormat,
+  events: Option<&dyn ArchiveEmitter>,
+  cancelled: Option<&AtomicBool>,
+) -> io::Result<ArchiveStats> {
+  if !dir.exists() {
+    return archive_requests_once_locked(dir, today, retention_days, format, events, cancelled);
+  }
+  let _lock = RequestMaintenanceLock::acquire(dir)?;
+  archive_requests_once_locked(dir, today, retention_days, format, events, cancelled)
+}
+
+fn archive_requests_once_locked(
   dir: &Path,
   today: Date,
   retention_days: i64,
@@ -357,7 +650,9 @@ fn archive_requests_once_with_events(
 }
 
 fn is_archivable_request_db(path: &Path, cutoff: Date) -> bool {
-  if !path.is_file() || path.extension().and_then(|v| v.to_str()) != Some("db") {
+  if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+    || path.extension().and_then(|v| v.to_str()) != Some("db")
+  {
     return false;
   }
   let Some(stem) = path.file_stem().and_then(|v| v.to_str()) else {
@@ -602,6 +897,91 @@ mod tests {
     assert_eq!(stats.skipped_existing, 1);
     assert!(!dir.join(format!("usage.{}", format.extension())).exists());
     assert!(!dir.join(format!("2026-05-03.{}", format.extension())).exists());
+  }
+
+  #[test]
+  fn prune_dry_run_verifies_without_deleting_source() {
+    let dir = tempdir();
+    let db = write_db(&dir, "2026-05-01.db", b"verified request database");
+    let format = archive_format();
+    archive_requests_once(&dir, date!(2026 - 05 - 09), 7, format).unwrap();
+
+    let report = prune_request_dbs_once(&dir, date!(2026 - 05 - 09), 7, format, false).unwrap();
+
+    assert_eq!(report.cutoff, date!(2026 - 05 - 02));
+    assert_eq!(report.entries.len(), 1);
+    assert!(matches!(
+      report.entries[0].outcome,
+      PruneOutcome::Verified { ref sha256 } if sha256.len() == 64
+    ));
+    assert!(db.exists());
+  }
+
+  #[test]
+  fn prune_commit_deletes_only_sha256_verified_source() {
+    let dir = tempdir();
+    let db = write_db(&dir, "2026-05-01.db", b"verified request database");
+    let format = archive_format();
+    archive_requests_once(&dir, date!(2026 - 05 - 09), 7, format).unwrap();
+
+    let report = prune_request_dbs_once(&dir, date!(2026 - 05 - 09), 7, format, true).unwrap();
+
+    assert!(matches!(
+      report.entries[0].outcome,
+      PruneOutcome::Deleted { ref sha256 } if sha256.len() == 64
+    ));
+    assert!(!db.exists());
+    assert!(report.entries[0].archive.exists());
+  }
+
+  #[test]
+  fn prune_keeps_source_when_archive_content_does_not_match() {
+    let dir = tempdir();
+    let db = write_db(&dir, "2026-05-01.db", b"original request database");
+    let format = archive_format();
+    archive_requests_once(&dir, date!(2026 - 05 - 09), 7, format).unwrap();
+    fs::write(&db, b"changed request database").unwrap();
+
+    let report = prune_request_dbs_once(&dir, date!(2026 - 05 - 09), 7, format, true).unwrap();
+
+    assert!(matches!(
+      report.entries[0].outcome,
+      PruneOutcome::HashMismatch {
+        ref source_sha256,
+        ref archived_sha256,
+      } if source_sha256.len() == 64 && archived_sha256.len() == 64 && source_sha256 != archived_sha256
+    ));
+    assert!(db.exists());
+  }
+
+  #[test]
+  fn prune_keeps_source_when_archive_is_missing_or_corrupt() {
+    let dir = tempdir();
+    let missing = write_db(&dir, "2026-05-01.db", b"missing archive");
+    let corrupt = write_db(&dir, "2026-05-02.db", b"corrupt archive");
+    let format = archive_format();
+    fs::write(archive_path(&corrupt, format), b"not an archive").unwrap();
+
+    let report = prune_request_dbs_once(&dir, date!(2026 - 05 - 09), 7, format, true).unwrap();
+
+    assert_eq!(report.entries.len(), 2);
+    assert!(matches!(report.entries[0].outcome, PruneOutcome::MissingArchive));
+    assert!(matches!(report.entries[1].outcome, PruneOutcome::Failed { .. }));
+    assert!(missing.exists());
+    assert!(corrupt.exists());
+  }
+
+  #[test]
+  fn maintenance_lock_prevents_overlapping_archive_and_prune_scans() {
+    let dir = tempdir();
+    write_db(&dir, "2026-05-01.db", b"old");
+    let _lock = RequestMaintenanceLock::acquire(&dir).unwrap();
+
+    let archive_error = archive_requests_once(&dir, date!(2026 - 05 - 09), 7, archive_format()).unwrap_err();
+    let prune_error = prune_request_dbs_once(&dir, date!(2026 - 05 - 09), 7, archive_format(), false).unwrap_err();
+
+    assert_eq!(archive_error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(prune_error.kind(), io::ErrorKind::WouldBlock);
   }
 
   #[test]

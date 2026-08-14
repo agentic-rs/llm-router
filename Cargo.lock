@@ -3063,6 +3063,7 @@ dependencies = [
  "lzma-rust2",
  "parking_lot",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
