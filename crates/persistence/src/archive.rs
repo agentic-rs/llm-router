@@ -248,16 +248,32 @@ fn revalidate_opened_file(path: &Path, file: &File, require_single_link: bool) -
       return Err(invalid_file(path, "changed while it was being opened or used"));
     }
   }
-  #[cfg(unix)]
-  if require_single_link {
-    use std::os::unix::fs::MetadataExt;
-    if file.metadata()?.nlink() != 1 {
-      return Err(invalid_file(path, "must not have multiple hard links"));
-    }
+  #[cfg(any(unix, windows))]
+  if require_single_link && file_link_count(file)? != 1 {
+    return Err(invalid_file(path, "must not have multiple hard links"));
   }
-  #[cfg(not(unix))]
+  #[cfg(not(any(unix, windows)))]
   let _ = require_single_link;
   Ok(())
+}
+
+#[cfg(unix)]
+fn file_link_count(file: &File) -> io::Result<u64> {
+  use std::os::unix::fs::MetadataExt;
+  Ok(file.metadata()?.nlink())
+}
+
+#[cfg(windows)]
+fn file_link_count(file: &File) -> io::Result<u64> {
+  use std::os::windows::io::AsRawHandle;
+  use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+  let mut info = BY_HANDLE_FILE_INFORMATION::default();
+  // SAFETY: the raw handle remains owned by `file` and `info` is writable for the duration of the call.
+  if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+    return Err(io::Error::last_os_error());
+  }
+  Ok(u64::from(info.nNumberOfLinks))
 }
 
 fn invalid_file(path: &Path, reason: &str) -> io::Error {

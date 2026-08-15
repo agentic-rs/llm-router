@@ -33,6 +33,9 @@ lzma-rust2 = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 parking_lot = { workspace = true }
 uuid = { workspace = true }
