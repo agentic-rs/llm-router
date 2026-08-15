@@ -9,7 +9,6 @@ use std::time::Duration as StdDuration;
 use time::{Date, Duration, Month, OffsetDateTime};
 use tokio::sync::{mpsc, oneshot};
 
-const RETENTION_DAYS: i64 = 7;
 const SCAN_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
 const MAINTENANCE_LOCK_FILE: &str = ".tokn-requests-maintenance.lock";
 
@@ -350,6 +349,7 @@ pub fn spawn_archive_event_loop(
 pub fn start_request_archive_worker(
   requests_dir: PathBuf,
   archive_extension: Option<&str>,
+  archive_after_days: i64,
   handlers: Vec<Box<dyn ArchiveEventHandler>>,
 ) -> Option<ArchiveRuntime> {
   let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -375,7 +375,7 @@ pub fn start_request_archive_worker(
         archive_requests_once_with_events(
           &dir,
           OffsetDateTime::now_utc().date(),
-          RETENTION_DAYS,
+          archive_after_days,
           format,
           Some(&events),
           Some(scan_cancelled.as_ref()),
@@ -421,20 +421,26 @@ async fn wait_cancelled(cancelled: Arc<AtomicBool>) {
 /// Verify old request database archives and optionally remove their source
 /// `.db` files. Archive bytes are decompressed before hashing so the digest is
 /// compared against the original database content.
-pub fn prune_request_dbs(dir: &Path, archive_extension: Option<&str>, commit: bool) -> io::Result<PruneReport> {
-  prune_request_dbs_with_progress(dir, archive_extension, commit, |_| {})
+pub fn prune_request_dbs(
+  dir: &Path,
+  archive_extension: Option<&str>,
+  prune_after_days: i64,
+  commit: bool,
+) -> io::Result<PruneReport> {
+  prune_request_dbs_with_progress(dir, archive_extension, prune_after_days, commit, |_| {})
 }
 
 pub fn prune_request_dbs_with_progress(
   dir: &Path,
   archive_extension: Option<&str>,
+  prune_after_days: i64,
   commit: bool,
   mut progress: impl FnMut(PruneProgressEvent),
 ) -> io::Result<PruneReport> {
   prune_request_dbs_once_with_progress(
     dir,
     OffsetDateTime::now_utc().date(),
-    RETENTION_DAYS,
+    prune_after_days,
     ArchiveFormat::resolve(archive_extension),
     commit,
     &mut progress,
@@ -445,14 +451,14 @@ pub fn prune_request_dbs_with_progress(
 fn prune_request_dbs_once(
   dir: &Path,
   today: Date,
-  retention_days: i64,
+  prune_after_days: i64,
   format: ArchiveFormat,
   commit: bool,
 ) -> io::Result<PruneReport> {
   prune_request_dbs_once_with_progress(
     dir,
     today,
-    retention_days,
+    prune_after_days,
     format,
     commit,
     &mut |_: PruneProgressEvent| {},
@@ -462,12 +468,12 @@ fn prune_request_dbs_once(
 fn prune_request_dbs_once_with_progress(
   dir: &Path,
   today: Date,
-  retention_days: i64,
+  prune_after_days: i64,
   format: ArchiveFormat,
   commit: bool,
   progress: &mut impl FnMut(PruneProgressEvent),
 ) -> io::Result<PruneReport> {
-  let cutoff = today - Duration::days(retention_days);
+  let cutoff = today - Duration::days(prune_after_days);
   let mut report = PruneReport {
     cutoff,
     entries: Vec::new(),
@@ -648,37 +654,37 @@ fn hash_xz_archive(_file: File, _progress: &mut impl FnMut(u64)) -> io::Result<[
 pub fn archive_requests_once(
   dir: &Path,
   today: Date,
-  retention_days: i64,
+  archive_after_days: i64,
   format: ArchiveFormat,
 ) -> io::Result<ArchiveStats> {
-  archive_requests_once_with_events(dir, today, retention_days, format, None, None)
+  archive_requests_once_with_events(dir, today, archive_after_days, format, None, None)
 }
 
 fn archive_requests_once_with_events(
   dir: &Path,
   today: Date,
-  retention_days: i64,
+  archive_after_days: i64,
   format: ArchiveFormat,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
 ) -> io::Result<ArchiveStats> {
   if !dir.exists() {
-    return archive_requests_once_locked(dir, today, retention_days, format, events, cancelled);
+    return archive_requests_once_locked(dir, today, archive_after_days, format, events, cancelled);
   }
   let _lock = RequestMaintenanceLock::acquire(dir)?;
-  archive_requests_once_locked(dir, today, retention_days, format, events, cancelled)
+  archive_requests_once_locked(dir, today, archive_after_days, format, events, cancelled)
 }
 
 fn archive_requests_once_locked(
   dir: &Path,
   today: Date,
-  retention_days: i64,
+  archive_after_days: i64,
   format: ArchiveFormat,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
 ) -> io::Result<ArchiveStats> {
   let mut stats = ArchiveStats::default();
-  let cutoff = today - Duration::days(retention_days);
+  let cutoff = today - Duration::days(archive_after_days);
   emit(events, ArchiveEvent::ScanStarted { dir: dir.to_path_buf() });
   if !dir.exists() {
     emit(

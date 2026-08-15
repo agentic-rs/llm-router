@@ -36,6 +36,7 @@ fn prune(explicit_config: Option<&Path>, args: PruneArgs) -> Result<()> {
   let result = tokn_persistence::archive::prune_request_dbs_with_progress(
     &paths.requests_dir,
     persistence.archive_extension(),
+    persistence.prune_after_days(),
     args.commit,
     |event| progress.on_event(event),
   );
@@ -240,8 +241,9 @@ fn print_report(requests_dir: &Path, report: &PruneReport, commit: bool) {
     }
   }
   println!(
-    "summary: eligible={} verified={verified} deleted={deleted} missing_archive={missing} mismatched={mismatched} failed={failed}",
-    report.entries.len()
+    "summary: eligible={} verified={verified} deleted={deleted} retained={} missing_archive={missing} mismatched={mismatched} failed={failed}",
+    report.entries.len(),
+    missing + mismatched + failed
   );
   if !commit && verified > 0 {
     println!("dry-run: rerun with --commit to delete verified source databases");
@@ -326,6 +328,21 @@ mod tests {
     run(Some(config_path), RequestsCmd::Prune(PruneArgs { commit: false }))
       .await
       .unwrap();
+  }
+
+  #[tokio::test]
+  async fn prune_default_cutoff_excludes_a_seven_day_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let (config_path, requests_dir) = write_v2_config(&directory);
+    let day = time::OffsetDateTime::now_utc().date() - time::Duration::days(7);
+    let database = requests_dir.join(format!("{day}.db"));
+    std::fs::write(&database, b"request database awaiting archive").unwrap();
+
+    run(Some(config_path), RequestsCmd::Prune(PruneArgs { commit: false }))
+      .await
+      .unwrap();
+
+    assert!(database.exists());
   }
 
   #[tokio::test]

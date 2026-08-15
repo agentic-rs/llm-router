@@ -23,18 +23,24 @@ type EventBusParts = (
 
 /// Build the event bus and its persistence/progress handlers.
 pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
+  build_event_bus_with_archive_after_days(cfg, tokn_config::v2::DEFAULT_ARCHIVE_AFTER_DAYS as i64)
+}
+
+fn build_event_bus_with_archive_after_days(cfg: &Config, archive_after_days: i64) -> Result<EventBusParts> {
   build_event_bus_with_request_options(
     cfg,
     tokn_persistence::requests::RequestPersistenceOptions {
       record_request_bodies: cfg.db.record_request_bodies,
       body_max_bytes: cfg.db.body_max_bytes,
     },
+    archive_after_days,
   )
 }
 
 fn build_event_bus_with_request_options(
   cfg: &Config,
   request_options: tokn_persistence::requests::RequestPersistenceOptions,
+  archive_after_days: i64,
 ) -> Result<EventBusParts> {
   let capacity = cfg.db.write_queue_capacity.max(256);
   let bus = EventBus::new(capacity);
@@ -73,6 +79,7 @@ fn build_event_bus_with_request_options(
     crate::db::archive::start_request_archive_worker(
       paths.requests_dir,
       cfg.db.archive_extension.as_deref(),
+      archive_after_days,
       archive_handlers,
     )
   } else {
@@ -100,7 +107,7 @@ pub fn build_v2_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Res
     cfg.db.sessions_db_path = Some(paths.sessions_db);
     cfg.db.requests_dir = Some(paths.requests_dir);
   }
-  build_event_bus(&cfg)
+  build_event_bus_with_archive_after_days(&cfg, persistence.archive_after_days())
 }
 
 /// Load accounts from the root `auth.yaml` and any `auth.d` fragments.

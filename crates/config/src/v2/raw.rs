@@ -13,6 +13,8 @@ pub const DEFAULT_MAX_WIRE_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_DECODED_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_BODY_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_WRITE_QUEUE_CAPACITY: u64 = 4_096;
+pub const DEFAULT_ARCHIVE_AFTER_DAYS: u64 = 7;
+pub const DEFAULT_PRUNE_AFTER_DAYS: u64 = 10;
 pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize =
   tokn_policy::DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES;
 
@@ -97,7 +99,7 @@ impl Default for RawRequestLimits {
   }
 }
 
-/// Existing persistence behavior without changing database schemas or paths.
+/// Persistence behavior without changing database schemas or path resolution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawPersistence {
@@ -119,6 +121,10 @@ pub struct RawPersistence {
   pub write_queue_capacity: u64,
   #[serde(default)]
   pub archive_extension: Option<String>,
+  #[serde(default = "default_archive_after_days")]
+  pub archive_after_days: u64,
+  #[serde(default = "default_prune_after_days")]
+  pub prune_after_days: u64,
 }
 
 impl Default for RawPersistence {
@@ -133,6 +139,8 @@ impl Default for RawPersistence {
       body_max_bytes: default_body_max_bytes(),
       write_queue_capacity: default_write_queue_capacity(),
       archive_extension: None,
+      archive_after_days: default_archive_after_days(),
+      prune_after_days: default_prune_after_days(),
     }
   }
 }
@@ -151,6 +159,14 @@ const fn default_body_max_bytes() -> u64 {
 
 const fn default_write_queue_capacity() -> u64 {
   DEFAULT_WRITE_QUEUE_CAPACITY
+}
+
+const fn default_archive_after_days() -> u64 {
+  DEFAULT_ARCHIVE_AFTER_DAYS
+}
+
+const fn default_prune_after_days() -> u64 {
+  DEFAULT_PRUNE_AFTER_DAYS
 }
 
 /// A network ingress and its listener-level fallback behavior.
