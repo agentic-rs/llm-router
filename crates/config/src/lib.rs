@@ -6,6 +6,7 @@ pub mod v2;
 
 pub use error::{Error, GuardedEditError, GuardedEditResult, Result};
 pub use file_identity::FileIdentity;
+pub use schema::ConfigSchema;
 pub use tokn_core::account::{Account, AccountConfig, AccountState, AccountTier, AuthType};
 pub use tokn_core::AgentId;
 
@@ -18,7 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokn_core::provider::ID_GITHUB_COPILOT;
 
-use crate::schema::{ConfigSchema, SchemaMarkerError};
+use crate::schema::SchemaMarkerError;
 
 pub const DEFAULT_PORT: u16 = 4141;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -1034,6 +1035,38 @@ impl Config {
   }
 }
 
+/// Classify a primary configuration without compiling either schema.
+///
+/// A missing file retains the legacy behavior of loading built-in defaults.
+/// Present files are parsed strictly enough to reject malformed or unsupported
+/// schema markers before a caller chooses a schema-specific loader.
+pub fn detect_config_schema(path: &Path) -> Result<ConfigSchema> {
+  let raw = match std::fs::read_to_string(path) {
+    Ok(raw) => raw,
+    Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(ConfigSchema::Legacy),
+    Err(source) => {
+      return Err(Error::Read {
+        path: path.to_path_buf(),
+        source,
+      });
+    }
+  };
+  let document: toml::Value = toml::from_str(&raw).map_err(|source| Error::Parse {
+    path: path.to_path_buf(),
+    source,
+  })?;
+  match schema::detect_toml(&document) {
+    Ok(schema) => Ok(schema),
+    Err(SchemaMarkerError::NonInteger) => Err(Error::InvalidSchemaVersion {
+      path: path.to_path_buf(),
+    }),
+    Err(SchemaMarkerError::Unsupported(found)) => Err(Error::UnsupportedSchemaVersion {
+      path: path.to_path_buf(),
+      found,
+    }),
+  }
+}
+
 fn ensure_config_parent(path: &Path) -> Result<()> {
   if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
     std::fs::create_dir_all(parent).context(error::CreateDirSnafu {
@@ -1095,7 +1128,7 @@ fn require_legacy_edit_schema(document: &toml_edit::DocumentMut, path: &Path) ->
 
 fn require_legacy_schema(schema: std::result::Result<ConfigSchema, SchemaMarkerError>, path: &Path) -> Result<()> {
   match schema {
-    Ok(ConfigSchema::LegacyUnversioned) => Ok(()),
+    Ok(ConfigSchema::Legacy) => Ok(()),
     Ok(ConfigSchema::V2) => Err(Error::V2ConfigRequiresV2Loader {
       path: path.to_path_buf(),
     }),
@@ -1509,6 +1542,32 @@ mod tests {
     assert_eq!(paths::default_requests_dir().unwrap(), home.join("requests"));
     assert_eq!(paths::default_logs_dir().unwrap(), home.join("logs"));
     assert_eq!(paths::default_ca_dir().unwrap(), home.join("ca"));
+  }
+
+  #[test]
+  fn config_schema_detector_classifies_present_and_missing_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+
+    assert_eq!(detect_config_schema(&path).unwrap(), ConfigSchema::Legacy);
+
+    std::fs::write(&path, "[server]\nport = 4141\n").unwrap();
+    assert_eq!(detect_config_schema(&path).unwrap(), ConfigSchema::Legacy);
+
+    std::fs::write(&path, "schema_version = 2\n").unwrap();
+    assert_eq!(detect_config_schema(&path).unwrap(), ConfigSchema::V2);
+
+    std::fs::write(&path, "schema_version = \"2\"\n").unwrap();
+    assert!(matches!(
+      detect_config_schema(&path),
+      Err(Error::InvalidSchemaVersion { path: rejected }) if rejected == path
+    ));
+
+    std::fs::write(&path, "schema_version = 3\n").unwrap();
+    assert!(matches!(
+      detect_config_schema(&path),
+      Err(Error::UnsupportedSchemaVersion { path: rejected, found: 3 }) if rejected == path
+    ));
   }
 
   #[test]

@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::Args;
 use futures::future::BoxFuture;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tokn_config::{RouteMode, DEFAULT_HOST};
@@ -35,7 +35,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     .clone()
     .map(Ok)
     .unwrap_or_else(tokn_config::paths::config_path)?;
-  if is_v2_config(&resolved_cfg_path)? {
+  if tokn_config::detect_config_schema(&resolved_cfg_path)? == tokn_config::ConfigSchema::V2 {
     return run_v2(resolved_cfg_path, args).await;
   }
   run_legacy(cfg_path, args).await
@@ -231,15 +231,6 @@ async fn serve_v2_plan(
   futures::future::try_join_all(servers).await.map(|_| ())
 }
 
-fn is_v2_config(path: &Path) -> Result<bool> {
-  if !path.exists() {
-    return Ok(false);
-  }
-  let contents = std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
-  let document: toml::Value = toml::from_str(&contents).with_context(|| format!("parse config {}", path.display()))?;
-  Ok(document.get("schema_version").and_then(toml::Value::as_integer) == Some(2))
-}
-
 struct ReloadState {
   generation: u64,
 }
@@ -364,6 +355,7 @@ fn route_mode_name(mode: RouteMode) -> &'static str {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::path::Path;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::TcpStream;
 
@@ -434,9 +426,18 @@ default_connect = "reject"
     std::fs::write(&v2_path, "schema_version = 2\n").unwrap();
     std::fs::write(&legacy_path, "[server]\nport = 4141\n").unwrap();
 
-    assert!(is_v2_config(&v2_path).unwrap());
-    assert!(!is_v2_config(&legacy_path).unwrap());
-    assert!(!is_v2_config(&directory.path().join("missing.toml")).unwrap());
+    assert_eq!(
+      tokn_config::detect_config_schema(&v2_path).unwrap(),
+      tokn_config::ConfigSchema::V2
+    );
+    assert_eq!(
+      tokn_config::detect_config_schema(&legacy_path).unwrap(),
+      tokn_config::ConfigSchema::Legacy
+    );
+    assert_eq!(
+      tokn_config::detect_config_schema(&directory.path().join("missing.toml")).unwrap(),
+      tokn_config::ConfigSchema::Legacy
+    );
   }
 
   #[test]
@@ -445,7 +446,7 @@ default_connect = "reject"
     let path = directory.path().join("invalid.toml");
     std::fs::write(&path, "schema_version = [").unwrap();
 
-    assert!(is_v2_config(&path).is_err());
+    assert!(tokn_config::detect_config_schema(&path).is_err());
   }
 
   #[tokio::test]

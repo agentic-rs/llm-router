@@ -1,8 +1,8 @@
 pub(crate) const V2_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConfigSchema {
-  LegacyUnversioned,
+pub enum ConfigSchema {
+  Legacy,
   V2,
 }
 
@@ -30,7 +30,7 @@ pub(crate) fn detect_edit(document: &toml_edit::DocumentMut) -> Result<ConfigSch
 
 fn classify(marker: Option<Result<i64, SchemaMarkerError>>) -> Result<ConfigSchema, SchemaMarkerError> {
   let Some(version) = marker else {
-    return Ok(ConfigSchema::LegacyUnversioned);
+    return Ok(ConfigSchema::Legacy);
   };
   let version = version?;
   if version == V2_SCHEMA_VERSION {
@@ -51,7 +51,7 @@ mod tests {
     let invalid: toml::Value = toml::from_str("schema_version = \"2\"\n").unwrap();
     let unsupported: toml::Value = toml::from_str("schema_version = 3\n").unwrap();
 
-    assert_eq!(detect_toml(&legacy), Ok(ConfigSchema::LegacyUnversioned));
+    assert_eq!(detect_toml(&legacy), Ok(ConfigSchema::Legacy));
     assert_eq!(detect_toml(&v2), Ok(ConfigSchema::V2));
     assert_eq!(detect_toml(&invalid), Err(SchemaMarkerError::NonInteger));
     assert_eq!(detect_toml(&unsupported), Err(SchemaMarkerError::Unsupported(3)));

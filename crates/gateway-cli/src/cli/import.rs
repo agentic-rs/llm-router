@@ -1,6 +1,5 @@
+use crate::cli::config_context::{ConfigContext, ResolvedProviderAuth};
 use crate::cli::onboarding::{resolve_account, CredentialSource};
-use crate::config::{Config, ProxyConfig};
-use crate::util::http::build_client;
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use std::io::Read;
@@ -65,13 +64,12 @@ pub struct ImportArgs {
   pub id: Option<String>,
 }
 
-pub async fn run(cfg_path: Option<PathBuf>, args: ImportArgs) -> Result<()> {
-  let source = build_source(&args)?;
-  let client = build_client(&ProxyConfig::default())?;
-  let account = resolve_account(&client, &args.provider, args.id.clone(), source).await?;
+pub(crate) async fn run_with_context(context: &ConfigContext, store: &mut AuthStore, args: ImportArgs) -> Result<()> {
+  let provider = context.resolve_provider(&args.provider)?;
+  let source = build_source(&args, &provider)?;
+  let client = context.build_http_client(false)?;
+  let account = resolve_account(&client, &provider, args.id.clone(), source).await?;
 
-  let (_cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
   let id = account.id.clone();
   let provider = account.provider.clone();
   store.upsert_in_main(account)?;
@@ -91,9 +89,8 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ImportArgs) -> Result<()> {
 /// [`CredentialSource`]. Provider-defined keys are resolved against
 /// [`ProviderAuth::custom_credential_sources`] so the resulting
 /// `CredentialSource::Custom` carries a `&'static str`.
-pub(crate) fn build_source(args: &ImportArgs) -> Result<CredentialSource> {
-  let auth = crate::auth_registry::provider_auth_for(&args.provider)
-    .ok_or_else(|| anyhow!("unknown provider '{}'", args.provider))?;
+pub(crate) fn build_source(args: &ImportArgs, provider: &ResolvedProviderAuth) -> Result<CredentialSource> {
+  let auth = provider.auth();
   let flavor = resolve_flavor(args, auth);
 
   // Validate provider accepts this flavor before doing real work.
@@ -194,6 +191,10 @@ pub(crate) fn default_env_var_name(provider: &str, flavor: CredentialFlavor) -> 
 mod tests {
   use super::*;
 
+  fn provider(id: &str) -> ResolvedProviderAuth {
+    ResolvedProviderAuth::legacy(id).unwrap()
+  }
+
   fn args() -> ImportArgs {
     ImportArgs {
       from: "env".to_string(),
@@ -222,7 +223,7 @@ mod tests {
   #[test]
   fn build_source_env_default_uses_provider_default_flavor() {
     let a = args();
-    let src = build_source(&a).unwrap();
+    let src = build_source(&a, &provider(&a.provider)).unwrap();
     match src {
       CredentialSource::Env { env_var, flavor } => {
         assert_eq!(env_var, "GITHUB_COPILOT_REFRESH_TOKEN");
@@ -236,7 +237,7 @@ mod tests {
   fn build_source_string_requires_credential() {
     let mut a = args();
     a.from = "string".to_string();
-    let err = build_source(&a).unwrap_err().to_string();
+    let err = build_source(&a, &provider(&a.provider)).unwrap_err().to_string();
     assert!(err.contains("--credential"), "got: {err}");
   }
 
@@ -245,7 +246,7 @@ mod tests {
     let mut a = args();
     a.from = "string".to_string();
     a.credential = Some("rtok".into());
-    let src = build_source(&a).unwrap();
+    let src = build_source(&a, &provider(&a.provider)).unwrap();
     assert!(matches!(
       src,
       CredentialSource::String {
@@ -262,7 +263,7 @@ mod tests {
     a.api_key = true;
     a.from = "string".to_string();
     a.credential = Some("k".into());
-    let src = build_source(&a).unwrap();
+    let src = build_source(&a, &provider(&a.provider)).unwrap();
     assert!(matches!(
       src,
       CredentialSource::String {
@@ -276,7 +277,7 @@ mod tests {
   fn build_source_resolves_known_custom_key() {
     let mut a = args();
     a.from = "gh".to_string();
-    let src = build_source(&a).unwrap();
+    let src = build_source(&a, &provider(&a.provider)).unwrap();
     assert!(matches!(src, CredentialSource::Custom { key: "gh", .. }));
   }
 
@@ -284,7 +285,7 @@ mod tests {
   fn build_source_rejects_unknown_custom_key() {
     let mut a = args();
     a.from = "no-such-source".to_string();
-    let err = build_source(&a).unwrap_err().to_string();
+    let err = build_source(&a, &provider(&a.provider)).unwrap_err().to_string();
     assert!(err.contains("unsupported"), "got: {err}");
   }
 
@@ -292,7 +293,7 @@ mod tests {
   fn build_source_rejects_login() {
     let mut a = args();
     a.from = "login".to_string();
-    let err = build_source(&a).unwrap_err().to_string();
+    let err = build_source(&a, &provider(&a.provider)).unwrap_err().to_string();
     assert!(err.contains("interactive-only"), "got: {err}");
   }
 
@@ -301,7 +302,7 @@ mod tests {
     let mut a = args();
     a.provider = "zai".to_string();
     a.refresh_token = true;
-    let err = build_source(&a).unwrap_err().to_string();
+    let err = build_source(&a, &provider(&a.provider)).unwrap_err().to_string();
     assert!(err.contains("does not accept"), "got: {err}");
   }
 }

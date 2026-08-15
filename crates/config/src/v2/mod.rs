@@ -38,7 +38,7 @@ pub fn decode(contents: &str, source: &Path) -> Result<RawConfig> {
   })?;
   match crate::schema::detect_toml(&document) {
     Ok(ConfigSchema::V2) => {}
-    Ok(ConfigSchema::LegacyUnversioned) => {
+    Ok(ConfigSchema::Legacy) => {
       return Err(Error::MissingSchemaVersion {
         path: source.to_path_buf(),
       });

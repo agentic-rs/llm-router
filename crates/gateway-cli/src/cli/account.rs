@@ -1,7 +1,7 @@
+use crate::cli::config_context::{AccountView, ConfigContext, ResolvedProviderAuth};
 use crate::cli::import::ImportArgs;
 use crate::cli::login::LoginArgs;
-use crate::config::{Account, AccountState, AccountTier, Config};
-use crate::util::http::build_client;
+use crate::config::{Account, AccountState, AccountTier};
 use crate::util::secret::Secret;
 use crate::util::timefmt::{relative_from_now, relative_from_now_ms};
 use anyhow::{anyhow, bail, Result};
@@ -18,7 +18,7 @@ pub enum AccountCmd {
   /// Remove an account by id
   Remove { id: String },
   /// Show details for an account
-  Show { id: String },
+  Show(ShowArgs),
   /// Add an account interactively (provider → credential source → id)
   Add(AddArgs),
   /// Add a Copilot account via GitHub device-flow login
@@ -30,7 +30,7 @@ pub enum AccountCmd {
   /// providers that use a static API key)
   Refresh { id: String },
   /// Print one-line per-account status (gh-auth-style)
-  Status { id: Option<String> },
+  Status(StatusArgs),
   /// Change account activation tiers (active / fallback / disabled).
   /// See `--only`, `--all`, and repeatable `--account` flags.
   Switch(SwitchArgs),
@@ -38,12 +38,41 @@ pub enum AccountCmd {
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
+  #[command(flatten)]
+  pub view: AccountViewArgs,
   /// Skip live upstream quota lookups (faster, no network).
   #[arg(long)]
   pub no_quota: bool,
   /// Per-upstream timeout in seconds for the live quota probe.
   #[arg(long, default_value_t = 5u64)]
   pub timeout: u64,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct AccountViewArgs {
+  /// Filter by a v2 account pool. Active/fallback state remains global.
+  #[arg(long, value_name = "ID", conflicts_with = "profile")]
+  pub pool: Option<String>,
+
+  /// Filter through a profile's effective account selection. Read-only.
+  #[arg(long, value_name = "ID", conflicts_with = "pool")]
+  pub profile: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+  pub id: String,
+
+  #[command(flatten)]
+  pub view: AccountViewArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+  pub id: Option<String>,
+
+  #[command(flatten)]
+  pub view: AccountViewArgs,
 }
 
 #[derive(Args, Debug)]
@@ -90,22 +119,22 @@ pub struct SwitchArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
+  let context = ConfigContext::load(cfg_path.as_deref())?;
+  let mut store = AuthStore::load(None, Some(context.path()))?;
   match cmd {
-    AccountCmd::List(args) => list(&cfg, &mut store, args).await?,
+    AccountCmd::List(args) => list(&context, &mut store, args).await?,
     AccountCmd::Remove { id } => {
       let removed = store.remove(&id).ok_or_else(|| anyhow!("no account with id '{id}'"))?;
       store.save()?;
       tracing::info!(account = %removed.id, remaining = store.accounts.len(), "account removed");
       println!("Removed '{id}'");
     }
-    AccountCmd::Show { id } => show(&store, &id)?,
-    AccountCmd::Add(args) => add(cfg_path, args).await?,
-    AccountCmd::Login(args) => crate::cli::login::run(cfg_path, args).await?,
-    AccountCmd::Import(args) => crate::cli::import::run(cfg_path, args).await?,
-    AccountCmd::Refresh { id } => refresh(&cfg, &mut store, &id).await?,
-    AccountCmd::Status { id } => status(&cfg, &mut store, id).await?,
+    AccountCmd::Show(args) => show(&context, &store, args)?,
+    AccountCmd::Add(args) => add(&context, &mut store, args).await?,
+    AccountCmd::Login(args) => crate::cli::login::run_with_context(&context, &mut store, args).await?,
+    AccountCmd::Import(args) => crate::cli::import::run_with_context(&context, &mut store, args).await?,
+    AccountCmd::Refresh { id } => refresh(&context, &mut store, &id).await?,
+    AccountCmd::Status(args) => status(&context, &mut store, args).await?,
     AccountCmd::Switch(args) => switch(&mut store, args)?,
   }
   Ok(())
@@ -115,78 +144,32 @@ pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
 // list
 // ---------------------------------------------------------------------------
 
-async fn list(cfg: &Config, store: &mut AuthStore, args: ListArgs) -> Result<()> {
-  if store.accounts.is_empty() {
-    println!("(no accounts)");
+async fn list(context: &ConfigContext, store: &mut AuthStore, args: ListArgs) -> Result<()> {
+  let view = resolve_account_view(context, &args.view)?;
+  let visible = account_indices(store, view.as_ref());
+  if visible.is_empty() {
+    print_no_accounts(view.as_ref(), None);
     return Ok(());
   }
 
-  // Fetch quotas concurrently. Each future is wrapped in an outer timeout
-  // so a single hung upstream cannot freeze the entire CLI invocation.
-  let quotas: Vec<QuotaResult> = if args.no_quota {
-    store.accounts.iter().map(|_| QuotaResult::Skipped).collect()
-  } else {
-    let http = build_client(&cfg.proxy)?;
-    let timeout = Duration::from_secs(args.timeout.max(1));
-    let futs = store
-      .accounts
-      .iter()
-      .map(|a| fetch_quota(http.clone(), a.clone(), timeout));
-    futures::future::join_all(futs).await
-  };
-
-  // Persist any refreshed Copilot access tokens. The quota probe already calls
-  // `token::exchange`, so we piggy-back on its result instead of issuing a
-  // second request. This is a no-op under `--no-quota`.
-  let mut dirty = false;
-  for (a, q) in store.accounts.iter_mut().zip(quotas.iter()) {
-    if let QuotaResult::Ok {
-      refreshed:
-        Some(tokn_auth::RefreshOutcome::Refreshed {
-          access_token,
-          expires_at,
-          username,
-          provider_account_id,
-        }),
-      ..
-    } = q
-    {
-      let same_tok = a
-        .access_token
-        .as_ref()
-        .map(|s| s.expose().as_str() == access_token.as_str())
-        .unwrap_or(false);
-      if !same_tok || a.access_token_expires_at != Some(*expires_at) {
-        a.access_token = Some(crate::util::secret::Secret::new(access_token.clone()));
-        a.access_token_expires_at = Some(*expires_at);
-        a.last_refresh = Some(time::OffsetDateTime::now_utc().unix_timestamp());
-        dirty = true;
-      }
-      if let Some(name) = username.as_ref().filter(|name| !name.trim().is_empty()) {
-        if a.username.as_deref() != Some(name.as_str()) {
-          a.username = Some(name.clone());
-          dirty = true;
-        }
-      }
-      if let Some(pid) = provider_account_id.as_ref().filter(|s| !s.trim().is_empty()) {
-        if a.provider_account_id.as_deref() != Some(pid.as_str()) {
-          a.provider_account_id = Some(pid.clone());
-          dirty = true;
-        }
-      }
-    }
-  }
-  if dirty {
-    store.save()?;
-  }
+  let quotas = probe_accounts(
+    context,
+    store,
+    &visible,
+    args.no_quota,
+    Duration::from_secs(args.timeout.max(1)),
+  )
+  .await?;
 
   // Render: group by provider (alphabetical), within each group sort by
   // effective state (Active → Fallback → Disabled). Account index in the
   // original Vec is preserved so we can pick the right quota slot.
   let mut by_provider: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-  for (i, a) in store.accounts.iter().enumerate() {
+  for &i in &visible {
+    let a = &store.accounts[i];
     by_provider.entry(a.provider.clone()).or_default().push(i);
   }
+  print_account_view(view.as_ref());
   let mut first = true;
   for (provider, mut idxs) in by_provider {
     idxs.sort_by_key(|&i| state_sort_key(store.accounts[i].state()));
@@ -196,17 +179,45 @@ async fn list(cfg: &Config, store: &mut AuthStore, args: ListArgs) -> Result<()>
     first = false;
     println!("# {provider}");
     for i in idxs {
-      render_account(&store.accounts[i], &quotas[i]);
+      render_account(&store.accounts[i], quotas.get(&i).expect("visible account was probed"));
     }
   }
   Ok(())
+}
+
+fn resolve_account_view(context: &ConfigContext, args: &AccountViewArgs) -> Result<Option<AccountView>> {
+  context.resolve_account_view(args.pool.as_deref(), args.profile.as_deref())
+}
+
+fn account_indices(store: &AuthStore, view: Option<&AccountView>) -> Vec<usize> {
+  store
+    .accounts
+    .iter()
+    .enumerate()
+    .filter_map(|(index, account)| view.is_none_or(|view| view.contains(account)).then_some(index))
+    .collect()
+}
+
+fn print_account_view(view: Option<&AccountView>) {
+  let Some(view) = view else {
+    return;
+  };
+  println!("scope: {}", view.description());
+  println!("activation: shared auth store");
+  println!();
+}
+
+fn print_no_accounts(view: Option<&AccountView>, suffix: Option<&str>) {
+  match view {
+    Some(view) => println!("(no accounts selected by {})", view.description()),
+    None => println!("(no accounts){}", suffix.unwrap_or_default()),
+  }
 }
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum QuotaResult {
   Skipped,
-  None, // not applicable to this provider
   Ok {
     snap: tokn_auth::QuotaSnapshot,
     /// Fresh access token returned by a piggy-backed `refresh_credential`
@@ -217,18 +228,98 @@ enum QuotaResult {
   Err(String),
 }
 
-async fn fetch_quota(http: reqwest::Client, account: Account, timeout: Duration) -> QuotaResult {
-  let Some(provider_auth) = crate::auth_registry::provider_auth_for(&account.provider) else {
-    return QuotaResult::None;
+async fn probe_accounts(
+  context: &ConfigContext,
+  store: &mut AuthStore,
+  indices: &[usize],
+  skip: bool,
+  timeout: Duration,
+) -> Result<BTreeMap<usize, QuotaResult>> {
+  let results = if skip {
+    indices.iter().map(|_| QuotaResult::Skipped).collect()
+  } else {
+    // Fetch concurrently, with an outer timeout per account so one hung
+    // upstream cannot freeze the command.
+    let http = context.build_http_client(false)?;
+    let futs = indices.iter().map(|&index| {
+      let account = &store.accounts[index];
+      fetch_quota(
+        http.clone(),
+        account.clone(),
+        context.resolve_account_provider(account),
+        timeout,
+      )
+    });
+    futures::future::join_all(futs).await
   };
+  let quotas: BTreeMap<usize, QuotaResult> = indices.iter().copied().zip(results).collect();
+
+  // Persist refreshed credentials produced by the quota probe instead of
+  // issuing a second refresh request.
+  let mut dirty = false;
+  for (&index, quota) in &quotas {
+    let QuotaResult::Ok {
+      refreshed:
+        Some(tokn_auth::RefreshOutcome::Refreshed {
+          access_token,
+          expires_at,
+          username,
+          provider_account_id,
+        }),
+      ..
+    } = quota
+    else {
+      continue;
+    };
+    let account = &mut store.accounts[index];
+    let same_token = account
+      .access_token
+      .as_ref()
+      .is_some_and(|secret| secret.expose().as_str() == access_token.as_str());
+    if !same_token || account.access_token_expires_at != Some(*expires_at) {
+      account.access_token = Some(Secret::new(access_token.clone()));
+      account.access_token_expires_at = Some(*expires_at);
+      account.last_refresh = Some(time::OffsetDateTime::now_utc().unix_timestamp());
+      dirty = true;
+    }
+    if let Some(name) = username.as_ref().filter(|name| !name.trim().is_empty()) {
+      if account.username.as_deref() != Some(name.as_str()) {
+        account.username = Some(name.clone());
+        dirty = true;
+      }
+    }
+    if let Some(provider_account_id) = provider_account_id.as_ref().filter(|id| !id.trim().is_empty()) {
+      if account.provider_account_id.as_deref() != Some(provider_account_id.as_str()) {
+        account.provider_account_id = Some(provider_account_id.clone());
+        dirty = true;
+      }
+    }
+  }
+  if dirty {
+    store.save()?;
+  }
+  Ok(quotas)
+}
+
+async fn fetch_quota(
+  http: reqwest::Client,
+  account: Account,
+  provider: Result<ResolvedProviderAuth>,
+  timeout: Duration,
+) -> QuotaResult {
+  let provider = match provider {
+    Ok(provider) => provider,
+    Err(error) => return QuotaResult::Err(short_err(&error)),
+  };
+  let provider_auth = provider.auth();
   // Two parallel calls so the operator gets a single round-trip latency:
   //   * refresh_credential — for Copilot also doubles as a "token still
   //     valid?" check; for Z.ai it's a NotApplicable no-op.
   //   * probe_quota       — the actual quota snapshot.
   // We bound the *combined* future by the caller-supplied timeout so a
   // single hung upstream cannot freeze the entire CLI invocation.
-  let acct = account.clone();
-  let acct2 = account.clone();
+  let acct = provider.account_for_auth(&account);
+  let acct2 = acct.clone();
   let http2 = http.clone();
   let fut = async move {
     let (refresh_res, quota_res) = tokio::join!(
@@ -277,7 +368,6 @@ fn render_account(a: &Account, q: &QuotaResult) {
 
   match q {
     QuotaResult::Skipped => {}
-    QuotaResult::None => {}
     QuotaResult::Err(e) => println!("  quota       : unavailable ({e})"),
     QuotaResult::Ok { snap, .. } => render_snapshot(snap),
   }
@@ -351,11 +441,20 @@ fn fmt_int(mut n: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// show (unchanged behaviour, lifted into a helper)
+// show
 // ---------------------------------------------------------------------------
 
-fn show(store: &AuthStore, id: &str) -> Result<()> {
-  let a = store.get(id).ok_or_else(|| anyhow!("no account with id '{id}'"))?;
+fn show(context: &ConfigContext, store: &AuthStore, args: ShowArgs) -> Result<()> {
+  let view = resolve_account_view(context, &args.view)?;
+  let a = store
+    .get(&args.id)
+    .ok_or_else(|| anyhow!("no account with id '{}'", args.id))?;
+  if let Some(view) = &view {
+    if !view.contains(a) {
+      bail!("account '{}' is not selected by {}", args.id, view.description());
+    }
+  }
+  print_account_view(view.as_ref());
   println!("id: {}", a.id);
   println!("provider: {}", a.provider);
   println!("enabled: {}", a.enabled);
@@ -437,11 +536,20 @@ fn state_label(s: AccountState) -> &'static str {
 // add (interactive wizard)
 // ---------------------------------------------------------------------------
 
-async fn add(cfg_path: Option<PathBuf>, args: AddArgs) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
-  let client = build_client(&cfg.proxy)?;
-  let account = crate::cli::onboarding::interactive_add_account(&client, args.provider, args.id).await?;
+async fn add(context: &ConfigContext, store: &mut AuthStore, args: AddArgs) -> Result<()> {
+  let provider_id = match args.provider {
+    Some(provider) => provider,
+    None => {
+      let provider_ids = context.provider_ids();
+      if provider_ids.is_empty() {
+        bail!("the config has no enabled providers that support account credentials");
+      }
+      crate::cli::onboarding::pick_provider(&provider_ids)?
+    }
+  };
+  let provider = context.resolve_provider(&provider_id)?;
+  let client = context.build_http_client(false)?;
+  let account = crate::cli::onboarding::interactive_add_account(&client, &provider, args.id).await?;
   let id = account.id.clone();
   let provider = account.provider.clone();
   store.upsert_in_main(account)?;
@@ -455,18 +563,18 @@ async fn add(cfg_path: Option<PathBuf>, args: AddArgs) -> Result<()> {
 // refresh (force token re-exchange for github-copilot)
 // ---------------------------------------------------------------------------
 
-async fn refresh(cfg: &Config, store: &mut AuthStore, id: &str) -> Result<()> {
+async fn refresh(context: &ConfigContext, store: &mut AuthStore, id: &str) -> Result<()> {
   let account = store
     .get(id)
     .ok_or_else(|| anyhow!("no account with id '{id}'"))?
     .clone();
 
-  let Some(provider_auth) = crate::auth_registry::provider_auth_for(&account.provider) else {
-    bail!("unknown provider '{}'", account.provider);
-  };
-  let http = build_client(&cfg.proxy)?;
+  let provider = context.resolve_account_provider(&account)?;
+  let provider_auth = provider.auth();
+  let auth_account = provider.account_for_auth(&account);
+  let http = context.build_http_client(false)?;
   match provider_auth
-    .refresh_credential(&http, &account)
+    .refresh_credential(&http, &auth_account)
     .await
     .map_err(|e| anyhow!("refresh failed: {e}"))?
   {
@@ -508,74 +616,30 @@ async fn refresh(cfg: &Config, store: &mut AuthStore, id: &str) -> Result<()> {
 // status (gh-auth-style one-line per account)
 // ---------------------------------------------------------------------------
 
-async fn status(cfg: &Config, store: &mut AuthStore, id: Option<String>) -> Result<()> {
-  if store.accounts.is_empty() {
-    println!("(no accounts) — run `tokn-router account add` to add one");
+async fn status(context: &ConfigContext, store: &mut AuthStore, args: StatusArgs) -> Result<()> {
+  let view = resolve_account_view(context, &args.view)?;
+  let mut visible = account_indices(store, view.as_ref());
+  if let Some(id) = &args.id {
+    let account = store.get(id).ok_or_else(|| anyhow!("no account with id '{id}'"))?;
+    if let Some(view) = &view {
+      if !view.contains(account) {
+        bail!("account '{id}' is not selected by {}", view.description());
+      }
+    }
+    visible.retain(|&index| store.accounts[index].id == *id);
+  }
+  if visible.is_empty() {
+    print_no_accounts(view.as_ref(), Some(" — run `tokn-router account add` to add one"));
     return Ok(());
   }
-  let timeout = Duration::from_secs(5);
-  let http = build_client(&cfg.proxy)?;
-  let futs = store
-    .accounts
-    .iter()
-    .map(|a| fetch_quota(http.clone(), a.clone(), timeout));
-  let quotas: Vec<QuotaResult> = futures::future::join_all(futs).await;
+  let quotas = probe_accounts(context, store, &visible, false, Duration::from_secs(5)).await?;
 
-  // Persist any token side-effects, same as `list`.
-  let mut dirty = false;
-  for (a, q) in store.accounts.iter_mut().zip(quotas.iter()) {
-    if let QuotaResult::Ok {
-      refreshed:
-        Some(tokn_auth::RefreshOutcome::Refreshed {
-          access_token,
-          expires_at,
-          username,
-          provider_account_id,
-        }),
-      ..
-    } = q
-    {
-      let same_tok = a
-        .access_token
-        .as_ref()
-        .map(|s| s.expose().as_str() == access_token.as_str())
-        .unwrap_or(false);
-      if !same_tok || a.access_token_expires_at != Some(*expires_at) {
-        a.access_token = Some(Secret::new(access_token.clone()));
-        a.access_token_expires_at = Some(*expires_at);
-        a.last_refresh = Some(time::OffsetDateTime::now_utc().unix_timestamp());
-        dirty = true;
-      }
-      if let Some(name) = username.as_ref().filter(|name| !name.trim().is_empty()) {
-        if a.username.as_deref() != Some(name.as_str()) {
-          a.username = Some(name.clone());
-          dirty = true;
-        }
-      }
-      if let Some(pid) = provider_account_id.as_ref().filter(|s| !s.trim().is_empty()) {
-        if a.provider_account_id.as_deref() != Some(pid.as_str()) {
-          a.provider_account_id = Some(pid.clone());
-          dirty = true;
-        }
-      }
-    }
-  }
-  if dirty {
-    store.save()?;
-  }
-
-  let mut shown = 0usize;
-  for (a, q) in store.accounts.iter().zip(quotas.iter()) {
-    if let Some(filter) = &id {
-      if a.id != *filter {
-        continue;
-      }
-    }
-    print_status_line(a, q);
-    shown += 1;
-  }
-  if shown == 0 {
-    bail!("no account with id '{}'", id.unwrap_or_default());
+  print_account_view(view.as_ref());
+  for index in visible {
+    print_status_line(
+      &store.accounts[index],
+      quotas.get(&index).expect("visible account was probed"),
+    );
   }
   Ok(())
 }
@@ -730,7 +794,42 @@ fn lookup_provider(accounts: &[Account], id: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use clap::Parser;
   use tokn_core::account::AccountTier;
+
+  fn write_v2_openai_config(path: &std::path::Path) {
+    std::fs::write(
+      path,
+      r#"
+schema_version = 2
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "coding" }
+
+[profiles.coding]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "preserve"
+
+[account_pools.primary]
+accounts = ["primary"]
+providers = ["company-openai"]
+
+[providers.company-openai]
+driver = "openai"
+base_url = "https://llm.example.test/v1"
+"#,
+    )
+    .unwrap();
+  }
 
   #[test]
   fn fmt_int_groups_thousands() {
@@ -740,6 +839,93 @@ mod tests {
     assert_eq!(fmt_int(1_000), "1,000");
     assert_eq!(fmt_int(80_000_000), "80,000,000");
     assert_eq!(fmt_int(6_000_000), "6,000,000");
+  }
+
+  #[test]
+  fn read_only_account_views_accept_pool_or_profile() {
+    let cli =
+      crate::cli::Cli::try_parse_from(["tokn-router", "account", "list", "--pool", "primary", "--no-quota"]).unwrap();
+    let crate::cli::Cmd::Account(AccountCmd::List(args)) = cli.cmd else {
+      panic!("expected account list");
+    };
+    assert_eq!(args.view.pool.as_deref(), Some("primary"));
+    assert_eq!(args.view.profile, None);
+
+    let cli =
+      crate::cli::Cli::try_parse_from(["tokn-router", "account", "show", "primary", "--profile", "coding"]).unwrap();
+    let crate::cli::Cmd::Account(AccountCmd::Show(args)) = cli.cmd else {
+      panic!("expected account show");
+    };
+    assert_eq!(args.id, "primary");
+    assert_eq!(args.view.profile.as_deref(), Some("coding"));
+
+    assert!(crate::cli::Cli::try_parse_from([
+      "tokn-router",
+      "account",
+      "status",
+      "--pool",
+      "primary",
+      "--profile",
+      "coding",
+    ])
+    .is_err());
+    assert!(
+      crate::cli::Cli::try_parse_from(["tokn-router", "account", "switch", "--pool", "primary", "--only", "a"])
+        .is_err()
+    );
+  }
+
+  #[tokio::test]
+  async fn v2_account_views_filter_list_and_show() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    write_v2_openai_config(&config_path);
+    let context = ConfigContext::load(Some(&config_path)).unwrap();
+    let auth_path = directory.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+    store.accounts.extend([
+      acct("primary", "company-openai", true, AccountTier::Active),
+      acct("secondary", "company-openai", true, AccountTier::Fallback),
+    ]);
+
+    list(
+      &context,
+      &mut store,
+      ListArgs {
+        view: AccountViewArgs {
+          pool: Some("primary".into()),
+          profile: None,
+        },
+        no_quota: true,
+        timeout: 1,
+      },
+    )
+    .await
+    .unwrap();
+    show(
+      &context,
+      &store,
+      ShowArgs {
+        id: "primary".into(),
+        view: AccountViewArgs {
+          pool: None,
+          profile: Some("coding".into()),
+        },
+      },
+    )
+    .unwrap();
+    assert!(show(
+      &context,
+      &store,
+      ShowArgs {
+        id: "secondary".into(),
+        view: AccountViewArgs {
+          pool: Some("primary".into()),
+          profile: None,
+        },
+      },
+    )
+    .is_err());
   }
 
   fn acct(id: &str, provider: &str, enabled: bool, tier: AccountTier) -> Account {
@@ -839,5 +1025,86 @@ mod tests {
   fn switch_unknown_id_errors() {
     let mut accts = vec![acct("a1", "p1", true, AccountTier::Active)];
     assert!(apply_switch(&mut accts, &switch_args(Some("ghost"), false, None, &[], false)).is_err());
+  }
+
+  #[tokio::test]
+  async fn v2_list_status_and_refresh_resolve_configured_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    write_v2_openai_config(&config_path);
+    let context = ConfigContext::load(Some(&config_path)).unwrap();
+    let auth_path = directory.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+    let mut account = acct("primary", "company-openai", true, AccountTier::Active);
+    account.api_key = Some(Secret::new("sk-test".into()));
+    store.accounts.push(account);
+
+    list(
+      &context,
+      &mut store,
+      ListArgs {
+        view: AccountViewArgs::default(),
+        no_quota: true,
+        timeout: 1,
+      },
+    )
+    .await
+    .unwrap();
+    status(
+      &context,
+      &mut store,
+      StatusArgs {
+        id: Some("primary".into()),
+        view: AccountViewArgs::default(),
+      },
+    )
+    .await
+    .unwrap();
+    refresh(&context, &mut store, "primary").await.unwrap();
+
+    let client = context.build_http_client(true).unwrap();
+    let failed = fetch_quota(
+      client,
+      store.accounts[0].clone(),
+      Err(anyhow!("provider resolution failed")),
+      Duration::from_secs(1),
+    )
+    .await;
+    assert!(matches!(failed, QuotaResult::Err(message) if message == "provider resolution failed"));
+  }
+
+  #[tokio::test]
+  async fn empty_account_views_return_without_network_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    write_v2_openai_config(&config_path);
+    let context = ConfigContext::load(Some(&config_path)).unwrap();
+    let auth_path = directory.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+
+    list(
+      &context,
+      &mut store,
+      ListArgs {
+        view: AccountViewArgs::default(),
+        no_quota: false,
+        timeout: 1,
+      },
+    )
+    .await
+    .unwrap();
+    status(
+      &context,
+      &mut store,
+      StatusArgs {
+        id: None,
+        view: AccountViewArgs {
+          pool: Some("primary".into()),
+          profile: None,
+        },
+      },
+    )
+    .await
+    .unwrap();
   }
 }

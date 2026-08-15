@@ -7,7 +7,7 @@
 //! requires registering its descriptor; this module needs no edits.
 
 use std::sync::OnceLock;
-use tokn_auth::ProviderAuth;
+use tokn_auth::{descriptor::ProviderDescriptor, ProviderAuth};
 use tokn_router::accounts::registry::Registry;
 
 fn registry() -> &'static Registry {
@@ -19,6 +19,13 @@ fn registry() -> &'static Registry {
 /// known provider matches.
 pub fn provider_auth_for(id: &str) -> Option<&'static dyn ProviderAuth> {
   registry().resolve(id).and_then(|d| d.provider_auth())
+}
+
+/// Resolve the descriptor that supplies a configured provider's auth
+/// behavior. Official destinations preserve their own descriptor, while a
+/// custom v2 provider inherits its reusable driver's descriptor.
+pub fn provider_descriptor_for(provider_id: &str, driver_id: &str) -> Option<&'static ProviderDescriptor> {
+  registry().resolve_provider_descriptor(provider_id, driver_id)
 }
 
 /// All provider ids known to the registry, sorted alphabetically (stable

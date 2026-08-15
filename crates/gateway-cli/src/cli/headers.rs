@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::cli::config_context::ConfigContext;
 use anyhow::{anyhow, Result};
 use clap::Args;
 use std::path::PathBuf;
@@ -12,13 +12,14 @@ pub struct HeadersArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: HeadersArgs) -> Result<()> {
-  let (_cfg, path) = Config::load(cfg_path.as_deref())?;
-  let store = AuthStore::load(None, Some(&path))?;
+  let context = ConfigContext::load(cfg_path.as_deref())?;
+  let store = AuthStore::load(None, Some(context.path()))?;
   let headers = match args.account {
     None => tokn_provider_copilot::config::CopilotHeaders::default(),
     Some(id) => {
       let a = store.get(&id).ok_or_else(|| anyhow!("no account with id '{id}'"))?;
-      if a.provider != crate::provider::ID_GITHUB_COPILOT {
+      let provider = context.resolve_account_provider(a)?;
+      if provider.auth().id() != crate::provider::ID_GITHUB_COPILOT {
         println!(
           "Account '{id}' uses provider '{}', which does not send Copilot identity headers.",
           a.provider

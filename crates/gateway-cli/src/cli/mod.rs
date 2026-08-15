@@ -9,6 +9,7 @@ mod account;
 mod agent;
 mod api_key;
 mod config_cmd;
+mod config_context;
 mod error;
 mod headers;
 mod import;
@@ -161,7 +162,7 @@ fn run_mode_for(cmd: &Cmd) -> RunMode {
       }
     },
     Cmd::Account(c) => match c {
-      AccountCmd::List(_) | AccountCmd::Show { .. } | AccountCmd::Status { .. } => RunMode::ReadOnlyCli,
+      AccountCmd::List(_) | AccountCmd::Show(_) | AccountCmd::Status(_) => RunMode::ReadOnlyCli,
       AccountCmd::Add(_)
       | AccountCmd::Login(_)
       | AccountCmd::Import(_)

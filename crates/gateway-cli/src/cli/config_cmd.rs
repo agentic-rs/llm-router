@@ -1,6 +1,7 @@
 //! `tokn-router config` subcommand — git-style key/value access. Comment-
 //! preserving edits via `toml_edit`.
 
+use crate::cli::config_context::ResolvedProviderAuth;
 use crate::config::{paths, Config};
 use crate::util::http::build_client;
 use anyhow::{anyhow, bail, Context, Result};
@@ -329,9 +330,9 @@ async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
     let client = build_client(&cfg.proxy)?;
     for raw in &args.accounts {
       let spec = parse_account_spec(raw)?;
-      let source = account_source_from_spec(&spec, false)?;
-      let account =
-        crate::cli::onboarding::resolve_account(&client, &spec.provider, Some(spec.id.clone()), source).await?;
+      let provider = ResolvedProviderAuth::legacy(&spec.provider)?;
+      let source = account_source_from_spec(&spec, &provider, false)?;
+      let account = crate::cli::onboarding::resolve_account(&client, &provider, Some(spec.id.clone()), source).await?;
       store.upsert_in_main(account)?;
     }
     cfg.save(path)?;
@@ -344,8 +345,14 @@ async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
   let mut store = AuthStore::load(None, Some(path))?;
   let client = build_client(&cfg.proxy)?;
   let mut upserted = 0usize;
+  let provider_ids = crate::auth_registry::known_providers()
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
   loop {
-    let account = crate::cli::onboarding::interactive_add_account(&client, None, None).await?;
+    let provider_id = crate::cli::onboarding::pick_provider(&provider_ids)?;
+    let provider = ResolvedProviderAuth::legacy(&provider_id)?;
+    let account = crate::cli::onboarding::interactive_add_account(&client, &provider, None).await?;
     store.upsert_in_main(account)?;
     upserted += 1;
     let more = Confirm::new("Add another account?")
@@ -520,7 +527,11 @@ fn parse_bool(key: &str, val: &str) -> Result<bool> {
   }
 }
 
-fn account_source_from_spec(spec: &AccountSpec, allow_login: bool) -> Result<crate::cli::onboarding::CredentialSource> {
+fn account_source_from_spec(
+  spec: &AccountSpec,
+  provider: &ResolvedProviderAuth,
+  allow_login: bool,
+) -> Result<crate::cli::onboarding::CredentialSource> {
   if spec.from == "login" {
     if !allow_login {
       bail!("from=login is interactive-only; use env/string/file/stdin (or a provider-specific source like gh / copilot-plugin) in --yes mode");
@@ -539,8 +550,8 @@ fn account_source_from_spec(spec: &AccountSpec, allow_login: bool) -> Result<cra
     api_key: spec.api_key,
     id: Some(spec.id.clone()),
   };
-  let source = crate::cli::import::build_source(&args)?;
-  crate::cli::onboarding::validate_provider_source(&spec.provider, &source)?;
+  let source = crate::cli::import::build_source(&args, provider)?;
+  crate::cli::onboarding::validate_provider_source(provider, &source)?;
   Ok(source)
 }
 
@@ -908,7 +919,10 @@ agent_id = "opencode"
       refresh_token: false,
       api_key: false,
     };
-    let err = account_source_from_spec(&spec, false).unwrap_err().to_string();
+    let provider = ResolvedProviderAuth::legacy(&spec.provider).unwrap();
+    let err = account_source_from_spec(&spec, &provider, false)
+      .unwrap_err()
+      .to_string();
     assert!(err.contains("unsupported"), "got: {err}");
     assert!(err.contains("gh"), "got: {err}");
   }
@@ -925,7 +939,10 @@ agent_id = "opencode"
       refresh_token: false,
       api_key: false,
     };
-    let err = account_source_from_spec(&spec, false).unwrap_err().to_string();
+    let provider = ResolvedProviderAuth::legacy(&spec.provider).unwrap();
+    let err = account_source_from_spec(&spec, &provider, false)
+      .unwrap_err()
+      .to_string();
     assert!(err.contains("interactive-only"));
   }
 
@@ -941,7 +958,8 @@ agent_id = "opencode"
       refresh_token: true,
       api_key: false,
     };
-    let source = account_source_from_spec(&spec, false).unwrap();
+    let provider = ResolvedProviderAuth::legacy(&spec.provider).unwrap();
+    let source = account_source_from_spec(&spec, &provider, false).unwrap();
     assert!(matches!(
       source,
       crate::cli::onboarding::CredentialSource::String {
