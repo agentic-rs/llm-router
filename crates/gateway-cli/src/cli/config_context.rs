@@ -24,6 +24,13 @@ enum ConfigSource {
 }
 
 impl ConfigContext {
+  pub(crate) fn from_v2(path: PathBuf, config: tokn_config::v2::CompiledConfig) -> Self {
+    Self {
+      path,
+      source: ConfigSource::V2(Box::new(config)),
+    }
+  }
+
   pub fn load(explicit_path: Option<&Path>) -> Result<Self> {
     let path = explicit_path
       .map(Path::to_path_buf)

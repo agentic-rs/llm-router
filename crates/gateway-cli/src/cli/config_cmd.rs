@@ -1,13 +1,13 @@
 //! `tokn-router config` subcommand — git-style key/value access. Comment-
 //! preserving edits via `toml_edit`.
 
-use crate::cli::config_context::ResolvedProviderAuth;
-use crate::config::{paths, Config, ConfigSchema};
-use crate::util::http::build_client;
+use crate::cli::config_context::{ConfigContext, ResolvedProviderAuth};
+use crate::config::{paths, Config, ConfigSchema, DEFAULT_HOST, DEFAULT_PORT};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
-use inquire::{Confirm, Select, Text};
-use std::path::PathBuf;
+use inquire::{Confirm, Text};
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value as EditValue};
@@ -32,7 +32,7 @@ pub enum ConfigCmd {
   Edit,
   /// Print the path to the config file
   Path,
-  /// Initialize config with onboarding wizard
+  /// Initialize a new version 2 config with the onboarding wizard
   Init(InitArgs),
 }
 
@@ -57,32 +57,32 @@ impl From<RouteModeArg> for RouteMode {
   }
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct InitArgs {
   /// Non-interactive mode.
   #[arg(long)]
   pub yes: bool,
-  /// Runtime route mode override.
-  #[arg(long, value_enum)]
+  /// Legacy-only option; unsupported by version 2 initialization.
+  #[arg(long, value_enum, hide = true)]
   pub route_mode: Option<RouteModeArg>,
-  /// Runtime serve host override.
+  /// Numeric loopback IP for the llm_api listener.
   #[arg(long)]
   pub host: Option<String>,
-  /// Runtime serve port override.
+  /// Port for the llm_api listener.
   #[arg(long)]
   pub port: Option<u16>,
-  /// Runtime proxy host override.
-  #[arg(long)]
+  /// Legacy-only option; unsupported by version 2 initialization.
+  #[arg(long, hide = true)]
   pub proxy_host: Option<String>,
-  /// Runtime proxy port override.
-  #[arg(long)]
+  /// Legacy-only option; unsupported by version 2 initialization.
+  #[arg(long, hide = true)]
   pub proxy_port: Option<u16>,
-  /// Runtime proxy default route mode override.
-  #[arg(long, value_enum)]
+  /// Legacy-only option; unsupported by version 2 initialization.
+  #[arg(long, value_enum, hide = true)]
   pub proxy_route_mode: Option<RouteModeArg>,
   /// Non-interactive repeatable account specs:
   /// id=...,provider=...,from=...[,env_var=...]
-  #[arg(long = "account")]
+  #[arg(long = "account", requires = "yes")]
   pub accounts: Vec<String>,
 }
 
@@ -357,43 +357,49 @@ struct AccountSpec {
 }
 
 async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
-  // `config init` owns the primary config file. Do not flatten managed agent
-  // overlays from `config.d` back into it when refreshing runtime settings.
-  let (mut cfg, _) = Config::load_primary(Some(path))?;
   println!("Config path: {}", path.display());
+  ensure_init_target_missing(path)?;
+  reject_legacy_init_options(&args)?;
 
-  apply_runtime_overrides(&mut cfg, &args);
+  let bind = if args.yes {
+    init_listener_bind(args.host.as_deref(), args.port)?
+  } else {
+    interactive_listener_bind(args.host.as_deref(), args.port)?
+  };
+  let (contents, compiled) = build_v2_init_config(path, bind)?;
+  if args.yes && args.accounts.is_empty() {
+    create_v2_config(path, &contents)?;
+    println!("Initialized version 2 config with no accounts.");
+    println!("Next: tokn-router account import ...  # then tokn-router serve");
+    return Ok(());
+  }
+
+  let context = ConfigContext::from_v2(path.to_path_buf(), compiled);
+  let mut store = AuthStore::load(None, Some(path))?;
+  let client = context.build_http_client(false)?;
 
   if args.yes {
-    if args.accounts.is_empty() {
-      bail!("--yes requires at least one --account spec");
-    }
-    let mut store = AuthStore::load(None, Some(path))?;
-    let client = build_client(&cfg.proxy)?;
     for raw in &args.accounts {
       let spec = parse_account_spec(raw)?;
-      let provider = ResolvedProviderAuth::legacy(&spec.provider)?;
+      let provider = context.resolve_provider(&spec.provider)?;
       let source = account_source_from_spec(&spec, &provider, false)?;
       let account = crate::cli::onboarding::resolve_account(&client, &provider, Some(spec.id.clone()), source).await?;
       store.upsert_in_main(account)?;
     }
-    cfg.save(path)?;
+    create_v2_config(path, &contents)?;
     store.save()?;
-    println!("Initialized config and upserted {} account(s).", args.accounts.len());
+    println!(
+      "Initialized version 2 config and upserted {} account(s).",
+      args.accounts.len()
+    );
     return Ok(());
   }
 
-  interactive_runtime_prompts(&mut cfg)?;
-  let mut store = AuthStore::load(None, Some(path))?;
-  let client = build_client(&cfg.proxy)?;
   let mut upserted = 0usize;
-  let provider_ids = crate::auth_registry::known_providers()
-    .into_iter()
-    .map(str::to_string)
-    .collect::<Vec<_>>();
+  let provider_ids = context.provider_ids();
   loop {
     let provider_id = crate::cli::onboarding::pick_provider(&provider_ids)?;
-    let provider = ResolvedProviderAuth::legacy(&provider_id)?;
+    let provider = context.resolve_provider(&provider_id)?;
     let account = crate::cli::onboarding::interactive_add_account(&client, &provider, None).await?;
     store.upsert_in_main(account)?;
     upserted += 1;
@@ -406,110 +412,128 @@ async fn cmd_init(path: &std::path::Path, args: InitArgs) -> Result<()> {
     }
   }
 
-  cfg.save(path)?;
+  create_v2_config(path, &contents)?;
   store.save()?;
-  println!("Initialized config and upserted {upserted} account(s).");
-  println!("Next: tokn-router serve  # or tokn-router proxy start");
+  println!("Initialized version 2 config and upserted {upserted} account(s).");
+  println!("Next: tokn-router serve");
   Ok(())
 }
 
-fn apply_runtime_overrides(cfg: &mut Config, args: &InitArgs) {
-  if let Some(mode) = args.route_mode {
-    cfg.defaults.mode = mode.into();
-  }
-  if let Some(host) = &args.host {
-    cfg.server.host = host.clone();
-  }
-  if let Some(port) = args.port {
-    cfg.server.port = port;
-  }
-  if let Some(host) = &args.proxy_host {
-    cfg.proxy_mode.host = host.clone();
-  }
-  if let Some(port) = args.proxy_port {
-    cfg.proxy_mode.port = port;
-  }
-  if let Some(mode) = args.proxy_route_mode {
-    cfg.proxy_mode.route_mode = mode.into();
-  }
-}
-
-fn interactive_runtime_prompts(cfg: &mut Config) -> Result<()> {
-  let route_options = vec!["route", "passthrough", "switch", "exact", "fuzzy"];
-  let default_idx = match cfg.defaults.mode {
-    RouteMode::Route => 0,
-    RouteMode::Passthrough => 1,
-    RouteMode::Switch => 2,
-    RouteMode::Exact => 3,
-    RouteMode::Fuzzy => 4,
-  };
-  let selected = Select::new("Route mode:", route_options.clone())
-    .with_starting_cursor(default_idx)
-    .prompt()
-    .context("route mode selection cancelled")?;
-  cfg.defaults.mode = match selected {
-    "route" => RouteMode::Route,
-    "passthrough" => RouteMode::Passthrough,
-    "switch" => RouteMode::Switch,
-    "exact" => RouteMode::Exact,
-    "fuzzy" => RouteMode::Fuzzy,
-    _ => RouteMode::Route,
-  };
-
-  let proxy_default_idx = match cfg.proxy_mode.route_mode {
-    RouteMode::Route => 0,
-    RouteMode::Passthrough => 1,
-    RouteMode::Switch => 2,
-    RouteMode::Exact => 3,
-    RouteMode::Fuzzy => 4,
-  };
-  let proxy_selected = Select::new("Proxy route mode:", route_options)
-    .with_starting_cursor(proxy_default_idx)
-    .prompt()
-    .context("proxy route mode selection cancelled")?;
-  cfg.proxy_mode.route_mode = match proxy_selected {
-    "route" => RouteMode::Route,
-    "passthrough" => RouteMode::Passthrough,
-    "switch" => RouteMode::Switch,
-    "exact" => RouteMode::Exact,
-    "fuzzy" => RouteMode::Fuzzy,
-    _ => RouteMode::Route,
-  };
-
-  if Confirm::new("Set serve host/port?")
-    .with_default(false)
-    .prompt()
-    .context("serve host/port prompt cancelled")?
-  {
-    let host = Text::new("Serve host:")
-      .with_initial_value(&cfg.server.host)
-      .prompt()
-      .context("serve host prompt cancelled")?;
-    let port = Text::new("Serve port:")
-      .with_initial_value(&cfg.server.port.to_string())
-      .prompt()
-      .context("serve port prompt cancelled")?;
-    cfg.server.host = host;
-    cfg.server.port = port.parse().context("serve port must be a valid u16")?;
-  }
-
-  if Confirm::new("Set proxy host/port?")
-    .with_default(false)
-    .prompt()
-    .context("proxy host/port prompt cancelled")?
-  {
-    let host = Text::new("Proxy host:")
-      .with_initial_value(&cfg.proxy_mode.host)
-      .prompt()
-      .context("proxy host prompt cancelled")?;
-    let port = Text::new("Proxy port:")
-      .with_initial_value(&cfg.proxy_mode.port.to_string())
-      .prompt()
-      .context("proxy port prompt cancelled")?;
-    cfg.proxy_mode.host = host;
-    cfg.proxy_mode.port = port.parse().context("proxy port must be a valid u16")?;
+fn ensure_init_target_missing(path: &Path) -> Result<()> {
+  if path.exists() {
+    bail!(
+      "config already exists at {}; `config init` only creates new version 2 configs and never overwrites or migrates existing files",
+      path.display()
+    );
   }
   Ok(())
+}
+
+fn reject_legacy_init_options(args: &InitArgs) -> Result<()> {
+  let mut options = Vec::new();
+  if args.route_mode.is_some() {
+    options.push("--route-mode");
+  }
+  if args.proxy_host.is_some() {
+    options.push("--proxy-host");
+  }
+  if args.proxy_port.is_some() {
+    options.push("--proxy-port");
+  }
+  if args.proxy_route_mode.is_some() {
+    options.push("--proxy-route-mode");
+  }
+  if !options.is_empty() {
+    bail!(
+      "{} are legacy-only and unsupported by version 2 config initialization; configure routes or a forward_proxy listener explicitly after initialization",
+      options.join(", ")
+    );
+  }
+  Ok(())
+}
+
+fn interactive_listener_bind(host: Option<&str>, port: Option<u16>) -> Result<SocketAddr> {
+  let default = init_listener_bind(host, port)?;
+  if host.is_some() || port.is_some() {
+    return Ok(default);
+  }
+  if !Confirm::new("Set llm_api listener IP/port?")
+    .with_default(false)
+    .prompt()
+    .context("listener IP/port prompt cancelled")?
+  {
+    return Ok(default);
+  }
+
+  let host = Text::new("Listener IP:")
+    .with_initial_value(&default.ip().to_string())
+    .prompt()
+    .context("listener IP prompt cancelled")?;
+  let port = Text::new("Listener port:")
+    .with_initial_value(&default.port().to_string())
+    .prompt()
+    .context("listener port prompt cancelled")?
+    .parse()
+    .context("listener port must be a valid u16")?;
+  init_listener_bind(Some(&host), Some(port))
+}
+
+fn init_listener_bind(host: Option<&str>, port: Option<u16>) -> Result<SocketAddr> {
+  let ip = host
+    .unwrap_or(DEFAULT_HOST)
+    .parse::<IpAddr>()
+    .context("version 2 listener host must be a numeric IP address")?;
+  if !ip.is_loopback() {
+    bail!(
+      "version 2 config init only creates an unauthenticated loopback listener; configure local_keys and allow_insecure_public explicitly for a non-loopback listener"
+    );
+  }
+  Ok(SocketAddr::new(ip, port.unwrap_or(DEFAULT_PORT)))
+}
+
+const V2_INIT_TEMPLATE: &str = r#"schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "default" }
+
+[profiles.default]
+route = "default"
+wire_identity = "auto"
+
+[routes.default]
+kind = "managed"
+account_pool = "default"
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+
+[account_pools.default]
+accounts = ["*"]
+providers = ["*"]
+strategy = "round_robin"
+"#;
+
+fn build_v2_init_config(path: &Path, bind: SocketAddr) -> Result<(String, tokn_config::v2::CompiledConfig)> {
+  let mut document = V2_INIT_TEMPLATE
+    .parse::<DocumentMut>()
+    .context("invalid built-in version 2 config template")?;
+  insert(
+    &mut document,
+    &["listeners".into(), "api".into(), "bind".into()],
+    value(bind.to_string()),
+  )?;
+  let contents = document.to_string();
+  let compiled = tokn_config::v2::parse_config(&contents, path)?;
+  Ok((contents, compiled))
+}
+
+fn create_v2_config(path: &Path, contents: &str) -> Result<()> {
+  tokn_config::replace_contents_if_unchanged(path, None, contents.as_bytes())
+    .map_err(anyhow::Error::from)
+    .with_context(|| format!("create version 2 config at {}", path.display()))
 }
 
 fn parse_account_spec(raw: &str) -> Result<AccountSpec> {
@@ -843,6 +867,7 @@ fn load_doc(path: &std::path::Path) -> Result<DocumentMut> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use clap::Parser;
 
   fn doc(s: &str) -> DocumentMut {
     s.parse().unwrap()
@@ -1038,6 +1063,120 @@ default_http_action = { kind = "reject" }
     )
     .is_ok());
     print_fragment_editor_note(&path);
+  }
+
+  #[test]
+  fn v2_init_builds_the_minimal_managed_graph() {
+    let path = Path::new("config.toml");
+    let bind = init_listener_bind(Some("::1"), Some(5151)).unwrap();
+    let (contents, compiled) = build_v2_init_config(path, bind).unwrap();
+    let raw = tokn_config::v2::decode(&contents, path).unwrap();
+
+    assert_eq!(raw.schema_version, 2);
+    assert_eq!(raw.listeners.len(), 1);
+    assert_eq!(raw.profiles.len(), 1);
+    assert_eq!(raw.routes.len(), 1);
+    assert_eq!(raw.account_pools.len(), 1);
+    assert!(raw.bindings.is_empty());
+    assert!(raw.connect_rules.is_empty());
+    assert!(raw.providers.is_empty());
+    assert!(contents.contains("bind = \"[::1]:5151\""));
+
+    let context = ConfigContext::from_v2(path.to_path_buf(), compiled);
+    let provider = context.resolve_provider("zai-coding-plan").unwrap();
+    assert_eq!(provider.provider_id(), "zai-coding-plan");
+    assert!(context.provider_ids().contains(&"zai-coding-plan".to_string()));
+  }
+
+  #[test]
+  fn v2_init_accepts_only_numeric_loopback_listener_addresses() {
+    assert_eq!(
+      init_listener_bind(None, None).unwrap(),
+      SocketAddr::new(DEFAULT_HOST.parse().unwrap(), DEFAULT_PORT)
+    );
+    assert_eq!(
+      interactive_listener_bind(Some("127.0.0.1"), Some(5151)).unwrap(),
+      "127.0.0.1:5151".parse().unwrap()
+    );
+    assert!(init_listener_bind(Some("localhost"), None)
+      .unwrap_err()
+      .to_string()
+      .contains("numeric IP"));
+    assert!(init_listener_bind(Some("0.0.0.0"), None)
+      .unwrap_err()
+      .to_string()
+      .contains("unauthenticated loopback"));
+  }
+
+  #[test]
+  fn v2_init_rejects_legacy_only_options() {
+    let args = InitArgs {
+      route_mode: Some(RouteModeArg::Route),
+      proxy_host: Some("127.0.0.1".into()),
+      proxy_port: Some(4142),
+      proxy_route_mode: Some(RouteModeArg::Exact),
+      ..InitArgs::default()
+    };
+    let error = reject_legacy_init_options(&args).unwrap_err().to_string();
+
+    assert!(error.contains("--route-mode"));
+    assert!(error.contains("--proxy-host"));
+    assert!(error.contains("--proxy-port"));
+    assert!(error.contains("--proxy-route-mode"));
+    assert!(error.contains("forward_proxy listener"));
+  }
+
+  #[test]
+  fn v2_init_never_overwrites_an_existing_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let original = b"[server]\nport = 5151\n";
+    std::fs::write(&path, original).unwrap();
+
+    let error = ensure_init_target_missing(&path).unwrap_err().to_string();
+    assert!(error.contains("never overwrites or migrates"));
+    let create_error = create_v2_config(&path, V2_INIT_TEMPLATE).unwrap_err().to_string();
+    assert!(create_error.contains("create version 2 config"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+  }
+
+  #[test]
+  fn v2_init_atomically_creates_a_compilable_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("nested/config.toml");
+    let bind = init_listener_bind(None, Some(5151)).unwrap();
+    let (contents, _) = build_v2_init_config(&path, bind).unwrap();
+
+    create_v2_config(&path, &contents).unwrap();
+
+    let compiled = tokn_config::v2::load_config(&path).unwrap();
+    assert_eq!(compiled.gateway().listeners().len(), 1);
+  }
+
+  #[tokio::test]
+  async fn non_interactive_v2_init_can_create_config_without_accounts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let args = InitArgs {
+      yes: true,
+      port: Some(5151),
+      ..InitArgs::default()
+    };
+
+    cmd_init(&path, args).await.unwrap();
+
+    let config = tokn_config::v2::load_config(&path).unwrap();
+    let listener = config.gateway().listeners().values().next().unwrap();
+    assert_eq!(listener.bind().port(), 5151);
+  }
+
+  #[test]
+  fn v2_init_account_specs_require_non_interactive_mode() {
+    let error =
+      crate::cli::Cli::try_parse_from(["tokn-router", "config", "init", "--account", "id=work,provider=openai"])
+        .unwrap_err();
+
+    assert!(error.to_string().contains("--yes"));
   }
 
   #[test]
