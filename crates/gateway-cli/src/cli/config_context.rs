@@ -254,6 +254,13 @@ base_url = "https://llm.example.test/v1"
     provider.finish_account(&mut newly_created);
     assert_eq!(newly_created.provider, "company-openai");
     assert_eq!(newly_created.base_url, None);
+
+    let defaulted = ResolvedProviderAuth::v2("company-openai", "openai", None).unwrap();
+    assert_eq!(
+      defaulted.account_for_auth(&stored).base_url.as_deref(),
+      Some("https://api.openai.com/v1")
+    );
+    assert!(ResolvedProviderAuth::v2("company-openai", "missing", None).is_err());
   }
 
   #[test]
