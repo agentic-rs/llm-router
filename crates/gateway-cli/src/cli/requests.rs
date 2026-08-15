@@ -43,7 +43,12 @@ fn prune(explicit_config: Option<&Path>, args: PruneArgs) -> Result<()> {
   let report = result?;
 
   print_report(&paths.requests_dir, &report, args.commit);
-  let failures = report
+  let missing_archives = report
+    .entries
+    .iter()
+    .filter(|entry| matches!(entry.outcome, PruneOutcome::MissingArchive))
+    .count();
+  let verification_failures = report
     .entries
     .iter()
     .filter(|entry| {
@@ -53,8 +58,12 @@ fn prune(explicit_config: Option<&Path>, args: PruneArgs) -> Result<()> {
       )
     })
     .count();
+  let failures = missing_archives + verification_failures;
   if failures > 0 {
-    bail!("{failures} request database(s) could not be verified; unverified source files were retained");
+    bail!(
+      "{failures} request database(s) were retained: {missing_archives} missing archive(s), \
+       {verification_failures} verification failure(s)"
+    );
   }
   Ok(())
 }
@@ -246,6 +255,20 @@ mod tests {
   use clap::Parser;
   use indicatif::ProgressDrawTarget;
 
+  fn write_v2_config(directory: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let requests_dir = directory.path().join("requests");
+    std::fs::create_dir(&requests_dir).unwrap();
+    let config_path = directory.path().join("config.toml");
+    let serialized_requests_dir = serde_json::to_string(&requests_dir).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../smoke.toml");
+    let mut config = std::fs::read_to_string(fixture).unwrap();
+    config.push_str(&format!(
+      "\n[service.persistence]\nrequests_dir = {serialized_requests_dir}\narchive_extension = \"db.zstd\"\n"
+    ));
+    std::fs::write(&config_path, config).unwrap();
+    (config_path, requests_dir)
+  }
+
   #[test]
   fn parses_prune_as_dry_run_by_default() {
     let cli = Cli::try_parse_from(["tokn-router", "requests", "prune"]).unwrap();
@@ -298,20 +321,29 @@ mod tests {
   #[tokio::test]
   async fn prune_loads_v2_persistence_settings() {
     let directory = tempfile::tempdir().unwrap();
-    let requests_dir = directory.path().join("requests");
-    std::fs::create_dir(&requests_dir).unwrap();
-    let config_path = directory.path().join("config.toml");
-    let requests_dir = serde_json::to_string(&requests_dir).unwrap();
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../smoke.toml");
-    let mut config = std::fs::read_to_string(fixture).unwrap();
-    config.push_str(&format!(
-      "\n[service.persistence]\nrequests_dir = {requests_dir}\narchive_extension = \"db.zstd\"\n"
-    ));
-    std::fs::write(&config_path, config).unwrap();
+    let (config_path, _) = write_v2_config(&directory);
 
     run(Some(config_path), RequestsCmd::Prune(PruneArgs { commit: false }))
       .await
       .unwrap();
+  }
+
+  #[tokio::test]
+  async fn prune_errors_and_distinguishes_missing_archives() {
+    let directory = tempfile::tempdir().unwrap();
+    let (config_path, requests_dir) = write_v2_config(&directory);
+    std::fs::write(requests_dir.join("2000-01-01.db"), b"request database").unwrap();
+    std::fs::write(requests_dir.join("2000-01-02.db"), b"another request database").unwrap();
+    std::fs::write(requests_dir.join("2000-01-02.db.zstd"), b"corrupt archive").unwrap();
+
+    let error = run(Some(config_path), RequestsCmd::Prune(PruneArgs { commit: false }))
+      .await
+      .unwrap_err();
+
+    assert_eq!(
+      error.to_string(),
+      "2 request database(s) were retained: 1 missing archive(s), 1 verification failure(s)"
+    );
   }
 
   #[tokio::test]
