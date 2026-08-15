@@ -1,16 +1,18 @@
 use crate::auth_registry::{known_providers, provider_auth_for, provider_descriptor_for};
 use crate::config::Config;
 use anyhow::{anyhow, bail, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tokn_auth::ProviderAuth;
 use tokn_core::account::AccountConfig;
 use tokn_core::provider::official_provider_preset;
+use tokn_policy::{AccountPoolPlan, GatewayPlan, RelayTarget, RoutePlan};
 
 /// The configuration details needed by account and credential commands.
 ///
 /// This intentionally does not expose either complete schema. Account
-/// management only needs the auth store location, outbound HTTP policy, and
-/// the configured-provider to reusable-driver mapping.
+/// management only needs the auth store location, outbound HTTP policy,
+/// configured-provider mapping, and read-only account selection views.
 pub struct ConfigContext {
   path: PathBuf,
   source: ConfigSource,
@@ -116,6 +118,134 @@ impl ConfigContext {
         ConfigSource::Legacy(_) => Err(error),
       },
     }
+  }
+
+  /// Resolve a read-only account view against the effective configuration.
+  ///
+  /// Legacy profiles own account/provider filters directly. V2 profiles are
+  /// deliberately indirect, so they resolve through their route to the pool
+  /// that owns account selection.
+  pub fn resolve_account_view(&self, pool: Option<&str>, profile: Option<&str>) -> Result<Option<AccountView>> {
+    if pool.is_some() && profile.is_some() {
+      bail!("`--pool` and `--profile` are mutually exclusive");
+    }
+
+    match (&self.source, pool, profile) {
+      (_, None, None) => Ok(None),
+      (ConfigSource::Legacy(_), Some(_), None) => {
+        bail!("`--pool` requires a schema_version = 2 configuration")
+      }
+      (ConfigSource::Legacy(config), None, Some(profile_id)) => {
+        let profile = config
+          .profiles
+          .get(profile_id)
+          .ok_or_else(|| anyhow!("unknown profile '{profile_id}'"))?;
+        Ok(Some(AccountView {
+          description: format!("profile '{profile_id}'"),
+          accounts: profile
+            .accounts
+            .clone()
+            .or_else(|| config.defaults.accounts.clone())
+            .map(|accounts| accounts.into_iter().collect()),
+          providers: profile
+            .providers
+            .clone()
+            .or_else(|| config.defaults.providers.clone())
+            .map(|providers| providers.into_iter().collect()),
+        }))
+      }
+      (ConfigSource::V2(config), Some(pool_id), None) => {
+        let gateway = config.gateway();
+        let (canonical_id, pool) = find_pool(gateway, pool_id)?;
+        Ok(Some(v2_account_view(gateway, pool, format!("pool '{canonical_id}'"))))
+      }
+      (ConfigSource::V2(config), None, Some(profile_id)) => {
+        let gateway = config.gateway();
+        let (canonical_profile_id, profile) = gateway
+          .profiles()
+          .iter()
+          .find(|(id, _)| id.as_str() == profile_id)
+          .ok_or_else(|| anyhow!("unknown profile '{profile_id}'"))?;
+        let route_id = profile.route();
+        let route = gateway
+          .route(route_id)
+          .expect("compiled v2 profile references an existing route");
+        let pool_id = route_account_pool(route).ok_or_else(|| {
+          anyhow!("profile '{canonical_profile_id}' uses a transparent route and has no account pool")
+        })?;
+        let pool = gateway
+          .account_pool(pool_id)
+          .expect("compiled v2 route references an existing account pool");
+        Ok(Some(v2_account_view(
+          gateway,
+          pool,
+          format!("profile '{canonical_profile_id}' -> route '{route_id}' -> pool '{pool_id}'"),
+        )))
+      }
+      _ => unreachable!("pool/profile exclusivity checked above"),
+    }
+  }
+}
+
+/// A configuration-derived filter for read-only account commands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountView {
+  description: String,
+  accounts: Option<BTreeSet<String>>,
+  providers: Option<BTreeSet<String>>,
+}
+
+impl AccountView {
+  pub fn description(&self) -> &str {
+    &self.description
+  }
+
+  pub fn contains(&self, account: &AccountConfig) -> bool {
+    self
+      .accounts
+      .as_ref()
+      .is_none_or(|accounts| accounts.contains(&account.id))
+      && self
+        .providers
+        .as_ref()
+        .is_none_or(|providers| providers.contains(&account.provider))
+  }
+}
+
+fn find_pool<'a>(gateway: &'a GatewayPlan, requested_id: &str) -> Result<(&'a str, &'a AccountPoolPlan)> {
+  gateway
+    .account_pools()
+    .iter()
+    .find(|(id, _)| id.as_str() == requested_id)
+    .map(|(id, pool)| (id.as_str(), pool))
+    .ok_or_else(|| anyhow!("unknown account pool '{requested_id}'"))
+}
+
+fn v2_account_view(gateway: &GatewayPlan, pool: &AccountPoolPlan, description: String) -> AccountView {
+  let selector = pool.selector();
+  let accounts = selector
+    .accounts()
+    .map(|accounts| accounts.iter().map(ToString::to_string).collect());
+  let providers = selector
+    .providers()
+    .map(|providers| providers.iter().map(ToString::to_string).collect())
+    .unwrap_or_else(|| gateway.providers().keys().map(ToString::to_string).collect());
+  AccountView {
+    description,
+    accounts,
+    providers: Some(providers),
+  }
+}
+
+fn route_account_pool(route: &RoutePlan) -> Option<&tokn_policy::AccountPoolId> {
+  match route {
+    RoutePlan::Managed(route) => Some(route.target().account_pool()),
+    RoutePlan::Relay(route) => Some(match route.target() {
+      RelayTarget::ProviderFromOrigin { account_pool } | RelayTarget::FixedProvider { account_pool, .. } => {
+        account_pool
+      }
+    }),
+    RoutePlan::Transparent(_) => None,
   }
 }
 
@@ -358,5 +488,105 @@ default_http_action = { kind = "reject" }
     assert_eq!(no_proxy.url, None);
     assert!(no_proxy.no_proxy.is_empty());
     assert!(!no_proxy.system);
+  }
+
+  #[test]
+  fn v2_account_views_resolve_pools_and_profiles() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+      &path,
+      r#"
+schema_version = 2
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "coding" }
+
+[profiles.coding]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "preserve"
+
+[account_pools.primary]
+accounts = ["primary"]
+providers = ["company-openai"]
+
+[providers.company-openai]
+driver = "openai"
+base_url = "https://llm.example.test/v1"
+"#,
+    )
+    .unwrap();
+    let context = ConfigContext::load(Some(&path)).unwrap();
+    let selected = AccountConfig {
+      id: "primary".into(),
+      ..account("company-openai", None)
+    };
+    let other_account = AccountConfig {
+      id: "other".into(),
+      ..selected.clone()
+    };
+    let other_provider = account("openai", None);
+
+    let pool = context.resolve_account_view(Some("primary"), None).unwrap().unwrap();
+    assert_eq!(pool.description(), "pool 'primary'");
+    assert!(pool.contains(&selected));
+    assert!(!pool.contains(&other_account));
+    assert!(!pool.contains(&other_provider));
+
+    let profile = context.resolve_account_view(None, Some("coding")).unwrap().unwrap();
+    assert_eq!(
+      profile.description(),
+      "profile 'coding' -> route 'managed' -> pool 'primary'"
+    );
+    assert!(profile.contains(&selected));
+    assert!(context.resolve_account_view(Some("missing"), None).is_err());
+    assert!(context.resolve_account_view(Some("primary"), Some("coding")).is_err());
+  }
+
+  #[test]
+  fn legacy_profile_account_view_applies_inherited_filters() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+      &path,
+      r#"
+[defaults]
+providers = ["openai"]
+accounts = ["default"]
+
+[profiles.batch]
+accounts = ["batch"]
+"#,
+    )
+    .unwrap();
+    let context = ConfigContext::load(Some(&path)).unwrap();
+    let selected = AccountConfig {
+      id: "batch".into(),
+      ..account("openai", None)
+    };
+    let wrong_account = AccountConfig {
+      id: "default".into(),
+      ..account("openai", None)
+    };
+    let wrong_provider = AccountConfig {
+      id: "batch".into(),
+      ..account("zai", None)
+    };
+
+    let profile = context.resolve_account_view(None, Some("batch")).unwrap().unwrap();
+    assert_eq!(profile.description(), "profile 'batch'");
+    assert!(profile.contains(&selected));
+    assert!(!profile.contains(&wrong_account));
+    assert!(!profile.contains(&wrong_provider));
+    assert!(context.resolve_account_view(Some("primary"), None).is_err());
   }
 }
