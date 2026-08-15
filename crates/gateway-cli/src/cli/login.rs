@@ -68,3 +68,71 @@ fn pick_provider_interactive(provider_ids: &[String]) -> Result<String> {
     .context("provider selection cancelled")?;
   Ok(pick.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn unknown_provider_is_rejected_before_login_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    let context = ConfigContext::load(Some(&config_path)).unwrap();
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+
+    let error = run_with_context(
+      &context,
+      &mut store,
+      LoginArgs {
+        provider: Some("unknown".into()),
+        id: None,
+        no_proxy: true,
+      },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "unknown provider 'unknown'");
+    assert!(!auth_path.exists());
+  }
+
+  #[tokio::test]
+  async fn v2_login_rejects_a_provider_outside_the_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    std::fs::write(
+      &config_path,
+      r#"
+schema_version = 2
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+
+[providers.openai]
+"#,
+    )
+    .unwrap();
+    let context = ConfigContext::load(Some(&config_path)).unwrap();
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+
+    let error = run_with_context(
+      &context,
+      &mut store,
+      LoginArgs {
+        provider: Some("missing".into()),
+        id: None,
+        no_proxy: false,
+      },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("provider 'missing' is not enabled"));
+    assert!(!auth_path.exists());
+  }
+}
