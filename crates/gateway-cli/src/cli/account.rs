@@ -1,7 +1,7 @@
+use crate::cli::config_context::{ConfigContext, ResolvedProviderAuth};
 use crate::cli::import::ImportArgs;
 use crate::cli::login::LoginArgs;
-use crate::config::{Account, AccountState, AccountTier, Config};
-use crate::util::http::build_client;
+use crate::config::{Account, AccountState, AccountTier};
 use crate::util::secret::Secret;
 use crate::util::timefmt::{relative_from_now, relative_from_now_ms};
 use anyhow::{anyhow, bail, Result};
@@ -90,10 +90,10 @@ pub struct SwitchArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
+  let context = ConfigContext::load(cfg_path.as_deref())?;
+  let mut store = AuthStore::load(None, Some(context.path()))?;
   match cmd {
-    AccountCmd::List(args) => list(&cfg, &mut store, args).await?,
+    AccountCmd::List(args) => list(&context, &mut store, args).await?,
     AccountCmd::Remove { id } => {
       let removed = store.remove(&id).ok_or_else(|| anyhow!("no account with id '{id}'"))?;
       store.save()?;
@@ -101,11 +101,11 @@ pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
       println!("Removed '{id}'");
     }
     AccountCmd::Show { id } => show(&store, &id)?,
-    AccountCmd::Add(args) => add(cfg_path, args).await?,
-    AccountCmd::Login(args) => crate::cli::login::run(cfg_path, args).await?,
-    AccountCmd::Import(args) => crate::cli::import::run(cfg_path, args).await?,
-    AccountCmd::Refresh { id } => refresh(&cfg, &mut store, &id).await?,
-    AccountCmd::Status { id } => status(&cfg, &mut store, id).await?,
+    AccountCmd::Add(args) => add(&context, &mut store, args).await?,
+    AccountCmd::Login(args) => crate::cli::login::run_with_context(&context, &mut store, args).await?,
+    AccountCmd::Import(args) => crate::cli::import::run_with_context(&context, &mut store, args).await?,
+    AccountCmd::Refresh { id } => refresh(&context, &mut store, &id).await?,
+    AccountCmd::Status { id } => status(&context, &mut store, id).await?,
     AccountCmd::Switch(args) => switch(&mut store, args)?,
   }
   Ok(())
@@ -115,7 +115,7 @@ pub async fn run(cfg_path: Option<PathBuf>, cmd: AccountCmd) -> Result<()> {
 // list
 // ---------------------------------------------------------------------------
 
-async fn list(cfg: &Config, store: &mut AuthStore, args: ListArgs) -> Result<()> {
+async fn list(context: &ConfigContext, store: &mut AuthStore, args: ListArgs) -> Result<()> {
   if store.accounts.is_empty() {
     println!("(no accounts)");
     return Ok(());
@@ -126,12 +126,16 @@ async fn list(cfg: &Config, store: &mut AuthStore, args: ListArgs) -> Result<()>
   let quotas: Vec<QuotaResult> = if args.no_quota {
     store.accounts.iter().map(|_| QuotaResult::Skipped).collect()
   } else {
-    let http = build_client(&cfg.proxy)?;
+    let http = context.build_http_client(false)?;
     let timeout = Duration::from_secs(args.timeout.max(1));
-    let futs = store
-      .accounts
-      .iter()
-      .map(|a| fetch_quota(http.clone(), a.clone(), timeout));
+    let futs = store.accounts.iter().map(|a| {
+      fetch_quota(
+        http.clone(),
+        a.clone(),
+        context.resolve_account_provider(&a.provider),
+        timeout,
+      )
+    });
     futures::future::join_all(futs).await
   };
 
@@ -206,7 +210,6 @@ async fn list(cfg: &Config, store: &mut AuthStore, args: ListArgs) -> Result<()>
 #[allow(clippy::large_enum_variant)]
 enum QuotaResult {
   Skipped,
-  None, // not applicable to this provider
   Ok {
     snap: tokn_auth::QuotaSnapshot,
     /// Fresh access token returned by a piggy-backed `refresh_credential`
@@ -217,18 +220,25 @@ enum QuotaResult {
   Err(String),
 }
 
-async fn fetch_quota(http: reqwest::Client, account: Account, timeout: Duration) -> QuotaResult {
-  let Some(provider_auth) = crate::auth_registry::provider_auth_for(&account.provider) else {
-    return QuotaResult::None;
+async fn fetch_quota(
+  http: reqwest::Client,
+  account: Account,
+  provider: Result<ResolvedProviderAuth>,
+  timeout: Duration,
+) -> QuotaResult {
+  let provider = match provider {
+    Ok(provider) => provider,
+    Err(error) => return QuotaResult::Err(short_err(&error)),
   };
+  let provider_auth = provider.auth();
   // Two parallel calls so the operator gets a single round-trip latency:
   //   * refresh_credential — for Copilot also doubles as a "token still
   //     valid?" check; for Z.ai it's a NotApplicable no-op.
   //   * probe_quota       — the actual quota snapshot.
   // We bound the *combined* future by the caller-supplied timeout so a
   // single hung upstream cannot freeze the entire CLI invocation.
-  let acct = account.clone();
-  let acct2 = account.clone();
+  let acct = provider.account_for_auth(&account);
+  let acct2 = acct.clone();
   let http2 = http.clone();
   let fut = async move {
     let (refresh_res, quota_res) = tokio::join!(
@@ -277,7 +287,6 @@ fn render_account(a: &Account, q: &QuotaResult) {
 
   match q {
     QuotaResult::Skipped => {}
-    QuotaResult::None => {}
     QuotaResult::Err(e) => println!("  quota       : unavailable ({e})"),
     QuotaResult::Ok { snap, .. } => render_snapshot(snap),
   }
@@ -437,11 +446,20 @@ fn state_label(s: AccountState) -> &'static str {
 // add (interactive wizard)
 // ---------------------------------------------------------------------------
 
-async fn add(cfg_path: Option<PathBuf>, args: AddArgs) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
-  let client = build_client(&cfg.proxy)?;
-  let account = crate::cli::onboarding::interactive_add_account(&client, args.provider, args.id).await?;
+async fn add(context: &ConfigContext, store: &mut AuthStore, args: AddArgs) -> Result<()> {
+  let provider_id = match args.provider {
+    Some(provider) => provider,
+    None => {
+      let provider_ids = context.provider_ids();
+      if provider_ids.is_empty() {
+        bail!("the config has no enabled providers that support account credentials");
+      }
+      crate::cli::onboarding::pick_provider(&provider_ids)?
+    }
+  };
+  let provider = context.resolve_provider(&provider_id)?;
+  let client = context.build_http_client(false)?;
+  let account = crate::cli::onboarding::interactive_add_account(&client, &provider, args.id).await?;
   let id = account.id.clone();
   let provider = account.provider.clone();
   store.upsert_in_main(account)?;
@@ -455,18 +473,18 @@ async fn add(cfg_path: Option<PathBuf>, args: AddArgs) -> Result<()> {
 // refresh (force token re-exchange for github-copilot)
 // ---------------------------------------------------------------------------
 
-async fn refresh(cfg: &Config, store: &mut AuthStore, id: &str) -> Result<()> {
+async fn refresh(context: &ConfigContext, store: &mut AuthStore, id: &str) -> Result<()> {
   let account = store
     .get(id)
     .ok_or_else(|| anyhow!("no account with id '{id}'"))?
     .clone();
 
-  let Some(provider_auth) = crate::auth_registry::provider_auth_for(&account.provider) else {
-    bail!("unknown provider '{}'", account.provider);
-  };
-  let http = build_client(&cfg.proxy)?;
+  let provider = context.resolve_account_provider(&account.provider)?;
+  let provider_auth = provider.auth();
+  let auth_account = provider.account_for_auth(&account);
+  let http = context.build_http_client(false)?;
   match provider_auth
-    .refresh_credential(&http, &account)
+    .refresh_credential(&http, &auth_account)
     .await
     .map_err(|e| anyhow!("refresh failed: {e}"))?
   {
@@ -508,17 +526,21 @@ async fn refresh(cfg: &Config, store: &mut AuthStore, id: &str) -> Result<()> {
 // status (gh-auth-style one-line per account)
 // ---------------------------------------------------------------------------
 
-async fn status(cfg: &Config, store: &mut AuthStore, id: Option<String>) -> Result<()> {
+async fn status(context: &ConfigContext, store: &mut AuthStore, id: Option<String>) -> Result<()> {
   if store.accounts.is_empty() {
     println!("(no accounts) — run `tokn-router account add` to add one");
     return Ok(());
   }
   let timeout = Duration::from_secs(5);
-  let http = build_client(&cfg.proxy)?;
-  let futs = store
-    .accounts
-    .iter()
-    .map(|a| fetch_quota(http.clone(), a.clone(), timeout));
+  let http = context.build_http_client(false)?;
+  let futs = store.accounts.iter().map(|a| {
+    fetch_quota(
+      http.clone(),
+      a.clone(),
+      context.resolve_account_provider(&a.provider),
+      timeout,
+    )
+  });
   let quotas: Vec<QuotaResult> = futures::future::join_all(futs).await;
 
   // Persist any token side-effects, same as `list`.

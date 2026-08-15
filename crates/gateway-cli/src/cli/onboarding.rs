@@ -8,7 +8,8 @@
 //!
 //! [`auth_registry`]: crate::auth_registry
 
-use crate::auth_registry::{known_providers, provider_auth_for};
+use crate::auth_registry::known_providers;
+use crate::cli::config_context::ResolvedProviderAuth;
 use crate::config::{Account, AuthType};
 use crate::util::secret::Secret;
 use anyhow::{anyhow, Context, Result};
@@ -20,17 +21,16 @@ use tokn_auth::{CredentialResult, ProviderAuth, RefreshOutcome};
 pub use tokn_auth::CredentialSource;
 
 pub fn validate_provider(provider: &str) -> Result<()> {
-  if provider_auth_for(provider).is_some() {
-    return Ok(());
-  }
-  Err(anyhow!(
-    "unknown provider '{provider}'. Try one of: {}",
-    known_providers().join(" | ")
-  ))
+  ResolvedProviderAuth::legacy(provider).map(|_| ()).map_err(|_| {
+    anyhow!(
+      "unknown provider '{provider}'. Try one of: {}",
+      known_providers().join(" | ")
+    )
+  })
 }
 
-pub fn validate_provider_source(provider: &str, source: &CredentialSource) -> Result<()> {
-  let auth = provider_auth_for(provider).ok_or_else(|| anyhow!("unknown provider '{provider}'"))?;
+pub fn validate_provider_source(provider: &ResolvedProviderAuth, source: &CredentialSource) -> Result<()> {
+  let auth = provider.auth();
   if auth.supports_credential_source(source) {
     return Ok(());
   }
@@ -42,28 +42,28 @@ pub fn validate_provider_source(provider: &str, source: &CredentialSource) -> Re
     .map(|k| k.as_str().to_string())
     .collect();
   Err(anyhow!(
-    "credential source not supported by provider '{provider}' — try one of: {}",
+    "credential source not supported by provider '{}' — try one of: {}",
+    provider.provider_id(),
     supported.join("|")
   ))
 }
 
 pub async fn resolve_account(
   client: &reqwest::Client,
-  provider: &str,
+  provider: &ResolvedProviderAuth,
   id_override: Option<String>,
   source: CredentialSource,
 ) -> Result<Account> {
-  validate_provider(provider)?;
   validate_provider_source(provider, &source)?;
-  let auth = provider_auth_for(provider).expect("validated above");
+  let auth = provider.auth();
 
-  match source {
+  let mut account = match source {
     CredentialSource::Login => {
       if auth.supports_device_flow() {
-        device_flow_login(client, auth, id_override).await
+        device_flow_login(client, provider, id_override).await
       } else {
         // Static-key provider: prompt for the key, verify, build account.
-        static_key_login(client, auth, id_override).await
+        static_key_login(client, provider, id_override).await
       }
     }
     // Every non-Login source goes through the trait. The provider tells
@@ -74,21 +74,24 @@ pub async fn resolve_account(
         .await
         .map_err(|e| anyhow!("import failed: {e}"))?;
       match result {
-        CredentialResult::Refresh(token) => oauth_account_from_token(client, auth, id_override, token).await,
-        CredentialResult::ApiKey(key) => static_key_account(client, auth, id_override, key).await,
+        CredentialResult::Refresh(token) => oauth_account_from_token(client, provider, id_override, token).await,
+        CredentialResult::ApiKey(key) => static_key_account(client, provider, id_override, key).await,
       }
     }
-  }
+  }?;
+  provider.finish_account(&mut account);
+  Ok(account)
 }
 
 /// Build an [`Account`] for an OAuth provider given a long-lived refresh
 /// token, then validate it with a live refresh when the provider supports it.
 async fn oauth_account_from_token(
   client: &reqwest::Client,
-  auth: &dyn ProviderAuth,
+  provider: &ResolvedProviderAuth,
   id_override: Option<String>,
   token: String,
 ) -> Result<Account> {
+  let auth = provider.auth();
   let mut account = Account {
     id: id_override.clone().unwrap_or_else(|| "imported".into()),
     provider: auth.id().into(),
@@ -112,6 +115,7 @@ async fn oauth_account_from_token(
     last_refresh: None,
     settings: toml::Table::new(),
   };
+  provider.prepare_for_auth(&mut account);
 
   let refresh = auth
     .refresh_credential(client, &account)
@@ -154,11 +158,13 @@ async fn oauth_account_from_token(
 /// Build an [`Account`] for a static-API-key provider given the raw key.
 async fn static_key_account(
   client: &reqwest::Client,
-  auth: &dyn ProviderAuth,
+  provider: &ResolvedProviderAuth,
   id_override: Option<String>,
   key: String,
 ) -> Result<Account> {
+  let auth = provider.auth();
   let mut account = static_key_account_unverified(auth, id_override.clone(), key)?;
+  provider.prepare_for_auth(&mut account);
   let outcome = auth
     .verify_credential(client, &account)
     .await
@@ -229,9 +235,10 @@ fn account_id_from_api_key(key: &str) -> String {
 /// two — the polling step blocks for ~minutes waiting on the browser.
 async fn device_flow_login(
   client: &reqwest::Client,
-  auth: &dyn ProviderAuth,
+  provider: &ResolvedProviderAuth,
   id_override: Option<String>,
 ) -> Result<Account> {
+  let auth = provider.auth();
   println!("Requesting device code from {} …", auth.id());
   let handle = auth
     .request_device_code(client)
@@ -253,7 +260,7 @@ async fn device_flow_login(
     .or(outcome.username)
     .unwrap_or_else(|| auth.default_account_id().to_string());
 
-  Ok(Account {
+  let mut account = Account {
     id,
     provider: auth.id().into(),
     enabled: true,
@@ -275,16 +282,19 @@ async fn device_flow_login(
     refresh_url: auth.default_refresh_url().map(str::to_string),
     last_refresh: Some(time::OffsetDateTime::now_utc().unix_timestamp()),
     settings: toml::Table::new(),
-  })
+  };
+  provider.prepare_for_auth(&mut account);
+  Ok(account)
 }
 
 /// Prompt for a static API key, verify it via the provider's
 /// [`ProviderAuth::verify_credential`], and return the assembled account.
 async fn static_key_login(
   client: &reqwest::Client,
-  auth: &dyn ProviderAuth,
+  provider: &ResolvedProviderAuth,
   id_override: Option<String>,
 ) -> Result<Account> {
+  let auth = provider.auth();
   println!("{} uses a static API key. Paste your key below.", auth.id());
   let key = rpassword::prompt_password("API key: ")
     .context("reading API key from stdin")?
@@ -295,7 +305,8 @@ async fn static_key_login(
   }
 
   // Build a throwaway Account so the trait can verify against it.
-  let probe = static_key_account_unverified(auth, Some("__probe__".into()), key.clone())?;
+  let mut probe = static_key_account_unverified(auth, Some("__probe__".into()), key.clone())?;
+  provider.prepare_for_auth(&mut probe);
   println!(
     "Verifying key against {} …",
     probe.base_url.as_deref().unwrap_or("upstream")
@@ -307,6 +318,7 @@ async fn static_key_login(
   println!("Key OK.");
 
   let mut account = static_key_account_unverified(auth, id_override.clone(), key)?;
+  provider.prepare_for_auth(&mut account);
   if id_override
     .as_deref()
     .map(str::trim)
@@ -330,24 +342,19 @@ async fn static_key_login(
 /// saving the resulting [`Account`].
 pub(crate) async fn interactive_add_account(
   client: &reqwest::Client,
-  provider_override: Option<String>,
+  provider: &ResolvedProviderAuth,
   id_override: Option<String>,
 ) -> Result<Account> {
-  let provider = match provider_override {
-    Some(p) => p,
-    None => pick_provider()?,
-  };
-  validate_provider(&provider)?;
-  let source = pick_source_interactive(&provider)?;
+  let source = pick_source_interactive(provider)?;
   let id = match id_override {
     Some(s) => Some(s),
-    None => pick_account_id(&provider, &source)?,
+    None => pick_account_id(provider, &source)?,
   };
-  resolve_account(client, &provider, id, source).await
+  resolve_account(client, provider, id, source).await
 }
 
-pub(crate) fn pick_provider() -> Result<String> {
-  let options = known_providers().to_vec();
+pub(crate) fn pick_provider(provider_ids: &[String]) -> Result<String> {
+  let options = provider_ids.to_vec();
   let selected = inquire::Select::new("Pick account provider:", options)
     .with_starting_cursor(0)
     .prompt()
@@ -355,10 +362,10 @@ pub(crate) fn pick_provider() -> Result<String> {
   Ok(selected.to_string())
 }
 
-pub(crate) fn pick_source_interactive(provider: &str) -> Result<CredentialSource> {
+pub(crate) fn pick_source_interactive(provider: &ResolvedProviderAuth) -> Result<CredentialSource> {
   // Build the menu from the trait's advertised credential sources, so
   // any new provider's options surface automatically.
-  let auth = provider_auth_for(provider).ok_or_else(|| anyhow!("unknown provider '{provider}'"))?;
+  let auth = provider.auth();
   let kinds = auth.credential_sources();
   let options: Vec<String> = kinds.iter().map(|k| k.as_str().to_string()).collect();
 
@@ -371,7 +378,7 @@ pub(crate) fn pick_source_interactive(provider: &str) -> Result<CredentialSource
     "login" => Ok(CredentialSource::Login),
     "env" => {
       let flavor = pick_flavor_interactive(auth)?;
-      let default_name = crate::cli::import::default_env_var_name(provider, flavor);
+      let default_name = crate::cli::import::default_env_var_name(provider.provider_id(), flavor);
       let env_var = inquire::Text::new("Environment variable name:")
         .with_initial_value(&default_name)
         .prompt()
@@ -448,16 +455,11 @@ fn pick_flavor_interactive(auth: &dyn tokn_auth::ProviderAuth) -> Result<tokn_au
   }
 }
 
-pub(crate) fn pick_account_id(provider: &str, source: &CredentialSource) -> Result<Option<String>> {
-  let default_id = provider_auth_for(provider)
-    .map(|a| a.default_account_id())
-    .unwrap_or("imported");
-  let supports_auto_api_key = provider_auth_for(provider)
-    .map(|a| {
-      a.supports_auth_flavor(tokn_auth::CredentialFlavor::ApiKey)
-        && matches!(source.flavor(), Some(tokn_auth::CredentialFlavor::ApiKey) | None)
-    })
-    .unwrap_or(false);
+pub(crate) fn pick_account_id(provider: &ResolvedProviderAuth, source: &CredentialSource) -> Result<Option<String>> {
+  let auth = provider.auth();
+  let default_id = auth.default_account_id();
+  let supports_auto_api_key = auth.supports_auth_flavor(tokn_auth::CredentialFlavor::ApiKey)
+    && matches!(source.flavor(), Some(tokn_auth::CredentialFlavor::ApiKey) | None);
   let supports_auto_id = matches!(source, CredentialSource::Login) || supports_auto_api_key;
   let prompt = match source {
     CredentialSource::Login => "Account id (leave empty for auto):",

@@ -9,6 +9,7 @@ mod account;
 mod agent;
 mod api_key;
 mod config_cmd;
+mod config_context;
 mod error;
 mod headers;
 mod import;

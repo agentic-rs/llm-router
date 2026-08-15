@@ -1,11 +1,8 @@
-use crate::auth_registry::known_providers;
+use crate::cli::config_context::ConfigContext;
 use crate::cli::onboarding::{resolve_account, CredentialSource};
-use crate::config::{Config, ProxyConfig};
-use crate::util::http::build_client;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use tokn_auth::AuthStore;
 
 #[derive(Args, Debug)]
@@ -28,20 +25,14 @@ pub struct LoginArgs {
   pub no_proxy: bool,
 }
 
-pub async fn run(cfg_path: Option<PathBuf>, args: LoginArgs) -> Result<()> {
-  let (cfg, path) = Config::load(cfg_path.as_deref())?;
-  let mut store = AuthStore::load(None, Some(&path))?;
-  let proxy = if args.no_proxy {
-    ProxyConfig::default()
-  } else {
-    cfg.proxy.clone()
-  };
-  let client = build_client(&proxy)?;
+pub(crate) async fn run_with_context(context: &ConfigContext, store: &mut AuthStore, args: LoginArgs) -> Result<()> {
+  let client = context.build_http_client(args.no_proxy)?;
 
-  let provider = match args.provider {
+  let provider_id = match args.provider {
     Some(p) => p,
-    None => pick_provider_interactive()?,
+    None => pick_provider_interactive(&context.provider_ids())?,
   };
+  let provider = context.resolve_provider(&provider_id)?;
   let account = resolve_account(&client, &provider, args.id, CredentialSource::Login).await?;
 
   let id = account.id.clone();
@@ -53,20 +44,25 @@ pub async fn run(cfg_path: Option<PathBuf>, args: LoginArgs) -> Result<()> {
   Ok(())
 }
 
-/// Show an arrow-key picker over all five accepted provider ids. Errors out
+/// Show an arrow-key picker over the configured provider ids. Errors out
 /// (rather than silently defaulting) when stdin isn't a TTY — scripted use
 /// must pass `--provider` explicitly.
-fn pick_provider_interactive() -> Result<String> {
+fn pick_provider_interactive(provider_ids: &[String]) -> Result<String> {
   if !std::io::stdin().is_terminal() {
     return Err(anyhow!(
       "no --provider given and stdin is not a TTY; pass --provider <id> (one of: {})",
-      known_providers().join(" | ")
+      provider_ids.join(" | ")
     ));
   }
-  let options = known_providers().to_vec();
+  if provider_ids.is_empty() {
+    return Err(anyhow!(
+      "the config has no enabled providers that support account credentials"
+    ));
+  }
+  let options = provider_ids.to_vec();
 
   let pick = inquire::Select::new("Pick a provider:", options)
-    .with_starting_cursor(0) // github-copilot
+    .with_starting_cursor(0)
     .with_help_message("↑/↓ to move · enter to select · esc to cancel")
     .prompt()
     .context("provider selection cancelled")?;
