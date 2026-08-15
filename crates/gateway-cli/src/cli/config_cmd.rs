@@ -2,7 +2,7 @@
 //! preserving edits via `toml_edit`.
 
 use crate::cli::config_context::ResolvedProviderAuth;
-use crate::config::{paths, Config};
+use crate::config::{paths, Config, ConfigSchema};
 use crate::util::http::build_client;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -26,7 +26,7 @@ pub enum ConfigCmd {
   Set(SetArgs),
   /// Remove a primary-config key
   Unset(UnsetArgs),
-  /// Print effective config as TOML
+  /// Print normalized config as TOML
   List,
   /// Open the primary config file in $EDITOR; validates after save
   Edit,
@@ -89,7 +89,7 @@ pub struct InitArgs {
 #[derive(Args, Debug)]
 pub struct GetArgs {
   pub key: String,
-  /// Operate inside the [accounts.<id>] subtree
+  /// Operate inside a legacy [[accounts]] entry
   #[arg(long)]
   pub account: Option<String>,
 }
@@ -101,7 +101,7 @@ pub struct SetArgs {
   /// Append to an array instead of replacing
   #[arg(long)]
   pub add: bool,
-  /// Operate inside the [accounts.<id>] subtree
+  /// Operate inside a legacy [[accounts]] entry
   #[arg(long)]
   pub account: Option<String>,
 }
@@ -109,7 +109,7 @@ pub struct SetArgs {
 #[derive(Args, Debug)]
 pub struct UnsetArgs {
   pub key: String,
-  /// Operate inside the [accounts.<id>] subtree
+  /// Operate inside a legacy [[accounts]] entry
   #[arg(long)]
   pub account: Option<String>,
 }
@@ -134,8 +134,10 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
 // --- get ---------------------------------------------------------------
 
 fn cmd_get(path: &std::path::Path, args: GetArgs) -> Result<()> {
+  let schema = crate::config::detect_config_schema(path)?;
+  reject_v2_account_selector(schema, args.account.as_deref())?;
   let segments = key_segments(args.account.as_deref(), &args.key);
-  ensure_root_key_is_not_fragment_managed(path, &segments)?;
+  ensure_root_key_is_not_fragment_managed(path, schema, &segments)?;
   let doc = load_doc(path)?;
   match lookup(&doc, &segments) {
     Some(item) => {
@@ -169,10 +171,12 @@ fn render_item(item: &Item) -> String {
 // --- set ---------------------------------------------------------------
 
 fn cmd_set(path: &std::path::Path, args: SetArgs) -> Result<()> {
+  let schema = crate::config::detect_config_schema(path)?;
+  reject_v2_account_selector(schema, args.account.as_deref())?;
   let segments = key_segments(args.account.as_deref(), &args.key);
-  ensure_root_key_is_not_fragment_managed(path, &segments)?;
+  ensure_root_key_is_not_fragment_managed(path, schema, &segments)?;
   #[allow(clippy::result_large_err)]
-  Config::edit_in_place(path, |doc| {
+  crate::config::edit_primary_in_place(path, |doc| {
     if args.add {
       append_array(doc, &segments, &args.value)?;
     } else {
@@ -237,10 +241,12 @@ fn append_array(doc: &mut DocumentMut, segments: &[String], raw: &str) -> Result
 // --- unset -------------------------------------------------------------
 
 fn cmd_unset(path: &std::path::Path, args: UnsetArgs) -> Result<()> {
+  let schema = crate::config::detect_config_schema(path)?;
+  reject_v2_account_selector(schema, args.account.as_deref())?;
   let segments = key_segments(args.account.as_deref(), &args.key);
-  ensure_root_key_is_not_fragment_managed(path, &segments)?;
+  ensure_root_key_is_not_fragment_managed(path, schema, &segments)?;
   #[allow(clippy::result_large_err)]
-  Config::edit_in_place(path, |doc| {
+  crate::config::edit_primary_in_place(path, |doc| {
     if !remove(doc, &segments) {
       return Err(anyhow::anyhow!("key not found: {}", args.key).into());
     }
@@ -254,40 +260,76 @@ fn cmd_unset(path: &std::path::Path, args: UnsetArgs) -> Result<()> {
 // --- list / edit / path ------------------------------------------------
 
 fn cmd_list(path: &std::path::Path) -> Result<()> {
-  let (cfg, _) = Config::load(Some(path))?;
-  let s = toml::to_string_pretty(&cfg)?;
+  let s = match crate::config::detect_config_schema(path)? {
+    ConfigSchema::Legacy => {
+      let (cfg, _) = Config::load(Some(path))?;
+      toml::to_string_pretty(&cfg)?
+    }
+    ConfigSchema::V2 => {
+      let raw = crate::config::v2::load_raw(path)?;
+      crate::config::v2::compile_config(&raw, path)?;
+      toml::to_string_pretty(&raw)?
+    }
+  };
   print!("{s}");
   Ok(())
 }
 
 fn cmd_edit(path: &std::path::Path) -> Result<()> {
-  let fragment_dir = paths::config_fragment_dir(path);
-  if fragment_dir.is_dir() {
-    let has_fragments = std::fs::read_dir(&fragment_dir)
-      .ok()
-      .into_iter()
-      .flatten()
-      .filter_map(Result::ok)
-      .map(|entry| entry.path())
-      .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
-    if has_fragments {
-      eprintln!(
-        "note: linked-agent state is managed separately under {}; this editor changes only {}",
-        fragment_dir.display(),
-        path.display()
-      );
-    }
+  let schema = crate::config::detect_config_schema(path)?;
+  if schema == ConfigSchema::Legacy {
+    print_fragment_editor_note(path);
   }
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent).ok();
   }
   open_in_editor(path)?;
-  // Validate
-  let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-  let _: DocumentMut = raw.parse().context("edited file is not valid TOML")?;
-  let (_cfg, _) = Config::load(Some(path)).context("validation failed after edit")?;
+  validate_config_path(path, schema).context("validation failed after edit")?;
   println!("ok");
   Ok(())
+}
+
+fn print_fragment_editor_note(path: &std::path::Path) {
+  let fragment_dir = paths::config_fragment_dir(path);
+  if !fragment_dir.is_dir() {
+    return;
+  }
+  let has_fragments = std::fs::read_dir(&fragment_dir)
+    .ok()
+    .into_iter()
+    .flatten()
+    .filter_map(Result::ok)
+    .map(|entry| entry.path())
+    .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
+  if has_fragments {
+    eprintln!(
+      "note: linked-agent state is managed separately under {}; this editor changes only {}",
+      fragment_dir.display(),
+      path.display()
+    );
+  }
+}
+
+fn validate_config_path(path: &std::path::Path, expected_schema: ConfigSchema) -> Result<()> {
+  let actual_schema = crate::config::detect_config_schema(path)?;
+  if actual_schema != expected_schema {
+    bail!(
+      "config editing cannot change schemas; use an explicit migration instead (expected {}, found {})",
+      schema_name(expected_schema),
+      schema_name(actual_schema)
+    );
+  }
+  match actual_schema {
+    ConfigSchema::Legacy => Config::load_primary(Some(path)).map(drop).map_err(Into::into),
+    ConfigSchema::V2 => crate::config::v2::load_config(path).map(drop).map_err(Into::into),
+  }
+}
+
+fn schema_name(schema: ConfigSchema) -> &'static str {
+  match schema {
+    ConfigSchema::Legacy => "legacy",
+    ConfigSchema::V2 => "version 2",
+  }
 }
 
 fn cmd_path(path: &std::path::Path) -> Result<()> {
@@ -583,11 +625,25 @@ fn key_segments(account: Option<&str>, key: &str) -> Vec<String> {
   out
 }
 
+fn reject_v2_account_selector(schema: ConfigSchema, account: Option<&str>) -> Result<()> {
+  if schema == ConfigSchema::V2 && account.is_some() {
+    bail!("`--account` addresses legacy inline accounts; v2 accounts are managed by `tokn-router account`");
+  }
+  Ok(())
+}
+
 /// The generic config editor operates on the primary TOML source. Agent
 /// overlays are deliberately separate and must be changed through `agent
 /// link`, `agent sync`, or `agent unlink`; silently editing their shadowed
 /// root keys would report a change that has no runtime effect.
-fn ensure_root_key_is_not_fragment_managed(path: &std::path::Path, segments: &[String]) -> Result<()> {
+fn ensure_root_key_is_not_fragment_managed(
+  path: &std::path::Path,
+  schema: ConfigSchema,
+  segments: &[String],
+) -> Result<()> {
+  if schema == ConfigSchema::V2 {
+    return Ok(());
+  }
   let [section, name, ..] = segments else {
     return Ok(());
   };
@@ -792,6 +848,29 @@ mod tests {
     s.parse().unwrap()
   }
 
+  fn write_v2_config(path: &std::path::Path) {
+    std::fs::write(
+      path,
+      r#"# v2 config comment
+schema_version = 2
+
+[service.outbound]
+use_system_proxy = false
+
+[service.request_limits]
+max_wire_bytes = 1024
+max_decoded_bytes = 2048
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+"#,
+    )
+    .unwrap();
+  }
+
   #[test]
   fn insert_top_level() {
     let mut d = doc("");
@@ -820,6 +899,148 @@ mod tests {
   }
 
   #[test]
+  fn v2_get_list_set_and_unset_use_the_v2_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    write_v2_config(&path);
+
+    cmd_get(
+      &path,
+      GetArgs {
+        key: "schema_version".into(),
+        account: None,
+      },
+    )
+    .unwrap();
+    cmd_set(
+      &path,
+      SetArgs {
+        key: "service.request_limits.max_wire_bytes".into(),
+        value: "4096".into(),
+        add: false,
+        account: None,
+      },
+    )
+    .unwrap();
+    cmd_unset(
+      &path,
+      UnsetArgs {
+        key: "service.outbound.use_system_proxy".into(),
+        account: None,
+      },
+    )
+    .unwrap();
+    cmd_list(&path).unwrap();
+
+    let updated = std::fs::read_to_string(&path).unwrap();
+    assert!(updated.starts_with("# v2 config comment\n"));
+    assert!(!updated.contains("use_system_proxy"));
+    let compiled = crate::config::v2::load_config(&path).unwrap();
+    assert_eq!(compiled.service().request_limits().max_wire_bytes(), 4096);
+    validate_config_path(&path, ConfigSchema::V2).unwrap();
+    assert_eq!(schema_name(ConfigSchema::V2), "version 2");
+  }
+
+  #[test]
+  fn set_continues_to_edit_legacy_documents() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[server]\nport = 4141\n").unwrap();
+
+    cmd_set(
+      &path,
+      SetArgs {
+        key: "server.port".into(),
+        value: "5151".into(),
+        add: false,
+        account: None,
+      },
+    )
+    .unwrap();
+
+    let (config, _) = Config::load_primary(Some(&path)).unwrap();
+    assert_eq!(config.server.port, 5151);
+    cmd_list(&path).unwrap();
+    validate_config_path(&path, ConfigSchema::Legacy).unwrap();
+    assert_eq!(schema_name(ConfigSchema::Legacy), "legacy");
+    print_fragment_editor_note(&path);
+  }
+
+  #[test]
+  fn v2_set_rejects_invalid_post_images_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    write_v2_config(&path);
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let error = cmd_set(
+      &path,
+      SetArgs {
+        key: "service.request_limits.max_wire_bytes".into(),
+        value: "0".into(),
+        add: false,
+        account: None,
+      },
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("max_wire_bytes"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+  }
+
+  #[test]
+  fn v2_config_commands_reject_legacy_account_selectors_and_schema_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    write_v2_config(&path);
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let account_error = cmd_get(
+      &path,
+      GetArgs {
+        key: "provider".into(),
+        account: Some("work".into()),
+      },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(account_error.contains("v2 accounts are managed"));
+
+    let schema_error = cmd_unset(
+      &path,
+      UnsetArgs {
+        key: "schema_version".into(),
+        account: None,
+      },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(schema_error.contains("explicit migration"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    let edit_error = validate_config_path(&path, ConfigSchema::Legacy)
+      .unwrap_err()
+      .to_string();
+    assert!(edit_error.contains("expected legacy, found version 2"));
+  }
+
+  #[test]
+  fn v2_profile_keys_are_not_checked_against_legacy_fragments() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    write_v2_config(&path);
+
+    assert!(ensure_root_key_is_not_fragment_managed(
+      &path,
+      ConfigSchema::V2,
+      &["profiles".into(), "default".into(), "route".into()],
+    )
+    .is_ok());
+    print_fragment_editor_note(&path);
+  }
+
+  #[test]
   fn rejects_edits_to_fragment_managed_agent_or_profile_keys() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("config.toml");
@@ -838,14 +1059,22 @@ agent_id = "opencode"
     )
     .unwrap();
 
-    let err = ensure_root_key_is_not_fragment_managed(&root, &["agents".into(), "opencode".into(), "mode".into()])
-      .unwrap_err()
-      .to_string();
+    let err = ensure_root_key_is_not_fragment_managed(
+      &root,
+      ConfigSchema::Legacy,
+      &["agents".into(), "opencode".into(), "mode".into()],
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("managed by"));
     assert!(err.contains("agent link"));
-    assert!(
-      ensure_root_key_is_not_fragment_managed(&root, &["profiles".into(), "other".into(), "mode".into()],).is_ok()
-    );
+    assert!(ensure_root_key_is_not_fragment_managed(
+      &root,
+      ConfigSchema::Legacy,
+      &["profiles".into(), "other".into(), "mode".into()],
+    )
+    .is_ok());
+    print_fragment_editor_note(&root);
   }
 
   #[test]

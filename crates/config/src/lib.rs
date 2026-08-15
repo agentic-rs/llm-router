@@ -947,18 +947,7 @@ impl Config {
   where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
   {
-    let lock = lock_config_file(path)?;
-    let locked_path = lock.path();
-    let raw = if locked_path.exists() {
-      std::fs::read_to_string(locked_path).context(error::ReadSnafu {
-        path: path.to_path_buf(),
-      })?
-    } else {
-      String::new()
-    };
-    let serialised = Self::serialise_edit(path, raw, f)?;
-    write_config_contents_locked(locked_path, &serialised)?;
-    Ok(serialised)
+    edit_document_in_place_with_contents(path, EditSchemaPolicy::LegacyOnly, f)
   }
 
   /// Edit, validate, and atomically write a config file guarded by an exact
@@ -1007,31 +996,97 @@ impl Config {
   where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
   {
-    let mut doc: toml_edit::DocumentMut = raw.parse().context(error::ParseEditSnafu {
+    serialise_document_edit(path, raw, EditSchemaPolicy::LegacyOnly, f)
+  }
+}
+
+/// Edit a primary configuration document without changing its schema.
+///
+/// Unlike [`Config::edit_in_place`], this entry point accepts both legacy and
+/// version 2 documents. The detected schema is fixed for the duration of the
+/// edit, and the complete post-image is validated before an atomic write. A
+/// missing file retains the legacy behavior.
+pub fn edit_primary_in_place<F>(path: &Path, f: F) -> Result<()>
+where
+  F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+{
+  edit_document_in_place_with_contents(path, EditSchemaPolicy::Preserve, f).map(drop)
+}
+
+#[derive(Clone, Copy)]
+enum EditSchemaPolicy {
+  LegacyOnly,
+  Preserve,
+}
+
+fn edit_document_in_place_with_contents<F>(path: &Path, policy: EditSchemaPolicy, f: F) -> Result<String>
+where
+  F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+{
+  let lock = lock_config_file(path)?;
+  let locked_path = lock.path();
+  let raw = if locked_path.exists() {
+    std::fs::read_to_string(locked_path).context(error::ReadSnafu {
       path: path.to_path_buf(),
-    })?;
-    require_legacy_edit_schema(&doc, path)?;
-    f(&mut doc)?;
-    require_legacy_edit_schema(&doc, path)?;
-    let serialised = doc.to_string();
-    let cfg: Config = toml::from_str(&serialised).context(error::EditValidateSnafu)?;
-    cfg.proxy.validate().map_err(|e| Error::EditValidateSection {
-      section: "[proxy]",
-      source: Box::new(e),
-    })?;
-    cfg.proxy_mode.validate().map_err(|e| Error::EditValidateSection {
-      section: "[proxy_mode]",
-      source: Box::new(e),
-    })?;
-    validate_model_families(&cfg.model_families).map_err(|e| Error::EditValidateSection {
-      section: "[[model_families]]",
-      source: Box::new(e),
-    })?;
-    cfg.validate().map_err(|e| Error::EditValidateSection {
-      section: "[defaults]/[profiles]",
-      source: Box::new(e),
-    })?;
-    Ok(serialised)
+    })?
+  } else {
+    String::new()
+  };
+  let serialised = serialise_document_edit(path, raw, policy, f)?;
+  write_config_contents_locked(locked_path, &serialised)?;
+  Ok(serialised)
+}
+
+fn serialise_document_edit<F>(path: &Path, raw: String, policy: EditSchemaPolicy, f: F) -> Result<String>
+where
+  F: FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+{
+  let mut document: toml_edit::DocumentMut = raw.parse().context(error::ParseEditSnafu {
+    path: path.to_path_buf(),
+  })?;
+  let schema = detect_edit_config_schema(&document, path)?;
+  if matches!(policy, EditSchemaPolicy::LegacyOnly) {
+    require_legacy_edit_schema(schema, path)?;
+  }
+
+  f(&mut document)?;
+
+  let edited_schema = detect_edit_config_schema(&document, path)?;
+  match policy {
+    EditSchemaPolicy::LegacyOnly => require_legacy_edit_schema(edited_schema, path)?,
+    EditSchemaPolicy::Preserve => require_unchanged_edit_schema(edited_schema, schema, path)?,
+  }
+  let serialised = document.to_string();
+  validate_edited_config(path, schema, &serialised)?;
+  Ok(serialised)
+}
+
+fn validate_edited_config(path: &Path, schema: ConfigSchema, serialised: &str) -> Result<()> {
+  match schema {
+    ConfigSchema::Legacy => {
+      let cfg: Config = toml::from_str(serialised).context(error::EditValidateSnafu)?;
+      cfg.proxy.validate().map_err(|source| Error::EditValidateSection {
+        section: "[proxy]",
+        source: Box::new(source),
+      })?;
+      cfg.proxy_mode.validate().map_err(|source| Error::EditValidateSection {
+        section: "[proxy_mode]",
+        source: Box::new(source),
+      })?;
+      validate_model_families(&cfg.model_families).map_err(|source| Error::EditValidateSection {
+        section: "[[model_families]]",
+        source: Box::new(source),
+      })?;
+      cfg.validate().map_err(|source| Error::EditValidateSection {
+        section: "[defaults]/[profiles]",
+        source: Box::new(source),
+      })
+    }
+    ConfigSchema::V2 => v2::parse_config(serialised, path)
+      .map(drop)
+      .map_err(|source| Error::Other {
+        message: format!("validation failed: {source}"),
+      }),
   }
 }
 
@@ -1122,10 +1177,6 @@ fn load_primary_config(path: &Path) -> Result<Config> {
   Ok(raw_cfg.config)
 }
 
-fn require_legacy_edit_schema(document: &toml_edit::DocumentMut, path: &Path) -> Result<()> {
-  require_legacy_schema(schema::detect_edit(document), path)
-}
-
 fn require_legacy_schema(schema: std::result::Result<ConfigSchema, SchemaMarkerError>, path: &Path) -> Result<()> {
   match schema {
     Ok(ConfigSchema::Legacy) => Ok(()),
@@ -1140,6 +1191,40 @@ fn require_legacy_schema(schema: std::result::Result<ConfigSchema, SchemaMarkerE
       found,
     }),
   }
+}
+
+fn detect_edit_config_schema(document: &toml_edit::DocumentMut, path: &Path) -> Result<ConfigSchema> {
+  match schema::detect_edit(document) {
+    Ok(schema) => Ok(schema),
+    Err(SchemaMarkerError::NonInteger) => Err(Error::InvalidSchemaVersion {
+      path: path.to_path_buf(),
+    }),
+    Err(SchemaMarkerError::Unsupported(found)) => Err(Error::UnsupportedSchemaVersion {
+      path: path.to_path_buf(),
+      found,
+    }),
+  }
+}
+
+fn require_legacy_edit_schema(schema: ConfigSchema, path: &Path) -> Result<()> {
+  match schema {
+    ConfigSchema::Legacy => Ok(()),
+    ConfigSchema::V2 => Err(Error::V2ConfigRequiresV2Loader {
+      path: path.to_path_buf(),
+    }),
+  }
+}
+
+fn require_unchanged_edit_schema(actual: ConfigSchema, expected: ConfigSchema, path: &Path) -> Result<()> {
+  if actual == expected {
+    return Ok(());
+  }
+  Err(Error::Other {
+    message: format!(
+      "config `{}` changed schemas during editing; use an explicit migration",
+      path.display()
+    ),
+  })
 }
 
 fn load_fragment_paths(fragment_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1642,6 +1727,125 @@ wire_identity = "managed"
 
     assert!(matches!(error, Error::V2ConfigRequiresV2Loader { path: rejected } if rejected == path));
     assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+  }
+
+  #[test]
+  fn schema_aware_editor_updates_and_validates_v2_documents() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let contents = r#"# keep this comment
+schema_version = 2
+
+[service.request_limits]
+max_wire_bytes = 1024
+max_decoded_bytes = 2048
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+"#;
+    std::fs::write(&path, contents).unwrap();
+
+    edit_primary_in_place(&path, |document| {
+      document["service"]["request_limits"]["max_wire_bytes"] = toml_edit::value(4096);
+      Ok(())
+    })
+    .unwrap();
+
+    let updated = std::fs::read_to_string(&path).unwrap();
+    assert!(updated.starts_with("# keep this comment\n"));
+    assert!(updated.contains("max_wire_bytes = 4096"));
+    let compiled = v2::load_config(&path).unwrap();
+    assert_eq!(compiled.service().request_limits().max_wire_bytes(), 4096);
+  }
+
+  #[test]
+  fn schema_aware_editor_rejects_invalid_v2_post_images() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let contents = r#"schema_version = 2
+
+[service.request_limits]
+max_wire_bytes = 1024
+max_decoded_bytes = 2048
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+"#;
+    std::fs::write(&path, contents).unwrap();
+
+    let error = edit_primary_in_place(&path, |document| {
+      document["service"]["request_limits"]["max_wire_bytes"] = toml_edit::value(0);
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("max_wire_bytes"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+  }
+
+  #[test]
+  fn schema_aware_editor_refuses_implicit_schema_conversion() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let contents = "schema_version = 2\n";
+    std::fs::write(&path, contents).unwrap();
+
+    let error = edit_primary_in_place(&path, |document| {
+      document.remove("schema_version");
+      Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("explicit migration"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+  }
+
+  #[test]
+  fn schema_aware_editor_rejects_invalid_schema_markers_before_editing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+
+    std::fs::write(&path, "schema_version = \"2\"\n").unwrap();
+    let error = edit_primary_in_place(&path, |_| Ok(())).unwrap_err();
+    assert!(matches!(error, Error::InvalidSchemaVersion { path: rejected } if rejected == path));
+
+    std::fs::write(&path, "schema_version = 3\n").unwrap();
+    let error = edit_primary_in_place(&path, |_| Ok(())).unwrap_err();
+    assert!(matches!(
+      error,
+      Error::UnsupportedSchemaVersion { path: rejected, found: 3 } if rejected == path
+    ));
+  }
+
+  #[test]
+  fn schema_aware_editor_preserves_legacy_validation_sections() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let cases = [
+      ("[proxy]\nurl = \"ftp://example.com\"\n", "[proxy]"),
+      (
+        "[proxy_mode]\nintercept_hosts = [\"not a valid host\"]\n",
+        "[proxy_mode]",
+      ),
+      ("[[model_families]]\nname = \"empty\"\n", "[[model_families]]"),
+      ("[defaults]\ndefault_provider_id = \"\"\n", "[defaults]/[profiles]"),
+    ];
+
+    for (contents, expected_section) in cases {
+      std::fs::write(&path, contents).unwrap();
+      let error = edit_primary_in_place(&path, |_| Ok(())).unwrap_err();
+      assert!(matches!(
+        error,
+        Error::EditValidateSection { section, .. } if section == expected_section
+      ));
+      assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
   }
 
   #[test]
