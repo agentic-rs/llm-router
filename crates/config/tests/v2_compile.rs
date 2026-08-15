@@ -1,7 +1,7 @@
 use std::path::Path;
 use tokn_config::v2::{
-  compile, decode, load, parse, parse_config, CompileError, Error, DEFAULT_BODY_MAX_BYTES, DEFAULT_MAX_DECODED_BYTES,
-  DEFAULT_MAX_WIRE_BYTES, DEFAULT_WRITE_QUEUE_CAPACITY,
+  compile, decode, load, parse, parse_config, CompileError, Error, DEFAULT_ARCHIVE_AFTER_DAYS, DEFAULT_BODY_MAX_BYTES,
+  DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, DEFAULT_PRUNE_AFTER_DAYS, DEFAULT_WRITE_QUEUE_CAPACITY,
 };
 use tokn_policy::{ConnectAction, HttpAction, ListenerPlan, RouteKind};
 
@@ -79,6 +79,8 @@ fn service_defaults_match_v2_operational_defaults() {
     DEFAULT_WRITE_QUEUE_CAPACITY as usize
   );
   assert_eq!(persistence.archive_extension(), None);
+  assert_eq!(persistence.archive_after_days(), DEFAULT_ARCHIVE_AFTER_DAYS as i64);
+  assert_eq!(persistence.prune_after_days(), DEFAULT_PRUNE_AFTER_DAYS as i64);
 }
 
 #[test]
@@ -102,6 +104,8 @@ record_request_bodies = false
 body_max_bytes = 12345
 write_queue_capacity = 17
 archive_extension = "db.zstd"
+archive_after_days = 5
+prune_after_days = 12
 
 [listeners.api]"#,
     1,
@@ -120,10 +124,49 @@ archive_extension = "db.zstd"
   assert_eq!(persistence.body_max_bytes(), 12_345);
   assert_eq!(persistence.write_queue_capacity(), 256);
   assert_eq!(persistence.archive_extension(), Some("db.zstd"));
+  assert_eq!(persistence.archive_after_days(), 5);
+  assert_eq!(persistence.prune_after_days(), 12);
   let paths = persistence.resolve_paths().unwrap();
   assert_eq!(paths.usage_db, Path::new("state/custom-usage.db"));
   assert_eq!(paths.sessions_db, Path::new("state/custom-sessions.db"));
   assert_eq!(paths.requests_dir, Path::new("state/custom-requests"));
+}
+
+#[test]
+fn service_rejects_invalid_persistence_ages() {
+  for (settings, location) in [
+    (
+      "archive_after_days = 0\nprune_after_days = 10",
+      "service.persistence.archive_after_days",
+    ),
+    (
+      "archive_after_days = 7\nprune_after_days = 0",
+      "service.persistence.prune_after_days",
+    ),
+    (
+      "archive_after_days = 7\nprune_after_days = 7",
+      "service.persistence.prune_after_days",
+    ),
+    (
+      "archive_after_days = 10\nprune_after_days = 7",
+      "service.persistence.prune_after_days",
+    ),
+    (
+      "archive_after_days = 106751991167301\nprune_after_days = 106751991167302",
+      "service.persistence.archive_after_days",
+    ),
+  ] {
+    let config = MINIMAL_MANAGED.replacen(
+      "[listeners.api]",
+      &format!("[service.persistence]\n{settings}\n\n[listeners.api]"),
+      1,
+    );
+    let error = unwrap_compile_error(parse_config(&config, Path::new("config.toml")).unwrap_err());
+    assert!(matches!(
+      *error,
+      CompileError::InvalidValue { location: actual, .. } if actual == location
+    ));
+  }
 }
 
 #[test]

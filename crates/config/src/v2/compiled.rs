@@ -139,6 +139,8 @@ pub struct PersistencePlan {
   body_max_bytes: usize,
   write_queue_capacity: usize,
   archive_extension: Option<String>,
+  archive_after_days: i64,
+  prune_after_days: i64,
 }
 
 impl Default for PersistencePlan {
@@ -153,6 +155,8 @@ impl Default for PersistencePlan {
       super::DEFAULT_BODY_MAX_BYTES as usize,
       super::DEFAULT_WRITE_QUEUE_CAPACITY as usize,
       None,
+      super::DEFAULT_ARCHIVE_AFTER_DAYS as i64,
+      super::DEFAULT_PRUNE_AFTER_DAYS as i64,
     )
   }
 }
@@ -169,6 +173,8 @@ impl PersistencePlan {
     body_max_bytes: usize,
     write_queue_capacity: usize,
     archive_extension: Option<String>,
+    archive_after_days: i64,
+    prune_after_days: i64,
   ) -> Self {
     Self {
       enabled,
@@ -180,6 +186,8 @@ impl PersistencePlan {
       body_max_bytes,
       write_queue_capacity,
       archive_extension,
+      archive_after_days,
+      prune_after_days,
     }
   }
 
@@ -205,6 +213,14 @@ impl PersistencePlan {
 
   pub fn archive_extension(&self) -> Option<&str> {
     self.archive_extension.as_deref()
+  }
+
+  pub const fn archive_after_days(&self) -> i64 {
+    self.archive_after_days
+  }
+
+  pub const fn prune_after_days(&self) -> i64 {
+    self.prune_after_days
   }
 
   pub fn resolve_paths(&self) -> crate::Result<PersistencePaths> {

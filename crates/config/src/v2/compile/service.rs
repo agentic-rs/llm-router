@@ -94,6 +94,14 @@ fn compile_persistence(raw: &RawPersistence) -> Result<PersistencePlan, CompileE
   let body_max_bytes = compile_usize("service.persistence.body_max_bytes", raw.body_max_bytes)?;
   let write_queue_capacity =
     compile_usize("service.persistence.write_queue_capacity", raw.write_queue_capacity)?.max(256);
+  let archive_after_days = compile_days("service.persistence.archive_after_days", raw.archive_after_days)?;
+  let prune_after_days = compile_days("service.persistence.prune_after_days", raw.prune_after_days)?;
+  if prune_after_days <= archive_after_days {
+    return Err(invalid_value(
+      "service.persistence.prune_after_days",
+      "must be greater than service.persistence.archive_after_days",
+    ));
+  }
   Ok(PersistencePlan::new(
     raw.enabled,
     raw.usage_db_path.clone(),
@@ -104,7 +112,20 @@ fn compile_persistence(raw: &RawPersistence) -> Result<PersistencePlan, CompileE
     body_max_bytes,
     write_queue_capacity,
     raw.archive_extension.clone(),
+    archive_after_days,
+    prune_after_days,
   ))
+}
+
+fn compile_days(location: &'static str, value: u64) -> Result<i64, CompileError> {
+  if value == 0 {
+    return Err(invalid_value(location, "must be greater than zero"));
+  }
+  let value = i64::try_from(value).map_err(|_| invalid_value(location, "is too large"))?;
+  value
+    .checked_mul(86_400)
+    .ok_or_else(|| invalid_value(location, "is too large for a time duration"))?;
+  Ok(value)
 }
 
 fn compile_usize(location: &'static str, value: u64) -> Result<usize, CompileError> {

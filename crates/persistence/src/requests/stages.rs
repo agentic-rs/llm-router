@@ -11,6 +11,7 @@
 //! `request_id → day` index used to route updates to the correct file.
 
 use super::{composite_request_id, RequestsDb};
+use crate::archive::RequestMaintenanceLock;
 use crate::{headers_json, Result};
 use rusqlite::params;
 use serde_json::{Map, Value};
@@ -72,10 +73,13 @@ impl EventHandler for RequestEventHandler {
     let Event::Requests(r2) = event else {
       return;
     };
+    if matches!(r2.payload, RequestEventPayload::Custom(_)) {
+      return;
+    }
     let request_id = r2.request_id.as_str();
     let attempt = r2.attempt;
     let result = match &r2.payload {
-      RequestEventPayload::Custom(_) => return,
+      RequestEventPayload::Custom(_) => unreachable!("custom request events were filtered before locking"),
       RequestEventPayload::Stage(stage) => match stage {
         StageEvent::Started { request_endpoint } => self.on_started(request_id, attempt, r2.ts, Some(request_endpoint)),
         StageEvent::Extract(s) => self.on_extract(
@@ -163,9 +167,13 @@ impl EventHandler for RequestEventHandler {
 }
 
 impl RequestEventHandler {
+  fn acquire_write_lock(&self) -> Result<RequestMaintenanceLock> {
+    Ok(RequestMaintenanceLock::acquire_writer(self.db.dir())?)
+  }
+
   fn ensure_started_for_record(&mut self, request_id: &str, attempt: u32, ts: i64) -> Result<()> {
     let id = composite_request_id(request_id, attempt);
-    if self.db.conn_for_request(&id).is_some() {
+    if self.db.contains_request(&id) {
       return Ok(());
     }
     self.on_started(request_id, attempt, ts, None)
@@ -177,6 +185,7 @@ impl RequestEventHandler {
     attempt: u32,
     update: InboundConnectionUpdate<'_>,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests InboundConnection bootstrap failed");
@@ -219,6 +228,7 @@ impl RequestEventHandler {
     ts: i64,
     endpoint: Option<&RequestEndpoint>,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let conn = self.db.conn_for_ts(ts)?;
     conn.execute(
@@ -253,6 +263,7 @@ impl RequestEventHandler {
     inbound_req_headers: &tokn_headers::HeaderMap,
     inbound_req_body: &bytes::Bytes,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(inbound_req_headers);
     let persisted_body = persisted_body(self.options, inbound_req_body);
@@ -288,6 +299,7 @@ impl RequestEventHandler {
     provider_id: &str,
     _upstream_endpoint: Option<&RequestEndpoint>,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests Resolve without prior Started");
@@ -310,6 +322,7 @@ impl RequestEventHandler {
     attempt: u32,
     outbound_req_headers: &tokn_headers::HeaderMap,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(outbound_req_headers);
     let Some(conn) = self.db.conn_for_request(&id) else {
@@ -327,6 +340,7 @@ impl RequestEventHandler {
   }
 
   pub fn on_convert_request(&mut self, request_id: &str, attempt: u32, outbound_req_body: &bytes::Bytes) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let persisted_body = persisted_body(self.options, outbound_req_body);
     let Some(conn) = self.db.conn_for_request(&id) else {
@@ -351,6 +365,7 @@ impl RequestEventHandler {
     status: u16,
     outbound_resp_headers: &tokn_headers::HeaderMap,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(outbound_resp_headers);
     let latency_header_ms = self.db.latency_since_start(&id, ts);
@@ -378,6 +393,7 @@ impl RequestEventHandler {
     inbound_resp_headers: &tokn_headers::HeaderMap,
     inbound_resp_body: &bytes::Bytes,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(inbound_resp_headers);
     let persisted_body = persisted_body(self.options, inbound_resp_body);
@@ -402,6 +418,7 @@ impl RequestEventHandler {
   }
 
   pub fn on_error(&mut self, request_id: &str, attempt: u32, stage: Stage, message: &str) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let formatted = format!("{}: {message}", stage.as_str());
     let Some(conn) = self.db.conn_for_request(&id) else {
@@ -416,6 +433,7 @@ impl RequestEventHandler {
   }
 
   pub fn on_completed(&mut self, request_id: &str, attempt: u32, ts: i64) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let latency_ms = self.db.latency_since_start(&id, ts);
     let Some(conn) = self.db.conn_for_request(&id) else {
@@ -443,6 +461,7 @@ impl RequestEventHandler {
     headers: &tokn_headers::HeaderMap,
     body: &bytes::Bytes,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(headers);
     let persisted_body = persisted_body(self.options, body);
@@ -481,6 +500,7 @@ impl RequestEventHandler {
     status: u16,
     headers: &tokn_headers::HeaderMap,
   ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(headers);
     let latency_header_ms = self.db.latency_since_start(&id, ts);
@@ -506,6 +526,7 @@ impl RequestEventHandler {
   /// legacy behavior). The `Send` stage already wrote status + response
   /// headers, so this update touches only the body column.
   pub fn on_upstream_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let persisted_body = persisted_body(self.options, body);
     let Some(conn) = self.db.conn_for_request(&id) else {
@@ -527,6 +548,7 @@ impl RequestEventHandler {
   /// this record backfills the same column for streaming flows once the full
   /// SSE output has been accumulated.
   pub fn on_converted_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let persisted_body = persisted_body(self.options, body);
     let Some(conn) = self.db.conn_for_request(&id) else {
@@ -544,6 +566,7 @@ impl RequestEventHandler {
   }
 
   pub fn on_usage(&mut self, request_id: &str, attempt: u32, usage: &tokn_core::db::Usage) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let Some(conn) = self.db.conn_for_request(&id) else {
       tracing::warn!(request_id = %id, "requests Usage without prior Started");

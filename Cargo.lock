@@ -3060,9 +3060,11 @@ dependencies = [
  "base64",
  "bytes",
  "flate2",
+ "libc",
  "lzma-rust2",
  "parking_lot",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -3074,6 +3076,7 @@ dependencies = [
  "tokn-headers",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

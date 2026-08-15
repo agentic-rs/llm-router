@@ -18,6 +18,7 @@ mod login;
 mod migration;
 mod onboarding;
 mod proxy;
+mod requests;
 mod serve;
 mod sessions;
 mod smoke;
@@ -58,6 +59,9 @@ pub enum Cmd {
   Usage(usage::UsageArgs),
   /// Open a loopback-only viewer for persisted requests and inferred sessions
   Inspect(inspect::InspectArgs),
+  /// Manage archived per-day request databases using a v2 configuration.
+  #[command(subcommand)]
+  Requests(requests::RequestsCmd),
   /// Inspect and build semantic session views
   #[command(subcommand)]
   Sessions(sessions::SessionsCmd),
@@ -76,7 +80,7 @@ impl Cli {
   pub async fn run(self) -> Result<()> {
     let cfg_path = self.config.clone();
     let is_inspect = matches!(&self.cmd, Cmd::Inspect(_));
-    let uses_v2_config = matches!(&self.cmd, Cmd::Smoke(_));
+    let uses_v2_config = matches!(&self.cmd, Cmd::Requests(_) | Cmd::Smoke(_));
     if !is_inspect && !uses_v2_config {
       prepare_default_config_home(cfg_path.as_deref())?;
     }
@@ -109,6 +113,7 @@ impl Cli {
       Cmd::Proxy(a) => proxy::run(cfg_path, a).await,
       Cmd::Usage(a) => usage::run(cfg_path, a).await,
       Cmd::Inspect(a) => inspect::run(cfg_path, a).await,
+      Cmd::Requests(c) => requests::run(cfg_path, c).await,
       Cmd::Sessions(c) => sessions::run(c).await,
       Cmd::Config(a) => config_cmd::run(cfg_path, a).await,
       Cmd::Update(a) => update::run(a).await,
@@ -141,7 +146,10 @@ fn run_mode_for(cmd: &Cmd) -> RunMode {
   use config_cmd::ConfigCmd::*;
   match cmd {
     Cmd::Serve(_) | Cmd::Proxy(_) => RunMode::Server,
-    Cmd::Inspect(_) => RunMode::ReadOnlyCli,
+    Cmd::Inspect(_) | Cmd::Requests(requests::RequestsCmd::Prune(requests::PruneArgs { commit: false })) => {
+      RunMode::ReadOnlyCli
+    }
+    Cmd::Requests(requests::RequestsCmd::Prune(requests::PruneArgs { commit: true })) => RunMode::MutatingCli,
     Cmd::Update(_) | Cmd::Migration(_) => RunMode::MutatingCli,
     Cmd::Sessions(_) => RunMode::MutatingCli,
     Cmd::ApiKey(api_key::ApiKeyCmd::List) => RunMode::ReadOnlyCli,
