@@ -18,7 +18,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: HeadersArgs) -> Result<()> {
     None => tokn_provider_copilot::config::CopilotHeaders::default(),
     Some(id) => {
       let a = store.get(&id).ok_or_else(|| anyhow!("no account with id '{id}'"))?;
-      let provider = context.resolve_account_provider(&a.provider)?;
+      let provider = context.resolve_account_provider(a)?;
       if provider.auth().id() != crate::provider::ID_GITHUB_COPILOT {
         println!(
           "Account '{id}' uses provider '{}', which does not send Copilot identity headers.",

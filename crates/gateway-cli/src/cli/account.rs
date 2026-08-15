@@ -128,14 +128,10 @@ async fn list(context: &ConfigContext, store: &mut AuthStore, args: ListArgs) ->
   } else {
     let http = context.build_http_client(false)?;
     let timeout = Duration::from_secs(args.timeout.max(1));
-    let futs = store.accounts.iter().map(|a| {
-      fetch_quota(
-        http.clone(),
-        a.clone(),
-        context.resolve_account_provider(&a.provider),
-        timeout,
-      )
-    });
+    let futs = store
+      .accounts
+      .iter()
+      .map(|a| fetch_quota(http.clone(), a.clone(), context.resolve_account_provider(a), timeout));
     futures::future::join_all(futs).await
   };
 
@@ -479,7 +475,7 @@ async fn refresh(context: &ConfigContext, store: &mut AuthStore, id: &str) -> Re
     .ok_or_else(|| anyhow!("no account with id '{id}'"))?
     .clone();
 
-  let provider = context.resolve_account_provider(&account.provider)?;
+  let provider = context.resolve_account_provider(&account)?;
   let provider_auth = provider.auth();
   let auth_account = provider.account_for_auth(&account);
   let http = context.build_http_client(false)?;
@@ -533,14 +529,10 @@ async fn status(context: &ConfigContext, store: &mut AuthStore, id: Option<Strin
   }
   let timeout = Duration::from_secs(5);
   let http = context.build_http_client(false)?;
-  let futs = store.accounts.iter().map(|a| {
-    fetch_quota(
-      http.clone(),
-      a.clone(),
-      context.resolve_account_provider(&a.provider),
-      timeout,
-    )
-  });
+  let futs = store
+    .accounts
+    .iter()
+    .map(|a| fetch_quota(http.clone(), a.clone(), context.resolve_account_provider(a), timeout));
   let quotas: Vec<QuotaResult> = futures::future::join_all(futs).await;
 
   // Persist any token side-effects, same as `list`.
@@ -754,6 +746,26 @@ mod tests {
   use super::*;
   use tokn_core::account::AccountTier;
 
+  fn write_v2_openai_config(path: &std::path::Path) {
+    std::fs::write(
+      path,
+      r#"
+schema_version = 2
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+
+[providers.company-openai]
+driver = "openai"
+base_url = "https://llm.example.test/v1"
+"#,
+    )
+    .unwrap();
+  }
+
   #[test]
   fn fmt_int_groups_thousands() {
     assert_eq!(fmt_int(0), "0");
@@ -861,5 +873,63 @@ mod tests {
   fn switch_unknown_id_errors() {
     let mut accts = vec![acct("a1", "p1", true, AccountTier::Active)];
     assert!(apply_switch(&mut accts, &switch_args(Some("ghost"), false, None, &[], false)).is_err());
+  }
+
+  #[tokio::test]
+  async fn v2_list_status_and_refresh_resolve_configured_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    write_v2_openai_config(&config_path);
+    let context = ConfigContext::load(Some(&config_path)).unwrap();
+    let auth_path = directory.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+    let mut account = acct("primary", "company-openai", true, AccountTier::Active);
+    account.api_key = Some(Secret::new("sk-test".into()));
+    store.accounts.push(account);
+
+    list(
+      &context,
+      &mut store,
+      ListArgs {
+        no_quota: true,
+        timeout: 1,
+      },
+    )
+    .await
+    .unwrap();
+    status(&context, &mut store, Some("primary".into())).await.unwrap();
+    refresh(&context, &mut store, "primary").await.unwrap();
+
+    let client = context.build_http_client(true).unwrap();
+    let failed = fetch_quota(
+      client,
+      store.accounts[0].clone(),
+      Err(anyhow!("provider resolution failed")),
+      Duration::from_secs(1),
+    )
+    .await;
+    assert!(matches!(failed, QuotaResult::Err(message) if message == "provider resolution failed"));
+  }
+
+  #[tokio::test]
+  async fn empty_account_views_return_without_network_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    write_v2_openai_config(&config_path);
+    let context = ConfigContext::load(Some(&config_path)).unwrap();
+    let auth_path = directory.path().join("auth.yaml");
+    let mut store = AuthStore::load(Some(&auth_path), None).unwrap();
+
+    list(
+      &context,
+      &mut store,
+      ListArgs {
+        no_quota: false,
+        timeout: 1,
+      },
+    )
+    .await
+    .unwrap();
+    status(&context, &mut store, None).await.unwrap();
   }
 }

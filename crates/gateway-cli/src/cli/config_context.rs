@@ -103,15 +103,15 @@ impl ConfigContext {
   /// explicitly disabled official v2 provider remains resolvable so the CLI
   /// can inspect, refresh, or remove its stored accounts even though the
   /// serving runtime will not bind them.
-  pub fn resolve_account_provider(&self, provider_id: &str) -> Result<ResolvedProviderAuth> {
-    match self.resolve_provider(provider_id) {
+  pub fn resolve_account_provider(&self, account: &AccountConfig) -> Result<ResolvedProviderAuth> {
+    match self.resolve_provider(&account.provider) {
       Ok(provider) => Ok(provider),
       Err(error) => match &self.source {
         ConfigSource::V2(_) => {
-          let Some(preset) = official_provider_preset(provider_id) else {
+          let Some(preset) = official_provider_preset(&account.provider) else {
             return Err(error);
           };
-          ResolvedProviderAuth::v2(provider_id, preset.driver, None)
+          ResolvedProviderAuth::v2(&account.provider, preset.driver, account.base_url.clone())
         }
         ConfigSource::Legacy(_) => Err(error),
       },
@@ -166,9 +166,7 @@ impl ResolvedProviderAuth {
     self.auth
   }
 
-  /// Apply driver identity and destination to a temporary account before an
-  /// auth implementation performs provider-specific network calls.
-  pub fn prepare_for_auth(&self, account: &mut AccountConfig) {
+  fn prepare_for_auth(&self, account: &mut AccountConfig) {
     account.provider = self.auth.id().to_string();
     if self.provider_owns_base_url || account.base_url.is_none() {
       account.base_url.clone_from(&self.base_url);
@@ -282,10 +280,16 @@ enable = false
 
     assert!(!context.provider_ids().contains(&"openai".to_string()));
     assert!(context.resolve_provider("openai").is_err());
+    let stored = account("openai", Some("https://stored.example.test/v1"));
+    let provider = context.resolve_account_provider(&stored).unwrap();
+    assert_eq!(provider.auth().id(), "openai");
     assert_eq!(
-      context.resolve_account_provider("openai").unwrap().auth().id(),
-      "openai"
+      provider.account_for_auth(&stored).base_url.as_deref(),
+      Some("https://stored.example.test/v1")
     );
+
+    let unknown = account("missing", None);
+    assert!(context.resolve_account_provider(&unknown).is_err());
   }
 
   #[test]
@@ -298,6 +302,21 @@ enable = false
     provider.finish_account(&mut auth_account);
     assert_eq!(auth_account.provider, "openai");
     assert_eq!(auth_account.base_url.as_deref(), Some("https://legacy.example.test/v1"));
+  }
+
+  #[test]
+  fn legacy_context_uses_defaults_and_rejects_unknown_account_providers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-config.toml");
+    let context = ConfigContext::load(Some(&path)).unwrap();
+
+    assert_eq!(context.path(), path);
+    assert!(context.http_client_options(false).url.is_none());
+    assert!(context.provider_ids().contains(&"openai".to_string()));
+    assert_eq!(context.resolve_provider("openai").unwrap().auth().id(), "openai");
+
+    let unknown = account("missing", None);
+    assert!(context.resolve_account_provider(&unknown).is_err());
   }
 
   #[test]

@@ -115,10 +115,10 @@ async fn oauth_account_from_token(
     last_refresh: None,
     settings: toml::Table::new(),
   };
-  provider.prepare_for_auth(&mut account);
+  let auth_account = provider.account_for_auth(&account);
 
   let refresh = auth
-    .refresh_credential(client, &account)
+    .refresh_credential(client, &auth_account)
     .await
     .map_err(|e| anyhow!("refresh token verification failed: {e}"))?;
   let mut username = match refresh {
@@ -140,7 +140,7 @@ async fn oauth_account_from_token(
   };
   if username.is_none() {
     username = auth
-      .verify_credential(client, &account)
+      .verify_credential(client, &auth_account)
       .await
       .ok()
       .and_then(|v| v.username);
@@ -164,9 +164,9 @@ async fn static_key_account(
 ) -> Result<Account> {
   let auth = provider.auth();
   let mut account = static_key_account_unverified(auth, id_override.clone(), key)?;
-  provider.prepare_for_auth(&mut account);
+  let auth_account = provider.account_for_auth(&account);
   let outcome = auth
-    .verify_credential(client, &account)
+    .verify_credential(client, &auth_account)
     .await
     .map_err(|e| anyhow!("key verification failed: {e}"))?;
   if id_override
@@ -260,7 +260,7 @@ async fn device_flow_login(
     .or(outcome.username)
     .unwrap_or_else(|| auth.default_account_id().to_string());
 
-  let mut account = Account {
+  let account = Account {
     id,
     provider: auth.id().into(),
     enabled: true,
@@ -283,7 +283,6 @@ async fn device_flow_login(
     last_refresh: Some(time::OffsetDateTime::now_utc().unix_timestamp()),
     settings: toml::Table::new(),
   };
-  provider.prepare_for_auth(&mut account);
   Ok(account)
 }
 
@@ -305,20 +304,19 @@ async fn static_key_login(
   }
 
   // Build a throwaway Account so the trait can verify against it.
-  let mut probe = static_key_account_unverified(auth, Some("__probe__".into()), key.clone())?;
-  provider.prepare_for_auth(&mut probe);
+  let probe = static_key_account_unverified(auth, Some("__probe__".into()), key.clone())?;
+  let auth_probe = provider.account_for_auth(&probe);
   println!(
     "Verifying key against {} …",
-    probe.base_url.as_deref().unwrap_or("upstream")
+    auth_probe.base_url.as_deref().unwrap_or("upstream")
   );
   let outcome = auth
-    .verify_credential(client, &probe)
+    .verify_credential(client, &auth_probe)
     .await
     .map_err(|e| anyhow!("key verification failed: {e}"))?;
   println!("Key OK.");
 
   let mut account = static_key_account_unverified(auth, id_override.clone(), key)?;
-  provider.prepare_for_auth(&mut account);
   if id_override
     .as_deref()
     .map(str::trim)
@@ -481,6 +479,31 @@ pub(crate) fn pick_account_id(provider: &ResolvedProviderAuth, source: &Credenti
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::cli::config_context::ConfigContext;
+  use tokn_auth::CredentialFlavor;
+  use tokn_mock_server::{MockAuthConfig, MockLlmConfig, MockLlmServer};
+
+  fn write_v2_openai_config(path: &std::path::Path, base_url: &str) {
+    std::fs::write(
+      path,
+      format!(
+        r#"
+schema_version = 2
+
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+
+[providers.company-openai]
+driver = "openai"
+base_url = "{base_url}"
+"#
+      ),
+    )
+    .unwrap();
+  }
 
   #[test]
   fn api_key_account_id_uses_last_four_when_missing() {
@@ -501,5 +524,50 @@ mod tests {
       resolve_static_key_account_id(Some("custom".into()), "sk-abcdef"),
       "custom"
     );
+  }
+
+  #[test]
+  fn provider_validation_reports_unknown_and_unsupported_sources() {
+    assert!(validate_provider("openai").is_ok());
+    assert!(validate_provider("missing").is_err());
+
+    let provider = ResolvedProviderAuth::legacy("openai").unwrap();
+    let source = CredentialSource::String {
+      value: "refresh-token".into(),
+      flavor: CredentialFlavor::RefreshToken,
+    };
+    let error = validate_provider_source(&provider, &source).unwrap_err();
+    assert!(error.to_string().contains("credential source not supported"));
+  }
+
+  #[tokio::test]
+  async fn v2_static_key_import_verifies_configured_destination_and_finishes_identity() {
+    let server = MockLlmServer::start(MockLlmConfig::default().with_auth(MockAuthConfig::bearer(["sk-test"]))).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    write_v2_openai_config(&path, server.base_url());
+    let context = ConfigContext::load(Some(&path)).unwrap();
+    let provider = context.resolve_provider("company-openai").unwrap();
+    let client = context.build_http_client(true).unwrap();
+
+    let account = resolve_account(
+      &client,
+      &provider,
+      None,
+      CredentialSource::String {
+        value: "sk-test".into(),
+        flavor: CredentialFlavor::ApiKey,
+      },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(account.id, "account_test");
+    assert_eq!(account.provider, "company-openai");
+    assert_eq!(account.base_url, None);
+    let request = server.last_request().unwrap();
+    assert_eq!(request.path, "/models");
+    assert_eq!(request.header("authorization"), Some("Bearer sk-test"));
+    server.shutdown().await;
   }
 }
