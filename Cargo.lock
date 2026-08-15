@@ -3060,6 +3060,7 @@ dependencies = [
  "base64",
  "bytes",
  "flate2",
+ "libc",
  "lzma-rust2",
  "parking_lot",
  "rusqlite",

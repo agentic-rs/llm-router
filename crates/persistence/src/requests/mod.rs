@@ -84,9 +84,14 @@ struct RequestMeta {
 /// for latency computation.
 pub struct RequestsDb {
   dir: PathBuf,
-  conns: HashMap<String, Connection>,
+  conns: HashMap<String, DayConnection>,
   order: VecDeque<String>,
   request_meta: HashMap<String, RequestMeta>,
+}
+
+struct DayConnection {
+  connection: Connection,
+  identity: same_file::Handle,
 }
 
 impl RequestsDb {
@@ -124,18 +129,23 @@ impl RequestsDb {
 
   /// Borrow (or open) the day connection keyed by `day` (e.g. `"2026-05-19"`).
   pub(crate) fn conn_for_day(&mut self, key: &str) -> Result<&mut Connection> {
+    let path = self.dir.join(format!("{key}.db"));
+    if self.conns.get(key).is_some_and(|cached| !cached.matches_path(&path)) {
+      self.conns.remove(key);
+      self.order.retain(|cached| cached != key);
+    }
     if !self.conns.contains_key(key) {
       if self.order.len() >= CACHE_CAP {
         if let Some(old) = self.order.pop_front() {
           self.conns.remove(&old);
         }
       }
-      let conn = open_day_db(&self.dir.join(format!("{key}.db")))?;
+      let conn = DayConnection::open(&path)?;
       self.conns.insert(key.to_string(), conn);
     }
     self.order.retain(|k| k != key);
     self.order.push_back(key.to_string());
-    Ok(self.conns.get_mut(key).expect("opened requests db"))
+    Ok(&mut self.conns.get_mut(key).expect("opened requests db").connection)
   }
 
   /// Look up the connection a previously-pinned `request_id` was written to.
@@ -143,6 +153,10 @@ impl RequestsDb {
   pub(crate) fn conn_for_request(&mut self, request_id: &str) -> Option<&mut Connection> {
     let key = self.request_meta.get(request_id)?.day.clone();
     self.conn_for_day(&key).ok()
+  }
+
+  pub(crate) fn contains_request(&self, request_id: &str) -> bool {
+    self.request_meta.contains_key(request_id)
   }
 
   pub(crate) fn pin_request(&mut self, request_id: &str, ts: i64) {
@@ -165,7 +179,29 @@ impl RequestsDb {
   }
 
   pub(crate) fn clear_request(&mut self, request_id: &str) {
-    self.request_meta.remove(request_id);
+    let Some(meta) = self.request_meta.remove(request_id) else {
+      return;
+    };
+    if !self.request_meta.values().any(|other| other.day == meta.day) {
+      self.conns.remove(&meta.day);
+      self.order.retain(|day| day != &meta.day);
+    }
+  }
+
+  pub(crate) fn dir(&self) -> &Path {
+    &self.dir
+  }
+}
+
+impl DayConnection {
+  fn open(path: &Path) -> Result<Self> {
+    let connection = open_day_db(path)?;
+    let identity = same_file::Handle::from_path(path)?;
+    Ok(Self { connection, identity })
+  }
+
+  fn matches_path(&self, path: &Path) -> bool {
+    same_file::Handle::from_path(path).is_ok_and(|identity| identity == self.identity)
   }
 }
 

@@ -97,6 +97,7 @@ ipnet = "2"
 indicatif = "0.18"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
+libc = "0.2"
 notify = "8"
 parking_lot = "0.12"
 rcgen = { version = "0.14", features = ["crypto", "pem"] }

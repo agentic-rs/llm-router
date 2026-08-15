@@ -30,6 +30,9 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 lzma-rust2 = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 parking_lot = { workspace = true }
 uuid = { workspace = true }

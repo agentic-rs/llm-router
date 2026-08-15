@@ -271,6 +271,20 @@ mod tests {
     (config_path, requests_dir)
   }
 
+  fn write_v2_config_with_ages(
+    directory: &tempfile::TempDir,
+    archive_after_days: u64,
+    prune_after_days: u64,
+  ) -> (PathBuf, PathBuf) {
+    let (config_path, requests_dir) = write_v2_config(directory);
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+      "archive_after_days = {archive_after_days}\nprune_after_days = {prune_after_days}\n"
+    ));
+    std::fs::write(&config_path, config).unwrap();
+    (config_path, requests_dir)
+  }
+
   #[test]
   fn parses_prune_as_dry_run_by_default() {
     let cli = Cli::try_parse_from(["tokn-router", "requests", "prune"]).unwrap();
@@ -343,6 +357,21 @@ mod tests {
       .unwrap();
 
     assert!(database.exists());
+  }
+
+  #[tokio::test]
+  async fn prune_reports_out_of_range_cutoff_without_panicking() {
+    let directory = tempfile::tempdir().unwrap();
+    let (config_path, _) = write_v2_config_with_ages(&directory, 1_000_000_000, 1_000_000_001);
+
+    let error = run(Some(config_path), RequestsCmd::Prune(PruneArgs { commit: false }))
+      .await
+      .unwrap_err();
+
+    assert_eq!(
+      error.to_string(),
+      "prune retention cutoff is outside the supported date range"
+    );
   }
 
   #[tokio::test]

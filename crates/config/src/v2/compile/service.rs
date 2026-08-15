@@ -121,7 +121,11 @@ fn compile_days(location: &'static str, value: u64) -> Result<i64, CompileError>
   if value == 0 {
     return Err(invalid_value(location, "must be greater than zero"));
   }
-  i64::try_from(value).map_err(|_| invalid_value(location, "is too large"))
+  let value = i64::try_from(value).map_err(|_| invalid_value(location, "is too large"))?;
+  value
+    .checked_mul(86_400)
+    .ok_or_else(|| invalid_value(location, "is too large for a time duration"))?;
+  Ok(value)
 }
 
 fn compile_usize(location: &'static str, value: u64) -> Result<usize, CompileError> {

@@ -151,6 +151,10 @@ fn service_rejects_invalid_persistence_ages() {
       "archive_after_days = 10\nprune_after_days = 7",
       "service.persistence.prune_after_days",
     ),
+    (
+      "archive_after_days = 106751991167301\nprune_after_days = 106751991167302",
+      "service.persistence.archive_after_days",
+    ),
   ] {
     let config = MINIMAL_MANAGED.replacen(
       "[listeners.api]",
