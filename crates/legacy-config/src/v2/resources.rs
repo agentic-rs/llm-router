@@ -109,7 +109,9 @@ pub(super) fn project_accounts_and_providers(
     .iter()
     .cloned()
     .map(|mut account| {
-      account.base_url = None;
+      if account.enabled {
+        account.base_url = None;
+      }
       account
     })
     .collect();
@@ -269,6 +271,23 @@ mod tests {
       V2ProjectionWarning::AccountBaseUrlPromoted { provider, .. } if provider == "openai"
     )));
     assert_eq!(accounts[0].base_url.as_deref(), Some("https://gateway.example/v1"));
+  }
+
+  #[test]
+  fn preserves_inert_disabled_account_destinations() {
+    let enabled = account("enabled", "openai", Some("https://gateway.example/v1"));
+    let mut disabled = account("disabled", "openai", Some("https://dormant.example/v1"));
+    disabled.enabled = false;
+
+    let (projected, providers) =
+      project_accounts_and_providers(&[enabled, disabled], V2ProjectionOptions::default(), &mut Vec::new()).unwrap();
+
+    assert_eq!(
+      providers["openai"].base_url.as_deref(),
+      Some("https://gateway.example/v1/")
+    );
+    assert!(projected[0].base_url.is_none());
+    assert_eq!(projected[1].base_url.as_deref(), Some("https://dormant.example/v1"));
   }
 
   #[test]

@@ -44,9 +44,10 @@ impl V2Projection {
 
   /// Ephemeral account copies normalized for the v2 provider model.
   ///
-  /// Account-level `base_url` fields are cleared after an equivalent provider
-  /// destination has been synthesized. The caller's original accounts are
-  /// never mutated.
+  /// Enabled account-level `base_url` fields are cleared after an equivalent
+  /// provider destination has been synthesized. Disabled accounts retain their
+  /// inert destination metadata; callers must project again before enabling
+  /// one. The caller's original accounts are never mutated.
   pub fn accounts(&self) -> &[AccountConfig] {
     &self.accounts
   }
