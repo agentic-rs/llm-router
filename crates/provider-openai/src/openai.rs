@@ -61,13 +61,8 @@ impl OpenAiProvider {
     Ok(self.target.base_url().operation_url(segments.iter().copied())?)
   }
 
-  async fn upstream_post(
-    &self,
-    ctx: RequestCtx<'_>,
-    segments: &[&str],
-    what: &'static str,
-  ) -> Result<reqwest::Response> {
-    let url = self.operation_url(segments)?;
+  async fn upstream_post(&self, ctx: RequestCtx<'_>, what: &'static str) -> Result<reqwest::Response> {
+    let url = crate::openai_operation_url(&self.target, ctx.endpoint)?;
     debug!(%url, "POST upstream");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -163,12 +158,12 @@ impl Provider for OpenAiProvider {
 
   #[instrument(name = "openai_chat", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, &["chat", "completions"], "openai chat").await
+    self.upstream_post(ctx, "openai chat").await
   }
 
   #[instrument(name = "openai_responses", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn responses(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, &["responses"], "openai responses").await
+    self.upstream_post(ctx, "openai responses").await
   }
 
   fn on_unauthorized(&self) {

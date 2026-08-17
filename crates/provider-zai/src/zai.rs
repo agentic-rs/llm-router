@@ -259,7 +259,7 @@ impl Provider for ZaiProvider {
     span.record("model", model_id);
     span.record("reasoning", reasoning);
 
-    let url = self.target.base_url().operation_url(["chat", "completions"])?;
+    let url = crate::zai_operation_url(&self.target, ctx.endpoint)?;
     debug!(%url, "POST zai chat");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(

@@ -420,6 +420,25 @@ mod tests {
       assert!(!d.endpoints.is_empty(), "{} has no endpoints", d.id);
       assert!(!d.credentials.is_empty(), "{} has no credentials", d.id);
       assert!(d.build_auth.is_some(), "{} has no build_auth", d.id);
+      let target = ProviderTarget::parse(d.base_url, CleartextHttpPolicy::LoopbackOnly).unwrap();
+      for endpoint in [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages] {
+        let resolved = d.operation_url(&target, endpoint);
+        if d.endpoints.iter().any(|candidate| candidate.endpoint == endpoint) {
+          let url = resolved.unwrap_or_else(|error| panic!("{} cannot resolve {endpoint}: {error}", d.id));
+          assert_eq!(url.origin(), target.base_url().as_url().origin());
+          assert!(
+            url.path().starts_with(target.base_url().as_url().path()),
+            "{} resolved {endpoint} outside its configured prefix: {url}",
+            d.id
+          );
+        } else {
+          assert!(
+            matches!(resolved, Err(error::Error::UnsupportedEndpoint { .. })),
+            "{} unexpectedly resolved unsupported {endpoint}",
+            d.id
+          );
+        }
+      }
     }
   }
 

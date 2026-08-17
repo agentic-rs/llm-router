@@ -33,6 +33,15 @@ pub const COPILOT_USER_INFO_URL: &str = "https://api.github.com/copilot_internal
 /// to populate `ProviderInfo::default_endpoints`.
 pub static DEFAULT_ENDPOINTS: &[Endpoint] = &[Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages];
 
+pub(crate) fn operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  let segments = match endpoint {
+    Endpoint::ChatCompletions => &["chat", "completions"][..],
+    Endpoint::Responses => &["responses"][..],
+    Endpoint::Messages => &["v1", "messages"][..],
+  };
+  Ok(target.base_url().operation_url(segments.iter().copied())?)
+}
+
 /// Per-model endpoint rules. Mirrors what the official Copilot CLI / VSCode
 /// plugin route — Copilot ships new ids continuously and `/models` does
 /// not annotate per-endpoint support, so we pattern-match the id.
@@ -93,6 +102,7 @@ pub static DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
     },
   ],
   model_endpoint_rules: Some(MODEL_ENDPOINT_RULES),
+  operation_url,
   rewrites: &[],
   auth_urls: &[
     ("device_authorize", COPILOT_DEVICE_CODE_URL),

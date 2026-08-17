@@ -80,6 +80,11 @@ pub struct ProviderDescriptor {
   /// Consumed by the default [`Provider::supports`] impl via
   /// [`Provider::endpoint_rules`].
   pub model_endpoint_rules: Option<&'static [EndpointRule]>,
+  /// Resolve one supported LLM operation against an explicitly configured
+  /// provider target without requiring an account-bound [`Provider`]
+  /// instance. Opaque client-credential routes use this to keep destination
+  /// selection independent from account selection.
+  pub operation_url: fn(&ProviderTarget, Endpoint) -> Result<reqwest::Url>,
   /// Non-canonical inbound paths the proxy should rewrite. The proxy
   /// also short-circuits when an inbound path already matches an entry
   /// in [`Self::endpoints`], so canonical paths do not need to appear
@@ -121,6 +126,10 @@ impl ProviderDescriptor {
 
   pub fn endpoint_path(&self, endpoint: Endpoint) -> Option<&'static str> {
     self.endpoints.iter().find(|e| e.endpoint == endpoint).map(|e| e.path)
+  }
+
+  pub fn operation_url(&self, target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+    (self.operation_url)(target, endpoint)
   }
 
   /// Look up a named auth URL.

@@ -25,6 +25,32 @@ const CHAT_COMPLETIONS_PATH_CODING: &str = "/api/coding/paas/v4/chat/completions
 
 pub static DEFAULT_ENDPOINTS: &[Endpoint] = &[Endpoint::ChatCompletions];
 
+fn operation_url_for(provider: &str, target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  match endpoint {
+    Endpoint::ChatCompletions => Ok(target.base_url().operation_url(["chat", "completions"])?),
+    Endpoint::Responses | Endpoint::Messages => Err(error::Error::UnsupportedEndpoint {
+      provider: provider.to_string(),
+      endpoint: endpoint.as_str(),
+    }),
+  }
+}
+
+pub(crate) fn zai_operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  operation_url_for(ID_ZAI, target, endpoint)
+}
+
+fn zai_coding_plan_operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  operation_url_for(ID_ZAI_CODING_PLAN, target, endpoint)
+}
+
+fn zhipuai_operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  operation_url_for(ID_ZHIPUAI, target, endpoint)
+}
+
+fn zhipuai_coding_plan_operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  operation_url_for(ID_ZHIPUAI_CODING_PLAN, target, endpoint)
+}
+
 pub static DESCRIPTOR_ZAI: ProviderDescriptor = ProviderDescriptor {
   id: ID_ZAI,
   display_name: "Z.ai",
@@ -38,6 +64,7 @@ pub static DESCRIPTOR_ZAI: ProviderDescriptor = ProviderDescriptor {
     aliases: &[CHAT_COMPLETIONS_PATH_PAAS],
   }],
   model_endpoint_rules: Some(&[]),
+  operation_url: zai_operation_url,
   rewrites: &[],
   auth_urls: &[],
   matches_url,
@@ -59,6 +86,7 @@ pub static DESCRIPTOR_ZAI_CODING_PLAN: ProviderDescriptor = ProviderDescriptor {
     aliases: &[CHAT_COMPLETIONS_PATH_CODING],
   }],
   model_endpoint_rules: Some(&[]),
+  operation_url: zai_coding_plan_operation_url,
   rewrites: &[],
   auth_urls: &[],
   matches_url,
@@ -80,6 +108,7 @@ pub static DESCRIPTOR_ZHIPUAI: ProviderDescriptor = ProviderDescriptor {
     aliases: &[CHAT_COMPLETIONS_PATH_PAAS],
   }],
   model_endpoint_rules: Some(&[]),
+  operation_url: zhipuai_operation_url,
   rewrites: &[],
   auth_urls: &[],
   matches_url,
@@ -101,6 +130,7 @@ pub static DESCRIPTOR_ZHIPUAI_CODING_PLAN: ProviderDescriptor = ProviderDescript
     aliases: &[CHAT_COMPLETIONS_PATH_CODING],
   }],
   model_endpoint_rules: Some(&[]),
+  operation_url: zhipuai_coding_plan_operation_url,
   rewrites: &[],
   auth_urls: &[],
   matches_url,

@@ -17,6 +17,16 @@ use tokn_core::provider::ProviderTarget;
 
 pub static DEFAULT_ENDPOINTS: &[Endpoint] = &[Endpoint::ChatCompletions];
 
+pub(crate) fn operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  match endpoint {
+    Endpoint::ChatCompletions => Ok(target.base_url().operation_url(["chat", "completions"])?),
+    Endpoint::Responses | Endpoint::Messages => Err(error::Error::UnsupportedEndpoint {
+      provider: ID_LLAMA_CPP.to_string(),
+      endpoint: endpoint.as_str(),
+    }),
+  }
+}
+
 pub static DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
   id: ID_LLAMA_CPP,
   display_name: "llama.cpp",
@@ -30,6 +40,7 @@ pub static DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
     aliases: &["/chat/completions"],
   }],
   model_endpoint_rules: Some(&[]),
+  operation_url,
   rewrites: &[],
   auth_urls: &[],
   matches_url,

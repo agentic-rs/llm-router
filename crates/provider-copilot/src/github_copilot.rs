@@ -234,15 +234,15 @@ impl Provider for CopilotProvider {
   }
 
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, &["chat", "completions"], "chat").await
+    self.upstream_post(ctx, "chat").await
   }
 
   async fn responses(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, &["responses"], "responses").await
+    self.upstream_post(ctx, "responses").await
   }
 
   async fn messages(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, &["v1", "messages"], "messages").await
+    self.upstream_post(ctx, "messages").await
   }
 
   fn on_unauthorized(&self) {
@@ -300,13 +300,8 @@ impl CopilotProvider {
       initiator = tracing::field::Empty,
     ),
   )]
-  async fn upstream_post(
-    &self,
-    ctx: RequestCtx<'_>,
-    path_segments: &[&str],
-    what: &'static str,
-  ) -> Result<reqwest::Response> {
-    let url = self.target.base_url().operation_url(path_segments.iter().copied())?;
+  async fn upstream_post(&self, ctx: RequestCtx<'_>, what: &'static str) -> Result<reqwest::Response> {
+    let url = crate::operation_url(&self.target, ctx.endpoint)?;
     tracing::Span::current().record("path", url.path());
     let token = self.ensure_api_token(ctx.http).await?;
     let initiator = match ctx.endpoint {
