@@ -1,5 +1,6 @@
 pub mod locations;
 pub mod schema;
+pub mod v2;
 
 use anyhow::Result;
 use std::path::Path;
