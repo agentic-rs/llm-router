@@ -130,7 +130,6 @@ fn canonical_destination(account: &AccountConfig, base_url: &str) -> Result<Cano
   let canonical = CanonicalUpstreamUrl::parse(base_url, CleartextHttpPolicy::Allow).map_err(|source| {
     V2ProjectionError::InvalidAccountBaseUrl {
       account_id: account.id.clone(),
-      base_url: base_url.to_string(),
       source,
     }
   })?;
@@ -398,5 +397,17 @@ mod tests {
       ),
       Err(V2ProjectionError::InvalidAccountBaseUrl { .. })
     ));
+
+    let credentialed = [account(
+      "credentialed",
+      "openai",
+      Some("https://sensitive-user:super-secret@gateway.example/v1"),
+    )];
+    let error =
+      project_accounts_and_providers(&credentialed, V2ProjectionOptions::default(), &mut Vec::new()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("credentialed"));
+    assert!(!message.contains("sensitive-user"));
+    assert!(!message.contains("super-secret"));
   }
 }

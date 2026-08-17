@@ -2,8 +2,9 @@
 //!
 //! This module deliberately owns no filesystem behavior. It neither reads nor
 //! writes config or auth files, and it does not change runtime schema
-//! selection. A caller supplies the already-merged legacy config and aggregate
-//! auth store, then receives a compiled v2 plan plus ephemeral account copies.
+//! selection. A caller supplies the already-merged legacy config and a slice of
+//! account configurations, then receives a compiled v2 plan plus ephemeral
+//! account copies.
 
 use std::net::SocketAddr;
 
@@ -95,7 +96,7 @@ pub enum V2ProjectionError {
     policy: LegacyPolicyLocation,
     mode: RouteMode,
   },
-  #[error("cannot project managed or switch API policies without supplied accounts")]
+  #[error("cannot project a legacy configuration without supplied accounts")]
   NoAccounts,
   #[error("supplied accounts contain duplicate id `{account_id}`")]
   DuplicateAccountId { account_id: String },
@@ -131,10 +132,9 @@ pub enum V2ProjectionError {
   UnsupportedSessionAffinity { session_tombstone_secs: u64 },
   #[error("legacy profile `{profile}` cannot be represented as a canonical v2 path segment")]
   UnsupportedProfilePath { profile: String },
-  #[error("account `{account_id}` has invalid base_url `{base_url}`: {source}")]
+  #[error("account `{account_id}` has an invalid base_url: {source}")]
   InvalidAccountBaseUrl {
     account_id: String,
-    base_url: String,
     #[source]
     source: tokn_core::upstream_url::InvalidUpstreamUrl,
   },

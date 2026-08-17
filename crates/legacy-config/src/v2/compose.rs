@@ -461,10 +461,12 @@ mod tests {
   #[test]
   fn reports_unrepresentable_inputs_before_runtime_activation() {
     let primary = account("primary", "openai", None);
-    assert!(matches!(
-      project_v2_config(&Config::default(), &[], V2ProjectionOptions::default()),
-      Err(V2ProjectionError::NoAccounts)
-    ));
+    let no_accounts = project_v2_config(&Config::default(), &[], V2ProjectionOptions::default()).unwrap_err();
+    assert!(matches!(&no_accounts, V2ProjectionError::NoAccounts));
+    assert_eq!(
+      no_accounts.to_string(),
+      "cannot project a legacy configuration without supplied accounts"
+    );
 
     let mut switch = Config::default();
     switch.defaults.mode = RouteMode::Switch;
