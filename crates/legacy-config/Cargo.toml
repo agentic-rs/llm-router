@@ -14,10 +14,14 @@ tokn-config = { workspace = true }
 
 anyhow = { workspace = true }
 directories = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+thiserror = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokn-accounts = { workspace = true }
+tokn-policy = { workspace = true }
