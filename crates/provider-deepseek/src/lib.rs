@@ -17,6 +17,23 @@ use tokn_core::provider::ProviderTarget;
 
 pub static DEFAULT_ENDPOINTS: &[Endpoint] = &[Endpoint::ChatCompletions, Endpoint::Messages];
 
+pub(crate) fn operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  let segments = match endpoint {
+    Endpoint::ChatCompletions => &["chat", "completions"][..],
+    Endpoint::Messages if target.base_url().as_str().trim_end_matches('/').ends_with("/anthropic") => {
+      &["v1", "messages"][..]
+    }
+    Endpoint::Messages => &["anthropic", "v1", "messages"][..],
+    Endpoint::Responses => {
+      return Err(error::Error::UnsupportedEndpoint {
+        provider: ID_DEEPSEEK.to_string(),
+        endpoint: endpoint.as_str(),
+      });
+    }
+  };
+  Ok(target.base_url().operation_url(segments.iter().copied())?)
+}
+
 pub static DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
   id: ID_DEEPSEEK,
   display_name: "DeepSeek",
@@ -38,6 +55,7 @@ pub static DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
     },
   ],
   model_endpoint_rules: Some(&[]),
+  operation_url,
   rewrites: &[],
   auth_urls: &[],
   matches_url,

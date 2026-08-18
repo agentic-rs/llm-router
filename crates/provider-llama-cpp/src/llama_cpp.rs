@@ -165,7 +165,7 @@ impl Provider for LlamaCppProvider {
 
   #[instrument(name = "llama_cpp_chat", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    let url = self.operation_url(&["chat", "completions"])?;
+    let url = crate::operation_url(&self.target, ctx.endpoint)?;
     debug!(%url, "POST llama.cpp chat");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(

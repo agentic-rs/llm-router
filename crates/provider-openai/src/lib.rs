@@ -18,6 +18,7 @@ pub use openai::OpenAiProvider;
 
 use tokn_auth::descriptor::{EndpointSpec, ProviderDescriptor};
 use tokn_auth::provider::CredentialFlavor;
+use tokn_core::provider::ProviderTarget;
 
 pub const CODEX_DEVICE_USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 pub const CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
@@ -27,6 +28,29 @@ pub const CODEX_DEVICE_REDIRECT_URL: &str = "https://auth.openai.com/deviceauth/
 
 pub static DEFAULT_ENDPOINTS_OPENAI: &[Endpoint] = &[Endpoint::ChatCompletions, Endpoint::Responses];
 pub static DEFAULT_ENDPOINTS_CODEX: &[Endpoint] = &[Endpoint::Responses];
+
+pub(crate) fn openai_operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  let segments = match endpoint {
+    Endpoint::ChatCompletions => &["chat", "completions"][..],
+    Endpoint::Responses => &["responses"][..],
+    Endpoint::Messages => return unsupported_operation(ID_OPENAI, endpoint),
+  };
+  Ok(target.base_url().operation_url(segments.iter().copied())?)
+}
+
+pub(crate) fn codex_operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
+  match endpoint {
+    Endpoint::Responses => Ok(target.base_url().operation_url(["responses"])?),
+    Endpoint::ChatCompletions | Endpoint::Messages => unsupported_operation(ID_CODEX, endpoint),
+  }
+}
+
+fn unsupported_operation(provider: &str, endpoint: Endpoint) -> Result<reqwest::Url> {
+  Err(error::Error::UnsupportedEndpoint {
+    provider: provider.to_string(),
+    endpoint: endpoint.as_str(),
+  })
+}
 
 pub static DESCRIPTOR_OPENAI: ProviderDescriptor = ProviderDescriptor {
   id: ID_OPENAI,
@@ -49,6 +73,7 @@ pub static DESCRIPTOR_OPENAI: ProviderDescriptor = ProviderDescriptor {
     },
   ],
   model_endpoint_rules: Some(&[]),
+  operation_url: openai_operation_url,
   rewrites: &[],
   auth_urls: &[],
   matches_url,
@@ -70,6 +95,7 @@ pub static DESCRIPTOR_CODEX: ProviderDescriptor = ProviderDescriptor {
     aliases: &["/backend-api/codex/responses"],
   }],
   model_endpoint_rules: Some(&[]),
+  operation_url: codex_operation_url,
   rewrites: &[],
   auth_urls: &[
     ("device_usercode", CODEX_DEVICE_USERCODE_URL),

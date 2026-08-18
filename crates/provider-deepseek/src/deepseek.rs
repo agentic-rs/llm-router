@@ -12,8 +12,8 @@ use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-  error, AuthKind, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result, TemplateVars,
-  ID_DEEPSEEK,
+  error, AuthKind, Endpoint, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
+  TemplateVars, ID_DEEPSEEK,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -82,17 +82,7 @@ impl DeepSeekProvider {
   }
 
   fn messages_url(&self) -> Result<reqwest::Url> {
-    if self
-      .target
-      .base_url()
-      .as_str()
-      .trim_end_matches('/')
-      .ends_with("/anthropic")
-    {
-      self.operation_url(&["v1", "messages"])
-    } else {
-      self.operation_url(&["anthropic", "v1", "messages"])
-    }
+    crate::operation_url(&self.target, Endpoint::Messages)
   }
 
   async fn upstream_post(
@@ -200,7 +190,7 @@ impl Provider for DeepSeekProvider {
 
   #[instrument(name = "deepseek_chat", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn chat(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    let url = self.operation_url(&["chat", "completions"])?;
+    let url = crate::operation_url(&self.target, ctx.endpoint)?;
     self.upstream_post(ctx, url, "deepseek chat").await
   }
 

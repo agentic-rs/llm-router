@@ -78,13 +78,8 @@ impl CodexProvider {
     Ok(url)
   }
 
-  async fn upstream_post(
-    &self,
-    ctx: RequestCtx<'_>,
-    segments: &[&str],
-    what: &'static str,
-  ) -> Result<reqwest::Response> {
-    let url = self.operation_url(segments)?;
+  async fn upstream_post(&self, ctx: RequestCtx<'_>, what: &'static str) -> Result<reqwest::Response> {
+    let url = crate::codex_operation_url(&self.target, ctx.endpoint)?;
     debug!(%url, "POST upstream");
     let mut headers = ctx.client_headers.clone().unwrap_or_default();
     self.patch_headers(
@@ -240,7 +235,7 @@ impl Provider for CodexProvider {
 
   #[instrument(name = "codex_responses", skip_all, fields(account = %self.id, stream = ctx.stream))]
   async fn responses(&self, ctx: RequestCtx<'_>) -> Result<reqwest::Response> {
-    self.upstream_post(ctx, &["responses"], "codex responses").await
+    self.upstream_post(ctx, "codex responses").await
   }
 
   async fn chat(&self, _ctx: RequestCtx<'_>) -> Result<reqwest::Response> {

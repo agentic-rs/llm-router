@@ -9,8 +9,9 @@ use smol_str::SmolStr;
 use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tokn_auth::descriptor::ProviderDescriptor;
 use tokn_core::account::AccountConfig;
-use tokn_core::provider::{official_provider_preset, Error as ProviderError, Provider, ProviderTarget};
+use tokn_core::provider::{official_provider_preset, Endpoint, Error as ProviderError, Provider, ProviderTarget};
 use tokn_core::upstream_url::{CleartextHttpPolicy, InvalidUpstreamUrl};
 use tokn_policy::{DriverId, GatewayPlan, ProviderId};
 
@@ -29,6 +30,49 @@ impl std::fmt::Display for ProviderUrlSource {
       Self::ProviderDefault => formatter.write_str("provider default"),
       Self::DriverDefault => formatter.write_str("driver default"),
     }
+  }
+}
+
+/// Linked metadata for one configured provider destination.
+///
+/// The descriptor supplies reusable driver behavior, while the target belongs
+/// to the named provider. Keeping this object independent from
+/// [`ProviderBinding`] lets client-credential routes resolve upstream URLs
+/// without manufacturing or selecting an account.
+#[derive(Clone)]
+pub struct ProviderDestination {
+  provider_id: ProviderId,
+  driver_id: DriverId,
+  target: ProviderTarget,
+  descriptor: &'static ProviderDescriptor,
+}
+
+impl ProviderDestination {
+  pub fn provider_id(&self) -> &ProviderId {
+    &self.provider_id
+  }
+
+  pub fn driver_id(&self) -> &DriverId {
+    &self.driver_id
+  }
+
+  pub fn target(&self) -> &ProviderTarget {
+    &self.target
+  }
+
+  pub fn operation_url(&self, endpoint: Endpoint) -> tokn_core::provider::Result<reqwest::Url> {
+    self.descriptor.operation_url(&self.target, endpoint)
+  }
+}
+
+impl std::fmt::Debug for ProviderDestination {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("ProviderDestination")
+      .field("provider_id", &self.provider_id)
+      .field("driver_id", &self.driver_id)
+      .field("base_url", &self.target.base_url().as_str())
+      .finish()
   }
 }
 
@@ -155,7 +199,7 @@ impl std::fmt::Debug for LinkedAccount {
 /// targets and model caches, while all accounts under one provider share its
 /// target.
 pub struct ProviderGraph {
-  targets: BTreeMap<ProviderId, ProviderTarget>,
+  destinations: BTreeMap<ProviderId, ProviderDestination>,
   bindings: BTreeMap<ProviderBindingKey, Arc<ProviderBinding>>,
   accounts: Box<[LinkedAccount]>,
   account_indices: BTreeMap<SmolStr, usize>,
@@ -163,11 +207,22 @@ pub struct ProviderGraph {
 
 impl ProviderGraph {
   pub fn target(&self, provider: &ProviderId) -> Option<&ProviderTarget> {
-    self.targets.get(provider)
+    self.destination(provider).map(ProviderDestination::target)
   }
 
   pub fn targets(&self) -> impl ExactSizeIterator<Item = (&ProviderId, &ProviderTarget)> {
-    self.targets.iter()
+    self
+      .destinations
+      .iter()
+      .map(|(provider, destination)| (provider, destination.target()))
+  }
+
+  pub fn destination(&self, provider: &ProviderId) -> Option<&ProviderDestination> {
+    self.destinations.get(provider)
+  }
+
+  pub fn destinations(&self) -> impl ExactSizeIterator<Item = (&ProviderId, &ProviderDestination)> {
+    self.destinations.iter()
   }
 
   pub fn binding(&self, provider: &ProviderId, account_id: &str) -> Option<&Arc<ProviderBinding>> {
@@ -191,7 +246,7 @@ impl ProviderGraph {
   }
 
   pub fn target_count(&self) -> usize {
-    self.targets.len()
+    self.destinations.len()
   }
 
   pub fn binding_count(&self) -> usize {
@@ -199,7 +254,7 @@ impl ProviderGraph {
   }
 
   pub fn is_empty(&self) -> bool {
-    self.targets.is_empty()
+    self.destinations.is_empty()
   }
 }
 
@@ -207,7 +262,7 @@ impl std::fmt::Debug for ProviderGraph {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter
       .debug_struct("ProviderGraph")
-      .field("targets", &self.targets)
+      .field("destinations", &self.destinations)
       .field("bindings", &self.bindings)
       .field("accounts", &self.accounts)
       .finish()
@@ -261,7 +316,7 @@ pub fn link_provider_graph(
   registry: &Registry,
 ) -> LinkResult<ProviderGraph> {
   let mut accounts = prepare_accounts(accounts)?;
-  let mut targets = BTreeMap::new();
+  let mut destinations = BTreeMap::new();
   let mut bindings = BTreeMap::new();
 
   for (provider_id, provider) in plan.providers() {
@@ -297,7 +352,15 @@ pub fn link_provider_graph(
       base_url: base_url.to_string(),
       source,
     })?;
-    targets.insert(provider_id.clone(), target);
+    destinations.insert(
+      provider_id.clone(),
+      ProviderDestination {
+        provider_id: provider_id.clone(),
+        driver_id: driver_id.clone(),
+        target,
+        descriptor,
+      },
+    );
   }
 
   for account in &mut accounts.entries {
@@ -326,9 +389,10 @@ pub fn link_provider_graph(
     }
 
     let driver_id = provider.driver();
-    let target = targets
+    let target = destinations
       .get(&provider_id)
       .expect("every compiled provider target was linked")
+      .target()
       .clone();
 
     // A driver may serve several named provider destinations. Preserve an
@@ -368,7 +432,7 @@ pub fn link_provider_graph(
 
   let (accounts, account_indices) = accounts.finish();
   Ok(ProviderGraph {
-    targets,
+    destinations,
     bindings,
     accounts,
     account_indices,
@@ -431,7 +495,7 @@ mod tests {
   use std::collections::{BTreeMap, HashSet};
   use std::time::Duration;
   use tokn_auth::descriptor::ProviderDescriptor;
-  use tokn_core::provider::{Endpoint, ID_LLAMA_CPP};
+  use tokn_core::provider::{Endpoint, ID_CODEX, ID_DEEPSEEK, ID_GITHUB_COPILOT, ID_LLAMA_CPP, ID_OPENAI, ID_ZAI};
   use tokn_policy::ProviderPlan;
 
   fn id(value: &str) -> ProviderId {
@@ -467,6 +531,105 @@ mod tests {
 
   fn provider(base_url: Option<&str>) -> ProviderPlan {
     ProviderPlan::new(driver_id(ID_LLAMA_CPP), base_url.map(Into::into), Box::default(), false)
+  }
+
+  fn provider_with_driver(driver: &str, base_url: Option<&str>) -> ProviderPlan {
+    ProviderPlan::new(driver_id(driver), base_url.map(Into::into), Box::default(), false)
+  }
+
+  #[test]
+  fn resolves_account_free_operation_urls_for_built_in_and_custom_destinations() {
+    let custom_deepseek = id("deepseek-anthropic");
+    let gateway = plan(BTreeMap::from([
+      (id(ID_OPENAI), provider_with_driver(ID_OPENAI, None)),
+      (id(ID_CODEX), provider_with_driver(ID_CODEX, None)),
+      (id(ID_DEEPSEEK), provider_with_driver(ID_DEEPSEEK, None)),
+      (
+        custom_deepseek.clone(),
+        provider_with_driver(ID_DEEPSEEK, Some("https://gateway.example/deepseek/anthropic")),
+      ),
+      (id(ID_GITHUB_COPILOT), provider_with_driver(ID_GITHUB_COPILOT, None)),
+      (id(ID_LLAMA_CPP), provider_with_driver(ID_LLAMA_CPP, None)),
+      (id(ID_ZAI), provider_with_driver(ID_ZAI, None)),
+    ]));
+
+    let graph = link_provider_graph(&gateway, &[], &Registry::builtin()).unwrap();
+
+    assert_eq!(graph.binding_count(), 0);
+    assert_eq!(
+      graph.destination(&id(ID_OPENAI)).unwrap().driver_id().as_str(),
+      ID_OPENAI
+    );
+    assert_eq!(
+      graph
+        .destination(&id(ID_OPENAI))
+        .unwrap()
+        .operation_url(Endpoint::Responses)
+        .unwrap()
+        .as_str(),
+      "https://api.openai.com/v1/responses"
+    );
+    assert_eq!(
+      graph
+        .destination(&id(ID_CODEX))
+        .unwrap()
+        .operation_url(Endpoint::Responses)
+        .unwrap()
+        .as_str(),
+      "https://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(
+      graph
+        .destination(&id(ID_DEEPSEEK))
+        .unwrap()
+        .operation_url(Endpoint::Messages)
+        .unwrap()
+        .as_str(),
+      "https://api.deepseek.com/anthropic/v1/messages"
+    );
+    assert_eq!(
+      graph
+        .destination(&custom_deepseek)
+        .unwrap()
+        .operation_url(Endpoint::Messages)
+        .unwrap()
+        .as_str(),
+      "https://gateway.example/deepseek/anthropic/v1/messages"
+    );
+    assert_eq!(
+      graph
+        .destination(&id(ID_GITHUB_COPILOT))
+        .unwrap()
+        .operation_url(Endpoint::Messages)
+        .unwrap()
+        .as_str(),
+      "https://api.githubcopilot.com/v1/messages"
+    );
+    assert_eq!(
+      graph
+        .destination(&id(ID_LLAMA_CPP))
+        .unwrap()
+        .operation_url(Endpoint::ChatCompletions)
+        .unwrap()
+        .as_str(),
+      "http://127.0.0.1:8080/v1/chat/completions"
+    );
+    assert_eq!(
+      graph
+        .destination(&id(ID_ZAI))
+        .unwrap()
+        .operation_url(Endpoint::ChatCompletions)
+        .unwrap()
+        .as_str(),
+      "https://api.z.ai/api/paas/v4/chat/completions"
+    );
+    assert!(matches!(
+      graph
+        .destination(&id(ID_OPENAI))
+        .unwrap()
+        .operation_url(Endpoint::Messages),
+      Err(ProviderError::UnsupportedEndpoint { .. })
+    ));
   }
 
   #[test]
@@ -710,6 +873,13 @@ mod tests {
     unreachable!("invalid provider default must fail before provider construction")
   }
 
+  fn unreachable_operation_url(
+    _target: &ProviderTarget,
+    _endpoint: Endpoint,
+  ) -> tokn_core::provider::Result<reqwest::Url> {
+    unreachable!("invalid provider default must fail before operation URL resolution")
+  }
+
   fn never_matches(_host: &str, _path: &str, _id: &'static str) -> bool {
     false
   }
@@ -722,6 +892,7 @@ mod tests {
     credentials: &[],
     endpoints: &[],
     model_endpoint_rules: Some(&[]),
+    operation_url: unreachable_operation_url,
     rewrites: &[],
     auth_urls: &[],
     matches_url: never_matches,
