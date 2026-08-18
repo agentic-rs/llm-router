@@ -33,21 +33,21 @@ impl std::fmt::Display for ProviderUrlSource {
   }
 }
 
-/// Account-free transport metadata for one configured provider destination.
+/// Linked metadata for one configured provider destination.
 ///
 /// The descriptor supplies reusable driver behavior, while the target belongs
 /// to the named provider. Keeping this object independent from
 /// [`ProviderBinding`] lets client-credential routes resolve upstream URLs
 /// without manufacturing or selecting an account.
 #[derive(Clone)]
-pub struct ProviderTransport {
+pub struct ProviderDestination {
   provider_id: ProviderId,
   driver_id: DriverId,
   target: ProviderTarget,
   descriptor: &'static ProviderDescriptor,
 }
 
-impl ProviderTransport {
+impl ProviderDestination {
   pub fn provider_id(&self) -> &ProviderId {
     &self.provider_id
   }
@@ -65,10 +65,10 @@ impl ProviderTransport {
   }
 }
 
-impl std::fmt::Debug for ProviderTransport {
+impl std::fmt::Debug for ProviderDestination {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter
-      .debug_struct("ProviderTransport")
+      .debug_struct("ProviderDestination")
       .field("provider_id", &self.provider_id)
       .field("driver_id", &self.driver_id)
       .field("base_url", &self.target.base_url().as_str())
@@ -199,7 +199,7 @@ impl std::fmt::Debug for LinkedAccount {
 /// targets and model caches, while all accounts under one provider share its
 /// target.
 pub struct ProviderGraph {
-  transports: BTreeMap<ProviderId, ProviderTransport>,
+  destinations: BTreeMap<ProviderId, ProviderDestination>,
   bindings: BTreeMap<ProviderBindingKey, Arc<ProviderBinding>>,
   accounts: Box<[LinkedAccount]>,
   account_indices: BTreeMap<SmolStr, usize>,
@@ -207,22 +207,22 @@ pub struct ProviderGraph {
 
 impl ProviderGraph {
   pub fn target(&self, provider: &ProviderId) -> Option<&ProviderTarget> {
-    self.transport(provider).map(ProviderTransport::target)
+    self.destination(provider).map(ProviderDestination::target)
   }
 
   pub fn targets(&self) -> impl ExactSizeIterator<Item = (&ProviderId, &ProviderTarget)> {
     self
-      .transports
+      .destinations
       .iter()
-      .map(|(provider, transport)| (provider, transport.target()))
+      .map(|(provider, destination)| (provider, destination.target()))
   }
 
-  pub fn transport(&self, provider: &ProviderId) -> Option<&ProviderTransport> {
-    self.transports.get(provider)
+  pub fn destination(&self, provider: &ProviderId) -> Option<&ProviderDestination> {
+    self.destinations.get(provider)
   }
 
-  pub fn transports(&self) -> impl ExactSizeIterator<Item = (&ProviderId, &ProviderTransport)> {
-    self.transports.iter()
+  pub fn destinations(&self) -> impl ExactSizeIterator<Item = (&ProviderId, &ProviderDestination)> {
+    self.destinations.iter()
   }
 
   pub fn binding(&self, provider: &ProviderId, account_id: &str) -> Option<&Arc<ProviderBinding>> {
@@ -246,7 +246,7 @@ impl ProviderGraph {
   }
 
   pub fn target_count(&self) -> usize {
-    self.transports.len()
+    self.destinations.len()
   }
 
   pub fn binding_count(&self) -> usize {
@@ -254,7 +254,7 @@ impl ProviderGraph {
   }
 
   pub fn is_empty(&self) -> bool {
-    self.transports.is_empty()
+    self.destinations.is_empty()
   }
 }
 
@@ -262,7 +262,7 @@ impl std::fmt::Debug for ProviderGraph {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter
       .debug_struct("ProviderGraph")
-      .field("transports", &self.transports)
+      .field("destinations", &self.destinations)
       .field("bindings", &self.bindings)
       .field("accounts", &self.accounts)
       .finish()
@@ -316,7 +316,7 @@ pub fn link_provider_graph(
   registry: &Registry,
 ) -> LinkResult<ProviderGraph> {
   let mut accounts = prepare_accounts(accounts)?;
-  let mut transports = BTreeMap::new();
+  let mut destinations = BTreeMap::new();
   let mut bindings = BTreeMap::new();
 
   for (provider_id, provider) in plan.providers() {
@@ -352,9 +352,9 @@ pub fn link_provider_graph(
       base_url: base_url.to_string(),
       source,
     })?;
-    transports.insert(
+    destinations.insert(
       provider_id.clone(),
-      ProviderTransport {
+      ProviderDestination {
         provider_id: provider_id.clone(),
         driver_id: driver_id.clone(),
         target,
@@ -389,7 +389,7 @@ pub fn link_provider_graph(
     }
 
     let driver_id = provider.driver();
-    let target = transports
+    let target = destinations
       .get(&provider_id)
       .expect("every compiled provider target was linked")
       .target()
@@ -432,7 +432,7 @@ pub fn link_provider_graph(
 
   let (accounts, account_indices) = accounts.finish();
   Ok(ProviderGraph {
-    transports,
+    destinations,
     bindings,
     accounts,
     account_indices,
@@ -556,10 +556,13 @@ mod tests {
     let graph = link_provider_graph(&gateway, &[], &Registry::builtin()).unwrap();
 
     assert_eq!(graph.binding_count(), 0);
-    assert_eq!(graph.transport(&id(ID_OPENAI)).unwrap().driver_id().as_str(), ID_OPENAI);
+    assert_eq!(
+      graph.destination(&id(ID_OPENAI)).unwrap().driver_id().as_str(),
+      ID_OPENAI
+    );
     assert_eq!(
       graph
-        .transport(&id(ID_OPENAI))
+        .destination(&id(ID_OPENAI))
         .unwrap()
         .operation_url(Endpoint::Responses)
         .unwrap()
@@ -568,7 +571,7 @@ mod tests {
     );
     assert_eq!(
       graph
-        .transport(&id(ID_CODEX))
+        .destination(&id(ID_CODEX))
         .unwrap()
         .operation_url(Endpoint::Responses)
         .unwrap()
@@ -577,7 +580,7 @@ mod tests {
     );
     assert_eq!(
       graph
-        .transport(&id(ID_DEEPSEEK))
+        .destination(&id(ID_DEEPSEEK))
         .unwrap()
         .operation_url(Endpoint::Messages)
         .unwrap()
@@ -586,7 +589,7 @@ mod tests {
     );
     assert_eq!(
       graph
-        .transport(&custom_deepseek)
+        .destination(&custom_deepseek)
         .unwrap()
         .operation_url(Endpoint::Messages)
         .unwrap()
@@ -595,7 +598,7 @@ mod tests {
     );
     assert_eq!(
       graph
-        .transport(&id(ID_GITHUB_COPILOT))
+        .destination(&id(ID_GITHUB_COPILOT))
         .unwrap()
         .operation_url(Endpoint::Messages)
         .unwrap()
@@ -604,7 +607,7 @@ mod tests {
     );
     assert_eq!(
       graph
-        .transport(&id(ID_LLAMA_CPP))
+        .destination(&id(ID_LLAMA_CPP))
         .unwrap()
         .operation_url(Endpoint::ChatCompletions)
         .unwrap()
@@ -613,7 +616,7 @@ mod tests {
     );
     assert_eq!(
       graph
-        .transport(&id(ID_ZAI))
+        .destination(&id(ID_ZAI))
         .unwrap()
         .operation_url(Endpoint::ChatCompletions)
         .unwrap()
@@ -622,7 +625,7 @@ mod tests {
     );
     assert!(matches!(
       graph
-        .transport(&id(ID_OPENAI))
+        .destination(&id(ID_OPENAI))
         .unwrap()
         .operation_url(Endpoint::Messages),
       Err(ProviderError::UnsupportedEndpoint { .. })
