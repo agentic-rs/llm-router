@@ -838,7 +838,9 @@ path_prefixes = ["/v1"]
 route = "transparent"
 
 [routes.transparent]
-kind = "transparent"
+kind = "relay"
+destination = { kind = "original" }
+credentials = { kind = "client" }
 "#,
   );
   assert!(matches!(

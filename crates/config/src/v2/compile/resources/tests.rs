@@ -1,4 +1,5 @@
 use super::*;
+use tokn_policy::{CredentialPolicy, DestinationPolicy};
 
 fn parse_config(contents: &str) -> RawConfig {
   toml::from_str(contents).unwrap()
@@ -57,6 +58,72 @@ fn compiles_wildcards_and_managed_auto_identity() {
 }
 
 #[test]
+fn compiles_relay_destination_and_credentials_independently() {
+  let mut config = base_config("");
+  config.routes = BTreeMap::from([
+    (
+      "fixed-client".into(),
+      RawRoute::Relay {
+        destination: RawRelayDestination::FixedProvider {
+          provider: "default".into(),
+        },
+        credentials: RawRelayCredentials::Client {},
+      },
+    ),
+    (
+      "fixed-pool".into(),
+      RawRoute::Relay {
+        destination: RawRelayDestination::FixedProvider {
+          provider: "default".into(),
+        },
+        credentials: RawRelayCredentials::AccountPool {
+          account_pool: "default".into(),
+        },
+      },
+    ),
+    (
+      "original-client".into(),
+      RawRoute::Relay {
+        destination: RawRelayDestination::Original {},
+        credentials: RawRelayCredentials::Client {},
+      },
+    ),
+    (
+      "original-pool".into(),
+      RawRoute::Relay {
+        destination: RawRelayDestination::Original {},
+        credentials: RawRelayCredentials::AccountPool {
+          account_pool: "default".into(),
+        },
+      },
+    ),
+  ]);
+  config.profiles.clear();
+
+  let compiled = compile_resources(&config).unwrap();
+  let axes = |id: &str| {
+    let route = &compiled.routes[&RouteId::new(id).unwrap()];
+    (route.destination_policy(), route.credential_policy())
+  };
+  assert_eq!(
+    axes("fixed-client"),
+    (DestinationPolicy::SelectedProvider, CredentialPolicy::Client)
+  );
+  assert_eq!(
+    axes("fixed-pool"),
+    (DestinationPolicy::SelectedProvider, CredentialPolicy::Account)
+  );
+  assert_eq!(
+    axes("original-client"),
+    (DestinationPolicy::Original, CredentialPolicy::Client)
+  );
+  assert_eq!(
+    axes("original-pool"),
+    (DestinationPolicy::Original, CredentialPolicy::Account)
+  );
+}
+
+#[test]
 fn shared_origin_is_allowed_when_no_origin_route_needs_unique_ownership() {
   let config = base_config(
     r#"
@@ -91,7 +158,8 @@ origins = ["https://example.com"]
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
-      target: RawRelayTarget::ProviderFromOrigin {
+      destination: RawRelayDestination::Original {},
+      credentials: RawRelayCredentials::AccountPool {
         account_pool: "default".into(),
       },
     },
@@ -155,9 +223,15 @@ driver = "zai"
 }
 
 #[test]
-fn transparent_auto_is_none_but_explicit_identity_is_rejected() {
+fn client_credentials_auto_is_none_but_explicit_identity_is_rejected() {
   let mut config = base_config("");
-  config.routes.insert("default".into(), RawRoute::Transparent {});
+  config.routes.insert(
+    "default".into(),
+    RawRoute::Relay {
+      destination: RawRelayDestination::Original {},
+      credentials: RawRelayCredentials::Client {},
+    },
+  );
   let compiled = compile_resources(&config.clone()).unwrap();
   assert_eq!(
     compiled.profiles[&ProfileId::new("default").unwrap()].wire_identity(),
@@ -217,7 +291,8 @@ driver = "zai"
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
-      target: RawRelayTarget::ProviderFromOrigin {
+      destination: RawRelayDestination::Original {},
+      credentials: RawRelayCredentials::AccountPool {
         account_pool: "default".into(),
       },
     },
@@ -238,7 +313,8 @@ driver = "openai"
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
-      target: RawRelayTarget::ProviderFromOrigin {
+      destination: RawRelayDestination::Original {},
+      credentials: RawRelayCredentials::AccountPool {
         account_pool: "default".into(),
       },
     },

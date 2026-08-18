@@ -185,7 +185,9 @@ default_connect = "reject"
 route = "transparent"
 
 [routes.transparent]
-kind = "transparent"
+kind = "relay"
+destination = {{ kind = "original" }}
+credentials = {{ kind = "client" }}
 "#
   );
   let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
@@ -273,7 +275,9 @@ default_connect = "reject"
 route = "transparent"
 
 [routes.transparent]
-kind = "transparent"
+kind = "relay"
+destination = {{ kind = "original" }}
+credentials = {{ kind = "client" }}
 "#
   );
   let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
@@ -437,7 +441,8 @@ route = "relay"
 
 [routes.relay]
 kind = "relay"
-target = {{ kind = "provider_from_origin", account_pool = "primary" }}
+destination = {{ kind = "original" }}
+credentials = {{ kind = "account_pool", account_pool = "primary" }}
 
 [account_pools.primary]
 accounts = ["acct"]

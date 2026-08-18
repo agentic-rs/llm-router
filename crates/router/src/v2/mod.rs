@@ -9,7 +9,9 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use selector::{PoolAwareSend, ProxyPoolAwareSend, V2AccountSelector, V2ProxyResolve, V2_PROXY_ORIGIN_KEY};
+use selector::{
+  PoolAwareSend, ProxyPoolAwareSend, V2AccountSelector, V2ClientResolve, V2ProxyResolve, V2_PROXY_ORIGIN_KEY,
+};
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
@@ -18,7 +20,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokn_access::AccessContext;
 use tokn_accounts::link::{
-  build_account_pool_runtimes, link_account_pools, link_provider_graph, AccountPoolRuntimes, ProviderGraph,
+  build_account_pool_runtimes, link_account_pools, link_provider_graph, AccountPoolRuntimes, ProviderDestination,
+  ProviderGraph,
 };
 use tokn_accounts::registry::Registry;
 use tokn_core::account::AccountConfig;
@@ -27,13 +30,13 @@ use tokn_core::provider::Endpoint;
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_core::AgentId;
 use tokn_policy::{
-  CanonicalAuthority, CanonicalHost, ClientAuthPlan, ConnectAction, ForwardProxyListenerPlan, GatewayPlan, HttpAction,
-  HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ProfileId, RelayRetry,
-  RelayTarget, RouteKind, RoutePlan, WireIdentity,
+  CanonicalAuthority, CanonicalHost, ClientAuthPlan, ConnectAction, CredentialPolicy, ForwardProxyListenerPlan,
+  GatewayPlan, HttpAction, HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry,
+  ProfileId, ProviderId, RelayCredentials, RelayDestination, RelayRetry, RouteKind, RoutePlan, WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
-  PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve, ProxyResolve, ProxySend,
+  PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve, ProxySend,
 };
 use tokn_requests::{ExecutionRequest, Pipeline, Profile, RawInbound, RequestService, RunConfig};
 use tower_http::request_id::SetRequestIdLayer;
@@ -45,14 +48,19 @@ struct ProfileRuntime {
   api_service: Option<tokn_service::HttpService>,
   proxy_service: Option<tokn_service::HttpService>,
   route_kind: RouteKind,
+  credential_policy: CredentialPolicy,
   agent_id: Option<AgentId>,
+  api_destination: Option<ProviderDestination>,
   proxy_destination: ProxyDestination,
 }
 
 #[derive(Clone)]
 enum ProxyDestination {
   Managed,
-  Fixed(CanonicalUpstreamUrl),
+  Fixed {
+    provider: ProviderId,
+    base: CanonicalUpstreamUrl,
+  },
   Original,
 }
 
@@ -281,13 +289,17 @@ impl ForwardProxyState {
     let (destination_scheme, destination_authority, destination_path) =
       proxy_destination(runtime, ingress, scheme, path_and_query)?;
     let origin = canonical_origin(scheme, ingress);
+    let provider_id = match &runtime.proxy_destination {
+      ProxyDestination::Fixed { provider, .. } => provider.to_string(),
+      ProxyDestination::Managed | ProxyDestination::Original => origin.clone(),
+    };
     let mut config = RunConfig::builder()
       .with_agent_id_opt(runtime.agent_id.clone())
       .with_str(
         tokn_requests::stages::resolve::proxy::keys::HOST,
         destination_authority.clone(),
       )
-      .with_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID, origin.clone())
+      .with_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID, provider_id)
       .with_str(
         tokn_requests::stages::resolve::proxy::keys::PATH,
         destination_path.clone(),
@@ -302,7 +314,7 @@ impl ForwardProxyState {
         destination_scheme,
       )
       .with_str(V2_PROXY_ORIGIN_KEY, origin);
-    if runtime.route_kind == RouteKind::Relay {
+    if runtime.credential_policy == CredentialPolicy::Account {
       config = config.with(tokn_requests::stages::send::proxy::send_keys::INJECT_AUTH, true);
     }
     if let Some(providers) = access.providers.provider_ids() {
@@ -517,7 +529,7 @@ fn build_profile_runtimes(
       )
     })?;
     let agent_id = wire_agent(profile_plan.wire_identity());
-    let (api_service, proxy_service, proxy_destination) = match route {
+    let (api_service, proxy_service, api_destination, proxy_destination) = match route {
       RoutePlan::Managed(route) => {
         if route.header_patches().is_some() || !matches!(route.retry(), ManagedRetry::Never) {
           anyhow::bail!("profile '{profile_id}' uses unsupported managed patches or retry policy");
@@ -541,7 +553,7 @@ fn build_profile_runtimes(
           PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
         };
         let service = RequestService::http_from_pipeline(Arc::new(Pipeline::new(Arc::new(profile), events.clone())));
-        (Some(service.clone()), Some(service), ProxyDestination::Managed)
+        (Some(service.clone()), Some(service), None, ProxyDestination::Managed)
       }
       RoutePlan::Relay(route) => {
         if route.header_patches().is_some() || !matches!(route.retry(), RelayRetry::Never) {
@@ -556,8 +568,18 @@ fn build_profile_runtimes(
           opaque_http.clone(),
           events.clone(),
         )?;
-        let (api_service, destination) = match route.target() {
-          RelayTarget::FixedProvider { provider, .. } => {
+        let linked_destination = match route.destination() {
+          RelayDestination::Original => None,
+          RelayDestination::FixedProvider(provider) => Some(
+            providers
+              .destination(provider)
+              .cloned()
+              .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' references missing provider '{provider}'"))?,
+          ),
+        };
+        let (api_service, api_destination) = match (route.destination(), route.credentials()) {
+          (RelayDestination::Original, _) => (None, None),
+          (RelayDestination::FixedProvider(_), RelayCredentials::AccountPool(_)) => {
             let (selector, selection_state) =
               V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
             let name = format!("v2-{profile_id}-api");
@@ -577,49 +599,58 @@ fn build_profile_runtimes(
               ),
               PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
             };
-            let target = providers
-              .target(provider)
-              .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' references missing provider '{provider}'"))?;
             (
               Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
                 Arc::new(profile),
                 events.clone(),
               )))),
-              ProxyDestination::Fixed(target.base_url().clone()),
+              None,
             )
           }
-          RelayTarget::ProviderFromOrigin { .. } => (None, ProxyDestination::Original),
+          (RelayDestination::FixedProvider(provider), RelayCredentials::Client) => {
+            let name = format!("v2-{profile_id}-api");
+            let extract = Arc::new(PassthroughExtract);
+            let resolve = Arc::new(V2ClientResolve::new(Some(provider.clone())));
+            let build_headers = Arc::new(PassthroughBuildHeaders::new());
+            let convert_request = Arc::new(PassthroughConvertRequest);
+            let profile = match mode {
+              PipelineMode::Full => Profile::full(
+                name,
+                extract,
+                resolve,
+                build_headers,
+                convert_request,
+                Arc::new(ProxySend::forward_all_statuses(opaque_http.clone())),
+                Arc::new(PassthroughConvertResponse::new()),
+              ),
+              PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
+            };
+            (
+              Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
+                Arc::new(profile),
+                events.clone(),
+              )))),
+              linked_destination.clone(),
+            )
+          }
         };
-        (api_service, Some(proxy_service), destination)
-      }
-      RoutePlan::Transparent(route) => {
-        if route.header_patches().is_some() {
-          anyhow::bail!("profile '{profile_id}' uses unsupported transparent patches");
-        }
-        let profile = Profile::full(
-          format!("v2-{profile_id}"),
-          Arc::new(PassthroughExtract),
-          Arc::new(ProxyResolve),
-          Arc::new(PassthroughBuildHeaders::preserve_host()),
-          Arc::new(PassthroughConvertRequest),
-          Arc::new(ProxySend::forward_all_statuses(opaque_http.clone())),
-          Arc::new(PassthroughConvertResponse::new()),
-        );
-        (
-          None,
-          Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
-            Arc::new(profile),
-            events.clone(),
-          )))),
-          ProxyDestination::Original,
-        )
+        let proxy_destination = match linked_destination {
+          Some(destination) => ProxyDestination::Fixed {
+            provider: destination.provider_id().clone(),
+            base: destination.target().base_url().clone(),
+          },
+          None => ProxyDestination::Original,
+        };
+        (api_service, Some(proxy_service), api_destination, proxy_destination)
       }
     };
     let runtime = ProfileRuntime {
       api_service,
       proxy_service,
       route_kind: route.kind(),
+      credential_policy: route.credential_policy(),
       agent_id,
+      api_destination,
       proxy_destination,
     };
     profiles.insert(profile_id, runtime);
@@ -636,20 +667,48 @@ fn build_proxy_relay_service(
   http: reqwest::Client,
   events: Arc<EventBus>,
 ) -> anyhow::Result<tokn_service::HttpService> {
-  let origins = match route.target() {
-    RelayTarget::FixedProvider { .. } => BTreeMap::new(),
-    RelayTarget::ProviderFromOrigin { account_pool } => provider_origins(plan, providers, pools, account_pool)?,
+  let name = format!("v2-{profile_id}-proxy");
+  let profile = match route.credentials() {
+    RelayCredentials::AccountPool(account_pool) => {
+      let origins = match route.destination() {
+        RelayDestination::FixedProvider(_) => BTreeMap::new(),
+        RelayDestination::Original => provider_origins(plan, providers, pools, account_pool)?,
+      };
+      let (resolve, selection_state) = V2ProxyResolve::new(route, pools, origins)?;
+      let build_headers = match route.destination() {
+        RelayDestination::FixedProvider(_) => PassthroughBuildHeaders::router_auth(),
+        RelayDestination::Original => PassthroughBuildHeaders::preserve_host_with_router_auth(),
+      };
+      Profile::full(
+        name,
+        Arc::new(PassthroughExtract),
+        Arc::new(resolve),
+        Arc::new(build_headers),
+        Arc::new(PassthroughConvertRequest),
+        Arc::new(ProxyPoolAwareSend::new(http, selection_state)),
+        Arc::new(PassthroughConvertResponse::new()),
+      )
+    }
+    RelayCredentials::Client => {
+      let fixed_provider = match route.destination() {
+        RelayDestination::FixedProvider(provider) => Some(provider.clone()),
+        RelayDestination::Original => None,
+      };
+      let build_headers = match route.destination() {
+        RelayDestination::FixedProvider(_) => PassthroughBuildHeaders::new(),
+        RelayDestination::Original => PassthroughBuildHeaders::preserve_host(),
+      };
+      Profile::full(
+        name,
+        Arc::new(PassthroughExtract),
+        Arc::new(V2ClientResolve::new(fixed_provider)),
+        Arc::new(build_headers),
+        Arc::new(PassthroughConvertRequest),
+        Arc::new(ProxySend::forward_all_statuses(http)),
+        Arc::new(PassthroughConvertResponse::new()),
+      )
+    }
   };
-  let (resolve, selection_state) = V2ProxyResolve::new(route, pools, origins)?;
-  let profile = Profile::full(
-    format!("v2-{profile_id}-proxy"),
-    Arc::new(PassthroughExtract),
-    Arc::new(resolve),
-    Arc::new(PassthroughBuildHeaders::preserve_host_with_router_auth()),
-    Arc::new(PassthroughConvertRequest),
-    Arc::new(ProxyPoolAwareSend::new(http, selection_state)),
-    Arc::new(PassthroughConvertResponse::new()),
-  );
   Ok(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
     Arc::new(profile),
     events,
@@ -723,7 +782,7 @@ fn proxy_destination(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
       Ok(url_destination(url))
     }
-    ProxyDestination::Fixed(base) => {
+    ProxyDestination::Fixed { base, .. } => {
       let url = base
         .relay_url(&path_and_query)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -813,6 +872,16 @@ async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, 
   if request.uri().path() == "/healthz" {
     request.extensions_mut().insert(AccessContext::unrestricted());
     return next.run(request).await;
+  }
+
+  if let Some(endpoint) = Endpoint::infer_from(request.uri().path()) {
+    match state.select_profile(request.method(), request.uri(), request.headers(), endpoint) {
+      Ok(runtime) if runtime.credential_policy == CredentialPolicy::Client => {
+        request.extensions_mut().insert(AccessContext::unrestricted());
+        return next.run(request).await;
+      }
+      Ok(_) | Err(_) => {}
+    }
   }
 
   let context = match state.listener.client_auth() {
@@ -920,6 +989,25 @@ async fn handle(
     request_id,
   };
   let mut config = RunConfig::builder().with_agent_id_opt(runtime.agent_id.clone());
+  if let Some(destination) = &runtime.api_destination {
+    let url = destination.operation_url(endpoint).map_err(|error| {
+      ApiError::internal(format!(
+        "resolve operation URL for provider '{}': {error}",
+        destination.provider_id()
+      ))
+    })?;
+    let (scheme, authority, path) = url_destination(url);
+    config = config
+      .with_str(tokn_requests::stages::resolve::proxy::keys::HOST, authority)
+      .with_str(
+        tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID,
+        destination.provider_id().to_string(),
+      )
+      .with_str(tokn_requests::stages::resolve::proxy::keys::PATH, path.clone())
+      .with_str(tokn_requests::stages::send::proxy::send_keys::PATH, path)
+      .with_str(tokn_requests::stages::send::proxy::send_keys::METHOD, method.as_str())
+      .with_str(tokn_requests::stages::send::proxy::send_keys::SCHEME, scheme);
+  }
   if let Some(providers) = access.providers.provider_ids() {
     config = config.with(
       tokn_requests::stages::ACCESS_ALLOWED_PROVIDERS_KEY,

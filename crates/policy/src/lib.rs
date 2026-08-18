@@ -20,8 +20,8 @@ pub use id::{
 };
 pub use route::{
   CredentialPolicy, DestinationPolicy, FallbackSelector, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget,
-  ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, ProviderSelector, QualificationNamespace, RelayRetry,
-  RelayRoute, RelayTarget, RouteKind, RoutePlan, WireIdentity,
+  ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, ProviderSelector, QualificationNamespace,
+  RelayCredentials, RelayDestination, RelayRetry, RelayRoute, RouteKind, RoutePlan, WireIdentity,
 };
 pub use topology::{
   AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
