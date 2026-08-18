@@ -4,7 +4,7 @@ use std::path::Path;
 use tokn_config::v2::{
   CompiledConfig, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawListener, RawModelSelector,
   RawOperationPolicy, RawOutbound, RawPersistence, RawProfile, RawProviderSelector, RawQualificationNamespace,
-  RawRelayTarget, RawRequestLimits, RawRoute, RawService, SCHEMA_VERSION,
+  RawRelayCredentials, RawRelayDestination, RawRequestLimits, RawRoute, RawService, SCHEMA_VERSION,
 };
 use tokn_config::{Config, RouteMode};
 use tokn_core::account::AccountConfig;
@@ -198,8 +198,8 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
           policy: policy.location.clone(),
         })?;
       Ok(RawRoute::Relay {
-        target: RawRelayTarget::FixedProvider {
-          provider,
+        destination: RawRelayDestination::FixedProvider { provider },
+        credentials: RawRelayCredentials::AccountPool {
           account_pool: account_pool.to_string(),
         },
       })
@@ -358,7 +358,8 @@ mod tests {
     assert!(matches!(
       projection.raw_config().routes["default"],
       RawRoute::Relay {
-        target: RawRelayTarget::FixedProvider { ref provider, .. }
+        destination: RawRelayDestination::FixedProvider { ref provider },
+        credentials: RawRelayCredentials::AccountPool { .. }
       } if provider == "openai"
     ));
     assert_eq!(

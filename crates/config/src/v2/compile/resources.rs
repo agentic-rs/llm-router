@@ -1,7 +1,7 @@
 use crate::v2::{
   CompileError, RawAccountPool, RawConfig, RawFallbackSelector, RawModelCandidate, RawModelSelector,
   RawOperationPolicy, RawPoolStrategy, RawProfile, RawProvider, RawProviderSelector, RawQualificationNamespace,
-  RawRelayTarget, RawRoute, RawWireIdentity,
+  RawRelayCredentials, RawRelayDestination, RawRoute, RawWireIdentity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -10,8 +10,8 @@ use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, Clearte
 use tokn_policy::{
   AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, DriverId, FallbackSelector, ManagedRetry,
   ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan, ModelSelector, OperationPolicy, ProfileId,
-  ProfilePlan, ProviderId, ProviderOrigin, ProviderPlan, ProviderSelector, QualificationNamespace, RelayRetry,
-  RelayRoute, RelayTarget, RouteId, RouteKind, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
+  ProfilePlan, ProviderId, ProviderOrigin, ProviderPlan, ProviderSelector, QualificationNamespace, RelayCredentials,
+  RelayDestination, RelayRetry, RelayRoute, RouteId, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
 };
 
 const MAX_FAILURE_COOLDOWN_SECS: u64 = 86_400;
@@ -414,26 +414,37 @@ fn compile_routes(
             ManagedRetry::Never,
           ))
         }
-        RawRoute::Relay { target } => {
-          let target = match target {
-            RawRelayTarget::ProviderFromOrigin { account_pool } => {
-              let pool_id = resolve_pool(raw_id, "target.account_pool", account_pool, pools)?;
-              ensure_origin_relay_viable(raw_id, &pool_id, pools, providers)?;
-              RelayTarget::ProviderFromOrigin { account_pool: pool_id }
-            }
-            RawRelayTarget::FixedProvider { provider, account_pool } => {
-              let pool_id = resolve_pool(raw_id, "target.account_pool", account_pool, pools)?;
-              let provider_id = resolve_provider("route", raw_id, "target.provider", provider, providers)?;
-              ensure_fixed_provider_compatible(raw_id, "target.provider", &pool_id, &provider_id, pools)?;
-              RelayTarget::FixedProvider {
-                provider: provider_id,
-                account_pool: pool_id,
-              }
+        RawRoute::Relay {
+          destination,
+          credentials,
+        } => {
+          let destination = match destination {
+            RawRelayDestination::Original {} => RelayDestination::Original,
+            RawRelayDestination::FixedProvider { provider } => RelayDestination::FixedProvider(resolve_provider(
+              "route",
+              raw_id,
+              "destination.provider",
+              provider,
+              providers,
+            )?),
+          };
+          let credentials = match credentials {
+            RawRelayCredentials::Client {} => RelayCredentials::Client,
+            RawRelayCredentials::AccountPool { account_pool } => {
+              RelayCredentials::AccountPool(resolve_pool(raw_id, "credentials.account_pool", account_pool, pools)?)
             }
           };
-          RoutePlan::Relay(RelayRoute::new(target, None, RelayRetry::Never))
+          match (&destination, &credentials) {
+            (RelayDestination::FixedProvider(provider), RelayCredentials::AccountPool(pool)) => {
+              ensure_fixed_provider_compatible(raw_id, "destination.provider", pool, provider, pools)?;
+            }
+            (RelayDestination::Original, RelayCredentials::AccountPool(pool)) => {
+              ensure_origin_relay_viable(raw_id, pool, pools, providers)?;
+            }
+            (_, RelayCredentials::Client) => {}
+          }
+          RoutePlan::Relay(RelayRoute::new(destination, credentials, None, RelayRetry::Never))
         }
-        RawRoute::Transparent {} => RoutePlan::Transparent(Default::default()),
       };
 
       Ok((id, plan))
@@ -648,7 +659,7 @@ fn ensure_origin_relay_viable(
 
   if !has_viable_provider {
     return Err(invalid_value(
-      format!("routes.{route_id}.target"),
+      format!("routes.{route_id}.destination"),
       format!(
         "origin-based relay requires a provider with a configured or driver-default origin compatible with account pool `{pool_id}`"
       ),
@@ -673,7 +684,7 @@ fn compile_profiles(
         target_kind: "route",
         target: raw_profile.route.clone(),
       })?;
-      let wire_identity = compile_wire_identity(raw_id, &raw_profile.wire_identity, route.kind())?;
+      let wire_identity = compile_wire_identity(raw_id, &raw_profile.wire_identity, route)?;
       Ok((id, ProfilePlan::new(route_id, wire_identity)))
     })
     .collect()
@@ -682,21 +693,21 @@ fn compile_profiles(
 fn compile_wire_identity(
   profile_id: &str,
   raw: &RawWireIdentity,
-  route_kind: RouteKind,
+  route: &RoutePlan,
 ) -> Result<WireIdentity, CompileError> {
   let location = format!("profiles.{profile_id}.wire_identity");
   match raw {
-    RawWireIdentity::Auto => match route_kind {
-      RouteKind::Managed | RouteKind::Relay => Ok(WireIdentity::ProviderDefault),
-      RouteKind::Transparent => Ok(WireIdentity::None),
-    },
+    RawWireIdentity::Auto if route.credential_policy() == tokn_policy::CredentialPolicy::Client => {
+      Ok(WireIdentity::None)
+    }
+    RawWireIdentity::Auto => Ok(WireIdentity::ProviderDefault),
     RawWireIdentity::None => Ok(WireIdentity::None),
     RawWireIdentity::ProviderDefault => {
-      reject_transparent_wire_identity(route_kind, location)?;
+      reject_client_credentials_wire_identity(route, location)?;
       Ok(WireIdentity::ProviderDefault)
     }
     RawWireIdentity::Named(raw_id) => {
-      reject_transparent_wire_identity(route_kind, location)?;
+      reject_client_credentials_wire_identity(route, location)?;
       // Named identities are runtime/plugin-owned names, not references to a
       // config registry. The runtime linker must reject names it cannot
       // materialize before starting listeners.
@@ -708,11 +719,11 @@ fn compile_wire_identity(
   }
 }
 
-fn reject_transparent_wire_identity(route_kind: RouteKind, location: String) -> Result<(), CompileError> {
-  if route_kind == RouteKind::Transparent {
+fn reject_client_credentials_wire_identity(route: &RoutePlan, location: String) -> Result<(), CompileError> {
+  if route.credential_policy() == tokn_policy::CredentialPolicy::Client {
     return Err(invalid_value(
       location,
-      "transparent routes preserve client identity; use `auto` or `none`",
+      "routes with client credentials preserve client identity; use `auto` or `none`",
     ));
   }
   Ok(())

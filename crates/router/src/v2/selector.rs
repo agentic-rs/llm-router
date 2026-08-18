@@ -7,7 +7,7 @@ use tokn_accounts::AccountHandle;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_policy::{
   AccountPoolId, DriverId, FallbackSelector, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProviderId,
-  ProviderSelector, QualificationNamespace, RelayRoute, RelayTarget, RouteId, RoutePlan,
+  ProviderSelector, QualificationNamespace, RelayCredentials, RelayDestination, RelayRoute, RouteId, RoutePlan,
 };
 use tokn_requests::event::Stage;
 use tokn_requests::pipeline::ctx::PipelineCtx;
@@ -16,7 +16,7 @@ use tokn_requests::pipeline::stages::{
   BuiltHeaders, ConvertedRequest, Extracted, ResolveStage, Resolved, ResolvedRoute, SendStage, SentResponse,
 };
 use tokn_requests::stages::{
-  resolve::proxy::keys as proxy_keys, AccountSelector, DefaultSend, ProxySend, SelectorOutcome,
+  resolve::proxy::keys as proxy_keys, AccountSelector, DefaultSend, ProxyResolve, ProxySend, SelectorOutcome,
   ACCESS_ALLOWED_PROVIDERS_KEY,
 };
 
@@ -64,9 +64,8 @@ impl V2AccountSelector {
     let route = plan
       .route(&route_id)
       .ok_or_else(|| anyhow::anyhow!("profile references missing route '{route_id}'"))?;
-    let pool_id = route_pool(route).ok_or_else(|| {
-      anyhow::anyhow!("route '{route_id}' requires an original destination and cannot run on an LLM API listener")
-    })?;
+    let pool_id =
+      route_pool(route).ok_or_else(|| anyhow::anyhow!("route '{route_id}' does not use account-pool credentials"))?;
     let pool = pools
       .runtime(pool_id)
       .cloned()
@@ -135,7 +134,7 @@ impl V2AccountSelector {
     route: &RelayRoute,
   ) -> Result<SelectorOutcome, PipelineError> {
     let endpoint = resolved_endpoint(ctx)?;
-    let RelayTarget::FixedProvider { provider, .. } = route.target() else {
+    let RelayDestination::FixedProvider(provider) = route.destination() else {
       return Err(invalid_route_request(
         "origin-based relay cannot run on an LLM API listener",
       ));
@@ -161,10 +160,42 @@ impl AccountSelector for V2AccountSelector {
     match self.route() {
       RoutePlan::Managed(route) => self.select_managed(ctx, extracted, route),
       RoutePlan::Relay(route) => self.select_relay(ctx, extracted, route),
-      RoutePlan::Transparent(_) => Err(invalid_route_request(
-        "transparent routes cannot run on an LLM API listener",
-      )),
     }
+  }
+}
+
+pub(super) struct V2ClientResolve {
+  fixed_provider: Option<ProviderId>,
+}
+
+impl V2ClientResolve {
+  pub(super) fn new(fixed_provider: Option<ProviderId>) -> Self {
+    Self { fixed_provider }
+  }
+}
+
+#[async_trait]
+impl ResolveStage for V2ClientResolve {
+  async fn resolve(&self, ctx: &PipelineCtx, extracted: &Extracted) -> Result<Resolved, PipelineError> {
+    if let Some(provider) = &self.fixed_provider {
+      let allowed = allowed_provider_ids(ctx)?;
+      if !provider_allowed(provider.as_str(), allowed.as_ref()) {
+        return Err(PipelineError::permanent(
+          Stage::Resolve,
+          RequestsError::ProviderAccessDenied,
+        ));
+      }
+    }
+    let resolved = ProxyResolve.resolve(ctx, extracted).await?;
+    if let Some(provider) = &self.fixed_provider {
+      if resolved.provider_id.as_str() != provider.as_str() {
+        return Err(invalid_route_request(format!(
+          "fixed relay expected provider '{provider}', got '{}'",
+          resolved.provider_id
+        )));
+      }
+    }
+    Ok(resolved)
   }
 }
 
@@ -189,15 +220,18 @@ impl V2ProxyResolve {
     pools: &AccountPoolRuntimes,
     origins: BTreeMap<String, ProviderId>,
   ) -> anyhow::Result<(Self, Arc<SelectionState>)> {
-    let pool_id = route.target().account_pool();
+    let pool_id = route
+      .credentials()
+      .account_pool()
+      .ok_or_else(|| anyhow::anyhow!("client-credential relay route does not have an account pool"))?;
     let pool = pools
       .runtime(pool_id)
       .cloned()
       .ok_or_else(|| anyhow::anyhow!("relay route references missing account pool '{pool_id}'"))?;
     let state = Arc::new(SelectionState::new(pool));
-    let target = match route.target() {
-      RelayTarget::FixedProvider { provider, .. } => ProxyRelayTarget::Fixed(provider.clone()),
-      RelayTarget::ProviderFromOrigin { .. } => ProxyRelayTarget::FromOrigin(origins),
+    let target = match route.destination() {
+      RelayDestination::FixedProvider(provider) => ProxyRelayTarget::Fixed(provider.clone()),
+      RelayDestination::Original => ProxyRelayTarget::FromOrigin(origins),
     };
     Ok((
       Self {
@@ -382,11 +416,10 @@ impl SendStage for PoolAwareSend {
 fn route_pool(route: &RoutePlan) -> Option<&AccountPoolId> {
   match route {
     RoutePlan::Managed(route) => Some(route.target().account_pool()),
-    RoutePlan::Relay(route) => match route.target() {
-      RelayTarget::FixedProvider { account_pool, .. } => Some(account_pool),
-      RelayTarget::ProviderFromOrigin { .. } => None,
+    RoutePlan::Relay(route) => match route.credentials() {
+      RelayCredentials::Client => None,
+      RelayCredentials::AccountPool(account_pool) => Some(account_pool),
     },
-    RoutePlan::Transparent(_) => None,
   }
 }
 

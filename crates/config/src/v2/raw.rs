@@ -289,9 +289,9 @@ pub enum RawWireIdentity {
   Named(String),
 }
 
-/// Request-handling policy. The route family fixes the payload, credentials,
-/// destination, and base header behavior; only valid family-specific choices
-/// are representable here.
+/// Request-handling policy. Managed routes decode supported LLM operations;
+/// relay routes preserve payload bytes and choose destination and credentials
+/// independently.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawRoute {
@@ -302,9 +302,9 @@ pub enum RawRoute {
     operation: RawOperationPolicy,
   },
   Relay {
-    target: RawRelayTarget,
+    destination: RawRelayDestination,
+    credentials: RawRelayCredentials,
   },
-  Transparent {},
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -345,9 +345,16 @@ pub enum RawOperationPolicy {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RawRelayTarget {
-  ProviderFromOrigin { account_pool: String },
-  FixedProvider { provider: String, account_pool: String },
+pub enum RawRelayDestination {
+  Original {},
+  FixedProvider { provider: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RawRelayCredentials {
+  Client {},
+  AccountPool { account_pool: String },
 }
 
 /// Account selection and affinity settings for one independently managed

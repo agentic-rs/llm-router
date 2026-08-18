@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokn_auth::ProviderAuth;
 use tokn_core::account::AccountConfig;
 use tokn_core::provider::official_provider_preset;
-use tokn_policy::{AccountPoolPlan, GatewayPlan, RelayTarget, RoutePlan};
+use tokn_policy::{AccountPoolPlan, GatewayPlan, RelayCredentials, RoutePlan};
 
 /// The configuration details needed by account and credential commands.
 ///
@@ -177,9 +177,8 @@ impl ConfigContext {
         let route = gateway
           .route(route_id)
           .expect("compiled v2 profile references an existing route");
-        let pool_id = route_account_pool(route).ok_or_else(|| {
-          anyhow!("profile '{canonical_profile_id}' uses a transparent route and has no account pool")
-        })?;
+        let pool_id = route_account_pool(route)
+          .ok_or_else(|| anyhow!("profile '{canonical_profile_id}' uses client credentials and has no account pool"))?;
         let pool = gateway
           .account_pool(pool_id)
           .expect("compiled v2 route references an existing account pool");
@@ -247,12 +246,10 @@ fn v2_account_view(gateway: &GatewayPlan, pool: &AccountPoolPlan, description: S
 fn route_account_pool(route: &RoutePlan) -> Option<&tokn_policy::AccountPoolId> {
   match route {
     RoutePlan::Managed(route) => Some(route.target().account_pool()),
-    RoutePlan::Relay(route) => Some(match route.target() {
-      RelayTarget::ProviderFromOrigin { account_pool } | RelayTarget::FixedProvider { account_pool, .. } => {
-        account_pool
-      }
-    }),
-    RoutePlan::Transparent(_) => None,
+    RoutePlan::Relay(route) => match route.credentials() {
+      RelayCredentials::Client => None,
+      RelayCredentials::AccountPool(account_pool) => Some(account_pool),
+    },
   }
 }
 

@@ -18,6 +18,91 @@ struct CapturedRequest {
 }
 
 #[tokio::test]
+async fn fixed_provider_client_relay_preserves_client_credentials_without_accounts() {
+  let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(1);
+  let upstream = Router::new()
+    .route(
+      "/{*path}",
+      any(
+        |State(capture_tx): State<tokio::sync::mpsc::Sender<CapturedRequest>>,
+         uri: Uri,
+         headers: HeaderMap,
+         body: Bytes| async move {
+          capture_tx.send(CapturedRequest { uri, headers, body }).await.unwrap();
+          Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"client_relay":"unchanged"}"#))
+            .unwrap()
+        },
+      ),
+    )
+    .with_state(capture_tx);
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let upstream_addr = listener.local_addr().unwrap();
+  let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "local_keys"
+default_http_action = {{ kind = "route", profile = "client-relay" }}
+
+[profiles.client-relay]
+route = "client-relay"
+
+[routes.client-relay]
+kind = "relay"
+destination = {{ kind = "fixed_provider", provider = "local" }}
+credentials = {{ kind = "client" }}
+
+[providers.local]
+driver = "openai"
+base_url = "http://{upstream_addr}/v1"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-client-relay.toml")).unwrap();
+  let states =
+    tokn_router::v2::build_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop())).unwrap();
+  let app = tokn_router::v2::router(states.into_iter().next().unwrap());
+  let body = Bytes::from_static(br#"{"model":"gpt-4o","input":"hello","opaque":true}"#);
+
+  let response = app
+    .oneshot(
+      Request::post("/v1/responses")
+        .header("host", "gateway.example")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer client-secret")
+        .header("x-api-key", "client-key")
+        .body(Body::from(body.clone()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  let status = response.status();
+  let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+  assert_eq!(
+    status,
+    StatusCode::OK,
+    "client relay response: {}",
+    String::from_utf8_lossy(&response_body)
+  );
+  assert_eq!(response_body.as_ref(), br#"{"client_relay":"unchanged"}"#);
+
+  let captured = capture_rx.recv().await.unwrap();
+  assert_eq!(captured.uri.path(), "/v1/responses");
+  assert_eq!(captured.headers["authorization"], "Bearer client-secret");
+  assert_eq!(captured.headers["x-api-key"], "client-key");
+  assert_ne!(captured.headers["host"], "gateway.example");
+  assert_eq!(captured.body, body);
+
+  server.abort();
+}
+
+#[tokio::test]
 async fn v2_listener_selects_managed_and_relay_six_stage_pipelines() {
   let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(2);
   let upstream = Router::new()
@@ -88,7 +173,8 @@ operation = "preserve"
 
 [routes.relay]
 kind = "relay"
-target = {{ kind = "fixed_provider", provider = "local", account_pool = "primary" }}
+destination = {{ kind = "fixed_provider", provider = "local" }}
+credentials = {{ kind = "account_pool", account_pool = "primary" }}
 
 [account_pools.primary]
 accounts = ["acct"]

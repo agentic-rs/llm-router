@@ -479,9 +479,10 @@ impl ConnectRulePlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectAction {
   /// Terminate TLS, then evaluate the decoded request against the listener's
-  /// HTTP bindings. Those bindings may select any route family, including a
-  /// transparent route. The immutable CONNECT authority remains the request's
-  /// original destination; an inner authority mismatch is rejected.
+  /// HTTP bindings. Those bindings may select an original-destination relay
+  /// that preserves client credentials. The immutable CONNECT authority
+  /// remains the request's original destination; an inner authority mismatch
+  /// is rejected.
   Intercept,
   /// Preserve the connection as an opaque byte stream.
   Tunnel,

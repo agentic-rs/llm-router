@@ -829,16 +829,18 @@ client_auth = "none"
 default_http_action = { kind = "reject" }
 
 [[bindings]]
-id = "transparent"
+id = "original"
 listener = "api"
-action = { kind = "route", profile = "transparent" }
+action = { kind = "route", profile = "original" }
 path_prefixes = ["/v1"]
 
-[profiles.transparent]
-route = "transparent"
+[profiles.original]
+route = "original"
 
-[routes.transparent]
-kind = "transparent"
+[routes.original]
+kind = "relay"
+destination = { kind = "original" }
+credentials = { kind = "client" }
 "#,
   );
   assert!(matches!(

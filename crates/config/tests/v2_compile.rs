@@ -393,32 +393,13 @@ hosts = ["*.internal.example"]
 
 #[test]
 fn llm_listener_rejects_routes_that_need_an_original_destination() {
-  for config in [transparent_llm_config(), origin_relay_llm_config()] {
+  for config in [client_origin_relay_llm_config(), account_origin_relay_llm_config()] {
     let error = unwrap_compile_error(parse(&config, Path::new("config.toml")).unwrap_err());
     assert!(matches!(*error, CompileError::InvalidValue { .. }));
   }
 }
 
-fn transparent_llm_config() -> String {
-  r#"
-schema_version = 2
-
-[listeners.api]
-kind = "llm_api"
-bind = "127.0.0.1:4141"
-client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
-
-[profiles.default]
-route = "default"
-
-[routes.default]
-kind = "transparent"
-"#
-  .into()
-}
-
-fn origin_relay_llm_config() -> String {
+fn client_origin_relay_llm_config() -> String {
   r#"
 schema_version = 2
 
@@ -433,7 +414,29 @@ route = "default"
 
 [routes.default]
 kind = "relay"
-target = { kind = "provider_from_origin", account_pool = "default" }
+destination = { kind = "original" }
+credentials = { kind = "client" }
+"#
+  .into()
+}
+
+fn account_origin_relay_llm_config() -> String {
+  r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "default" }
+
+[profiles.default]
+route = "default"
+
+[routes.default]
+kind = "relay"
+destination = { kind = "original" }
+credentials = { kind = "account_pool", account_pool = "default" }
 
 [account_pools.default]
 providers = ["openai"]

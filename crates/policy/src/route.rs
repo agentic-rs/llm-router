@@ -1,16 +1,14 @@
 use crate::{AccountPoolId, HeaderPatchSetId, ModelGroupId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
 
-/// The three coherent request-handling families supported by the gateway.
+/// The request-handling families supported by the gateway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteKind {
   /// Decode a supported LLM request, select a managed account, and allow
   /// request/response translation.
   Managed,
-  /// Preserve payload bytes while selecting a managed account and replacing
-  /// client credentials.
+  /// Preserve payload bytes while choosing destination and credential
+  /// behavior independently.
   Relay,
-  /// Preserve the original destination, payload, headers, and credentials.
-  Transparent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,7 +42,8 @@ pub enum OperationPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeaderStrategy {
   ProviderOwned,
-  CrossOriginSanitize,
+  CrossOriginReplaceCredentials,
+  CrossOriginForward,
   SameOriginReplaceCredentials,
   SameOriginForward,
 }
@@ -119,21 +118,26 @@ impl ManagedTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RelayTarget {
-  /// Match the original request authority to a provider for account
-  /// selection while preserving the original destination.
-  ProviderFromOrigin { account_pool: AccountPoolId },
+pub enum RelayDestination {
+  /// Preserve the inbound destination.
+  Original,
   /// Send to a configured provider instead of the inbound destination.
-  FixedProvider {
-    provider: ProviderId,
-    account_pool: AccountPoolId,
-  },
+  FixedProvider(ProviderId),
 }
 
-impl RelayTarget {
-  pub fn account_pool(&self) -> &AccountPoolId {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelayCredentials {
+  /// Preserve credentials supplied by the client.
+  Client,
+  /// Replace client credentials with an account selected from this pool.
+  AccountPool(AccountPoolId),
+}
+
+impl RelayCredentials {
+  pub fn account_pool(&self) -> Option<&AccountPoolId> {
     match self {
-      Self::ProviderFromOrigin { account_pool } | Self::FixedProvider { account_pool, .. } => account_pool,
+      Self::Client => None,
+      Self::AccountPool(account_pool) => Some(account_pool),
     }
   }
 }
@@ -201,26 +205,37 @@ impl ManagedRoute {
   }
 }
 
-/// A relay route keeps the payload opaque while selecting managed account
-/// credentials for either a fixed provider or one detected from the origin.
+/// A relay route keeps the payload opaque while choosing its destination and
+/// credential source independently.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayRoute {
-  target: RelayTarget,
+  destination: RelayDestination,
+  credentials: RelayCredentials,
   header_patches: Option<HeaderPatchSetId>,
   retry: RelayRetry,
 }
 
 impl RelayRoute {
-  pub fn new(target: RelayTarget, header_patches: Option<HeaderPatchSetId>, retry: RelayRetry) -> Self {
+  pub fn new(
+    destination: RelayDestination,
+    credentials: RelayCredentials,
+    header_patches: Option<HeaderPatchSetId>,
+    retry: RelayRetry,
+  ) -> Self {
     Self {
-      target,
+      destination,
+      credentials,
       header_patches,
       retry,
     }
   }
 
-  pub fn target(&self) -> &RelayTarget {
-    &self.target
+  pub fn destination(&self) -> &RelayDestination {
+    &self.destination
+  }
+
+  pub fn credentials(&self) -> &RelayCredentials {
+    &self.credentials
   }
 
   pub fn header_patches(&self) -> Option<&HeaderPatchSetId> {
@@ -232,28 +247,10 @@ impl RelayRoute {
   }
 }
 
-/// Transparent routes cannot name an account pool, retry policy, or alternate
-/// destination. Those omissions are intentional security invariants.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TransparentRoute {
-  header_patches: Option<HeaderPatchSetId>,
-}
-
-impl TransparentRoute {
-  pub fn new(header_patches: Option<HeaderPatchSetId>) -> Self {
-    Self { header_patches }
-  }
-
-  pub fn header_patches(&self) -> Option<&HeaderPatchSetId> {
-    self.header_patches.as_ref()
-  }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoutePlan {
   Managed(ManagedRoute),
   Relay(RelayRoute),
-  Transparent(TransparentRoute),
 }
 
 impl RoutePlan {
@@ -261,14 +258,13 @@ impl RoutePlan {
     match self {
       Self::Managed(_) => RouteKind::Managed,
       Self::Relay(_) => RouteKind::Relay,
-      Self::Transparent(_) => RouteKind::Transparent,
     }
   }
 
   pub fn request_transform(&self) -> PayloadTransform {
     match self {
       Self::Managed(_) => PayloadTransform::Structured,
-      Self::Relay(_) | Self::Transparent(_) => PayloadTransform::Opaque,
+      Self::Relay(_) => PayloadTransform::Opaque,
     }
   }
 
@@ -278,45 +274,42 @@ impl RoutePlan {
 
   pub fn credential_policy(&self) -> CredentialPolicy {
     match self {
-      Self::Managed(_) | Self::Relay(_) => CredentialPolicy::Account,
-      Self::Transparent(_) => CredentialPolicy::Client,
+      Self::Managed(_) => CredentialPolicy::Account,
+      Self::Relay(route) => match route.credentials() {
+        RelayCredentials::Client => CredentialPolicy::Client,
+        RelayCredentials::AccountPool(_) => CredentialPolicy::Account,
+      },
     }
   }
 
   pub fn destination_policy(&self) -> DestinationPolicy {
     match self {
-      Self::Managed(_)
-      | Self::Relay(RelayRoute {
-        target: RelayTarget::FixedProvider { .. },
-        ..
-      }) => DestinationPolicy::SelectedProvider,
-      Self::Relay(RelayRoute {
-        target: RelayTarget::ProviderFromOrigin { .. },
-        ..
-      })
-      | Self::Transparent(_) => DestinationPolicy::Original,
+      Self::Managed(_) => DestinationPolicy::SelectedProvider,
+      Self::Relay(route) => match route.destination() {
+        RelayDestination::FixedProvider(_) => DestinationPolicy::SelectedProvider,
+        RelayDestination::Original => DestinationPolicy::Original,
+      },
     }
   }
 
   pub fn operation_policy(&self) -> OperationPolicy {
     match self {
       Self::Managed(route) => route.operation(),
-      Self::Relay(_) | Self::Transparent(_) => OperationPolicy::Preserve,
+      Self::Relay(_) => OperationPolicy::Preserve,
     }
   }
 
   pub fn header_strategy(&self) -> HeaderStrategy {
     match self {
       Self::Managed(_) => HeaderStrategy::ProviderOwned,
-      Self::Relay(RelayRoute {
-        target: RelayTarget::FixedProvider { .. },
-        ..
-      }) => HeaderStrategy::CrossOriginSanitize,
-      Self::Relay(RelayRoute {
-        target: RelayTarget::ProviderFromOrigin { .. },
-        ..
-      }) => HeaderStrategy::SameOriginReplaceCredentials,
-      Self::Transparent(_) => HeaderStrategy::SameOriginForward,
+      Self::Relay(route) => match (route.destination(), route.credentials()) {
+        (RelayDestination::FixedProvider(_), RelayCredentials::AccountPool(_)) => {
+          HeaderStrategy::CrossOriginReplaceCredentials
+        }
+        (RelayDestination::FixedProvider(_), RelayCredentials::Client) => HeaderStrategy::CrossOriginForward,
+        (RelayDestination::Original, RelayCredentials::AccountPool(_)) => HeaderStrategy::SameOriginReplaceCredentials,
+        (RelayDestination::Original, RelayCredentials::Client) => HeaderStrategy::SameOriginForward,
+      },
     }
   }
 
@@ -324,7 +317,6 @@ impl RoutePlan {
     match self {
       Self::Managed(route) => route.header_patches(),
       Self::Relay(route) => route.header_patches(),
-      Self::Transparent(route) => route.header_patches(),
     }
   }
 }
@@ -384,10 +376,8 @@ mod tests {
   #[test]
   fn fixed_relay_exposes_cross_origin_account_owned_axes() {
     let route = RoutePlan::Relay(RelayRoute::new(
-      RelayTarget::FixedProvider {
-        provider: id("openai-public"),
-        account_pool: id("default"),
-      },
+      RelayDestination::FixedProvider(id("openai-public")),
+      RelayCredentials::AccountPool(id("default")),
       None,
       RelayRetry::Never,
     ));
@@ -397,15 +387,14 @@ mod tests {
     assert_eq!(route.credential_policy(), CredentialPolicy::Account);
     assert_eq!(route.destination_policy(), DestinationPolicy::SelectedProvider);
     assert_eq!(route.operation_policy(), OperationPolicy::Preserve);
-    assert_eq!(route.header_strategy(), HeaderStrategy::CrossOriginSanitize);
+    assert_eq!(route.header_strategy(), HeaderStrategy::CrossOriginReplaceCredentials);
   }
 
   #[test]
   fn origin_relay_preserves_destination_and_replaces_credentials() {
     let route = RoutePlan::Relay(RelayRoute::new(
-      RelayTarget::ProviderFromOrigin {
-        account_pool: id("default"),
-      },
+      RelayDestination::Original,
+      RelayCredentials::AccountPool(id("default")),
       None,
       RelayRetry::SafeMethods(id("conservative")),
     ));
@@ -415,15 +404,34 @@ mod tests {
   }
 
   #[test]
-  fn transparent_route_exposes_only_original_client_axes() {
-    let route = RoutePlan::Transparent(TransparentRoute::default());
+  fn original_client_relay_replaces_transparent_route() {
+    let route = RoutePlan::Relay(RelayRoute::new(
+      RelayDestination::Original,
+      RelayCredentials::Client,
+      None,
+      RelayRetry::Never,
+    ));
 
-    assert_eq!(route.kind(), RouteKind::Transparent);
+    assert_eq!(route.kind(), RouteKind::Relay);
     assert_eq!(route.request_transform(), PayloadTransform::Opaque);
     assert_eq!(route.credential_policy(), CredentialPolicy::Client);
     assert_eq!(route.destination_policy(), DestinationPolicy::Original);
     assert_eq!(route.operation_policy(), OperationPolicy::Preserve);
     assert_eq!(route.header_strategy(), HeaderStrategy::SameOriginForward);
+  }
+
+  #[test]
+  fn fixed_client_relay_forwards_credentials_cross_origin() {
+    let route = RoutePlan::Relay(RelayRoute::new(
+      RelayDestination::FixedProvider(id("openai-public")),
+      RelayCredentials::Client,
+      None,
+      RelayRetry::Never,
+    ));
+
+    assert_eq!(route.credential_policy(), CredentialPolicy::Client);
+    assert_eq!(route.destination_policy(), DestinationPolicy::SelectedProvider);
+    assert_eq!(route.header_strategy(), HeaderStrategy::CrossOriginForward);
   }
 
   #[test]
