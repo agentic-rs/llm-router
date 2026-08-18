@@ -829,15 +829,15 @@ client_auth = "none"
 default_http_action = { kind = "reject" }
 
 [[bindings]]
-id = "original"
+id = "transparent"
 listener = "api"
-action = { kind = "route", profile = "original" }
+action = { kind = "route", profile = "transparent" }
 path_prefixes = ["/v1"]
 
-[profiles.original]
-route = "original"
+[profiles.transparent]
+route = "transparent"
 
-[routes.original]
+[routes.transparent]
 kind = "relay"
 destination = { kind = "original" }
 credentials = { kind = "client" }
