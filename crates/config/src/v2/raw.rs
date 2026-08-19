@@ -51,9 +51,6 @@ pub struct RawConfig {
   pub account_pools: BTreeMap<String, RawAccountPool>,
   #[serde(default)]
   pub providers: BTreeMap<String, RawProvider>,
-  /// Each group value is directly an ordered list of fallback candidates.
-  #[serde(default)]
-  pub model_groups: BTreeMap<String, Vec<RawModelCandidate>>,
 }
 
 /// Process-wide settings consumed while constructing one serving runtime.
@@ -319,7 +316,7 @@ pub enum RawProviderSelector {
 pub enum RawModelSelector {
   Capability {},
   Qualified { namespace: RawQualificationNamespace },
-  Fallback { selector: RawFallbackSelector },
+  Family { families: BTreeMap<String, Vec<String>> },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -327,13 +324,6 @@ pub enum RawModelSelector {
 pub enum RawQualificationNamespace {
   Driver,
   Provider,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RawFallbackSelector {
-  Fixed { group: String },
-  ByRequested { groups: Vec<String> },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -426,15 +416,6 @@ const fn default_true() -> bool {
   true
 }
 
-/// One ordered model fallback candidate.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawModelCandidate {
-  pub model: String,
-  #[serde(default)]
-  pub provider: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -488,7 +469,7 @@ driver = "openai"
   }
 
   #[test]
-  fn preserves_binding_and_model_candidate_order() {
+  fn preserves_binding_and_model_family_order() {
     let config: RawConfig = toml::from_str(
       r#"
 schema_version = 2
@@ -517,12 +498,12 @@ listener = "proxy"
 action = "tunnel"
 ports = [443]
 
-[[model_groups.coding]]
-model = "claude-sonnet-4"
-provider = "anthropic-public"
-
-[[model_groups.coding]]
-model = "gpt-5"
+[routes.coding]
+kind = "managed"
+account_pool = "default"
+provider = { kind = "any" }
+model = { kind = "family", families = { coding = ["claude-sonnet-4", "gpt-5"] } }
+operation = "translate_compatible"
 "#,
     )
     .unwrap();
@@ -531,8 +512,14 @@ model = "gpt-5"
     assert_eq!(config.bindings[1].id, "second");
     assert_eq!(config.connect_rules[0].id, "intercept");
     assert_eq!(config.connect_rules[1].id, "tunnel");
-    assert_eq!(config.model_groups["coding"][0].model, "claude-sonnet-4");
-    assert_eq!(config.model_groups["coding"][1].model, "gpt-5");
+    let RawRoute::Managed {
+      model: RawModelSelector::Family { families },
+      ..
+    } = &config.routes["coding"]
+    else {
+      panic!("expected family model selector");
+    };
+    assert_eq!(families["coding"], ["claude-sonnet-4", "gpt-5"]);
   }
 
   #[test]

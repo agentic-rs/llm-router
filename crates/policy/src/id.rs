@@ -120,7 +120,6 @@ define_identifier!(ProfileId, "profile");
 define_identifier!(AccountPoolId, "account pool");
 define_identifier!(DriverId, "driver");
 define_identifier!(ProviderId, "provider");
-define_identifier!(ModelGroupId, "model group");
 define_identifier!(HeaderPatchSetId, "header patch set");
 define_identifier!(RetryPolicyId, "retry policy");
 define_identifier!(WireIdentityId, "wire identity");

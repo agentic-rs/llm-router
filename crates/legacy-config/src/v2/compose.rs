@@ -161,7 +161,6 @@ pub fn project_v2_config(
     routes,
     account_pools,
     providers,
-    model_groups: BTreeMap::new(),
   };
   let compiled_config = tokn_config::v2::compile_config(&raw_config, Path::new(GENERATED_SOURCE))
     .map_err(|source| V2ProjectionError::InvalidGeneratedConfig { source })?;
@@ -190,6 +189,18 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
       },
       operation: RawOperationPolicy::TranslateCompatible,
     }),
+    RouteMode::Fuzzy => Ok(RawRoute::Managed {
+      account_pool: account_pool.to_string(),
+      provider: RawProviderSelector::Any {},
+      model: RawModelSelector::Family {
+        families: policy
+          .model_families
+          .iter()
+          .map(|family| (family.name.clone(), family.members.clone()))
+          .collect(),
+      },
+      operation: RawOperationPolicy::TranslateCompatible,
+    }),
     RouteMode::Switch => {
       let provider = policy
         .default_provider_id
@@ -204,7 +215,7 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
         },
       })
     }
-    RouteMode::Fuzzy | RouteMode::Passthrough => Err(V2ProjectionError::UnsupportedRouteMode {
+    RouteMode::Passthrough => Err(V2ProjectionError::UnsupportedRouteMode {
       policy: policy.location.clone(),
       mode: policy.mode,
     }),
@@ -262,8 +273,8 @@ mod tests {
   use crate::v2::LegacyPolicyLocation;
   use tokn_accounts::link::{link_account_pools, link_provider_graph};
   use tokn_accounts::registry::Registry;
-  use tokn_config::ProfileConfig;
-  use tokn_policy::{RouteKind, WireIdentity};
+  use tokn_config::{ModelFamily, ProfileConfig};
+  use tokn_policy::{ModelSelector, RouteKind, RoutePlan, WireIdentity};
 
   fn account(id: &str, provider: &str, base_url: Option<&str>) -> AccountConfig {
     let mut account: AccountConfig = toml::from_str(&format!(
@@ -376,6 +387,60 @@ mod tests {
   }
 
   #[test]
+  fn projects_fuzzy_families_into_each_managed_route() {
+    let mut legacy = Config::default();
+    legacy.defaults.mode = RouteMode::Fuzzy;
+    legacy.model_families = vec![ModelFamily {
+      name: "smart".into(),
+      members: vec!["gpt-5".into(), "gpt-4o".into()],
+    }];
+    legacy.profiles.insert(
+      "work".into(),
+      ProfileConfig {
+        mode: Some(RouteMode::Fuzzy),
+        model_families: Some(vec![ModelFamily {
+          name: "smart".into(),
+          members: vec!["gpt-4o-mini".into()],
+        }]),
+        ..Default::default()
+      },
+    );
+
+    let projection = project_v2_config(
+      &legacy,
+      &[account("primary", "openai", None)],
+      V2ProjectionOptions::default(),
+    )
+    .unwrap();
+    let RawRoute::Managed {
+      model: RawModelSelector::Family { families: default },
+      ..
+    } = &projection.raw_config().routes["default"]
+    else {
+      panic!("expected default family route");
+    };
+    let RawRoute::Managed {
+      model: RawModelSelector::Family { families: work },
+      ..
+    } = &projection.raw_config().routes["work"]
+    else {
+      panic!("expected profile family route");
+    };
+    assert_eq!(default["smart"], ["gpt-5", "gpt-4o"]);
+    assert_eq!(work["smart"], ["gpt-4o-mini"]);
+
+    let plan = projection.compiled_config().gateway();
+    let RoutePlan::Managed(route) = &plan.routes()["work"] else {
+      panic!("expected compiled managed route");
+    };
+    let ModelSelector::Family(families) = route.target().model() else {
+      panic!("expected compiled family selector");
+    };
+    assert_eq!(families[0].name(), "smart");
+    assert_eq!(families[0].members(), ["gpt-4o-mini"]);
+  }
+
+  #[test]
   fn normalized_accounts_runtime_link_against_promoted_provider_destination() {
     let accounts = [account("primary", "openai", Some("https://gateway.example/v1"))];
     let projection = project_v2_config(&Config::default(), &accounts, V2ProjectionOptions::default()).unwrap();
@@ -389,22 +454,20 @@ mod tests {
   }
 
   #[test]
-  fn rejects_modes_without_exact_v2_semantics() {
-    for mode in [RouteMode::Fuzzy, RouteMode::Passthrough] {
-      let mut legacy = Config::default();
-      legacy.defaults.mode = mode;
-      assert!(matches!(
-        project_v2_config(
-          &legacy,
-          &[account("primary", "openai", None)],
-          V2ProjectionOptions::default()
-        ),
-        Err(V2ProjectionError::UnsupportedRouteMode {
-          policy: LegacyPolicyLocation::Default,
-          mode: found,
-        }) if found == mode
-      ));
-    }
+  fn rejects_passthrough_until_client_credential_projection_is_added() {
+    let mut legacy = Config::default();
+    legacy.defaults.mode = RouteMode::Passthrough;
+    assert!(matches!(
+      project_v2_config(
+        &legacy,
+        &[account("primary", "openai", None)],
+        V2ProjectionOptions::default()
+      ),
+      Err(V2ProjectionError::UnsupportedRouteMode {
+        policy: LegacyPolicyLocation::Default,
+        mode: RouteMode::Passthrough,
+      })
+    ));
   }
 
   #[test]

@@ -44,7 +44,6 @@ fn transport_only_gateway_may_have_no_routing_resources() {
     tokn_core::provider::OFFICIAL_PROVIDER_PRESETS.len()
   );
   assert!(compiled.providers.contains_key("openai"));
-  assert!(compiled.model_groups.is_empty());
 }
 
 #[test]
@@ -246,29 +245,61 @@ fn client_credentials_auto_is_none_but_explicit_identity_is_rejected() {
 }
 
 #[test]
-fn by_requested_fallback_is_nonempty_and_unique() {
+fn model_families_require_ordered_unambiguous_members() {
   let mut config = base_config("");
-  config.model_groups.insert(
-    "coding".into(),
-    vec![RawModelCandidate {
-      model: "gpt-5".into(),
-      provider: None,
-    }],
-  );
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
       account_pool: "default".into(),
       provider: RawProviderSelector::Any {},
-      model: RawModelSelector::Fallback {
-        selector: RawFallbackSelector::ByRequested {
-          groups: vec!["coding".into(), "coding".into()],
-        },
+      model: RawModelSelector::Family {
+        families: BTreeMap::from([("coding".into(), vec!["gpt-5".into(), "gpt-4o".into()])]),
       },
       operation: RawOperationPolicy::Preserve,
     },
   );
+  let compiled = compile_resources(&config).unwrap();
+  let RoutePlan::Managed(route) = &compiled.routes[&RouteId::new("default").unwrap()] else {
+    panic!("expected managed route");
+  };
+  let ModelSelector::Family(families) = route.target().model() else {
+    panic!("expected family model selector");
+  };
+  assert_eq!(families[0].name(), "coding");
+  assert_eq!(families[0].members(), ["gpt-5", "gpt-4o"]);
 
+  if let RawRoute::Managed {
+    model: RawModelSelector::Family { families },
+    ..
+  } = config.routes.get_mut("default").unwrap()
+  {
+    families.insert("coding".into(), Vec::new());
+  }
+  assert!(matches!(
+    compile_resources(&config),
+    Err(CompileError::InvalidValue { .. })
+  ));
+
+  if let RawRoute::Managed {
+    model: RawModelSelector::Family { families },
+    ..
+  } = config.routes.get_mut("default").unwrap()
+  {
+    families.insert("coding".into(), vec!["gpt-5".into(), "gpt-5".into()]);
+  }
+  assert!(matches!(
+    compile_resources(&config),
+    Err(CompileError::InvalidValue { .. })
+  ));
+
+  if let RawRoute::Managed {
+    model: RawModelSelector::Family { families },
+    ..
+  } = config.routes.get_mut("default").unwrap()
+  {
+    families.insert("coding".into(), vec!["gpt-5".into()]);
+    families.insert("gpt-5".into(), vec!["gpt-4o".into()]);
+  }
   assert!(matches!(
     compile_resources(&config),
     Err(CompileError::InvalidValue { .. })
@@ -321,57 +352,6 @@ driver = "openai"
   );
 
   compile_resources(&config).unwrap();
-}
-
-#[test]
-fn fallback_pins_must_match_the_route_pool_and_fixed_provider() {
-  let mut config = base_config(
-    r#"
-[providers.openai]
-driver = "openai"
-
-[providers.zai]
-driver = "zai"
-
-[[model_groups.coding]]
-model = "gpt-5"
-provider = "openai"
-"#,
-  );
-  config.routes.insert(
-    "default".into(),
-    RawRoute::Managed {
-      account_pool: "default".into(),
-      provider: RawProviderSelector::Fixed { provider: "zai".into() },
-      model: RawModelSelector::Fallback {
-        selector: RawFallbackSelector::Fixed { group: "coding".into() },
-      },
-      operation: RawOperationPolicy::Preserve,
-    },
-  );
-
-  assert!(matches!(
-    compile_resources(&config),
-    Err(CompileError::InvalidValue { .. })
-  ));
-
-  config.routes.insert(
-    "default".into(),
-    RawRoute::Managed {
-      account_pool: "default".into(),
-      provider: RawProviderSelector::Any {},
-      model: RawModelSelector::Fallback {
-        selector: RawFallbackSelector::Fixed { group: "coding".into() },
-      },
-      operation: RawOperationPolicy::Preserve,
-    },
-  );
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
-
-  assert!(matches!(
-    compile_resources(&config),
-    Err(CompileError::InvalidValue { .. })
-  ));
 }
 
 #[test]
@@ -618,21 +598,8 @@ fn pool_durations_have_operational_bounds() {
 }
 
 #[test]
-fn fixed_route_rejects_effectively_duplicate_fallback_candidates() {
+fn family_route_rejects_duplicate_members() {
   let mut config = base_config("");
-  config.model_groups.insert(
-    "coding".into(),
-    vec![
-      RawModelCandidate {
-        model: "gpt-5".into(),
-        provider: None,
-      },
-      RawModelCandidate {
-        model: "gpt-5".into(),
-        provider: Some("default".into()),
-      },
-    ],
-  );
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
@@ -640,8 +607,8 @@ fn fixed_route_rejects_effectively_duplicate_fallback_candidates() {
       provider: RawProviderSelector::Fixed {
         provider: "default".into(),
       },
-      model: RawModelSelector::Fallback {
-        selector: RawFallbackSelector::Fixed { group: "coding".into() },
+      model: RawModelSelector::Family {
+        families: BTreeMap::from([("coding".into(), vec!["gpt-5".into(), "gpt-5".into()])]),
       },
       operation: RawOperationPolicy::Preserve,
     },
@@ -650,6 +617,6 @@ fn fixed_route_rejects_effectively_duplicate_fallback_candidates() {
   assert!(matches!(
     compile_resources(&config),
     Err(CompileError::InvalidValue { location, message })
-      if location == "routes.default.model" && message.contains("effective candidate")
+      if location == "routes.default.model.families.coding[1]" && message.contains("duplicates")
   ));
 }

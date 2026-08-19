@@ -18,9 +18,9 @@ pub use compiled::{CompiledConfig, OutboundPlan, PersistencePaths, PersistencePl
 pub use error::{CompileError, Error, Result};
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
-  RawFallbackSelector, RawListener, RawModelCandidate, RawModelSelector, RawOperationPolicy, RawOutbound,
-  RawPersistence, RawPoolStrategy, RawProfile, RawProvider, RawProviderSelector, RawQualificationNamespace,
-  RawRelayCredentials, RawRelayDestination, RawRequestLimits, RawRoute, RawService, RawWireIdentity,
+  RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawPoolStrategy, RawProfile,
+  RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination,
+  RawRequestLimits, RawRoute, RawService, RawWireIdentity,
 };
 pub use raw::{
   DEFAULT_ARCHIVE_AFTER_DAYS, DEFAULT_BODY_MAX_BYTES, DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES,

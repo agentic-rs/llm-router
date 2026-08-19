@@ -525,7 +525,6 @@ mod tests {
       BTreeMap::new(),
       BTreeMap::new(),
       providers,
-      BTreeMap::new(),
     )
   }
 
