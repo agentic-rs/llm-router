@@ -1,6 +1,6 @@
 use crate::{
-  AccountPoolId, BindingId, CanonicalHost, DriverId, ListenerId, ModelGroupId, OperationId, ProfileId, ProfilePlan,
-  ProviderId, RouteId, RoutePlan,
+  AccountPoolId, BindingId, CanonicalHost, DriverId, ListenerId, OperationId, ProfileId, ProfilePlan, ProviderId,
+  RouteId, RoutePlan,
 };
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,7 +27,6 @@ pub struct GatewayPlan {
   routes: BTreeMap<RouteId, RoutePlan>,
   account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
   providers: BTreeMap<ProviderId, ProviderPlan>,
-  model_groups: BTreeMap<ModelGroupId, ModelGroupPlan>,
 }
 
 impl GatewayPlan {
@@ -37,7 +36,6 @@ impl GatewayPlan {
     routes: BTreeMap<RouteId, RoutePlan>,
     account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
     providers: BTreeMap<ProviderId, ProviderPlan>,
-    model_groups: BTreeMap<ModelGroupId, ModelGroupPlan>,
   ) -> Self {
     Self {
       listeners,
@@ -45,7 +43,6 @@ impl GatewayPlan {
       routes,
       account_pools,
       providers,
-      model_groups,
     }
   }
 
@@ -87,14 +84,6 @@ impl GatewayPlan {
 
   pub fn provider(&self, id: &ProviderId) -> Option<&ProviderPlan> {
     self.providers.get(id)
-  }
-
-  pub fn model_groups(&self) -> &BTreeMap<ModelGroupId, ModelGroupPlan> {
-    &self.model_groups
-  }
-
-  pub fn model_group(&self, id: &ModelGroupId) -> Option<&ModelGroupPlan> {
-    self.model_groups.get(id)
   }
 }
 
@@ -692,45 +681,6 @@ impl ProviderPlan {
   }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelCandidate {
-  provider: Option<ProviderId>,
-  model: SmolStr,
-}
-
-impl ModelCandidate {
-  pub fn new(provider: Option<ProviderId>, model: impl AsRef<str>) -> Self {
-    Self {
-      provider,
-      model: SmolStr::new(model.as_ref()),
-    }
-  }
-
-  pub fn provider(&self) -> Option<&ProviderId> {
-    self.provider.as_ref()
-  }
-
-  pub fn model(&self) -> &str {
-    self.model.as_str()
-  }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelGroupPlan {
-  candidates: Box<[ModelCandidate]>,
-}
-
-impl ModelGroupPlan {
-  pub fn new(candidates: Box<[ModelCandidate]>) -> Self {
-    Self { candidates }
-  }
-
-  /// Candidates in fallback order.
-  pub fn candidates(&self) -> &[ModelCandidate] {
-    &self.candidates
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -913,7 +863,7 @@ mod tests {
   }
 
   #[test]
-  fn provider_and_model_group_keep_distinct_ordered_facts() {
+  fn provider_keeps_driver_and_origin_facts() {
     let provider = ProviderPlan::new(
       id("openai-driver"),
       Some(SmolStr::new("https://gateway.example/v1")),
@@ -924,18 +874,9 @@ mod tests {
       .into_boxed_slice(),
       false,
     );
-    let group = ModelGroupPlan::new(
-      vec![
-        ModelCandidate::new(Some(id("openai-public")), "gpt-5"),
-        ModelCandidate::new(None, "claude-sonnet"),
-      ]
-      .into_boxed_slice(),
-    );
 
     assert_eq!(provider.driver().as_str(), "openai-driver");
     assert_eq!(provider.origins()[1].as_str(), "https://chatgpt.com");
-    assert_eq!(group.candidates()[0].model(), "gpt-5");
-    assert_eq!(group.candidates()[1].provider(), None);
   }
 
   #[test]
@@ -945,7 +886,6 @@ mod tests {
     let route_id: RouteId = id("managed");
     let pool_id: AccountPoolId = id("default");
     let provider_id: ProviderId = id("openai-public");
-    let group_id: ModelGroupId = id("flagship");
 
     let listener = ListenerPlan::LlmApi(LlmApiListenerPlan::new(
       "127.0.0.1:3000".parse().unwrap(),
@@ -978,10 +918,6 @@ mod tests {
         provider_id.clone(),
         ProviderPlan::new(id("openai"), None, Box::default(), false),
       )]),
-      BTreeMap::from([(
-        group_id.clone(),
-        ModelGroupPlan::new(vec![ModelCandidate::new(None, "gpt-5")].into_boxed_slice()),
-      )]),
     );
 
     assert_eq!(gateway.listener(&listener_id).unwrap().kind(), ListenerKind::LlmApi);
@@ -989,6 +925,5 @@ mod tests {
     assert!(gateway.route(&route_id).is_some());
     assert!(gateway.account_pool(&pool_id).is_some());
     assert!(gateway.provider(&provider_id).is_some());
-    assert!(gateway.model_group(&group_id).is_some());
   }
 }

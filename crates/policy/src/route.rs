@@ -1,4 +1,5 @@
-use crate::{AccountPoolId, HeaderPatchSetId, ModelGroupId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
+use crate::{AccountPoolId, HeaderPatchSetId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
+use smol_str::SmolStr;
 
 /// The request-handling families supported by the gateway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,14 +58,36 @@ pub enum QualificationNamespace {
   Provider,
 }
 
-/// How an ordered model fallback group is chosen for a request.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FallbackSelector {
-  /// Use one group for every request handled by the route.
-  Fixed(ModelGroupId),
-  /// Find the first listed group whose name or members contain the requested
-  /// model. This is the explicit replacement for legacy fuzzy routing.
-  ByRequested(Box<[ModelGroupId]>),
+pub struct ModelFamily {
+  name: SmolStr,
+  members: Box<[SmolStr]>,
+}
+
+impl ModelFamily {
+  pub fn new<I, S>(name: impl AsRef<str>, members: I) -> Self
+  where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+  {
+    Self {
+      name: SmolStr::new(name.as_ref()),
+      members: members
+        .into_iter()
+        .map(|member| SmolStr::new(member.as_ref()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
+    }
+  }
+
+  pub fn name(&self) -> &str {
+    self.name.as_str()
+  }
+
+  /// Concrete upstream models in fallback order.
+  pub fn members(&self) -> &[SmolStr] {
+    &self.members
+  }
 }
 
 /// How a managed route interprets the requested model.
@@ -74,9 +97,9 @@ pub enum ModelSelector {
   Capability,
   /// Parse a qualified model and constrain selection to its namespace.
   Qualified { namespace: QualificationNamespace },
-  /// Resolve to an ordered candidate list and use the actual chosen candidate
-  /// as the outbound model.
-  Fallback(FallbackSelector),
+  /// Expand a named family into concrete upstream models in fallback order.
+  /// Requests for names not present in this route remain exact model requests.
+  Family(Box<[ModelFamily]>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -435,17 +458,20 @@ mod tests {
   }
 
   #[test]
-  fn fallback_by_requested_is_explicit() {
-    let selector = ModelSelector::Fallback(FallbackSelector::ByRequested(
-      vec![id("claude"), id("gpt")].into_boxed_slice(),
-    ));
-
-    assert_eq!(
-      selector,
-      ModelSelector::Fallback(FallbackSelector::ByRequested(
-        vec![id("claude"), id("gpt")].into_boxed_slice()
-      ))
+  fn model_families_keep_route_local_fallback_order() {
+    let selector = ModelSelector::Family(
+      vec![ModelFamily::new(
+        "smart",
+        vec![SmolStr::new("gpt-5"), SmolStr::new("claude-sonnet-4-6")].into_boxed_slice(),
+      )]
+      .into_boxed_slice(),
     );
+
+    let ModelSelector::Family(families) = selector else {
+      panic!("expected family selector");
+    };
+    assert_eq!(families[0].name(), "smart");
+    assert_eq!(families[0].members(), ["gpt-5", "claude-sonnet-4-6"]);
   }
 
   #[test]

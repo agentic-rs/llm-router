@@ -1,17 +1,17 @@
 use crate::v2::{
-  CompileError, RawAccountPool, RawConfig, RawFallbackSelector, RawModelCandidate, RawModelSelector,
-  RawOperationPolicy, RawPoolStrategy, RawProfile, RawProvider, RawProviderSelector, RawQualificationNamespace,
-  RawRelayCredentials, RawRelayDestination, RawRoute, RawWireIdentity,
+  CompileError, RawAccountPool, RawConfig, RawModelSelector, RawOperationPolicy, RawPoolStrategy, RawProfile,
+  RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRoute,
+  RawWireIdentity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokn_core::provider::{official_provider_preset, OFFICIAL_PROVIDER_PRESETS};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_policy::{
-  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, DriverId, FallbackSelector, ManagedRetry,
-  ManagedRoute, ManagedTarget, ModelCandidate, ModelGroupId, ModelGroupPlan, ModelSelector, OperationPolicy, ProfileId,
-  ProfilePlan, ProviderId, ProviderOrigin, ProviderPlan, ProviderSelector, QualificationNamespace, RelayCredentials,
-  RelayDestination, RelayRetry, RelayRoute, RouteId, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
+  AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, DriverId, ManagedRetry, ManagedRoute,
+  ManagedTarget, ModelFamily, ModelSelector, OperationPolicy, ProfileId, ProfilePlan, ProviderId, ProviderOrigin,
+  ProviderPlan, ProviderSelector, QualificationNamespace, RelayCredentials, RelayDestination, RelayRetry, RelayRoute,
+  RouteId, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
 };
 
 const MAX_FAILURE_COOLDOWN_SECS: u64 = 86_400;
@@ -23,14 +23,12 @@ pub(super) struct CompiledResources {
   pub(super) routes: BTreeMap<RouteId, RoutePlan>,
   pub(super) account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
   pub(super) providers: BTreeMap<ProviderId, ProviderPlan>,
-  pub(super) model_groups: BTreeMap<ModelGroupId, ModelGroupPlan>,
 }
 
 pub(super) fn compile_resources(raw: &RawConfig) -> Result<CompiledResources, CompileError> {
   let providers = compile_providers(&raw.providers)?;
   let account_pools = compile_account_pools(&raw.account_pools, &providers)?;
-  let model_groups = compile_model_groups(&raw.model_groups, &providers)?;
-  let routes = compile_routes(&raw.routes, &account_pools, &providers, &model_groups)?;
+  let routes = compile_routes(&raw.routes, &account_pools, &providers)?;
   let profiles = compile_profiles(&raw.profiles, &routes)?;
 
   Ok(CompiledResources {
@@ -38,7 +36,6 @@ pub(super) fn compile_resources(raw: &RawConfig) -> Result<CompiledResources, Co
     routes,
     account_pools,
     providers,
-    model_groups,
   })
 }
 
@@ -305,79 +302,10 @@ fn cleartext_policy(allow_insecure_http: bool) -> CleartextHttpPolicy {
   }
 }
 
-fn compile_model_groups(
-  raw_groups: &BTreeMap<String, Vec<RawModelCandidate>>,
-  providers: &BTreeMap<ProviderId, ProviderPlan>,
-) -> Result<BTreeMap<ModelGroupId, ModelGroupPlan>, CompileError> {
-  raw_groups
-    .iter()
-    .map(|(raw_id, raw_candidates)| {
-      let id = parse_id::<ModelGroupId>("model group id", raw_id)?;
-      if raw_candidates.is_empty() {
-        return Err(invalid_value(
-          format!("model_groups.{raw_id}"),
-          "must contain at least one candidate",
-        ));
-      }
-
-      let mut candidates = Vec::with_capacity(raw_candidates.len());
-      let mut seen = BTreeSet::new();
-      for (index, raw_candidate) in raw_candidates.iter().enumerate() {
-        let candidate = compile_model_candidate(raw_id, index, raw_candidate, providers)?;
-        let key = (candidate.provider().cloned(), candidate.model().to_string());
-        if !seen.insert(key) {
-          return Err(invalid_value(
-            format!("model_groups.{raw_id}[{index}]"),
-            "duplicates an earlier model candidate",
-          ));
-        }
-        candidates.push(candidate);
-      }
-
-      Ok((id, ModelGroupPlan::new(candidates.into_boxed_slice())))
-    })
-    .collect()
-}
-
-fn compile_model_candidate(
-  group_id: &str,
-  index: usize,
-  raw: &RawModelCandidate,
-  providers: &BTreeMap<ProviderId, ProviderPlan>,
-) -> Result<ModelCandidate, CompileError> {
-  if raw.model.trim().is_empty() || raw.model.trim() != raw.model {
-    return Err(invalid_value(
-      format!("model_groups.{group_id}[{index}].model"),
-      "model must be non-empty and have no surrounding whitespace",
-    ));
-  }
-
-  let provider = raw
-    .provider
-    .as_deref()
-    .map(|raw_provider| {
-      let provider = parse_id::<ProviderId>("model candidate provider reference", raw_provider)?;
-      require_reference(
-        providers,
-        &provider,
-        "model group",
-        group_id,
-        "provider",
-        "provider",
-        raw_provider,
-      )?;
-      Ok(provider)
-    })
-    .transpose()?;
-
-  Ok(ModelCandidate::new(provider, &raw.model))
-}
-
 fn compile_routes(
   raw_routes: &BTreeMap<String, RawRoute>,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
   providers: &BTreeMap<ProviderId, ProviderPlan>,
-  groups: &BTreeMap<ModelGroupId, ModelGroupPlan>,
 ) -> Result<BTreeMap<RouteId, RoutePlan>, CompileError> {
   raw_routes
     .iter()
@@ -402,7 +330,7 @@ fn compile_routes(
               ProviderSelector::Fixed(provider_id)
             }
           };
-          let model = compile_model_selector(raw_id, model, &pool_id, &provider_selector, pools, groups)?;
+          let model = compile_model_selector(raw_id, model)?;
           let operation = match operation {
             RawOperationPolicy::Preserve => OperationPolicy::Preserve,
             RawOperationPolicy::TranslateCompatible => OperationPolicy::TranslateCompatible,
@@ -475,14 +403,7 @@ fn resolve_provider(
   Ok(provider)
 }
 
-fn compile_model_selector(
-  route_id: &str,
-  raw: &RawModelSelector,
-  pool_id: &AccountPoolId,
-  route_provider: &ProviderSelector,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  groups: &BTreeMap<ModelGroupId, ModelGroupPlan>,
-) -> Result<ModelSelector, CompileError> {
+fn compile_model_selector(route_id: &str, raw: &RawModelSelector) -> Result<ModelSelector, CompileError> {
   match raw {
     RawModelSelector::Capability {} => Ok(ModelSelector::Capability),
     RawModelSelector::Qualified { namespace } => {
@@ -492,96 +413,44 @@ fn compile_model_selector(
       };
       Ok(ModelSelector::Qualified { namespace })
     }
-    RawModelSelector::Fallback { selector } => {
-      let selector = match selector {
-        RawFallbackSelector::Fixed { group } => {
-          let group_id = resolve_group(route_id, "model.selector.group", group, groups)?;
-          validate_group_compatibility(route_id, &group_id, pool_id, route_provider, pools, groups)?;
-          FallbackSelector::Fixed(group_id)
+    RawModelSelector::Family { families } => {
+      let aliases = families.keys().map(String::as_str).collect::<BTreeSet<_>>();
+      let mut compiled = Vec::with_capacity(families.len());
+      for (name, members) in families {
+        validate_model_name(format!("routes.{route_id}.model.families.{name}"), name)?;
+        if members.is_empty() {
+          return Err(invalid_value(
+            format!("routes.{route_id}.model.families.{name}"),
+            "model family must contain at least one member",
+          ));
         }
-        RawFallbackSelector::ByRequested { groups: raw_groups } => {
-          if raw_groups.is_empty() {
+        let mut seen = BTreeSet::new();
+        for (index, member) in members.iter().enumerate() {
+          let location = format!("routes.{route_id}.model.families.{name}[{index}]");
+          validate_model_name(location.clone(), member)?;
+          if aliases.contains(member.as_str()) {
             return Err(invalid_value(
-              format!("routes.{route_id}.model.selector.groups"),
-              "must contain at least one model group",
+              location,
+              format!("model `{member}` is also a family name; family names and concrete models must be distinct"),
             ));
           }
-
-          let mut group_ids = Vec::with_capacity(raw_groups.len());
-          let mut seen = BTreeSet::new();
-          for raw_group in raw_groups {
-            let group = resolve_group(route_id, "model.selector.groups", raw_group, groups)?;
-            if !seen.insert(group.clone()) {
-              return Err(duplicate_value(
-                format!("routes.{route_id}.model.selector.groups"),
-                raw_group,
-              ));
-            }
-            validate_group_compatibility(route_id, &group, pool_id, route_provider, pools, groups)?;
-            group_ids.push(group);
+          if !seen.insert(member) {
+            return Err(invalid_value(location, "duplicates an earlier family member"));
           }
-          FallbackSelector::ByRequested(group_ids.into_boxed_slice())
         }
-      };
-      Ok(ModelSelector::Fallback(selector))
+        compiled.push(ModelFamily::new(name, members));
+      }
+      Ok(ModelSelector::Family(compiled.into_boxed_slice()))
     }
   }
 }
 
-fn resolve_group(
-  route_id: &str,
-  field: &'static str,
-  raw_group: &str,
-  groups: &BTreeMap<ModelGroupId, ModelGroupPlan>,
-) -> Result<ModelGroupId, CompileError> {
-  let group = parse_id::<ModelGroupId>("model group reference", raw_group)?;
-  require_reference(groups, &group, "route", route_id, field, "model group", raw_group)?;
-  Ok(group)
-}
-
-fn validate_group_compatibility(
-  route_id: &str,
-  group_id: &ModelGroupId,
-  pool_id: &AccountPoolId,
-  route_provider: &ProviderSelector,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  groups: &BTreeMap<ModelGroupId, ModelGroupPlan>,
-) -> Result<(), CompileError> {
-  let allowed_providers = pools[pool_id].selector().providers();
-  let mut effective_candidates = BTreeSet::new();
-  for (index, candidate) in groups[group_id].candidates().iter().enumerate() {
-    if let Some(candidate_provider_id) = candidate.provider() {
-      if let ProviderSelector::Fixed(route_provider_id) = route_provider {
-        if candidate_provider_id != route_provider_id {
-          return Err(invalid_value(
-            format!("routes.{route_id}.model"),
-            format!(
-              "model group `{group_id}` candidate {index} pins provider `{candidate_provider_id}`, which conflicts with fixed route provider `{route_provider_id}`"
-            ),
-          ));
-        }
-      }
-
-      if allowed_providers.is_some_and(|providers| !providers.contains(candidate_provider_id)) {
-        return Err(invalid_value(
-          format!("routes.{route_id}.model"),
-          format!(
-            "model group `{group_id}` candidate {index} pins provider `{candidate_provider_id}`, which account pool `{pool_id}` excludes"
-          ),
-        ));
-      }
-    }
-
-    let effective_provider = candidate.provider().or(match route_provider {
-      ProviderSelector::Any => None,
-      ProviderSelector::Fixed(provider) => Some(provider),
-    });
-    if !effective_candidates.insert((effective_provider.cloned(), candidate.model())) {
-      return Err(invalid_value(
-        format!("routes.{route_id}.model"),
-        format!("model group `{group_id}` candidate {index} duplicates an earlier effective candidate"),
-      ));
-    }
+fn validate_model_name(location: String, model: &str) -> Result<(), CompileError> {
+  if model.trim().is_empty() || model.trim() != model {
+    return Err(invalid_value(
+      location,
+      "model names must be non-empty and have no surrounding whitespace",
+    ));
   }
   Ok(())
 }

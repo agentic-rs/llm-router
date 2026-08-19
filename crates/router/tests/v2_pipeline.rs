@@ -168,7 +168,7 @@ route = "relay"
 kind = "managed"
 account_pool = "primary"
 provider = {{ kind = "fixed", provider = "local" }}
-model = {{ kind = "capability" }}
+model = {{ kind = "family", families = {{ smart = ["not-an-openai-model", "gpt-4o"] }} }}
 operation = "preserve"
 
 [routes.relay]
@@ -192,7 +192,7 @@ base_url = "http://{upstream_addr}/v1"
   let states = tokn_router::v2::build_states(plan, &[account()], access, Arc::new(EventBus::noop())).unwrap();
   let app = tokn_router::v2::router(states.into_iter().next().unwrap());
 
-  let managed_body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+  let managed_body = br#"{"model":"smart","messages":[{"role":"user","content":"hi"}]}"#;
   let missing_key = app
     .clone()
     .oneshot(

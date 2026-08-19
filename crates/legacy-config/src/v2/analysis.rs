@@ -2,11 +2,11 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 
 use tokn_config::v2::RawWireIdentity;
-use tokn_config::{AgentId, Config, RouteMode};
+use tokn_config::{AgentId, Config, ModelFamily, RouteMode};
 
 use super::{LegacyPolicyLocation, V2BehaviorChange, V2ProjectionError, V2ProjectionWarning};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct EffectivePolicy {
   pub(super) location: LegacyPolicyLocation,
   pub(super) legacy_profile: Option<String>,
@@ -15,6 +15,7 @@ pub(super) struct EffectivePolicy {
   pub(super) default_provider_id: Option<String>,
   pub(super) providers: Option<Vec<String>>,
   pub(super) accounts: Option<Vec<String>>,
+  pub(super) model_families: Vec<ModelFamily>,
 }
 
 pub(super) fn base_warnings(legacy: &Config) -> Vec<V2ProjectionWarning> {
@@ -57,6 +58,11 @@ pub(super) fn effective_policies(
     legacy.defaults.mode
   };
   ensure_supported_mode(&LegacyPolicyLocation::Default, default_mode)?;
+  let default_model_families = if legacy.defaults.model_families.is_empty() {
+    legacy.model_families.clone()
+  } else {
+    legacy.defaults.model_families.clone()
+  };
 
   let mut policies = vec![EffectivePolicy {
     location: LegacyPolicyLocation::Default,
@@ -66,6 +72,7 @@ pub(super) fn effective_policies(
     default_provider_id: legacy.defaults.default_provider_id.clone(),
     providers: legacy.defaults.providers.clone(),
     accounts: legacy.defaults.accounts.clone(),
+    model_families: default_model_families.clone(),
   }];
   for (name, profile) in &legacy.profiles {
     let location = LegacyPolicyLocation::Profile(name.clone());
@@ -82,12 +89,16 @@ pub(super) fn effective_policies(
         .or_else(|| legacy.defaults.default_provider_id.clone()),
       providers: profile.providers.clone().or_else(|| legacy.defaults.providers.clone()),
       accounts: profile.accounts.clone().or_else(|| legacy.defaults.accounts.clone()),
+      model_families: profile
+        .model_families
+        .clone()
+        .unwrap_or_else(|| default_model_families.clone()),
     });
   }
 
   if policies
     .iter()
-    .any(|policy| matches!(policy.mode, RouteMode::Route | RouteMode::Exact))
+    .any(|policy| matches!(policy.mode, RouteMode::Route | RouteMode::Exact | RouteMode::Fuzzy))
   {
     warnings.push(V2ProjectionWarning::BehaviorChange(
       V2BehaviorChange::ManagedSelectionOrder,
@@ -98,8 +109,8 @@ pub(super) fn effective_policies(
 
 fn ensure_supported_mode(location: &LegacyPolicyLocation, mode: RouteMode) -> Result<(), V2ProjectionError> {
   match mode {
-    RouteMode::Route | RouteMode::Exact | RouteMode::Switch => Ok(()),
-    RouteMode::Fuzzy | RouteMode::Passthrough => Err(V2ProjectionError::UnsupportedRouteMode {
+    RouteMode::Route | RouteMode::Exact | RouteMode::Switch | RouteMode::Fuzzy => Ok(()),
+    RouteMode::Passthrough => Err(V2ProjectionError::UnsupportedRouteMode {
       policy: location.clone(),
       mode,
     }),
@@ -212,6 +223,10 @@ mod tests {
     legacy.defaults.providers = Some(vec!["openai".into()]);
     legacy.defaults.accounts = Some(vec!["primary".into()]);
     legacy.defaults.default_provider_id = Some("openai".into());
+    legacy.model_families = vec![ModelFamily {
+      name: "smart".into(),
+      members: vec!["gpt-5".into(), "gpt-4o".into()],
+    }];
     legacy.profiles.insert("work".into(), ProfileConfig::default());
 
     let mut warnings = Vec::new();
@@ -223,6 +238,8 @@ mod tests {
     assert_eq!(profile.providers.as_deref().unwrap(), ["openai"]);
     assert_eq!(profile.accounts.as_deref().unwrap(), ["primary"]);
     assert_eq!(profile.default_provider_id.as_deref(), Some("openai"));
+    assert_eq!(profile.model_families[0].name, "smart");
+    assert_eq!(profile.model_families[0].members, ["gpt-5", "gpt-4o"]);
     assert!(warnings.contains(&V2ProjectionWarning::LegacyServerRouteModeUsed { mode: RouteMode::Exact }));
   }
 

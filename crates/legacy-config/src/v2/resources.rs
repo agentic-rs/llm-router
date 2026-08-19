@@ -248,6 +248,7 @@ mod tests {
       default_provider_id: None,
       providers: None,
       accounts: None,
+      model_families: Vec::new(),
     }
   }
 

@@ -26,6 +26,5 @@ fn compile_gateway(raw: &RawConfig, source: &Path) -> Result<GatewayPlan, Compil
     resources.routes,
     resources.account_pools,
     resources.providers,
-    resources.model_groups,
   ))
 }

@@ -6,8 +6,8 @@ use tokn_accounts::link::{AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, 
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_policy::{
-  AccountPoolId, DriverId, FallbackSelector, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProviderId,
-  ProviderSelector, QualificationNamespace, RelayCredentials, RelayDestination, RelayRoute, RouteId, RoutePlan,
+  AccountPoolId, DriverId, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProviderId, ProviderSelector,
+  QualificationNamespace, RelayCredentials, RelayDestination, RelayRoute, RouteId, RoutePlan,
 };
 use tokn_requests::event::Stage;
 use tokn_requests::pipeline::ctx::PipelineCtx;
@@ -96,7 +96,7 @@ impl V2AccountSelector {
   ) -> Result<SelectorOutcome, PipelineError> {
     let endpoint = resolved_endpoint(ctx)?;
     let allowed = allowed_provider_ids(ctx)?;
-    let candidates = model_candidates(&self.plan, route, extracted.model.as_str())?;
+    let candidates = model_candidates(route, extracted.model.as_str())?;
     let operations = operation_candidates(route.operation(), endpoint);
     let mut matching_binding_exists = false;
     let mut allowed_matching_binding_exists = false;
@@ -459,11 +459,7 @@ impl ProviderConstraint {
   }
 }
 
-fn model_candidates(
-  plan: &GatewayPlan,
-  route: &ManagedRoute,
-  requested_model: &str,
-) -> Result<Vec<ModelCandidate>, PipelineError> {
+fn model_candidates(route: &ManagedRoute, requested_model: &str) -> Result<Vec<ModelCandidate>, PipelineError> {
   match route.target().model() {
     ModelSelector::Capability => Ok(vec![ModelCandidate {
       model: SmolStr::new(requested_model),
@@ -492,39 +488,24 @@ fn model_candidates(
         constraint,
       }])
     }
-    ModelSelector::Fallback(selector) => {
-      let group_ids: Vec<_> = match selector {
-        FallbackSelector::Fixed(group) => vec![group],
-        FallbackSelector::ByRequested(groups) => groups
-          .iter()
-          .find(|group_id| {
-            group_id.as_str() == requested_model
-              || plan.model_group(group_id).is_some_and(|group| {
-                group
-                  .candidates()
-                  .iter()
-                  .any(|candidate| candidate.model() == requested_model)
-              })
-          })
-          .into_iter()
-          .collect(),
+    ModelSelector::Family(families) => {
+      let Some(family) = families.iter().find(|family| family.name() == requested_model) else {
+        return Ok(vec![ModelCandidate {
+          model: SmolStr::new(requested_model),
+          constraint: ProviderConstraint::Any,
+        }]);
       };
-      let mut candidates = Vec::new();
-      for group_id in group_ids {
-        let group = plan.model_group(group_id).ok_or_else(|| {
-          invalid_route_request(format!("fallback selector references missing model group '{group_id}'"))
-        })?;
-        for candidate in group.candidates() {
-          candidates.push(ModelCandidate {
-            model: SmolStr::new(candidate.model()),
-            constraint: candidate
-              .provider()
-              .cloned()
-              .map_or(ProviderConstraint::Any, ProviderConstraint::Provider),
-          });
-        }
-      }
-      Ok(candidates)
+      Ok(
+        family
+          .members()
+          .iter()
+          .cloned()
+          .map(|model| ModelCandidate {
+            model,
+            constraint: ProviderConstraint::Any,
+          })
+          .collect(),
+      )
     }
   }
 }
@@ -622,7 +603,7 @@ mod tests {
   use super::*;
   use std::path::Path;
 
-  fn managed_plan(model: &str, groups: &str) -> GatewayPlan {
+  fn managed_plan(model: &str) -> GatewayPlan {
     let config = format!(
       r#"
 schema_version = 2
@@ -649,8 +630,6 @@ providers = ["*"]
 
 [providers.local]
 driver = "openai"
-
-{groups}
 "#
     );
     tokn_config::v2::parse(&config, Path::new("selector-test.toml")).unwrap()
@@ -669,8 +648,8 @@ driver = "openai"
       ("driver", "openai/gpt-5", "openai"),
       ("provider", "local/gpt-5", "local"),
     ] {
-      let plan = managed_plan(&format!(r#"{{ kind = "qualified", namespace = "{namespace}" }}"#), "");
-      let candidates = model_candidates(&plan, managed_route(&plan), requested).unwrap();
+      let plan = managed_plan(&format!(r#"{{ kind = "qualified", namespace = "{namespace}" }}"#));
+      let candidates = model_candidates(managed_route(&plan), requested).unwrap();
       assert_eq!(candidates.len(), 1);
       assert_eq!(candidates[0].model, "gpt-5");
       match &candidates[0].constraint {
@@ -678,26 +657,15 @@ driver = "openai"
         ProviderConstraint::Provider(id) => assert_eq!(id.as_str(), expected_qualifier),
         ProviderConstraint::Any => panic!("expected qualified constraint"),
       }
-      assert!(model_candidates(&plan, managed_route(&plan), "gpt-5").is_err());
-      assert!(model_candidates(&plan, managed_route(&plan), &format!("{expected_qualifier}/ ")).is_err());
+      assert!(model_candidates(managed_route(&plan), "gpt-5").is_err());
+      assert!(model_candidates(managed_route(&plan), &format!("{expected_qualifier}/ ")).is_err());
     }
   }
 
   #[test]
-  fn builds_fixed_and_requested_fallback_candidates_in_order() {
-    let groups = r#"
-[[model_groups.coding]]
-model = "gpt-5"
-provider = "local"
-
-[[model_groups.coding]]
-model = "gpt-4o"
-"#;
-    let fixed = managed_plan(
-      r#"{ kind = "fallback", selector = { kind = "fixed", group = "coding" } }"#,
-      groups,
-    );
-    let candidates = model_candidates(&fixed, managed_route(&fixed), "ignored").unwrap();
+  fn expands_only_named_families_and_preserves_member_order() {
+    let plan = managed_plan(r#"{ kind = "family", families = { coding = ["gpt-5", "gpt-4o"] } }"#);
+    let candidates = model_candidates(managed_route(&plan), "coding").unwrap();
     assert_eq!(
       candidates
         .iter()
@@ -705,22 +673,16 @@ model = "gpt-4o"
         .collect::<Vec<_>>(),
       ["gpt-5", "gpt-4o"]
     );
-    assert!(matches!(candidates[0].constraint, ProviderConstraint::Provider(_)));
+    assert!(matches!(candidates[0].constraint, ProviderConstraint::Any));
     assert!(matches!(candidates[1].constraint, ProviderConstraint::Any));
 
-    let requested = managed_plan(
-      r#"{ kind = "fallback", selector = { kind = "by_requested", groups = ["coding"] } }"#,
-      groups,
-    );
-    assert_eq!(
-      model_candidates(&requested, managed_route(&requested), "gpt-4o")
-        .unwrap()
-        .len(),
-      2
-    );
-    assert!(model_candidates(&requested, managed_route(&requested), "unknown")
-      .unwrap()
-      .is_empty());
+    let concrete = model_candidates(managed_route(&plan), "gpt-4o").unwrap();
+    assert_eq!(concrete.len(), 1);
+    assert_eq!(concrete[0].model, "gpt-4o");
+
+    let unknown = model_candidates(managed_route(&plan), "unknown").unwrap();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].model, "unknown");
   }
 
   #[test]

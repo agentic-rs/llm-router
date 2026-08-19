@@ -377,14 +377,7 @@ mod tests {
     providers: BTreeMap<ProviderId, ProviderPlan>,
     accounts: &[AccountConfig],
   ) -> AccountPoolRuntimes {
-    let plan = GatewayPlan::new(
-      BTreeMap::new(),
-      BTreeMap::new(),
-      BTreeMap::new(),
-      pools,
-      providers,
-      BTreeMap::new(),
-    );
+    let plan = GatewayPlan::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), pools, providers);
     let registry = Registry::builtin();
     let providers = link_provider_graph(&plan, accounts, &registry).unwrap();
     let pools = link_account_pools(&plan, &providers).unwrap();
