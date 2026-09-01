@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokn_access::AccessStore;
 use tokn_core::event::{Event, EventBus};
-use tokn_core::request_event::{RequestEventPayload, StageEvent};
+use tokn_core::request_event::{RecordEvent, RequestEventPayload, StageEvent};
 
 #[tokio::test]
 async fn v2_forward_proxy_authenticates_and_applies_connect_policy() {
@@ -216,6 +216,7 @@ access_token = "codex-client-token"
   wait_for_listener(proxy_addr).await;
 
   let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  let client_addr = client.local_addr().unwrap();
   client
     .write_all(
       format!(
@@ -262,8 +263,47 @@ access_token = "codex-client-token"
   }
   assert!(request.ends_with("hello"));
 
-  let resolved = std::iter::from_fn(|| event_rx.try_recv().ok()).find_map(|event| {
-    let Event::Requests(request) = &*event else {
+  let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+  let inbound = events.iter().find_map(|event| {
+    let Event::Requests(request) = &**event else {
+      return None;
+    };
+    match &request.payload {
+      RequestEventPayload::Record(RecordEvent::InboundConnection {
+        local_addr,
+        peer_addr,
+        mode,
+        method,
+        inbound_method,
+        url,
+        ..
+      }) => Some((
+        request.request_id.clone(),
+        local_addr.clone(),
+        peer_addr.clone(),
+        mode.clone(),
+        method.clone(),
+        inbound_method.clone(),
+        url.clone(),
+      )),
+      _ => None,
+    }
+  });
+  let (request_id, local_addr, peer_addr, mode, pipeline_id, inbound_method, inbound_url) =
+    inbound.expect("proxy request did not emit an inbound connection event");
+  assert_eq!(request_id.as_str(), generated_request_id);
+  assert_eq!(local_addr.as_deref(), Some(proxy_addr.to_string().as_str()));
+  assert_eq!(peer_addr.as_deref(), Some(client_addr.to_string().as_str()));
+  assert_eq!(mode.as_str(), "passthrough");
+  assert_eq!(pipeline_id.as_str(), "proxy");
+  assert_eq!(inbound_method.as_str(), "POST");
+  assert_eq!(
+    inbound_url.as_deref(),
+    Some(format!("http://{upstream_addr}/opaque?x=1").as_str())
+  );
+
+  let resolved = events.iter().find_map(|event| {
+    let Event::Requests(request) = &**event else {
       return None;
     };
     match &request.payload {

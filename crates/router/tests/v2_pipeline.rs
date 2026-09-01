@@ -1,5 +1,5 @@
 use axum::body::{to_bytes, Body, Bytes};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Extension, State};
 use axum::http::{HeaderMap, Request, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::any;
@@ -8,7 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tokn_access::AccessStore;
 use tokn_core::account::{AccountConfig, AccountTier, AuthType, Secret};
-use tokn_core::event::EventBus;
+use tokn_core::event::{Event, EventBus};
+use tokn_core::request_event::{RecordEvent, RequestEventPayload};
 use tower::ServiceExt;
 
 struct CapturedRequest {
@@ -65,23 +66,31 @@ base_url = "http://{upstream_addr}/v1"
 "#
   );
   let plan = tokn_config::v2::parse(&config, Path::new("v2-client-relay.toml")).unwrap();
-  let states =
-    tokn_router::v2::build_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop())).unwrap();
-  let app = tokn_router::v2::router(states.into_iter().next().unwrap());
+  let events = Arc::new(EventBus::new(64));
+  let mut event_rx = events.subscribe();
+  let states = tokn_router::v2::build_states(plan, &[], Arc::new(AccessStore::disabled()), events).unwrap();
+  let local_addr = "127.0.0.1:4141".parse::<std::net::SocketAddr>().unwrap();
+  let peer_addr = "127.0.0.1:5151".parse::<std::net::SocketAddr>().unwrap();
+  let app = tokn_router::v2::router(states.into_iter().next().unwrap()).layer(Extension(local_addr));
   let body = Bytes::from_static(br#"{"model":"gpt-4o","input":"hello","opaque":true}"#);
 
-  let response = app
-    .oneshot(
-      Request::post("/v1/responses")
-        .header("host", "gateway.example")
-        .header("content-type", "application/json")
-        .header("authorization", "Bearer client-secret")
-        .header("x-api-key", "client-key")
-        .body(Body::from(body.clone()))
-        .unwrap(),
-    )
-    .await
+  let mut request = Request::post("/v1/responses")
+    .header("host", "gateway.example")
+    .header("x-tokn-router-local-addr", "spoofed.example")
+    .header("content-type", "application/json")
+    .header("authorization", "Bearer client-secret")
+    .header("x-api-key", "client-key")
+    .body(Body::from(body.clone()))
     .unwrap();
+  request.extensions_mut().insert(ConnectInfo(peer_addr));
+  let response = app.oneshot(request).await.unwrap();
+  let request_id = response
+    .headers()
+    .get("x-request-id")
+    .expect("v2 response missing request id")
+    .to_str()
+    .unwrap()
+    .to_string();
   let status = response.status();
   let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
   assert_eq!(
@@ -98,6 +107,46 @@ base_url = "http://{upstream_addr}/v1"
   assert_eq!(captured.headers["x-api-key"], "client-key");
   assert_ne!(captured.headers["host"], "gateway.example");
   assert_eq!(captured.body, body);
+
+  let inbound = std::iter::from_fn(|| event_rx.try_recv().ok()).find_map(|event| {
+    let Event::Requests(request) = &*event else {
+      return None;
+    };
+    match &request.payload {
+      RequestEventPayload::Record(RecordEvent::InboundConnection {
+        user,
+        api_key_id,
+        local_addr,
+        peer_addr,
+        mode,
+        method,
+        inbound_method,
+        url,
+      }) => Some((
+        request.request_id.clone(),
+        user.clone(),
+        api_key_id.clone(),
+        local_addr.clone(),
+        peer_addr.clone(),
+        mode.clone(),
+        method.clone(),
+        inbound_method.clone(),
+        url.clone(),
+      )),
+      _ => None,
+    }
+  });
+  let (event_request_id, user, api_key_id, local_addr, peer_addr, mode, pipeline_id, inbound_method, url) =
+    inbound.expect("v2 API request did not emit an inbound connection event");
+  assert_eq!(event_request_id.as_str(), request_id);
+  assert!(user.is_none());
+  assert!(api_key_id.is_none());
+  assert_eq!(local_addr.as_deref(), Some("127.0.0.1:4141"));
+  assert_eq!(peer_addr.as_deref(), Some("127.0.0.1:5151"));
+  assert_eq!(mode.as_str(), "passthrough");
+  assert_eq!(pipeline_id.as_str(), "requests");
+  assert_eq!(inbound_method.as_str(), "POST");
+  assert!(url.is_none());
 
   server.abort();
 }
