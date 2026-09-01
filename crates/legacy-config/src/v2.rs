@@ -86,7 +86,7 @@ impl std::fmt::Display for V2BehaviorChange {
       Self::RequestModeOverrides => "per-request legacy route-mode overrides are not projected",
       Self::ManagedSelectionOrder => "managed account and provider selection follows v2 ordering",
       Self::RetryPolicy => "legacy retry policy is not projected",
-      Self::OperationalSettings => "legacy operational settings not represented by v2 use v2 defaults",
+      Self::OperationalSettings => "legacy operational settings are not projected; v2 defaults are used",
       Self::Cors => "legacy CORS settings are not projected",
       Self::AgentBindings => "legacy agent bindings are not projected",
       Self::PercentDecodedProfileAliases => "profile paths use canonical v2 percent-encoding semantics",
