@@ -13,6 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use parking_lot::Mutex;
 use selector::{
   PoolAwareSend, ProxyPoolAwareSend, V2AccountSelector, V2ClientResolve, V2ProxyResolve, V2_PROXY_ORIGIN_KEY,
 };
@@ -51,6 +52,9 @@ use tokn_requests::{ExecutionRequest, Pipeline, Profile, RawInbound, RequestServ
 use tower_http::request_id::SetRequestIdLayer;
 
 use crate::request_id::REQUEST_ID_HEADER;
+
+const ADMIN_ACTION_HEADER: &str = "x-tokn-admin";
+const ADMIN_RELOAD_ACTION: &str = "reload";
 
 #[derive(Clone)]
 struct ProfileRuntime {
@@ -590,6 +594,7 @@ impl RuntimeGeneration {
 #[derive(Clone)]
 pub struct LiveRuntime {
   current: Arc<ArcSwap<RuntimeGeneration>>,
+  replace_lock: Arc<Mutex<()>>,
   admin_reloader: Arc<OnceLock<AdminReloader>>,
 }
 
@@ -597,6 +602,7 @@ impl LiveRuntime {
   pub fn new(states: RuntimeStates, accounts: usize) -> Self {
     Self {
       current: Arc::new(ArcSwap::from_pointee(RuntimeGeneration::new(1, accounts, states))),
+      replace_lock: Arc::new(Mutex::new(())),
       admin_reloader: Arc::new(OnceLock::new()),
     }
   }
@@ -638,6 +644,7 @@ impl LiveRuntime {
   }
 
   pub fn replace(&self, states: RuntimeStates, accounts: usize) -> Result<ReloadReport, ReloadError> {
+    let _guard = self.replace_lock.lock();
     let current = self.current.load_full();
     let replacement = RuntimeGeneration::new(current.number + 1, accounts, states);
     ensure_reload_compatible(&current, &replacement)?;
@@ -1417,7 +1424,7 @@ pub fn router(state: AppState) -> Router {
 pub fn router_live(state: LiveAppState) -> Router {
   let max_wire_bytes = state.current().request_limits.max_wire_bytes();
   let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
-  Router::new()
+  let mut router = Router::new()
     .route("/v1/chat/completions", post(chat_completions))
     .route("/v1/responses", post(responses))
     .route("/v1/messages", post(messages))
@@ -1428,8 +1435,11 @@ pub fn router_live(state: LiveAppState) -> Router {
     .route("/{profile}/v1/messages", post(messages))
     .route("/{profile}/v1/providers", get(list_providers))
     .route("/{profile}/v1/models", get(list_models))
-    .route("/admin/config/reload", post(admin_config_reload))
-    .route("/healthz", get(health))
+    .route("/healthz", get(health));
+  if state.bind().ip().is_loopback() {
+    router = router.route("/admin/config/reload", post(admin_config_reload));
+  }
+  router
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     .layer(middleware::from_fn(crate::request_id::propagate_request_id))
     .layer(SetRequestIdLayer::new(
@@ -1516,27 +1526,37 @@ async fn authenticate(State(live): State<LiveAppState>, mut request: Request, ne
   }
 }
 
-async fn admin_config_reload(State(state): State<LiveAppState>) -> Response {
+async fn admin_config_reload(State(state): State<LiveAppState>, headers: HeaderMap) -> Response {
+  if headers.get(ADMIN_ACTION_HEADER).and_then(|value| value.to_str().ok()) != Some(ADMIN_RELOAD_ACTION) {
+    return ApiError::forbidden("config reload requires an explicit admin action header").into_response();
+  }
   match state.runtime.reload().await {
     Ok(report) => Json(report).into_response(),
-    Err(ReloadError::NotConfigured) => {
-      reload_error_response(StatusCode::NOT_FOUND, "not_found", ReloadError::NotConfigured)
-    }
+    Err(ReloadError::NotConfigured) => reload_error_response(
+      StatusCode::NOT_FOUND,
+      "not_found",
+      ReloadError::NotConfigured.to_string(),
+    ),
     Err(error @ ReloadError::RestartRequired(_)) => {
-      reload_error_response(StatusCode::CONFLICT, "restart_required", error)
+      reload_error_response(StatusCode::CONFLICT, "restart_required", error.to_string())
     }
     Err(error @ ReloadError::Invalid(_)) => {
-      reload_error_response(StatusCode::UNPROCESSABLE_ENTITY, "reload_failed", error)
+      tracing::warn!(%error, "v2 configuration reload failed");
+      reload_error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "reload_failed",
+        "configuration reload failed; see server logs".into(),
+      )
     }
   }
 }
 
-fn reload_error_response(status: StatusCode, kind: &'static str, error: ReloadError) -> Response {
+fn reload_error_response(status: StatusCode, kind: &'static str, message: String) -> Response {
   (
     status,
     Json(serde_json::json!({
       "error": {
-        "message": error.to_string(),
+        "message": message,
         "type": kind,
         "code": status.as_u16(),
         "request_id": serde_json::Value::Null,
@@ -1871,6 +1891,40 @@ default_connect = "{default_connect}"
   }
 
   #[test]
+  fn concurrent_live_runtime_replacements_are_serialized() {
+    let live = LiveRuntime::new(reload_test_states("127.0.0.1:4141", "127.0.0.1:4142", "reject"), 1);
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let handles = (0..8)
+      .map(|index| {
+        let live = live.clone();
+        let barrier = barrier.clone();
+        let states = reload_test_states(
+          "127.0.0.1:4141",
+          "127.0.0.1:4142",
+          if index % 2 == 0 { "reject" } else { "tunnel" },
+        );
+        std::thread::spawn(move || {
+          barrier.wait();
+          live.replace(states, index + 2).unwrap()
+        })
+      })
+      .collect::<Vec<_>>();
+
+    let mut reports = handles
+      .into_iter()
+      .map(|handle| handle.join().unwrap())
+      .collect::<Vec<_>>();
+    reports.sort_by_key(|report| report.generation);
+
+    assert_eq!(
+      reports.iter().map(|report| report.generation).collect::<Vec<_>>(),
+      (2..=9).collect::<Vec<_>>()
+    );
+    assert_eq!(live.generation(), 9);
+    assert_eq!(live.accounts(), reports.last().unwrap().accounts);
+  }
+
+  #[test]
   fn live_runtime_rejects_restart_required_listener_changes_without_swapping() {
     let live = LiveRuntime::new(reload_test_states("127.0.0.1:4141", "127.0.0.1:4142", "reject"), 1);
 
@@ -1913,8 +1967,21 @@ default_connect = "{default_connect}"
       .is_ok());
     let app = router_live(live.llm_api_listeners().pop().unwrap());
 
-    let response = app
+    let missing_admin_action = app
+      .clone()
       .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(missing_admin_action.status(), StatusCode::FORBIDDEN);
+    assert_eq!(live.generation(), 1);
+
+    let response = app
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header(ADMIN_ACTION_HEADER, ADMIN_RELOAD_ACTION)
+          .body(Body::empty())
+          .unwrap(),
+      )
       .await
       .unwrap();
 
@@ -1926,10 +1993,18 @@ default_connect = "{default_connect}"
     assert_eq!(live.generation(), 2);
 
     let failed = router_live(live.llm_api_listeners().pop().unwrap())
-      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header(ADMIN_ACTION_HEADER, ADMIN_RELOAD_ACTION)
+          .body(Body::empty())
+          .unwrap(),
+      )
       .await
       .unwrap();
     assert_eq!(failed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(failed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["message"], "configuration reload failed; see server logs");
     assert_eq!(live.generation(), 2);
   }
 
@@ -1963,7 +2038,12 @@ default_http_action = { kind = "reject" }
 
     let unauthorized = app
       .clone()
-      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header(ADMIN_ACTION_HEADER, ADMIN_RELOAD_ACTION)
+          .body(Body::empty())
+          .unwrap(),
+      )
       .await
       .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -1972,12 +2052,62 @@ default_http_action = { kind = "reject" }
       .oneshot(
         Request::post("/admin/config/reload")
           .header("authorization", format!("Bearer {}", key.token))
+          .header(ADMIN_ACTION_HEADER, ADMIN_RELOAD_ACTION)
           .body(Body::empty())
           .unwrap(),
       )
       .await
       .unwrap();
     assert_eq!(authorized.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn admin_reload_endpoint_is_not_exposed_on_public_listeners() {
+    let config = r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "0.0.0.0:4141"
+client_auth = "local_keys"
+allow_insecure_public = true
+default_http_action = { kind = "reject" }
+"#;
+    let plan = tokn_config::v2::parse(config, std::path::Path::new("reload-public-test.toml")).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let access = tokn_access::AccessStore::open(directory.path().join("access.db")).unwrap();
+    let key = access.create_key("ordinary client", vec!["*".into()]).unwrap();
+    let states = build_runtime_states(plan, &[], Arc::new(access), Arc::new(EventBus::noop())).unwrap();
+    let live = LiveRuntime::new(states, 0);
+    let reload_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reload_called_by_handler = reload_called.clone();
+    assert!(live
+      .set_admin_reloader(AdminReloader::new(move || {
+        reload_called_by_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+        async {
+          Ok(ReloadReport {
+            status: "reloaded",
+            generation: 2,
+            accounts: 0,
+          })
+        }
+      }))
+      .is_ok());
+    let app = router_live(live.llm_api_listeners().pop().unwrap());
+
+    let response = app
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header("authorization", format!("Bearer {}", key.token))
+          .header(ADMIN_ACTION_HEADER, ADMIN_RELOAD_ACTION)
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!reload_called.load(std::sync::atomic::Ordering::SeqCst));
   }
 
   #[test]

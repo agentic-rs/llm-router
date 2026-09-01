@@ -410,15 +410,21 @@ falling back silently to the old server runtime. For legacy configs,
 route mode. Native v2 configs continue to declare their listeners in config
 and reject these compatibility flags.
 
-Every v2 `llm_api` listener exposes `POST /admin/config/reload`. The endpoint
-re-reads the selected config plus `auth.yaml` and `auth.d`; for an unversioned
-legacy config it also merges fragments and repeats the in-memory v2 projection
-with the original `serve` flags. Listener authentication applies to this
-endpoint, so include the same Bearer token when `client_auth = "local_keys"`
-(or `[api_key].enabled = true` in a projected legacy config):
+Every loopback-bound v2 `llm_api` listener exposes the local control endpoint
+`POST /admin/config/reload`. It is deliberately absent from non-loopback
+listeners because ordinary client keys do not grant gateway-administration
+capability. The endpoint re-reads the selected config plus `auth.yaml` and
+`auth.d`; for an unversioned legacy config it also merges fragments and repeats
+the in-memory v2 projection with the original `serve` flags. Listener
+authentication still applies, so include the same Bearer token when
+`client_auth = "local_keys"` (or `[api_key].enabled = true` in a projected
+legacy config). Every call must also include `x-tokn-admin: reload`; this
+explicit non-simple header prevents ambient browser requests from triggering a
+reload on an unauthenticated loopback listener:
 
 ```sh
 curl -X POST http://127.0.0.1:4141/admin/config/reload \
+  -H "x-tokn-admin: reload" \
   -H "authorization: Bearer $TOKN_API_KEY"
 ```
 
@@ -432,9 +438,10 @@ either failure leaves the active generation untouched.
 Listener ids, kinds, bind addresses, client authentication, and proxy TLS/CA
 settings require a restart. Service-level outbound transport, request limits,
 persistence settings, and switching between legacy and native-v2 config
-schemas also require a restart. A native config containing only
-`forward_proxy` listeners has no HTTP admin endpoint, so it must be restarted
-to apply changes.
+schemas also require a restart. A forward-proxy listener's
+`request_body_max_bytes` is request policy and can reload. A native config with
+only `forward_proxy` listeners, or with no loopback `llm_api` listener, has no
+HTTP admin endpoint and must be restarted to apply changes.
 
 Native v2 retries are opt-in route policy. Define a bounded exponential
 backoff policy once, then reference it from each route that may retry:

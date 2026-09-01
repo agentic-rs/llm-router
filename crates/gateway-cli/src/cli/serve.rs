@@ -319,6 +319,8 @@ fn ensure_service_reload_compatible(
   current: &tokn_config::v2::ServicePlan,
   replacement: &tokn_config::v2::ServicePlan,
 ) -> std::result::Result<(), tokn_router::v2::ReloadError> {
+  // These fields are restart-only, so every accepted generation still matches
+  // the process-start service plan used as this comparison baseline.
   let changed = if current.outbound() != replacement.outbound() {
     "outbound transport settings changed"
   } else if current.request_limits() != replacement.request_limits() {
@@ -781,7 +783,12 @@ default_connect = "{default_connect}"
     .unwrap();
     let reloaded = app
       .clone()
-      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header("x-tokn-admin", "reload")
+          .body(Body::empty())
+          .unwrap(),
+      )
       .await
       .unwrap();
     assert_eq!(reloaded.status(), StatusCode::OK);
@@ -797,7 +804,12 @@ default_connect = "{default_connect}"
     .unwrap();
     let restart_required = app
       .clone()
-      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header("x-tokn-admin", "reload")
+          .body(Body::empty())
+          .unwrap(),
+      )
       .await
       .unwrap();
     assert_eq!(restart_required.status(), StatusCode::CONFLICT);
@@ -812,7 +824,12 @@ default_connect = "{default_connect}"
 
     std::fs::write(&config_path, "[server]\nport = 4141\n").unwrap();
     let schema_change = app
-      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header("x-tokn-admin", "reload")
+          .body(Body::empty())
+          .unwrap(),
+      )
       .await
       .unwrap();
     assert_eq!(schema_change.status(), StatusCode::CONFLICT);
@@ -873,7 +890,12 @@ default_connect = "{default_connect}"
     auth.upsert(account("secondary", "openai"));
     auth.save().unwrap();
     let response = app
-      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header("x-tokn-admin", "reload")
+          .body(Body::empty())
+          .unwrap(),
+      )
       .await
       .unwrap();
 

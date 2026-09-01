@@ -215,6 +215,9 @@ async fn run_connect(upgrade: ConnectUpgrade, state: LiveForwardProxyState) -> R
         .context("intercepted TLS handshake timed out")?
         .context("intercepted TLS handshake failed")?;
       let ingress = upgrade.ingress;
+      // Proxy authentication is admitted once for the CONNECT connection. The
+      // authentication mode cannot reload, while each inner HTTP request takes
+      // a current policy generation just like a keep-alive API connection.
       let access = upgrade.access;
       let connection = upgrade.connection;
       let service = service_fn(move |mut request| {
