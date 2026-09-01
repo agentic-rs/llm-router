@@ -282,7 +282,14 @@ mod tests {
     pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
     providers: BTreeMap<tokn_policy::ProviderId, ProviderPlan>,
   ) -> GatewayPlan {
-    GatewayPlan::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), pools, providers)
+    GatewayPlan::new(
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      pools,
+      providers,
+    )
   }
 
   fn link(plan: &GatewayPlan, accounts: &[AccountConfig]) -> PoolLinkResult<(ProviderGraph, LinkedAccountPools)> {

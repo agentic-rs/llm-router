@@ -57,6 +57,147 @@ fn compiles_wildcards_and_managed_auto_identity() {
 }
 
 #[test]
+fn compiles_retry_policies_for_managed_and_relay_routes() {
+  let mut config = base_config("");
+  config.retry_policies.insert(
+    "standard".into(),
+    RawRetryPolicy {
+      max_retries: 2,
+      initial_backoff_ms: 100,
+    },
+  );
+  config.routes.insert(
+    "managed".into(),
+    RawRoute::Managed {
+      account_pool: "default".into(),
+      provider: RawProviderSelector::Any {},
+      model: RawModelSelector::Capability {},
+      operation: RawOperationPolicy::TranslateCompatible,
+      retry: RawRouteRetry::Recoverable {
+        policy: "standard".into(),
+      },
+    },
+  );
+  config.routes.insert(
+    "relay-safe".into(),
+    RawRoute::Relay {
+      destination: RawRelayDestination::FixedProvider {
+        provider: "default".into(),
+      },
+      credentials: RawRelayCredentials::Client {},
+      retry: RawRouteRetry::SafeMethods {
+        policy: "standard".into(),
+      },
+    },
+  );
+  config.routes.insert(
+    "relay-buffered".into(),
+    RawRoute::Relay {
+      destination: RawRelayDestination::FixedProvider {
+        provider: "default".into(),
+      },
+      credentials: RawRelayCredentials::AccountPool {
+        account_pool: "default".into(),
+      },
+      retry: RawRouteRetry::Buffered {
+        policy: "standard".into(),
+      },
+    },
+  );
+
+  let compiled = compile_resources(&config).unwrap();
+  let retry_id = RetryPolicyId::new("standard").unwrap();
+  assert_eq!(
+    compiled.retry_policies[&retry_id],
+    RetryPolicyPlan::new(2, Duration::from_millis(100))
+  );
+  assert!(matches!(
+    compiled.routes[&RouteId::new("managed").unwrap()],
+    RoutePlan::Managed(ref route) if route.retry() == &ManagedRetry::Recoverable(retry_id.clone())
+  ));
+  assert!(matches!(
+    compiled.routes[&RouteId::new("relay-safe").unwrap()],
+    RoutePlan::Relay(ref route) if route.retry() == &RelayRetry::SafeMethods(retry_id.clone())
+  ));
+  assert!(matches!(
+    compiled.routes[&RouteId::new("relay-buffered").unwrap()],
+    RoutePlan::Relay(ref route) if route.retry() == &RelayRetry::Buffered(retry_id)
+  ));
+}
+
+#[test]
+fn rejects_invalid_retry_policy_bounds_and_references() {
+  for (max_retries, initial_backoff_ms, location) in [
+    (0, 100, "retry_policies.standard.max_retries"),
+    (11, 100, "retry_policies.standard.max_retries"),
+    (1, 60_001, "retry_policies.standard.initial_backoff_ms"),
+  ] {
+    let mut config = base_config("");
+    config.retry_policies.insert(
+      "standard".into(),
+      RawRetryPolicy {
+        max_retries,
+        initial_backoff_ms,
+      },
+    );
+    assert!(matches!(
+      compile_resources(&config),
+      Err(CompileError::InvalidValue { location: actual, .. }) if actual == location
+    ));
+  }
+
+  let mut config = base_config("");
+  let RawRoute::Managed { retry, .. } = config.routes.get_mut("default").unwrap() else {
+    panic!("expected managed route");
+  };
+  *retry = RawRouteRetry::Recoverable {
+    policy: "missing".into(),
+  };
+  assert!(matches!(
+    compile_resources(&config),
+    Err(CompileError::UnresolvedReference { target, .. }) if target == "missing"
+  ));
+}
+
+#[test]
+fn rejects_retry_kinds_that_do_not_match_route_replay_semantics() {
+  let mut config = base_config(
+    r#"
+[retry_policies.standard]
+max_retries = 1
+initial_backoff_ms = 0
+"#,
+  );
+  let RawRoute::Managed { retry, .. } = config.routes.get_mut("default").unwrap() else {
+    panic!("expected managed route");
+  };
+  *retry = RawRouteRetry::SafeMethods {
+    policy: "standard".into(),
+  };
+  assert!(matches!(
+    compile_resources(&config),
+    Err(CompileError::InvalidValue { location, .. }) if location == "routes.default.retry.kind"
+  ));
+
+  config.routes.insert(
+    "default".into(),
+    RawRoute::Relay {
+      destination: RawRelayDestination::FixedProvider {
+        provider: "default".into(),
+      },
+      credentials: RawRelayCredentials::Client {},
+      retry: RawRouteRetry::Recoverable {
+        policy: "standard".into(),
+      },
+    },
+  );
+  assert!(matches!(
+    compile_resources(&config),
+    Err(CompileError::InvalidValue { location, .. }) if location == "routes.default.retry.kind"
+  ));
+}
+
+#[test]
 fn compiles_relay_destination_and_credentials_independently() {
   let mut config = base_config("");
   config.routes = BTreeMap::from([
@@ -67,6 +208,7 @@ fn compiles_relay_destination_and_credentials_independently() {
           provider: "default".into(),
         },
         credentials: RawRelayCredentials::Client {},
+        retry: RawRouteRetry::Never {},
       },
     ),
     (
@@ -78,6 +220,7 @@ fn compiles_relay_destination_and_credentials_independently() {
         credentials: RawRelayCredentials::AccountPool {
           account_pool: "default".into(),
         },
+        retry: RawRouteRetry::Never {},
       },
     ),
     (
@@ -85,6 +228,7 @@ fn compiles_relay_destination_and_credentials_independently() {
       RawRoute::Relay {
         destination: RawRelayDestination::Original {},
         credentials: RawRelayCredentials::Client {},
+        retry: RawRouteRetry::Never {},
       },
     ),
     (
@@ -94,6 +238,7 @@ fn compiles_relay_destination_and_credentials_independently() {
         credentials: RawRelayCredentials::AccountPool {
           account_pool: "default".into(),
         },
+        retry: RawRouteRetry::Never {},
       },
     ),
   ]);
@@ -161,6 +306,7 @@ origins = ["https://example.com"]
       credentials: RawRelayCredentials::AccountPool {
         account_pool: "default".into(),
       },
+      retry: RawRouteRetry::Never {},
     },
   );
 
@@ -212,6 +358,7 @@ driver = "zai"
       },
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::Preserve,
+      retry: RawRouteRetry::Never {},
     },
   );
 
@@ -229,6 +376,7 @@ fn client_credentials_auto_is_none_but_explicit_identity_is_rejected() {
     RawRoute::Relay {
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::Client {},
+      retry: RawRouteRetry::Never {},
     },
   );
   let compiled = compile_resources(&config.clone()).unwrap();
@@ -256,6 +404,7 @@ fn model_families_require_ordered_unambiguous_members() {
         families: BTreeMap::from([("coding".into(), vec!["gpt-5".into(), "gpt-4o".into()])]),
       },
       operation: RawOperationPolicy::Preserve,
+      retry: RawRouteRetry::Never {},
     },
   );
   let compiled = compile_resources(&config).unwrap();
@@ -326,6 +475,7 @@ driver = "zai"
       credentials: RawRelayCredentials::AccountPool {
         account_pool: "default".into(),
       },
+      retry: RawRouteRetry::Never {},
     },
   );
 
@@ -348,6 +498,7 @@ driver = "openai"
       credentials: RawRelayCredentials::AccountPool {
         account_pool: "default".into(),
       },
+      retry: RawRouteRetry::Never {},
     },
   );
 
@@ -420,6 +571,7 @@ fn fixed_routes_and_pools_can_reference_an_implicit_official_provider() {
       },
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::Preserve,
+      retry: RawRouteRetry::Never {},
     },
   );
 
@@ -611,6 +763,7 @@ fn family_route_rejects_duplicate_members() {
         families: BTreeMap::from([("coding".into(), vec!["gpt-5".into(), "gpt-5".into()])]),
       },
       operation: RawOperationPolicy::Preserve,
+      retry: RawRouteRetry::Never {},
     },
   );
 

@@ -4,8 +4,9 @@ use std::path::Path;
 use tokn_config::v2::{
   CompiledConfig, RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction,
   RawConnectRule, RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawProfile,
-  RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRequestLimits, RawRoute,
-  RawService, RawWireIdentity, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES, SCHEMA_VERSION,
+  RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRequestLimits,
+  RawRetryPolicy, RawRoute, RawRouteRetry, RawService, RawWireIdentity, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
+  SCHEMA_VERSION,
 };
 use tokn_config::{Config, ProxyProviderMode, RouteMode};
 use tokn_core::account::AccountConfig;
@@ -23,6 +24,9 @@ use super::{
 const API_LISTENER_ID: &str = "api";
 const FORWARD_PROXY_LISTENER_ID: &str = "proxy";
 const DEFAULT_POLICY_ID: &str = "default";
+const LEGACY_RETRY_POLICY_ID: &str = "legacy-recoverable";
+const LEGACY_MAX_RETRIES: u32 = 2;
+const LEGACY_INITIAL_BACKOFF_MS: u64 = 100;
 const GENERATED_SOURCE: &str = "in-memory-v1-projection.toml";
 const LLM_ENDPOINTS: [(&str, &str, &str); 3] = [
   ("chat-completions", "chat/completions", "chat_completions"),
@@ -193,6 +197,13 @@ pub fn project_v2_config(
     connect_rules,
     profiles,
     routes,
+    retry_policies: BTreeMap::from([(
+      LEGACY_RETRY_POLICY_ID.to_string(),
+      RawRetryPolicy {
+        max_retries: LEGACY_MAX_RETRIES,
+        initial_backoff_ms: LEGACY_INITIAL_BACKOFF_MS,
+      },
+    )]),
     account_pools,
     providers,
   };
@@ -417,12 +428,14 @@ fn proxy_route_recipe(
     RouteMode::Passthrough => Ok(RawRoute::Relay {
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::Client {},
+      retry: RawRouteRetry::Never {},
     }),
     RouteMode::Switch => Ok(RawRoute::Relay {
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::AccountPool {
         account_pool: account_pool.to_string(),
       },
+      retry: RawRouteRetry::Never {},
     }),
     RouteMode::Route | RouteMode::Exact | RouteMode::Fuzzy => {
       let mut policy = policy.clone();
@@ -457,6 +470,9 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::TranslateCompatible,
+      retry: RawRouteRetry::Recoverable {
+        policy: LEGACY_RETRY_POLICY_ID.to_string(),
+      },
     }),
     RouteMode::Exact => Ok(RawRoute::Managed {
       account_pool: account_pool.to_string(),
@@ -465,6 +481,9 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
         namespace: RawQualificationNamespace::Provider,
       },
       operation: RawOperationPolicy::TranslateCompatible,
+      retry: RawRouteRetry::Recoverable {
+        policy: LEGACY_RETRY_POLICY_ID.to_string(),
+      },
     }),
     RouteMode::Fuzzy => Ok(RawRoute::Managed {
       account_pool: account_pool.to_string(),
@@ -477,6 +496,9 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
           .collect(),
       },
       operation: RawOperationPolicy::TranslateCompatible,
+      retry: RawRouteRetry::Recoverable {
+        policy: LEGACY_RETRY_POLICY_ID.to_string(),
+      },
     }),
     RouteMode::Switch => {
       let provider = policy
@@ -489,6 +511,9 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
         destination: RawRelayDestination::FixedProvider { provider },
         credentials: RawRelayCredentials::AccountPool {
           account_pool: account_pool.to_string(),
+        },
+        retry: RawRouteRetry::Buffered {
+          policy: LEGACY_RETRY_POLICY_ID.to_string(),
         },
       })
     }
@@ -551,7 +576,7 @@ mod tests {
   use tokn_accounts::link::{link_account_pools, link_provider_graph};
   use tokn_accounts::registry::Registry;
   use tokn_config::{ModelFamily, ProfileConfig};
-  use tokn_policy::{ModelSelector, RouteKind, RoutePlan, WireIdentity};
+  use tokn_policy::{ManagedRetry, ModelSelector, RelayRetry, RetryPolicyId, RouteKind, RoutePlan, WireIdentity};
 
   fn account(id: &str, provider: &str, base_url: Option<&str>) -> AccountConfig {
     let mut account: AccountConfig = toml::from_str(&format!(
@@ -609,6 +634,14 @@ mod tests {
     assert_eq!(raw.routes.len(), 2);
     assert_eq!(raw.account_pools.len(), 2);
     assert_eq!(raw.bindings.len(), 6);
+    assert_eq!(
+      raw.retry_policies[LEGACY_RETRY_POLICY_ID].max_retries,
+      LEGACY_MAX_RETRIES
+    );
+    assert_eq!(
+      raw.retry_policies[LEGACY_RETRY_POLICY_ID].initial_backoff_ms,
+      LEGACY_INITIAL_BACKOFF_MS
+    );
     for (path, operation) in [
       ("/v1/chat/completions", "chat_completions"),
       ("/v1/responses", "responses"),
@@ -625,8 +658,9 @@ mod tests {
       raw.routes["default"],
       RawRoute::Managed {
         model: RawModelSelector::Capability {},
+        retry: RawRouteRetry::Recoverable { ref policy },
         ..
-      }
+      } if policy == LEGACY_RETRY_POLICY_ID
     ));
     assert!(matches!(
       raw.routes["team-blue"],
@@ -639,6 +673,11 @@ mod tests {
     ));
 
     let plan = projection.compiled_config().gateway();
+    let retry_id = RetryPolicyId::new(LEGACY_RETRY_POLICY_ID).unwrap();
+    assert!(matches!(
+      plan.routes()["default"],
+      RoutePlan::Managed(ref route) if route.retry() == &ManagedRetry::Recoverable(retry_id)
+    ));
     let profile_id = tokn_policy::ProfileId::new("team-blue").unwrap();
     assert_eq!(
       plan.profile(&profile_id).unwrap().wire_identity(),
@@ -662,8 +701,10 @@ mod tests {
       projection.raw_config().routes["default"],
       RawRoute::Relay {
         destination: RawRelayDestination::FixedProvider { ref provider },
-        credentials: RawRelayCredentials::AccountPool { .. }
-      } if provider == "openai"
+        credentials: RawRelayCredentials::AccountPool { .. },
+        retry: RawRouteRetry::Buffered { ref policy },
+        ..
+      } if provider == "openai" && policy == LEGACY_RETRY_POLICY_ID
     ));
     assert_eq!(
       projection
@@ -776,6 +817,7 @@ mod tests {
       RawRoute::Relay {
         destination: RawRelayDestination::Original {},
         credentials: RawRelayCredentials::Client {},
+        retry: RawRouteRetry::Never {},
       }
     ));
     assert!(matches!(
@@ -783,7 +825,18 @@ mod tests {
       RawRoute::Relay {
         destination: RawRelayDestination::Original {},
         credentials: RawRelayCredentials::AccountPool { .. },
+        retry: RawRouteRetry::Never {},
       }
+    ));
+
+    let plan = projection.compiled_config().gateway();
+    assert!(matches!(
+      plan.routes()[passthrough_profile.as_str()],
+      RoutePlan::Relay(ref route) if route.retry() == &RelayRetry::Never
+    ));
+    assert!(matches!(
+      plan.routes()[switch_profile.as_str()],
+      RoutePlan::Relay(ref route) if route.retry() == &RelayRetry::Never
     ));
   }
 

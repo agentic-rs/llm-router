@@ -3,7 +3,7 @@ use tokn_config::v2::{
   compile, decode, load, parse, parse_config, CompileError, Error, DEFAULT_ARCHIVE_AFTER_DAYS, DEFAULT_BODY_MAX_BYTES,
   DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, DEFAULT_PRUNE_AFTER_DAYS, DEFAULT_WRITE_QUEUE_CAPACITY,
 };
-use tokn_policy::{ConnectAction, HttpAction, ListenerPlan, RouteKind};
+use tokn_policy::{ConnectAction, HttpAction, ListenerPlan, ManagedRetry, RetryPolicyId, RouteKind, RoutePlan};
 
 const MINIMAL_MANAGED: &str = r#"
 schema_version = 2
@@ -51,6 +51,30 @@ fn minimal_managed_llm_listener_compiles() {
   ));
   assert_eq!(plan.routes().get("default").unwrap().kind(), RouteKind::Managed);
   assert_eq!(plan.account_pools().len(), 1);
+}
+
+#[test]
+fn native_retry_policy_syntax_compiles_into_the_gateway_plan() {
+  let config = MINIMAL_MANAGED.replacen(
+    "operation = \"translate_compatible\"",
+    r#"operation = "translate_compatible"
+retry = { kind = "recoverable", policy = "standard" }
+
+[retry_policies.standard]
+max_retries = 2
+initial_backoff_ms = 100"#,
+    1,
+  );
+
+  let plan = parse(&config, Path::new("config.toml")).unwrap();
+  let retry_id = RetryPolicyId::new("standard").unwrap();
+  let retry = plan.retry_policy(&retry_id).unwrap();
+  assert_eq!(retry.max_retries(), 2);
+  assert_eq!(retry.initial_backoff(), std::time::Duration::from_millis(100));
+  assert!(matches!(
+    plan.routes().get("default"),
+    Some(RoutePlan::Managed(route)) if route.retry() == &ManagedRetry::Recoverable(retry_id)
+  ));
 }
 
 #[test]

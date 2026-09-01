@@ -24,6 +24,7 @@ fn compile_gateway(raw: &RawConfig, source: &Path) -> Result<GatewayPlan, Compil
     listeners,
     resources.profiles,
     resources.routes,
+    resources.retry_policies,
     resources.account_pools,
     resources.providers,
   ))

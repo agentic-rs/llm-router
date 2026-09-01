@@ -22,7 +22,6 @@ pub(super) fn base_warnings(legacy: &Config) -> Vec<V2ProjectionWarning> {
   let mut warnings = vec![
     V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AuxiliaryApiEndpoints),
     V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RequestModeOverrides),
-    V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RetryPolicy),
     V2ProjectionWarning::BehaviorChange(V2BehaviorChange::HttpRejectionBehavior),
   ];
   if legacy.server.cors.enabled {

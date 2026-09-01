@@ -1,6 +1,6 @@
 use crate::{
   AccountPoolId, BindingId, CanonicalHost, DriverId, ListenerId, OperationId, ProfileId, ProfilePlan, ProviderId,
-  RouteId, RoutePlan,
+  RetryPolicyId, RetryPolicyPlan, RouteId, RoutePlan,
 };
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,6 +25,7 @@ pub struct GatewayPlan {
   listeners: BTreeMap<ListenerId, ListenerPlan>,
   profiles: BTreeMap<ProfileId, ProfilePlan>,
   routes: BTreeMap<RouteId, RoutePlan>,
+  retry_policies: BTreeMap<RetryPolicyId, RetryPolicyPlan>,
   account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
   providers: BTreeMap<ProviderId, ProviderPlan>,
 }
@@ -34,6 +35,7 @@ impl GatewayPlan {
     listeners: BTreeMap<ListenerId, ListenerPlan>,
     profiles: BTreeMap<ProfileId, ProfilePlan>,
     routes: BTreeMap<RouteId, RoutePlan>,
+    retry_policies: BTreeMap<RetryPolicyId, RetryPolicyPlan>,
     account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
     providers: BTreeMap<ProviderId, ProviderPlan>,
   ) -> Self {
@@ -41,6 +43,7 @@ impl GatewayPlan {
       listeners,
       profiles,
       routes,
+      retry_policies,
       account_pools,
       providers,
     }
@@ -68,6 +71,14 @@ impl GatewayPlan {
 
   pub fn route(&self, id: &RouteId) -> Option<&RoutePlan> {
     self.routes.get(id)
+  }
+
+  pub fn retry_policies(&self) -> &BTreeMap<RetryPolicyId, RetryPolicyPlan> {
+    &self.retry_policies
+  }
+
+  pub fn retry_policy(&self, id: &RetryPolicyId) -> Option<&RetryPolicyPlan> {
+    self.retry_policies.get(id)
   }
 
   pub fn account_pools(&self) -> &BTreeMap<AccountPoolId, AccountPoolPlan> {
@@ -905,6 +916,7 @@ mod tests {
       BTreeMap::from([(listener_id.clone(), listener)]),
       BTreeMap::from([(profile_id.clone(), profile)]),
       BTreeMap::from([(route_id.clone(), route)]),
+      BTreeMap::new(),
       BTreeMap::from([(
         pool_id.clone(),
         AccountPoolPlan::new(
@@ -923,6 +935,7 @@ mod tests {
     assert_eq!(gateway.listener(&listener_id).unwrap().kind(), ListenerKind::LlmApi);
     assert_eq!(gateway.profile(&profile_id).unwrap().route(), &route_id);
     assert!(gateway.route(&route_id).is_some());
+    assert!(gateway.retry_policies().is_empty());
     assert!(gateway.account_pool(&pool_id).is_some());
     assert!(gateway.provider(&provider_id).is_some());
   }

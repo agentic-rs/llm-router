@@ -62,6 +62,14 @@ pub struct PipelineRunner {
 pub struct RetryPolicy {
   pub max_retries: u32,
   pub initial_backoff: Duration,
+  replay_safety: ReplaySafety,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum ReplaySafety {
+  #[default]
+  Buffered,
+  SafeMethods,
 }
 
 impl RetryPolicy {
@@ -69,11 +77,38 @@ impl RetryPolicy {
     Self {
       max_retries,
       initial_backoff,
+      replay_safety: ReplaySafety::Buffered,
     }
   }
 
-  fn should_retry(&self, attempt: u32, err: &PipelineError) -> bool {
-    attempt < self.max_retries && err.stage == crate::event::Stage::Send && err.recoverable && !err.stop
+  /// Retry only HTTP methods defined as safe by RFC 9110. Requests without a
+  /// transport method are not retried under this policy.
+  pub const fn safe_methods(max_retries: u32, initial_backoff: Duration) -> Self {
+    Self {
+      max_retries,
+      initial_backoff,
+      replay_safety: ReplaySafety::SafeMethods,
+    }
+  }
+
+  fn should_retry(&self, attempt: u32, err: &PipelineError, config: &RunConfig) -> bool {
+    attempt < self.max_retries
+      && err.stage == crate::event::Stage::Send
+      && err.recoverable
+      && !err.stop
+      && self.request_is_replayable(config)
+  }
+
+  fn request_is_replayable(&self, config: &RunConfig) -> bool {
+    match self.replay_safety {
+      ReplaySafety::Buffered => true,
+      ReplaySafety::SafeMethods => config.request_method().is_some_and(|method| {
+        method == http::Method::GET
+          || method == http::Method::HEAD
+          || method == http::Method::OPTIONS
+          || method == http::Method::TRACE
+      }),
+    }
   }
 
   fn backoff_for(&self, attempt: u32) -> Duration {
@@ -127,7 +162,7 @@ impl PipelineRunner {
         .await
       {
         Ok(response) => return Ok(response),
-        Err(err) if self.retry_policy.should_retry(attempt, &err) => {
+        Err(err) if self.retry_policy.should_retry(attempt, &err, config.as_ref()) => {
           let backoff = self.retry_policy.backoff_for(attempt);
           if !backoff.is_zero() {
             tokio::time::sleep(backoff).await;

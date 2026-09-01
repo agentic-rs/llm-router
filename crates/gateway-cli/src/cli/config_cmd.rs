@@ -509,6 +509,11 @@ account_pool = "default"
 provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "translate_compatible"
+retry = { kind = "recoverable", policy = "standard" }
+
+[retry_policies.standard]
+max_retries = 2
+initial_backoff_ms = 100
 
 [account_pools.default]
 accounts = ["*"]
@@ -1151,6 +1156,7 @@ default_http_action = { kind = "reject" }
 
     let compiled = tokn_config::v2::load_config(&path).unwrap();
     assert_eq!(compiled.gateway().listeners().len(), 1);
+    assert_eq!(compiled.gateway().retry_policies().len(), 1);
   }
 
   #[tokio::test]

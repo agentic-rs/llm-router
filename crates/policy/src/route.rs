@@ -1,5 +1,6 @@
 use crate::{AccountPoolId, HeaderPatchSetId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
 use smol_str::SmolStr;
+use std::time::Duration;
 
 /// The request-handling families supported by the gateway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +163,30 @@ impl RelayCredentials {
       Self::Client => None,
       Self::AccountPool(account_pool) => Some(account_pool),
     }
+  }
+}
+
+/// Bounded exponential-backoff policy referenced by one or more routes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryPolicyPlan {
+  max_retries: u32,
+  initial_backoff: Duration,
+}
+
+impl RetryPolicyPlan {
+  pub fn new(max_retries: u32, initial_backoff: Duration) -> Self {
+    Self {
+      max_retries,
+      initial_backoff,
+    }
+  }
+
+  pub fn max_retries(self) -> u32 {
+    self.max_retries
+  }
+
+  pub fn initial_backoff(self) -> Duration {
+    self.initial_backoff
   }
 }
 

@@ -279,7 +279,9 @@ async fn execution_from_http(request: tokn_service::Request) -> Result<Execution
     }
   };
   let request_id = context.as_ref().and_then(|context| context.request_id.clone());
-  let config = context.map_or_else(RunConfig::default, |context| context.config);
+  let config = context
+    .map_or_else(RunConfig::default, |context| context.config)
+    .with_request_method(parts.method);
   Ok(
     ExecutionRequest::new(RawInbound {
       request_endpoint,
