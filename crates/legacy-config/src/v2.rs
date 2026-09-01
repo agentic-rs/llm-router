@@ -69,7 +69,6 @@ pub enum V2BehaviorChange {
   RequestModeOverrides,
   ManagedSelectionOrder,
   RetryPolicy,
-  OperationalSettings,
   Cors,
   AgentBindings,
   PercentDecodedProfileAliases,
@@ -82,11 +81,10 @@ pub enum V2BehaviorChange {
 impl std::fmt::Display for V2BehaviorChange {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter.write_str(match self {
-      Self::AuxiliaryApiEndpoints => "auxiliary legacy API endpoints are not projected",
+      Self::AuxiliaryApiEndpoints => "the legacy admin config reload endpoint is not available in v2",
       Self::RequestModeOverrides => "per-request legacy route-mode overrides are not projected",
       Self::ManagedSelectionOrder => "managed account and provider selection follows v2 ordering",
       Self::RetryPolicy => "legacy retry policy is not projected",
-      Self::OperationalSettings => "legacy operational settings are not projected; v2 defaults are used",
       Self::Cors => "legacy CORS settings are not projected",
       Self::AgentBindings => "legacy agent bindings are not projected",
       Self::PercentDecodedProfileAliases => "profile paths use canonical v2 percent-encoding semantics",
@@ -298,6 +296,10 @@ mod tests {
 
   #[test]
   fn projection_warnings_have_operator_facing_messages() {
+    assert_eq!(
+      V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AuxiliaryApiEndpoints).to_string(),
+      "the legacy admin config reload endpoint is not available in v2"
+    );
     assert_eq!(
       V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RetryPolicy).to_string(),
       "legacy retry policy is not projected"

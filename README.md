@@ -410,6 +410,25 @@ falling back silently to the old server runtime. For legacy configs,
 route mode. Native v2 configs continue to declare their listeners in config
 and reject these compatibility flags.
 
+Every v2 `llm_api` listener serves `GET /v1/providers` and `GET /v1/models`
+alongside the three inference endpoints. Discovery is derived from the
+profiles and account pools reachable through that listener, filtered by the
+authenticated key's provider allowlist. Model discovery queries eligible
+upstream accounts and falls back to the local catalogue. When the selected
+profiles use different routing policies, the response reports
+`"route_mode": "mixed"` and lists the individual values in `route_modes`.
+Projected legacy profile paths also expose the same discovery and inference
+surface at `/{profile}/v1/*`; native v2 configs must create matching path
+bindings before those profile-compatible paths are active.
+
+The remaining legacy-to-v2 behavior differences are intentional and reported
+at startup: retry behavior, per-request route-mode overrides, CORS, agent
+binding metadata, selection-order details, proxy authentication/override
+semantics, LAN bootstrap helpers, percent-decoded profile aliases, HTTP
+rejection behavior, and the admin config reload endpoint. Legacy listener,
+outbound-proxy, persistence, account-pool cooldown, and session-affinity
+settings are projected; they do not fall back wholesale to v2 defaults.
+
 Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`. A
 fresh link defaults to `route`; a relink or sync preserves the binding's
 current mode when `--mode` is omitted. `exact` requires an agent that can
