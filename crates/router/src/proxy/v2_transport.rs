@@ -94,7 +94,7 @@ async fn handle_request_inner(
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
   if is_websocket_upgrade(request.headers()) {
-    return response(StatusCode::UPGRADE_REQUIRED, "websocket proxying is not supported");
+    return websocket_upgrade_response();
   }
   if request.method() == Method::CONNECT && request_body_present(&request) {
     return ApiError::bad_request("CONNECT requests must not contain a body representation").into_response();
@@ -216,15 +216,19 @@ async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> 
         let access = access.clone();
         async move {
           let request_id = crate::request_id::ensure_request_id(request.headers_mut());
-          let mut response = match admit_intercepted(&request, &ingress) {
-            Ok(()) => {
-              request.headers_mut().remove(header::PROXY_AUTHORIZATION);
-              match strip_hop_by_hop_headers(request.headers_mut()) {
-                Ok(()) => state.dispatch_http(&ingress, "https", access, request).await,
-                Err(error) => ApiError::bad_request(error.to_string()).into_response(),
+          let mut response = if is_websocket_upgrade(request.headers()) {
+            websocket_upgrade_response()
+          } else {
+            match admit_intercepted(&request, &ingress) {
+              Ok(()) => {
+                request.headers_mut().remove(header::PROXY_AUTHORIZATION);
+                match strip_hop_by_hop_headers(request.headers_mut()) {
+                  Ok(()) => state.dispatch_http(&ingress, "https", access, request).await,
+                  Err(error) => ApiError::bad_request(error.to_string()).into_response(),
+                }
               }
+              Err(error) => ApiError::bad_request(error.to_string()).into_response(),
             }
-            Err(error) => ApiError::bad_request(error.to_string()).into_response(),
           };
           crate::request_id::set_response_request_id(&mut response, request_id);
           Ok::<_, Infallible>(response)
@@ -280,10 +284,17 @@ fn single_host(headers: &HeaderMap) -> Result<Option<CanonicalAuthority>> {
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
-  headers
-    .get(header::UPGRADE)
-    .and_then(|value| value.to_str().ok())
-    .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+  let connection_upgrade = headers
+    .get_all(header::CONNECTION)
+    .iter()
+    .filter_map(|value| value.to_str().ok())
+    .flat_map(|value| value.split(','))
+    .any(|value| value.trim().eq_ignore_ascii_case("upgrade"));
+  connection_upgrade
+    && headers
+      .get(header::UPGRADE)
+      .and_then(|value| value.to_str().ok())
+      .is_some_and(|value| value.trim().eq_ignore_ascii_case("websocket"))
 }
 
 fn request_body_present(request: &Request<hyper::body::Incoming>) -> bool {
@@ -344,6 +355,17 @@ fn proxy_auth_required() -> Response<Body> {
   response
 }
 
+fn websocket_upgrade_response() -> Response<Body> {
+  let mut response = response(StatusCode::UPGRADE_REQUIRED, "");
+  response
+    .headers_mut()
+    .insert(header::CONNECTION, header::HeaderValue::from_static("Upgrade"));
+  response
+    .headers_mut()
+    .insert(header::UPGRADE, header::HeaderValue::from_static("websocket"));
+  response
+}
+
 fn response(status: StatusCode, message: &str) -> Response<Body> {
   let mut response = Response::new(Body::from(message.to_string()));
   *response.status_mut() = status;
@@ -379,5 +401,18 @@ mod tests {
 
     assert_eq!(headers.len(), 1);
     assert_eq!(headers["x-keep-me"], "value");
+  }
+
+  #[test]
+  fn identifies_complete_websocket_upgrade_requests() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
+    headers.insert(header::UPGRADE, HeaderValue::from_static("WebSocket"));
+    assert!(is_websocket_upgrade(&headers));
+
+    headers.remove(header::CONNECTION);
+    assert!(!is_websocket_upgrade(&headers));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    assert!(!is_websocket_upgrade(&headers));
   }
 }
