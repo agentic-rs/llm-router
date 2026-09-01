@@ -3,15 +3,16 @@ mod selector;
 
 use crate::api::error::ApiError;
 use crate::api::identity::AccountIdentityResolver;
+use arc_swap::ArcSwap;
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{ConnectInfo, Extension, FromRequestParts, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, Method, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
 use selector::{
   PoolAwareSend, ProxyPoolAwareSend, V2AccountSelector, V2ClientResolve, V2ProxyResolve, V2_PROXY_ORIGIN_KEY,
 };
@@ -21,7 +22,9 @@ use std::convert::Infallible;
 use std::error::Error as _;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokn_access::AccessContext;
 use tokn_accounts::link::{
   build_account_pool_runtimes, link_account_pools, link_provider_graph, AccountPoolRuntimes, ProviderDestination,
@@ -86,6 +89,55 @@ pub struct AppState {
   events: Arc<EventBus>,
   request_limits: tokn_config::v2::RequestLimitsPlan,
 }
+
+type ReloadFuture = Pin<Box<dyn Future<Output = Result<ReloadReport, ReloadError>> + Send>>;
+
+#[derive(Clone)]
+pub struct AdminReloader {
+  reload: Arc<dyn Fn() -> ReloadFuture + Send + Sync>,
+}
+
+impl AdminReloader {
+  pub fn new<F, Fut>(reload: F) -> Self
+  where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ReloadReport, ReloadError>> + Send + 'static,
+  {
+    Self {
+      reload: Arc::new(move || Box::pin(reload())),
+    }
+  }
+
+  async fn reload(&self) -> Result<ReloadReport, ReloadError> {
+    (self.reload)().await
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ReloadReport {
+  pub status: &'static str,
+  pub generation: u64,
+  pub accounts: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReloadError {
+  NotConfigured,
+  RestartRequired(String),
+  Invalid(String),
+}
+
+impl std::fmt::Display for ReloadError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::NotConfigured => formatter.write_str("admin config reload is not configured"),
+      Self::RestartRequired(message) => write!(formatter, "reload requires restart: {message}"),
+      Self::Invalid(message) => formatter.write_str(message),
+    }
+  }
+}
+
+impl std::error::Error for ReloadError {}
 
 impl AppState {
   pub fn listener_id(&self) -> &ListenerId {
@@ -476,12 +528,305 @@ pub async fn serve_forward_proxy<F>(state: ForwardProxyState, bind: SocketAddr, 
 where
   F: Future<Output = ()> + Send,
 {
-  crate::proxy::serve_v2_policy(bind, state.outbound.clone(), Arc::new(state), shutdown).await
+  let outbound = state.outbound.clone();
+  let live = LiveRuntime::new(
+    RuntimeStates {
+      llm_api: Vec::new(),
+      forward_proxy: vec![state],
+    },
+    0,
+  );
+  let state = live
+    .forward_proxy_listeners()
+    .into_iter()
+    .next()
+    .expect("a runtime created with one forward proxy exposes it");
+  crate::proxy::serve_v2_policy(bind, outbound, state, shutdown).await
+}
+
+pub async fn serve_live_forward_proxy<F>(
+  state: LiveForwardProxyState,
+  bind: SocketAddr,
+  shutdown: F,
+) -> anyhow::Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  let outbound = state.outbound();
+  crate::proxy::serve_v2_policy(bind, outbound, state, shutdown).await
 }
 
 pub struct RuntimeStates {
   pub llm_api: Vec<AppState>,
   pub forward_proxy: Vec<ForwardProxyState>,
+}
+
+struct RuntimeGeneration {
+  number: u64,
+  accounts: usize,
+  llm_api: BTreeMap<ListenerId, Arc<AppState>>,
+  forward_proxy: BTreeMap<ListenerId, Arc<ForwardProxyState>>,
+}
+
+impl RuntimeGeneration {
+  fn new(number: u64, accounts: usize, states: RuntimeStates) -> Self {
+    Self {
+      number,
+      accounts,
+      llm_api: states
+        .llm_api
+        .into_iter()
+        .map(|state| (state.listener_id.clone(), Arc::new(state)))
+        .collect(),
+      forward_proxy: states
+        .forward_proxy
+        .into_iter()
+        .map(|state| (state.listener_id.clone(), Arc::new(state)))
+        .collect(),
+    }
+  }
+}
+
+#[derive(Clone)]
+pub struct LiveRuntime {
+  current: Arc<ArcSwap<RuntimeGeneration>>,
+  admin_reloader: Arc<OnceLock<AdminReloader>>,
+}
+
+impl LiveRuntime {
+  pub fn new(states: RuntimeStates, accounts: usize) -> Self {
+    Self {
+      current: Arc::new(ArcSwap::from_pointee(RuntimeGeneration::new(1, accounts, states))),
+      admin_reloader: Arc::new(OnceLock::new()),
+    }
+  }
+
+  pub fn generation(&self) -> u64 {
+    self.current.load().number
+  }
+
+  pub fn accounts(&self) -> usize {
+    self.current.load().accounts
+  }
+
+  pub fn llm_api_listeners(&self) -> Vec<LiveAppState> {
+    self
+      .current
+      .load()
+      .llm_api
+      .keys()
+      .cloned()
+      .map(|listener_id| LiveAppState {
+        runtime: self.clone(),
+        listener_id,
+      })
+      .collect()
+  }
+
+  pub fn forward_proxy_listeners(&self) -> Vec<LiveForwardProxyState> {
+    self
+      .current
+      .load()
+      .forward_proxy
+      .keys()
+      .cloned()
+      .map(|listener_id| LiveForwardProxyState {
+        runtime: self.clone(),
+        listener_id,
+      })
+      .collect()
+  }
+
+  pub fn replace(&self, states: RuntimeStates, accounts: usize) -> Result<ReloadReport, ReloadError> {
+    let current = self.current.load_full();
+    let replacement = RuntimeGeneration::new(current.number + 1, accounts, states);
+    ensure_reload_compatible(&current, &replacement)?;
+    let report = ReloadReport {
+      status: "reloaded",
+      generation: replacement.number,
+      accounts: replacement.accounts,
+    };
+    self.current.store(Arc::new(replacement));
+    Ok(report)
+  }
+
+  pub fn validate_reload(&self, plan: &GatewayPlan) -> Result<(), ReloadError> {
+    let current = self.current.load();
+    let api_ids = plan
+      .listeners()
+      .iter()
+      .filter_map(|(listener_id, listener)| matches!(listener, ListenerPlan::LlmApi(_)).then_some(listener_id))
+      .collect::<BTreeSet<_>>();
+    if current.llm_api.keys().collect::<BTreeSet<_>>() != api_ids {
+      return Err(ReloadError::RestartRequired(
+        "LLM API listener ids or kinds changed".into(),
+      ));
+    }
+    let proxy_ids = plan
+      .listeners()
+      .iter()
+      .filter_map(|(listener_id, listener)| matches!(listener, ListenerPlan::ForwardProxy(_)).then_some(listener_id))
+      .collect::<BTreeSet<_>>();
+    if current.forward_proxy.keys().collect::<BTreeSet<_>>() != proxy_ids {
+      return Err(ReloadError::RestartRequired(
+        "forward-proxy listener ids or kinds changed".into(),
+      ));
+    }
+    for (listener_id, listener) in plan.listeners() {
+      match listener {
+        ListenerPlan::LlmApi(replacement) => {
+          let existing = &current.llm_api[listener_id];
+          if existing.bind() != replacement.bind() {
+            return Err(restart_required(listener_id, "bind address changed"));
+          }
+          if existing.client_auth() != replacement.client_auth() {
+            return Err(restart_required(listener_id, "client authentication changed"));
+          }
+        }
+        ListenerPlan::ForwardProxy(replacement) => {
+          let existing = &current.forward_proxy[listener_id];
+          if existing.bind() != replacement.bind() {
+            return Err(restart_required(listener_id, "bind address changed"));
+          }
+          if existing.listener.client_auth() != replacement.client_auth() {
+            return Err(restart_required(listener_id, "client authentication changed"));
+          }
+          if existing.listener.tls() != replacement.tls() {
+            return Err(restart_required(listener_id, "TLS CA configuration changed"));
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
+  pub fn set_admin_reloader(&self, reloader: AdminReloader) -> Result<(), AdminReloader> {
+    self.admin_reloader.set(reloader)
+  }
+
+  async fn reload(&self) -> Result<ReloadReport, ReloadError> {
+    let Some(reloader) = self.admin_reloader.get() else {
+      return Err(ReloadError::NotConfigured);
+    };
+    reloader.reload().await
+  }
+
+  fn current_api(&self, listener_id: &ListenerId) -> Arc<AppState> {
+    self
+      .current
+      .load()
+      .llm_api
+      .get(listener_id)
+      .cloned()
+      .expect("reload compatibility preserves API listener ids")
+  }
+
+  fn current_forward_proxy(&self, listener_id: &ListenerId) -> Arc<ForwardProxyState> {
+    self
+      .current
+      .load()
+      .forward_proxy
+      .get(listener_id)
+      .cloned()
+      .expect("reload compatibility preserves forward-proxy listener ids")
+  }
+}
+
+#[derive(Clone)]
+pub struct LiveAppState {
+  runtime: LiveRuntime,
+  listener_id: ListenerId,
+}
+
+impl LiveAppState {
+  pub fn listener_id(&self) -> &ListenerId {
+    &self.listener_id
+  }
+
+  pub fn bind(&self) -> SocketAddr {
+    self.current().bind()
+  }
+
+  fn current(&self) -> Arc<AppState> {
+    self.runtime.current_api(&self.listener_id)
+  }
+}
+
+#[derive(Clone)]
+pub struct LiveForwardProxyState {
+  runtime: LiveRuntime,
+  listener_id: ListenerId,
+}
+
+impl LiveForwardProxyState {
+  pub fn listener_id(&self) -> &ListenerId {
+    &self.listener_id
+  }
+
+  pub fn bind(&self) -> SocketAddr {
+    self.current().bind()
+  }
+
+  pub fn outbound(&self) -> tokn_core::util::http::HttpClientOptions {
+    self.current().outbound.clone()
+  }
+
+  pub(crate) fn current(&self) -> Arc<ForwardProxyState> {
+    self.runtime.current_forward_proxy(&self.listener_id)
+  }
+}
+
+fn ensure_reload_compatible(current: &RuntimeGeneration, replacement: &RuntimeGeneration) -> Result<(), ReloadError> {
+  if current.llm_api.keys().ne(replacement.llm_api.keys()) {
+    return Err(ReloadError::RestartRequired("LLM API listener ids changed".into()));
+  }
+  if current.forward_proxy.keys().ne(replacement.forward_proxy.keys()) {
+    return Err(ReloadError::RestartRequired(
+      "forward-proxy listener ids changed".into(),
+    ));
+  }
+  for (listener_id, current) in &current.llm_api {
+    let replacement = &replacement.llm_api[listener_id];
+    if current.bind() != replacement.bind() {
+      return Err(restart_required(listener_id, "bind address changed"));
+    }
+    if current.client_auth() != replacement.client_auth() {
+      return Err(restart_required(listener_id, "client authentication changed"));
+    }
+    if current.request_limits != replacement.request_limits {
+      return Err(restart_required(listener_id, "request limits changed"));
+    }
+  }
+  for (listener_id, current) in &current.forward_proxy {
+    let replacement = &replacement.forward_proxy[listener_id];
+    if current.bind() != replacement.bind() {
+      return Err(restart_required(listener_id, "bind address changed"));
+    }
+    if current.listener.client_auth() != replacement.listener.client_auth() {
+      return Err(restart_required(listener_id, "client authentication changed"));
+    }
+    if current.listener.tls() != replacement.listener.tls() {
+      return Err(restart_required(listener_id, "TLS CA configuration changed"));
+    }
+    if !http_client_options_eq(&current.outbound, &replacement.outbound) {
+      return Err(restart_required(listener_id, "outbound transport changed"));
+    }
+    if current.request_limits != replacement.request_limits {
+      return Err(restart_required(listener_id, "request limits changed"));
+    }
+  }
+  Ok(())
+}
+
+fn restart_required(listener_id: &ListenerId, message: &str) -> ReloadError {
+  ReloadError::RestartRequired(format!("listener '{listener_id}' {message}"))
+}
+
+fn http_client_options_eq(
+  left: &tokn_core::util::http::HttpClientOptions,
+  right: &tokn_core::util::http::HttpClientOptions,
+) -> bool {
+  left.url == right.url && left.no_proxy == right.no_proxy && left.system == right.system
 }
 
 #[derive(Clone, Copy)]
@@ -1054,8 +1399,23 @@ fn decode_opaque_body_for_inspection(
 }
 
 pub fn router(state: AppState) -> Router {
-  let max_wire_bytes = state.request_limits.max_wire_bytes();
-  let state = Arc::new(state);
+  let live = LiveRuntime::new(
+    RuntimeStates {
+      llm_api: vec![state],
+      forward_proxy: Vec::new(),
+    },
+    0,
+  );
+  let state = live
+    .llm_api_listeners()
+    .into_iter()
+    .next()
+    .expect("a runtime created with one API listener exposes it");
+  router_live(state)
+}
+
+pub fn router_live(state: LiveAppState) -> Router {
+  let max_wire_bytes = state.current().request_limits.max_wire_bytes();
   let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
   Router::new()
     .route("/v1/chat/completions", post(chat_completions))
@@ -1068,6 +1428,7 @@ pub fn router(state: AppState) -> Router {
     .route("/{profile}/v1/messages", post(messages))
     .route("/{profile}/v1/providers", get(list_providers))
     .route("/{profile}/v1/models", get(list_models))
+    .route("/admin/config/reload", post(admin_config_reload))
     .route("/healthz", get(health))
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     .layer(middleware::from_fn(crate::request_id::propagate_request_id))
@@ -1084,7 +1445,7 @@ async fn health() -> &'static str {
 }
 
 async fn list_providers(
-  State(state): State<Arc<AppState>>,
+  Extension(state): Extension<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
   uri: Uri,
   headers: HeaderMap,
@@ -1094,7 +1455,7 @@ async fn list_providers(
 }
 
 async fn list_models(
-  State(state): State<Arc<AppState>>,
+  Extension(state): Extension<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
   uri: Uri,
   headers: HeaderMap,
@@ -1103,7 +1464,9 @@ async fn list_models(
   state.discovery.models(&profiles, &access).await.map(axum::Json)
 }
 
-async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
+async fn authenticate(State(live): State<LiveAppState>, mut request: Request, next: Next) -> Response {
+  let state = live.current();
+  request.extensions_mut().insert(state.clone());
   if request.uri().path() == "/healthz" {
     request.extensions_mut().insert(AccessContext::unrestricted());
     return next.run(request).await;
@@ -1153,6 +1516,36 @@ async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, 
   }
 }
 
+async fn admin_config_reload(State(state): State<LiveAppState>) -> Response {
+  match state.runtime.reload().await {
+    Ok(report) => Json(report).into_response(),
+    Err(ReloadError::NotConfigured) => {
+      reload_error_response(StatusCode::NOT_FOUND, "not_found", ReloadError::NotConfigured)
+    }
+    Err(error @ ReloadError::RestartRequired(_)) => {
+      reload_error_response(StatusCode::CONFLICT, "restart_required", error)
+    }
+    Err(error @ ReloadError::Invalid(_)) => {
+      reload_error_response(StatusCode::UNPROCESSABLE_ENTITY, "reload_failed", error)
+    }
+  }
+}
+
+fn reload_error_response(status: StatusCode, kind: &'static str, error: ReloadError) -> Response {
+  (
+    status,
+    Json(serde_json::json!({
+      "error": {
+        "message": error.to_string(),
+        "type": kind,
+        "code": status.as_u16(),
+        "request_id": serde_json::Value::Null,
+      }
+    })),
+  )
+    .into_response()
+}
+
 fn collect_profile(action: &HttpAction, profiles: &mut BTreeSet<ProfileId>) {
   if let HttpAction::Route(profile_id) = action {
     profiles.insert(profile_id.clone());
@@ -1160,7 +1553,7 @@ fn collect_profile(action: &HttpAction, profiles: &mut BTreeSet<ProfileId>) {
 }
 
 async fn chat_completions(
-  State(state): State<Arc<AppState>>,
+  Extension(state): Extension<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
   connection: InboundConnectionInfo,
   method: Method,
@@ -1181,7 +1574,7 @@ async fn chat_completions(
 }
 
 async fn responses(
-  State(state): State<Arc<AppState>>,
+  Extension(state): Extension<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
   connection: InboundConnectionInfo,
   method: Method,
@@ -1202,7 +1595,7 @@ async fn responses(
 }
 
 async fn messages(
-  State(state): State<Arc<AppState>>,
+  Extension(state): Extension<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
   connection: InboundConnectionInfo,
   method: Method,
@@ -1423,6 +1816,168 @@ mod tests {
 
   fn canonical_host(value: &str) -> tokn_policy::CanonicalHost {
     CanonicalAuthority::parse(value).unwrap().host().clone()
+  }
+
+  fn reload_test_states(api_bind: &str, proxy_bind: &str, default_connect: &str) -> RuntimeStates {
+    let config = format!(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "{api_bind}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_bind}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+default_connect = "{default_connect}"
+"#
+    );
+    let plan = tokn_config::v2::parse(&config, std::path::Path::new("reload-test.toml")).unwrap();
+    build_runtime_states(
+      plan,
+      &[],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap()
+  }
+
+  #[test]
+  fn live_runtime_replaces_api_and_proxy_as_one_generation() {
+    let live = LiveRuntime::new(reload_test_states("127.0.0.1:4141", "127.0.0.1:4142", "reject"), 1);
+    let proxy = live.forward_proxy_listeners().pop().unwrap();
+    assert_eq!(proxy.current().listener.default_connect_action(), ConnectAction::Reject);
+
+    let report = live
+      .replace(reload_test_states("127.0.0.1:4141", "127.0.0.1:4142", "tunnel"), 2)
+      .unwrap();
+
+    assert_eq!(
+      report,
+      ReloadReport {
+        status: "reloaded",
+        generation: 2,
+        accounts: 2,
+      }
+    );
+    assert_eq!(live.generation(), 2);
+    assert_eq!(live.accounts(), 2);
+    assert_eq!(proxy.current().listener.default_connect_action(), ConnectAction::Tunnel);
+  }
+
+  #[test]
+  fn live_runtime_rejects_restart_required_listener_changes_without_swapping() {
+    let live = LiveRuntime::new(reload_test_states("127.0.0.1:4141", "127.0.0.1:4142", "reject"), 1);
+
+    let error = live
+      .replace(reload_test_states("127.0.0.1:4241", "127.0.0.1:4142", "tunnel"), 2)
+      .unwrap_err();
+
+    assert!(matches!(error, ReloadError::RestartRequired(_)));
+    assert_eq!(live.generation(), 1);
+    assert_eq!(live.accounts(), 1);
+    assert_eq!(
+      live.forward_proxy_listeners()[0]
+        .current()
+        .listener
+        .default_connect_action(),
+      ConnectAction::Reject
+    );
+  }
+
+  #[tokio::test]
+  async fn admin_reload_endpoint_swaps_generation_and_reports_failures() {
+    let live = LiveRuntime::new(reload_test_states("127.0.0.1:4141", "127.0.0.1:4142", "reject"), 1);
+    let replacement = Arc::new(std::sync::Mutex::new(Some(reload_test_states(
+      "127.0.0.1:4141",
+      "127.0.0.1:4142",
+      "tunnel",
+    ))));
+    let live_for_reload = live.clone();
+    assert!(live
+      .set_admin_reloader(AdminReloader::new(move || {
+        let live = live_for_reload.clone();
+        let replacement = replacement.lock().unwrap().take();
+        async move {
+          replacement.map_or_else(
+            || Err(ReloadError::Invalid("invalid replacement".into())),
+            |replacement| live.replace(replacement, 2),
+          )
+        }
+      }))
+      .is_ok());
+    let app = router_live(live.llm_api_listeners().pop().unwrap());
+
+    let response = app
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["generation"], 2);
+    assert_eq!(body["accounts"], 2);
+    assert_eq!(live.generation(), 2);
+
+    let failed = router_live(live.llm_api_listeners().pop().unwrap())
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(failed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(live.generation(), 2);
+  }
+
+  #[tokio::test]
+  async fn admin_reload_endpoint_uses_listener_authentication() {
+    let config = r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "local_keys"
+default_http_action = { kind = "reject" }
+"#;
+    let plan = tokn_config::v2::parse(config, std::path::Path::new("reload-auth-test.toml")).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let access = tokn_access::AccessStore::open(directory.path().join("access.db")).unwrap();
+    let key = access.create_key("reload operator", vec!["*".into()]).unwrap();
+    let states = build_runtime_states(plan, &[], Arc::new(access), Arc::new(EventBus::noop())).unwrap();
+    let live = LiveRuntime::new(states, 0);
+    assert!(live
+      .set_admin_reloader(AdminReloader::new(|| async {
+        Ok(ReloadReport {
+          status: "reloaded",
+          generation: 2,
+          accounts: 0,
+        })
+      }))
+      .is_ok());
+    let app = router_live(live.llm_api_listeners().pop().unwrap());
+
+    let unauthorized = app
+      .clone()
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header("authorization", format!("Bearer {}", key.token))
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
   }
 
   #[test]

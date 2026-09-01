@@ -410,6 +410,32 @@ falling back silently to the old server runtime. For legacy configs,
 route mode. Native v2 configs continue to declare their listeners in config
 and reject these compatibility flags.
 
+Every v2 `llm_api` listener exposes `POST /admin/config/reload`. The endpoint
+re-reads the selected config plus `auth.yaml` and `auth.d`; for an unversioned
+legacy config it also merges fragments and repeats the in-memory v2 projection
+with the original `serve` flags. Listener authentication applies to this
+endpoint, so include the same Bearer token when `client_auth = "local_keys"`
+(or `[api_key].enabled = true` in a projected legacy config):
+
+```sh
+curl -X POST http://127.0.0.1:4141/admin/config/reload \
+  -H "authorization: Bearer $TOKN_API_KEY"
+```
+
+A successful reload replaces routes, bindings, profiles, retry policies,
+providers, account pools, accounts, discovery data, and forward-proxy routing
+rules as one generation across every listener. Requests already admitted keep
+their previous generation; later requests use the new generation. Invalid
+configuration returns `422`, and a change that needs a restart returns `409`;
+either failure leaves the active generation untouched.
+
+Listener ids, kinds, bind addresses, client authentication, and proxy TLS/CA
+settings require a restart. Service-level outbound transport, request limits,
+persistence settings, and switching between legacy and native-v2 config
+schemas also require a restart. A native config containing only
+`forward_proxy` listeners has no HTTP admin endpoint, so it must be restarted
+to apply changes.
+
 Native v2 retries are opt-in route policy. Define a bounded exponential
 backoff policy once, then reference it from each route that may retry:
 
@@ -448,10 +474,10 @@ surface at `/{profile}/v1/*`; native v2 configs must create matching path
 bindings before those profile-compatible paths are active.
 
 The remaining legacy-to-v2 behavior differences are intentional and reported
-at startup: per-request route-mode overrides, CORS, agent
-binding metadata, selection-order details, proxy authentication/override
-semantics, LAN bootstrap helpers, percent-decoded profile aliases, HTTP
-rejection behavior, and the admin config reload endpoint. Legacy listener,
+at startup: admin reload authentication, per-request route-mode overrides,
+CORS, agent binding metadata, selection-order details, proxy
+authentication/override semantics, LAN bootstrap helpers, percent-decoded
+profile aliases, and HTTP rejection behavior. Legacy listener,
 outbound-proxy, persistence, account-pool cooldown, and session-affinity
 settings are projected; they do not fall back wholesale to v2 defaults.
 

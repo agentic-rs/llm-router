@@ -65,7 +65,7 @@ impl std::fmt::Display for LegacyPolicyLocation {
 /// projection as a replacement runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum V2BehaviorChange {
-  AuxiliaryApiEndpoints,
+  AdminReloadAuthentication,
   RequestModeOverrides,
   ManagedSelectionOrder,
   Cors,
@@ -80,7 +80,9 @@ pub enum V2BehaviorChange {
 impl std::fmt::Display for V2BehaviorChange {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter.write_str(match self {
-      Self::AuxiliaryApiEndpoints => "the legacy admin config reload endpoint is not available in v2",
+      Self::AdminReloadAuthentication => {
+        "the admin config reload endpoint follows v2 listener authentication instead of legacy unauthenticated access"
+      }
       Self::RequestModeOverrides => "per-request legacy route-mode overrides are not projected",
       Self::ManagedSelectionOrder => "managed account and provider selection follows v2 ordering",
       Self::Cors => "legacy CORS settings are not projected",
@@ -295,8 +297,8 @@ mod tests {
   #[test]
   fn projection_warnings_have_operator_facing_messages() {
     assert_eq!(
-      V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AuxiliaryApiEndpoints).to_string(),
-      "the legacy admin config reload endpoint is not available in v2"
+      V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AdminReloadAuthentication).to_string(),
+      "the admin config reload endpoint follows v2 listener authentication instead of legacy unauthenticated access"
     );
     assert_eq!(
       V2ProjectionWarning::RemoteApiBindAllowed {

@@ -20,10 +20,14 @@ pub(super) struct EffectivePolicy {
 
 pub(super) fn base_warnings(legacy: &Config) -> Vec<V2ProjectionWarning> {
   let mut warnings = vec![
-    V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AuxiliaryApiEndpoints),
     V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RequestModeOverrides),
     V2ProjectionWarning::BehaviorChange(V2BehaviorChange::HttpRejectionBehavior),
   ];
+  if legacy.api_key.enabled {
+    warnings.push(V2ProjectionWarning::BehaviorChange(
+      V2BehaviorChange::AdminReloadAuthentication,
+    ));
+  }
   if legacy.server.cors.enabled {
     warnings.push(V2ProjectionWarning::BehaviorChange(V2BehaviorChange::Cors));
   }
@@ -273,12 +277,16 @@ mod tests {
   #[test]
   fn reports_conditional_behavior_warnings() {
     let mut legacy = Config::default();
+    legacy.api_key.enabled = true;
     legacy.server.cors.enabled = true;
     legacy.agents.insert("codex".into(), AgentConfig::default());
     legacy.profiles.insert("work".into(), ProfileConfig::default());
     legacy.pool.strategy = "random".into();
 
     let warnings = base_warnings(&legacy);
+    assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(
+      V2BehaviorChange::AdminReloadAuthentication
+    )));
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(V2BehaviorChange::Cors)));
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AgentBindings)));
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(

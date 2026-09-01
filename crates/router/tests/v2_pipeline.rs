@@ -468,6 +468,156 @@ base_url = "http://{upstream_addr}/v1"
   server.abort();
 }
 
+#[derive(Clone)]
+struct ControlledUpstreamState {
+  label: &'static str,
+  arrived: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+  release: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+}
+
+struct ControlledUpstream {
+  addr: std::net::SocketAddr,
+  arrived: tokio::sync::oneshot::Receiver<()>,
+  release: tokio::sync::oneshot::Sender<()>,
+  server: tokio::task::JoinHandle<()>,
+}
+
+async fn controlled_upstream(label: &'static str) -> ControlledUpstream {
+  let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+  let (release, release_rx) = tokio::sync::oneshot::channel();
+  let state = ControlledUpstreamState {
+    label,
+    arrived: Arc::new(tokio::sync::Mutex::new(Some(arrived_tx))),
+    release: Arc::new(tokio::sync::Mutex::new(Some(release_rx))),
+  };
+  let upstream = Router::new()
+    .route(
+      "/{*path}",
+      any(|State(state): State<ControlledUpstreamState>| async move {
+        if let Some(arrived) = state.arrived.lock().await.take() {
+          let _ = arrived.send(());
+        }
+        let release = state.release.lock().await.take();
+        if let Some(release) = release {
+          let _ = release.await;
+        }
+        Response::builder()
+          .header("content-type", "application/json")
+          .body(Body::from(
+            serde_json::json!({
+              "id": format!("chatcmpl-{}", state.label),
+              "choices": [{"message": {"role": "assistant", "content": state.label}}],
+            })
+            .to_string(),
+          ))
+          .unwrap()
+      }),
+    )
+    .with_state(state);
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let addr = listener.local_addr().unwrap();
+  let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+  ControlledUpstream {
+    addr,
+    arrived,
+    release,
+    server,
+  }
+}
+
+fn reload_runtime_states(upstream: std::net::SocketAddr) -> tokn_router::v2::RuntimeStates {
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "managed" }}
+
+[profiles.managed]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = {{ kind = "fixed", provider = "local" }}
+model = {{ kind = "capability" }}
+operation = "preserve"
+
+[account_pools.primary]
+accounts = ["acct"]
+providers = ["local"]
+
+[providers.local]
+driver = "openai"
+base_url = "http://{upstream}/v1"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-reload.toml")).unwrap();
+  tokn_router::v2::build_runtime_states(
+    plan,
+    &[account()],
+    Arc::new(AccessStore::disabled()),
+    Arc::new(EventBus::noop()),
+  )
+  .unwrap()
+}
+
+fn managed_chat_request() -> Request<Body> {
+  Request::post("/v1/chat/completions")
+    .header("content-type", "application/json")
+    .body(Body::from(
+      br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn live_reload_pins_in_flight_api_requests_and_updates_new_requests() {
+  let old = controlled_upstream("old").await;
+  let new = controlled_upstream("new").await;
+  let live = tokn_router::v2::LiveRuntime::new(reload_runtime_states(old.addr), 1);
+  let app = tokn_router::v2::router_live(live.llm_api_listeners().pop().unwrap());
+
+  let old_request = tokio::spawn({
+    let app = app.clone();
+    async move { app.oneshot(managed_chat_request()).await.unwrap() }
+  });
+  tokio::time::timeout(std::time::Duration::from_secs(2), old.arrived)
+    .await
+    .expect("old request should reach its upstream before reload")
+    .unwrap();
+
+  live.replace(reload_runtime_states(new.addr), 1).unwrap();
+  let new_request = tokio::spawn({
+    let app = app.clone();
+    async move { app.oneshot(managed_chat_request()).await.unwrap() }
+  });
+  tokio::time::timeout(std::time::Duration::from_secs(2), new.arrived)
+    .await
+    .expect("new request should reach the reloaded upstream")
+    .unwrap();
+
+  new.release.send(()).unwrap();
+  let response = new_request.await.unwrap();
+  assert_eq!(response.status(), StatusCode::OK);
+  let body: serde_json::Value =
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+  assert_eq!(body["id"], "chatcmpl-new");
+
+  old.release.send(()).unwrap();
+  let response = old_request.await.unwrap();
+  assert_eq!(response.status(), StatusCode::OK);
+  let body: serde_json::Value =
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+  assert_eq!(body["id"], "chatcmpl-old");
+
+  old.server.abort();
+  new.server.abort();
+}
+
 fn account() -> AccountConfig {
   account_with_credentials("acct", "sk-v2-test")
 }

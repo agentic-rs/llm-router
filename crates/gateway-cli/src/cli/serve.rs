@@ -12,7 +12,7 @@ use tokn_router_legacy_config::v2::{
   project_v2_config, V2ForwardProxyProjectionOptions, V2ProjectionOptions, V2ProjectionWarning,
 };
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct ServeArgs {
   #[arg(long)]
   pub host: Option<String>,
@@ -40,12 +40,105 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   }
 }
 
+#[derive(Clone)]
+enum RuntimeSource {
+  NativeV2 {
+    config_path: PathBuf,
+    auth_path: PathBuf,
+    args: ServeArgs,
+  },
+  ProjectedLegacy {
+    config_path: PathBuf,
+    auth_path: PathBuf,
+    args: ServeArgs,
+  },
+}
+
+struct LoadedRuntime {
+  compiled: tokn_config::v2::CompiledConfig,
+  accounts: Vec<tokn_core::account::AccountConfig>,
+  args: ServeArgs,
+  warnings: Vec<V2ProjectionWarning>,
+  config_path: PathBuf,
+}
+
+impl RuntimeSource {
+  fn load(&self) -> Result<LoadedRuntime> {
+    let expected_schema = self.expected_schema();
+    if tokn_config::detect_config_schema(self.config_path())? != expected_schema {
+      anyhow::bail!("config schema changed; restart the gateway to switch runtime sources");
+    }
+    self.load_matching_schema()
+  }
+
+  fn load_for_reload(&self) -> std::result::Result<LoadedRuntime, tokn_router::v2::ReloadError> {
+    let schema = tokn_config::detect_config_schema(self.config_path())
+      .map_err(|error| tokn_router::v2::ReloadError::Invalid(format!("{error:#}")))?;
+    if schema != self.expected_schema() {
+      return Err(tokn_router::v2::ReloadError::RestartRequired(
+        "config schema changed; restart the gateway to switch runtime sources".into(),
+      ));
+    }
+    self
+      .load_matching_schema()
+      .map_err(|error| tokn_router::v2::ReloadError::Invalid(format!("{error:#}")))
+  }
+
+  fn load_matching_schema(&self) -> Result<LoadedRuntime> {
+    match self {
+      Self::NativeV2 {
+        config_path,
+        auth_path,
+        args,
+      } => Ok(LoadedRuntime {
+        compiled: tokn_config::v2::load_config(config_path)?,
+        accounts: tokn_auth::AuthStore::load(Some(auth_path), Some(config_path))?.accounts,
+        args: args.clone(),
+        warnings: Vec::new(),
+        config_path: config_path.clone(),
+      }),
+      Self::ProjectedLegacy {
+        config_path,
+        auth_path,
+        args,
+      } => {
+        let (legacy, resolved_config_path) = Config::load(Some(config_path))?;
+        let accounts = tokn_auth::AuthStore::load(Some(auth_path), Some(&resolved_config_path))?.accounts;
+        let (compiled, accounts, warnings, args) = prepare_projected_legacy_runtime(legacy, accounts, args.clone())?;
+        Ok(LoadedRuntime {
+          compiled,
+          accounts,
+          args,
+          warnings,
+          config_path: resolved_config_path,
+        })
+      }
+    }
+  }
+
+  fn config_path(&self) -> &std::path::Path {
+    match self {
+      Self::NativeV2 { config_path, .. } | Self::ProjectedLegacy { config_path, .. } => config_path,
+    }
+  }
+
+  const fn expected_schema(&self) -> tokn_config::ConfigSchema {
+    match self {
+      Self::NativeV2 { .. } => tokn_config::ConfigSchema::V2,
+      Self::ProjectedLegacy { .. } => tokn_config::ConfigSchema::Legacy,
+    }
+  }
+}
+
 async fn run_projected_legacy(config_path: PathBuf, args: ServeArgs) -> Result<()> {
-  let (legacy, resolved_config_path) = Config::load(Some(&config_path))?;
-  let accounts = crate::server_runtime::load_accounts(Some(&resolved_config_path))?;
-  let (compiled, accounts, warnings, args) = prepare_projected_legacy_runtime(legacy, accounts, args)?;
-  log_projection_warnings(&resolved_config_path, &warnings);
-  run_v2_runtime(compiled, accounts, args).await
+  let source = RuntimeSource::ProjectedLegacy {
+    config_path,
+    auth_path: tokn_auth::default_auth_path()?,
+    args,
+  };
+  let loaded = source.load()?;
+  log_projection_warnings(&loaded.config_path, &loaded.warnings);
+  run_v2_runtime(source, loaded).await
 }
 
 async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
@@ -55,9 +148,13 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
     );
   }
 
-  let compiled = tokn_config::v2::load_config(&config_path)?;
-  let accounts = crate::server_runtime::load_accounts(Some(&config_path))?;
-  run_v2_runtime(compiled, accounts, args).await
+  let source = RuntimeSource::NativeV2 {
+    config_path,
+    auth_path: tokn_auth::default_auth_path()?,
+    args,
+  };
+  let loaded = source.load()?;
+  run_v2_runtime(source, loaded).await
 }
 
 fn prepare_projected_legacy_runtime(
@@ -138,11 +235,14 @@ fn log_projection_warnings(config_path: &std::path::Path, warnings: &[V2Projecti
   }
 }
 
-async fn run_v2_runtime(
-  compiled: tokn_config::v2::CompiledConfig,
-  accounts: Vec<tokn_core::account::AccountConfig>,
-  args: ServeArgs,
-) -> Result<()> {
+async fn run_v2_runtime(source: RuntimeSource, loaded: LoadedRuntime) -> Result<()> {
+  let LoadedRuntime {
+    compiled,
+    accounts,
+    args,
+    ..
+  } = loaded;
+  let initial_service = compiled.service().clone();
   let (plan, service) = compiled.into_parts();
   let needs_access = plan
     .listeners()
@@ -151,16 +251,11 @@ async fn run_v2_runtime(
   let access = crate::server_runtime::load_access_store(needs_access)?;
   let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_v2_event_bus(service.persistence())?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let result = serve_v2_plan(
-    plan,
-    service,
-    &accounts,
-    access,
-    events.clone(),
-    args,
-    shutdown_channel(),
-  )
-  .await;
+  let states =
+    tokn_router::v2::build_runtime_states_with_service(plan, service, &accounts, access.clone(), events.clone())?;
+  let live = tokn_router::v2::LiveRuntime::new(states, accounts.len());
+  install_admin_reloader(&live, source, initial_service, access, events.clone())?;
+  let result = serve_live_v2_runtime(live, args, shutdown_channel()).await;
 
   if let Some(archive_runtime) = archive_runtime {
     archive_runtime.shutdown().await;
@@ -169,6 +264,74 @@ async fn run_v2_runtime(
   result
 }
 
+fn install_admin_reloader(
+  live: &tokn_router::v2::LiveRuntime,
+  source: RuntimeSource,
+  initial_service: tokn_config::v2::ServicePlan,
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+) -> Result<()> {
+  let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
+  let live_for_reload = live.clone();
+  live
+    .set_admin_reloader(tokn_router::v2::AdminReloader::new(move || {
+      let live = live_for_reload.clone();
+      let source = source.clone();
+      let initial_service = initial_service.clone();
+      let access = access.clone();
+      let events = events.clone();
+      let reload_lock = reload_lock.clone();
+      async move {
+        let _guard = reload_lock.lock().await;
+        let loaded = tokio::task::spawn_blocking(move || source.load_for_reload())
+          .await
+          .map_err(|error| tokn_router::v2::ReloadError::Invalid(format!("reload task failed: {error}")))??;
+        ensure_service_reload_compatible(&initial_service, loaded.compiled.service())?;
+        let LoadedRuntime {
+          compiled,
+          accounts,
+          warnings,
+          config_path,
+          ..
+        } = loaded;
+        let (plan, service) = compiled.into_parts();
+        live.validate_reload(&plan)?;
+        let states = tokn_router::v2::build_runtime_states_with_service(plan, service, &accounts, access, events)
+          .map_err(|error| tokn_router::v2::ReloadError::Invalid(format!("{error:#}")))?;
+        let report = live.replace(states, accounts.len())?;
+        tracing::info!(
+          config = %config_path.display(),
+          generation = report.generation,
+          accounts = report.accounts,
+          "v2 runtime configuration reloaded"
+        );
+        if !warnings.is_empty() {
+          log_projection_warnings(&config_path, &warnings);
+        }
+        Ok(report)
+      }
+    }))
+    .map_err(|_| anyhow::anyhow!("admin config reloader is already installed"))?;
+  Ok(())
+}
+
+fn ensure_service_reload_compatible(
+  current: &tokn_config::v2::ServicePlan,
+  replacement: &tokn_config::v2::ServicePlan,
+) -> std::result::Result<(), tokn_router::v2::ReloadError> {
+  let changed = if current.outbound() != replacement.outbound() {
+    "outbound transport settings changed"
+  } else if current.request_limits() != replacement.request_limits() {
+    "request limits changed"
+  } else if current.persistence() != replacement.persistence() {
+    "persistence settings changed"
+  } else {
+    return Ok(());
+  };
+  Err(tokn_router::v2::ReloadError::RestartRequired(changed.into()))
+}
+
+#[cfg(test)]
 async fn serve_v2_plan(
   plan: tokn_policy::GatewayPlan,
   service: tokn_config::v2::ServicePlan,
@@ -179,8 +342,17 @@ async fn serve_v2_plan(
   shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
   let states = tokn_router::v2::build_runtime_states_with_service(plan, service, accounts, access, events)?;
-  let proxy_states = states.forward_proxy;
-  let states = states.llm_api;
+  let live = tokn_router::v2::LiveRuntime::new(states, accounts.len());
+  serve_live_v2_runtime(live, args, shutdown).await
+}
+
+async fn serve_live_v2_runtime(
+  live: tokn_router::v2::LiveRuntime,
+  args: ServeArgs,
+  shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+  let states = live.llm_api_listeners();
+  let proxy_states = live.forward_proxy_listeners();
   let listener_count = states.len() + proxy_states.len();
   if listener_count != 1 && (args.host.is_some() || args.port.is_some()) {
     anyhow::bail!("--host and --port can only override a v2 config with exactly one listener");
@@ -198,7 +370,7 @@ async fn serve_v2_plan(
       configured
     };
     tracing::info!(listener = %state.listener_id(), %addr, "tokn-router v2 listener starting");
-    let app = tokn_router::v2::router(state);
+    let app = tokn_router::v2::router_live(state);
     let shutdown = shutdown.clone();
     servers.push(Box::pin(async move {
       crate::server_runtime::serve_http(app, addr, wait_for_shutdown(shutdown)).await
@@ -217,7 +389,7 @@ async fn serve_v2_plan(
     tracing::info!(listener = %state.listener_id(), %addr, "tokn-router v2 forward proxy starting");
     let shutdown = shutdown.clone();
     servers.push(Box::pin(async move {
-      tokn_router::v2::serve_forward_proxy(state, addr, wait_for_shutdown(shutdown)).await
+      tokn_router::v2::serve_live_forward_proxy(state, addr, wait_for_shutdown(shutdown)).await
     }));
   }
   futures::future::try_join_all(servers).await.map(|_| ())
@@ -242,9 +414,12 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use axum::body::{to_bytes, Body};
+  use axum::http::{Request, StatusCode};
   use std::path::Path;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::{TcpListener, TcpStream};
+  use tower::ServiceExt;
 
   fn unused_loopback_addr() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -289,6 +464,35 @@ default_connect = "reject"
 "#
     );
     tokn_config::v2::parse(&config, Path::new("v2-serve-test.toml")).unwrap()
+  }
+
+  fn v2_reload_config(
+    api_addr: std::net::SocketAddr,
+    proxy_addr: std::net::SocketAddr,
+    default_connect: &str,
+    max_wire_bytes: usize,
+  ) -> String {
+    format!(
+      r#"
+schema_version = 2
+
+[service.request_limits]
+max_wire_bytes = {max_wire_bytes}
+
+[listeners.api]
+kind = "llm_api"
+bind = "{api_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+default_connect = "{default_connect}"
+"#
+    )
   }
 
   async fn wait_for_listener(addr: std::net::SocketAddr) {
@@ -534,6 +738,152 @@ default_connect = "reject"
       .contains("authorization: bearer client-secret\r\n"));
     shutdown_tx.send(true).unwrap();
     server.await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn native_v2_admin_reload_reads_disk_and_preserves_generation_on_restart_only_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    let api_addr = unused_loopback_addr();
+    let proxy_addr = unused_loopback_addr();
+    std::fs::write(
+      &config_path,
+      v2_reload_config(api_addr, proxy_addr, "reject", 1_048_576),
+    )
+    .unwrap();
+    let source = RuntimeSource::NativeV2 {
+      config_path: config_path.clone(),
+      auth_path,
+      args: v2_serve_args(),
+    };
+    let loaded = source.load().unwrap();
+    let initial_service = loaded.compiled.service().clone();
+    let (plan, service) = loaded.compiled.into_parts();
+    let access = Arc::new(tokn_access::AccessStore::disabled());
+    let events = Arc::new(EventBus::noop());
+    let states = tokn_router::v2::build_runtime_states_with_service(
+      plan,
+      service,
+      &loaded.accounts,
+      access.clone(),
+      events.clone(),
+    )
+    .unwrap();
+    let live = tokn_router::v2::LiveRuntime::new(states, loaded.accounts.len());
+    install_admin_reloader(&live, source, initial_service, access, events).unwrap();
+    let app = tokn_router::v2::router_live(live.llm_api_listeners().pop().unwrap());
+
+    std::fs::write(
+      &config_path,
+      v2_reload_config(api_addr, proxy_addr, "tunnel", 1_048_576),
+    )
+    .unwrap();
+    let reloaded = app
+      .clone()
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(reloaded.status(), StatusCode::OK);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(reloaded.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["generation"], 2);
+    assert_eq!(live.generation(), 2);
+
+    std::fs::write(
+      &config_path,
+      v2_reload_config(api_addr, proxy_addr, "reject", 2_097_152),
+    )
+    .unwrap();
+    let restart_required = app
+      .clone()
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(restart_required.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(restart_required.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "restart_required");
+    assert!(body["error"]["message"]
+      .as_str()
+      .unwrap()
+      .contains("request limits changed"));
+    assert_eq!(live.generation(), 2);
+
+    std::fs::write(&config_path, "[server]\nport = 4141\n").unwrap();
+    let schema_change = app
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(schema_change.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(schema_change.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["error"]["message"]
+      .as_str()
+      .unwrap()
+      .contains("config schema changed"));
+    assert_eq!(live.generation(), 2);
+  }
+
+  #[tokio::test]
+  async fn projected_legacy_admin_reload_reprojects_config_and_accounts() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("legacy.toml");
+    let auth_path = directory.path().join("auth.yaml");
+    let ca_path = directory.path().join("ca");
+    let api_addr = unused_loopback_addr();
+    let proxy_addr = unused_loopback_addr();
+    let mut legacy = Config::default();
+    legacy.server.host = api_addr.ip().to_string();
+    legacy.server.port = api_addr.port();
+    legacy.proxy_mode.host = proxy_addr.ip().to_string();
+    legacy.proxy_mode.port = proxy_addr.port();
+    legacy.proxy_mode.ca_dir = Some(ca_path);
+    legacy.save(&config_path).unwrap();
+    let mut auth = tokn_auth::AuthStore::load(Some(&auth_path), None).unwrap();
+    auth.upsert(account("primary", "openai"));
+    auth.save().unwrap();
+    let mut args = v2_serve_args();
+    args.with_proxy = true;
+    let source = RuntimeSource::ProjectedLegacy {
+      config_path: config_path.clone(),
+      auth_path: auth_path.clone(),
+      args,
+    };
+    let loaded = source.load().unwrap();
+    let initial_service = loaded.compiled.service().clone();
+    let (plan, service) = loaded.compiled.into_parts();
+    let access = Arc::new(tokn_access::AccessStore::disabled());
+    let events = Arc::new(EventBus::noop());
+    let states = tokn_router::v2::build_runtime_states_with_service(
+      plan,
+      service,
+      &loaded.accounts,
+      access.clone(),
+      events.clone(),
+    )
+    .unwrap();
+    let live = tokn_router::v2::LiveRuntime::new(states, loaded.accounts.len());
+    install_admin_reloader(&live, source, initial_service, access, events).unwrap();
+    let app = tokn_router::v2::router_live(live.llm_api_listeners().pop().unwrap());
+
+    legacy.proxy_mode.route_mode = tokn_config::RouteMode::Fuzzy;
+    legacy.save(&config_path).unwrap();
+    let mut auth = tokn_auth::AuthStore::load(Some(&auth_path), None).unwrap();
+    auth.upsert(account("secondary", "openai"));
+    auth.save().unwrap();
+    let response = app
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["generation"], 2);
+    assert_eq!(body["accounts"], 2);
+    assert_eq!(live.generation(), 2);
+    assert_eq!(live.accounts(), 2);
   }
 
   #[tokio::test]

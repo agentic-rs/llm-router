@@ -1,6 +1,6 @@
 use super::connect_proxy::{connect_upstream, ConnectProxy};
 use crate::api::error::ApiError;
-use crate::v2::{ForwardProxyState, InboundConnectionInfo, ProxyAuthenticationError};
+use crate::v2::{InboundConnectionInfo, LiveForwardProxyState, ProxyAuthenticationError};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
@@ -37,7 +37,7 @@ struct ConnectUpgrade {
 pub(super) async fn handle_v2_client(
   stream: TcpStream,
   peer: SocketAddr,
-  state: Arc<ForwardProxyState>,
+  state: LiveForwardProxyState,
   outbound_proxy: Arc<ConnectProxy>,
   mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -74,7 +74,7 @@ pub(super) async fn handle_v2_client(
 }
 
 async fn handle_request(
-  state: Arc<ForwardProxyState>,
+  state: LiveForwardProxyState,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
   connection: InboundConnectionInfo,
@@ -91,7 +91,7 @@ async fn handle_request(
 }
 
 async fn handle_request_inner(
-  state: Arc<ForwardProxyState>,
+  live: LiveForwardProxyState,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
   connection: InboundConnectionInfo,
@@ -112,6 +112,7 @@ async fn handle_request_inner(
     Ok(admission) => admission,
     Err(error) => return ApiError::bad_request(error.to_string()).into_response(),
   };
+  let state = live.current();
   let access = match state.authenticate_proxy(request.headers_mut()).await {
     Ok(access) => access,
     Err(ProxyAuthenticationError::Rejected) => return proxy_auth_required(),
@@ -198,7 +199,7 @@ fn admit_direct_http(request: &Request<hyper::body::Incoming>) -> Result<Ingress
   Ok(ingress)
 }
 
-async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> Result<()> {
+async fn run_connect(upgrade: ConnectUpgrade, state: LiveForwardProxyState) -> Result<()> {
   let upgraded = upgrade.on_upgrade.await.context("upgrade downstream CONNECT")?;
   let downstream = TokioIo::new(upgraded);
   match upgrade.transport {
@@ -217,7 +218,7 @@ async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> 
       let access = upgrade.access;
       let connection = upgrade.connection;
       let service = service_fn(move |mut request| {
-        let state = state.clone();
+        let state = state.current();
         let ingress = ingress.clone();
         let access = access.clone();
         async move {
