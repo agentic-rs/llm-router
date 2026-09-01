@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokn_access::AccessStore;
-use tokn_core::event::EventBus;
+use tokn_core::event::{Event, EventBus};
+use tokn_core::request_event::{RequestEventPayload, StageEvent};
 
 #[tokio::test]
 async fn v2_forward_proxy_authenticates_and_applies_connect_policy() {
@@ -188,15 +189,26 @@ route = "transparent"
 kind = "relay"
 destination = {{ kind = "original" }}
 credentials = {{ kind = "client" }}
+
+[providers.codex]
 "#
   );
   let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
-  let state =
-    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
-      .unwrap()
-      .forward_proxy
-      .pop()
-      .unwrap();
+  let account = toml::from_str(
+    r#"
+id = "codex-primary"
+provider = "codex"
+access_token = "codex-client-token"
+"#,
+  )
+  .unwrap();
+  let events = Arc::new(EventBus::new(64));
+  let mut event_rx = events.subscribe();
+  let state = tokn_router::v2::build_runtime_states(plan, &[account], Arc::new(AccessStore::disabled()), events)
+    .unwrap()
+    .forward_proxy
+    .pop()
+    .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
   let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
     let _ = shutdown_rx.await;
@@ -207,7 +219,7 @@ credentials = {{ kind = "client" }}
   client
     .write_all(
       format!(
-        "POST http://{upstream_addr}/opaque?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client\r\nContent-Length: 5\r\nConnection: close, x-hop\r\nKeep-Alive: timeout=5\r\nX-Hop: remove-me\r\n\r\nhello"
+        "POST http://{upstream_addr}/opaque?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer codex-client-token\r\nContent-Length: 5\r\nConnection: close, x-hop\r\nKeep-Alive: timeout=5\r\nX-Hop: remove-me\r\n\r\nhello"
       )
       .as_bytes(),
     )
@@ -242,13 +254,26 @@ credentials = {{ kind = "client" }}
 
   let request = String::from_utf8(received.await.unwrap()).unwrap();
   assert!(request.starts_with("POST /opaque?x=1 HTTP/1.1\r\n"));
-  assert!(request.contains("authorization: Bearer client\r\n"));
+  assert!(request.contains("authorization: Bearer codex-client-token\r\n"));
   let request_lower = request.to_ascii_lowercase();
   assert!(request_lower.contains(&format!("x-request-id: {}\r\n", generated_request_id)));
   for removed in ["proxy-authorization", "connection:", "keep-alive:", "x-hop:"] {
     assert!(!request_lower.contains(removed), "forwarded request retained {removed}");
   }
   assert!(request.ends_with("hello"));
+
+  let resolved = std::iter::from_fn(|| event_rx.try_recv().ok()).find_map(|event| {
+    let Event::Requests(request) = &*event else {
+      return None;
+    };
+    match &request.payload {
+      RequestEventPayload::Stage(StageEvent::Resolve(summary)) => Some(summary.clone()),
+      _ => None,
+    }
+  });
+  let resolved = resolved.expect("proxy request did not emit a resolve event");
+  assert_eq!(resolved.provider_id.as_str(), "codex");
+  assert_eq!(resolved.account_id.as_str(), "codex-primary");
 
   shutdown_tx.send(()).unwrap();
   proxy_task.await.unwrap().unwrap();
