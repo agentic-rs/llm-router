@@ -23,6 +23,9 @@ pub struct V2ProjectionOptions {
   /// Permit a projected provider to send account credentials over
   /// non-loopback cleartext HTTP.
   pub allow_insecure_http: bool,
+  /// Permit projection of a non-loopback API listener. The generated listener
+  /// still has to satisfy v2 authentication requirements during compilation.
+  pub allow_insecure_public_listener: bool,
 }
 
 /// The effective legacy policy whose behavior cannot be represented.
@@ -56,6 +59,22 @@ pub enum V2BehaviorChange {
   HttpRejectionBehavior,
 }
 
+impl std::fmt::Display for V2BehaviorChange {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(match self {
+      Self::AuxiliaryApiEndpoints => "auxiliary legacy API endpoints are not projected",
+      Self::RequestModeOverrides => "per-request legacy route-mode overrides are not projected",
+      Self::ManagedSelectionOrder => "managed account and provider selection follows v2 ordering",
+      Self::RetryPolicy => "legacy retry policy is not projected",
+      Self::OperationalSettings => "legacy operational settings not represented by v2 use v2 defaults",
+      Self::Cors => "legacy CORS settings are not projected",
+      Self::AgentBindings => "legacy agent bindings are not projected",
+      Self::PercentDecodedProfileAliases => "profile paths use canonical v2 percent-encoding semantics",
+      Self::HttpRejectionBehavior => "HTTP rejection behavior follows v2 listener rules",
+    })
+  }
+}
+
 /// A non-fatal diagnostic produced with a projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum V2ProjectionWarning {
@@ -77,11 +96,56 @@ pub enum V2ProjectionWarning {
     accounts: Vec<String>,
     base_url: String,
   },
+  RemoteApiBindAllowed {
+    bind: SocketAddr,
+  },
   LegacyPoolStrategyIgnored {
     strategy: String,
   },
   LegacySystemProxyShadowedByExplicitProxy,
   LegacyNoProxyWithoutExplicitProxyIgnored,
+}
+
+impl std::fmt::Display for V2ProjectionWarning {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::BehaviorChange(change) => change.fmt(formatter),
+      Self::LegacyServerRouteModeUsed { mode } => {
+        write!(formatter, "legacy server route mode {mode:?} became the effective default")
+      }
+      Self::ProfileResourceRenamed { profile, resource_id } => {
+        write!(formatter, "legacy profile `{profile}` was projected as v2 resource `{resource_id}`")
+      }
+      Self::AccountBaseUrlPromoted {
+        provider,
+        accounts,
+        base_url,
+      } => write!(
+        formatter,
+        "account-level base URL `{base_url}` for provider `{provider}` and accounts {accounts:?} was promoted to the provider"
+      ),
+      Self::CleartextProviderAllowed {
+        provider,
+        accounts,
+        base_url,
+      } => write!(
+        formatter,
+        "provider `{provider}` for accounts {accounts:?} is allowed to send credentials over cleartext HTTP to `{base_url}`"
+      ),
+      Self::RemoteApiBindAllowed { bind } => {
+        write!(formatter, "non-loopback API listener `{bind}` was explicitly allowed")
+      }
+      Self::LegacyPoolStrategyIgnored { strategy } => {
+        write!(formatter, "legacy pool strategy `{strategy}` is not available; v2 uses round_robin")
+      }
+      Self::LegacySystemProxyShadowedByExplicitProxy => {
+        formatter.write_str("the explicit outbound proxy takes precedence over legacy system-proxy discovery")
+      }
+      Self::LegacyNoProxyWithoutExplicitProxyIgnored => {
+        formatter.write_str("legacy no_proxy entries have no effect without an explicit outbound proxy")
+      }
+    }
+  }
 }
 
 #[derive(Debug, Error)]
@@ -170,6 +234,21 @@ mod tests {
     assert_eq!(
       LegacyPolicyLocation::Profile("work".into()).to_string(),
       "profile `work`"
+    );
+  }
+
+  #[test]
+  fn projection_warnings_have_operator_facing_messages() {
+    assert_eq!(
+      V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RetryPolicy).to_string(),
+      "legacy retry policy is not projected"
+    );
+    assert_eq!(
+      V2ProjectionWarning::RemoteApiBindAllowed {
+        bind: "0.0.0.0:4141".parse().unwrap(),
+      }
+      .to_string(),
+      "non-loopback API listener `0.0.0.0:4141` was explicitly allowed"
     );
   }
 }

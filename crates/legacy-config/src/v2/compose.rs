@@ -24,7 +24,7 @@ const LLM_ENDPOINTS: [(&str, &str, &str); 3] = [
   ("messages", "messages", "messages"),
 ];
 
-/// A read-only projection ready for a future opt-in v2 runtime path.
+/// A read-only projection ready for the v2 runtime path.
 #[derive(Clone, Debug)]
 pub struct V2Projection {
   raw_config: RawConfig,
@@ -83,6 +83,10 @@ pub fn project_v2_config(
   }
   let account_index = index_accounts(accounts)?;
   let (projected_accounts, providers) = project_accounts_and_providers(accounts, options, &mut warnings)?;
+  let api_bind = api_bind(legacy, options.allow_insecure_public_listener)?;
+  if !api_bind.ip().is_loopback() {
+    warnings.push(V2ProjectionWarning::RemoteApiBindAllowed { bind: api_bind });
+  }
 
   let mut ids = IdentifierAllocator::with_reserved(DEFAULT_POLICY_ID);
   let mut profiles = BTreeMap::new();
@@ -145,13 +149,13 @@ pub fn project_v2_config(
     listeners: BTreeMap::from([(
       API_LISTENER_ID.to_string(),
       RawListener::LlmApi {
-        bind: api_bind(legacy)?.to_string(),
+        bind: api_bind.to_string(),
         client_auth: if legacy.api_key.enabled {
           RawClientAuth::LocalKeys
         } else {
           RawClientAuth::None
         },
-        allow_insecure_public: false,
+        allow_insecure_public: options.allow_insecure_public_listener,
         default_http_action: RawBindingAction::Reject {},
       },
     )]),
@@ -521,6 +525,40 @@ mod tests {
     assert_eq!(compiled.service().persistence().body_max_bytes(), 1234);
     assert_eq!(accounts.len(), 1);
     assert!(!warnings.is_empty());
+  }
+
+  #[test]
+  fn explicitly_projects_an_authenticated_remote_listener() {
+    let mut legacy = Config::default();
+    legacy.api_key.enabled = true;
+    legacy.server.host = "0.0.0.0".into();
+
+    let projection = project_v2_config(
+      &legacy,
+      &[account("primary", "openai", None)],
+      V2ProjectionOptions {
+        allow_insecure_public_listener: true,
+        ..V2ProjectionOptions::default()
+      },
+    )
+    .unwrap();
+    let RawListener::LlmApi {
+      bind,
+      client_auth,
+      allow_insecure_public,
+      ..
+    } = &projection.raw_config().listeners["api"]
+    else {
+      panic!("API listener")
+    };
+    assert_eq!(bind, "0.0.0.0:4141");
+    assert_eq!(*client_auth, RawClientAuth::LocalKeys);
+    assert!(*allow_insecure_public);
+    assert!(projection
+      .warnings()
+      .contains(&V2ProjectionWarning::RemoteApiBindAllowed {
+        bind: "0.0.0.0:4141".parse().unwrap(),
+      }));
   }
 
   #[test]

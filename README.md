@@ -353,7 +353,7 @@ tokn-gateway account list [--no-quota]
 tokn-gateway account status [ID]
 tokn-gateway account switch --only ID
 tokn-gateway headers [--account ID]
-tokn-gateway serve [--host HOST] [--port PORT] [--with-proxy] [--no-proxy]
+tokn-gateway serve [--host HOST] [--port PORT] [--no-proxy]
 tokn-gateway proxy start [--host HOST] [--port PORT] [--route-mode MODE] [--passthrough]
 tokn-gateway proxy env [--shell sh|bash|zsh|fish|pwsh]
 tokn-gateway proxy shell [--shell /path/to/shell]
@@ -382,6 +382,15 @@ tokn-gateway smoke provider|model|send ...
 request through the selected `llm_api` listener in memory. Pass `--listener`
 when the config contains more than one LLM API listener. `smoke model` remains
 a catalogue-only lookup and does not load the gateway config.
+
+`serve` always runs the v2 request runtime. A native `schema_version = 2`
+config is compiled directly. An unversioned legacy config is merged with its
+fragments, projected into v2 together with the current account store, and
+compiled entirely in memory; neither config nor auth files are rewritten.
+Projection warnings are logged at startup. Legacy `route`, `exact`, `fuzzy`,
+and `switch` policies are supported when their referenced accounts and
+providers can be represented. Legacy `passthrough` and `serve --with-proxy`
+are rejected instead of falling back silently to the old server runtime.
 
 Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`. A
 fresh link defaults to `route`; a relink or sync preserves the binding's
@@ -500,12 +509,10 @@ route_mode = "route"
 # passthrough_hosts = ["api.githubcopilot.com"]
 ```
 
-`tokn-gateway serve --with-proxy` runs both the API listener and proxy in one
-process. API routes use `[defaults]` or a named profile; proxy interception uses
-`[proxy_mode].route_mode` unless overridden with `--proxy-route-mode`. With
-`[api_key].enabled = true`, intercepted requests in any managed mode require a
-client key. Passthrough requests and non-intercepted CONNECT tunnels preserve
-the client's credentials and bypass the check.
+Run the legacy-configured proxy as a separate process with `tokn-gateway proxy
+start`. Native v2 configs can declare one or more `forward_proxy` listeners and
+serve them together with API listeners. The in-memory legacy projection does
+not synthesize a forward-proxy listener, so `serve --with-proxy` is rejected.
 
 ## LAN Bootstrap
 
@@ -513,16 +520,16 @@ By default, listeners must bind to loopback. To expose a trusted LAN gateway,
 bind explicitly and opt into the risk:
 
 ```sh
-tokn-gateway serve --host 0.0.0.0 --with-proxy --insecure-allow-remote
+tokn-gateway proxy start --host 0.0.0.0 --insecure-allow-remote
 ```
 
-This exposes helper routes on the API listener:
+This exposes helper routes through plain HTTP requests to the proxy listener:
 
 - `/-/lan/bootstrap.json`
 - `/-/lan/ca.crt`
 - `/-/lan/env?shell=sh|bash|zsh|fish|pwsh`
 
-The server prints the CA SHA-256 fingerprint at startup. Verify that fingerprint
+The proxy prints the CA SHA-256 fingerprint at startup. Verify that fingerprint
 before trusting a CA fetched over the LAN. The private CA key is never served.
 
 ## Development

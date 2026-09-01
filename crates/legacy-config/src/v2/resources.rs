@@ -399,6 +399,7 @@ mod tests {
       &remote,
       V2ProjectionOptions {
         allow_insecure_http: true,
+        ..V2ProjectionOptions::default()
       },
       &mut warnings,
     )
