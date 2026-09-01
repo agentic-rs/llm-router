@@ -1,3 +1,4 @@
+mod discovery;
 mod selector;
 
 use crate::api::error::ApiError;
@@ -80,6 +81,7 @@ pub struct AppState {
   listener_id: ListenerId,
   listener: LlmApiListenerPlan,
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
+  discovery: Arc<discovery::DiscoveryRuntime>,
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
   request_limits: tokn_config::v2::RequestLimitsPlan,
@@ -121,6 +123,46 @@ impl AppState {
         .ok_or_else(|| ApiError::internal(format!("listener selected missing profile '{profile_id}'"))),
       HttpAction::Reject => Err(ApiError::forbidden("request rejected by v2 listener policy")),
     }
+  }
+
+  fn discovery_profiles(&self, uri: &Uri, headers: &HeaderMap) -> Result<BTreeSet<ProfileId>, ApiError> {
+    let path = uri.path();
+    let prefix = path
+      .strip_suffix("models")
+      .or_else(|| path.strip_suffix("providers"))
+      .ok_or_else(|| ApiError::internal(format!("unsupported v2 discovery path '{path}'")))?;
+    let host = request_host(uri, headers)?;
+    let mut profiles = self
+      .listener
+      .http_bindings()
+      .iter()
+      .filter(|binding| {
+        let matcher = binding.matcher();
+        (matcher.hosts().is_empty()
+          || host
+            .as_ref()
+            .is_some_and(|host| matcher.hosts().iter().any(|pattern| pattern.matches(host))))
+          && (matcher.path_prefixes().is_empty()
+            || matcher
+              .path_prefixes()
+              .iter()
+              .any(|candidate| candidate.starts_with(prefix) || prefix.starts_with(candidate.as_str())))
+      })
+      .filter_map(|binding| match binding.action() {
+        HttpAction::Route(profile) => Some(profile.clone()),
+        HttpAction::Reject => None,
+      })
+      .collect::<BTreeSet<_>>();
+
+    if profiles.is_empty() && path.starts_with("/v1/") {
+      collect_profile(self.listener.default_http_action(), &mut profiles);
+    }
+    if profiles.is_empty() {
+      return Err(ApiError::bad_request(format!(
+        "no v2 profile is bound to discovery path '{path}'"
+      )));
+    }
+    Ok(profiles)
   }
 }
 
@@ -448,6 +490,11 @@ enum PipelineMode {
   DryRun,
 }
 
+struct LinkedRuntimes {
+  profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
+  discovery: Arc<discovery::DiscoveryRuntime>,
+}
+
 /// Build one shared v2 runtime generation for every configured listener.
 pub fn build_runtime_states(
   plan: GatewayPlan,
@@ -468,7 +515,7 @@ pub fn build_runtime_states_with_service(
   let plan = Arc::new(plan);
   let outbound = service.outbound().to_http_client_options();
   let request_limits = service.request_limits();
-  let profiles = build_profile_runtimes(plan.clone(), accounts, events.clone(), &outbound, PipelineMode::Full)?;
+  let linked = build_profile_runtimes(plan.clone(), accounts, events.clone(), &outbound, PipelineMode::Full)?;
   let identity = Arc::new(AccountIdentityResolver::from_accounts(accounts));
   let provider_registry = Arc::new(Registry::builtin());
   let mut llm_api = Vec::new();
@@ -478,7 +525,8 @@ pub fn build_runtime_states_with_service(
       ListenerPlan::LlmApi(listener) => llm_api.push(AppState {
         listener_id: listener_id.clone(),
         listener: listener.clone(),
-        profiles: profiles.clone(),
+        profiles: linked.profiles.clone(),
+        discovery: linked.discovery.clone(),
         access: access.clone(),
         events: events.clone(),
         request_limits,
@@ -492,7 +540,7 @@ pub fn build_runtime_states_with_service(
         forward_proxy.push(ForwardProxyState {
           listener_id: listener_id.clone(),
           listener: listener.clone(),
-          profiles: profiles.clone(),
+          profiles: linked.profiles.clone(),
           access: access.clone(),
           events: events.clone(),
           identity: identity.clone(),
@@ -560,7 +608,7 @@ fn build_api_states(
   let plan = Arc::new(plan);
   let outbound = service.outbound().to_http_client_options();
   let request_limits = service.request_limits();
-  let profiles = build_profile_runtimes(plan.clone(), accounts, events.clone(), &outbound, mode)?;
+  let linked = build_profile_runtimes(plan.clone(), accounts, events.clone(), &outbound, mode)?;
   Ok(
     plan
       .listeners()
@@ -569,7 +617,8 @@ fn build_api_states(
         ListenerPlan::LlmApi(listener) => Some(AppState {
           listener_id: listener_id.clone(),
           listener: listener.clone(),
-          profiles: profiles.clone(),
+          profiles: linked.profiles.clone(),
+          discovery: linked.discovery.clone(),
           access: access.clone(),
           events: events.clone(),
           request_limits,
@@ -586,7 +635,7 @@ fn build_profile_runtimes(
   events: Arc<EventBus>,
   outbound: &tokn_core::util::http::HttpClientOptions,
   mode: PipelineMode,
-) -> anyhow::Result<Arc<BTreeMap<ProfileId, ProfileRuntime>>> {
+) -> anyhow::Result<LinkedRuntimes> {
   let mut reachable_profiles = BTreeSet::new();
   for listener in plan.listeners().values() {
     collect_profile(listener.default_http_action(), &mut reachable_profiles);
@@ -597,10 +646,18 @@ fn build_profile_runtimes(
 
   let registry = Registry::builtin();
   let providers = link_provider_graph(&plan, accounts, &registry)?;
-  let pools = link_account_pools(&plan, &providers)?;
-  let pools = build_account_pool_runtimes(&pools);
+  let linked_pools = link_account_pools(&plan, &providers)?;
   let managed_http = tokn_core::util::http::build_managed_client(outbound)?;
   let opaque_http = tokn_core::util::http::build_opaque_client(outbound)?;
+  let discovery = Arc::new(discovery::DiscoveryRuntime::new(
+    &plan,
+    &providers,
+    &linked_pools,
+    &registry,
+    managed_http.clone(),
+    &reachable_profiles,
+  )?);
+  let pools = build_account_pool_runtimes(&linked_pools);
 
   let mut profiles = BTreeMap::new();
   for profile_id in reachable_profiles {
@@ -741,7 +798,10 @@ fn build_profile_runtimes(
     };
     profiles.insert(profile_id, runtime);
   }
-  Ok(Arc::new(profiles))
+  Ok(LinkedRuntimes {
+    profiles: Arc::new(profiles),
+    discovery,
+  })
 }
 
 fn build_proxy_relay_service(
@@ -959,6 +1019,13 @@ pub fn router(state: AppState) -> Router {
     .route("/v1/chat/completions", post(chat_completions))
     .route("/v1/responses", post(responses))
     .route("/v1/messages", post(messages))
+    .route("/v1/providers", get(list_providers))
+    .route("/v1/models", get(list_models))
+    .route("/{profile}/v1/chat/completions", post(chat_completions))
+    .route("/{profile}/v1/responses", post(responses))
+    .route("/{profile}/v1/messages", post(messages))
+    .route("/{profile}/v1/providers", get(list_providers))
+    .route("/{profile}/v1/models", get(list_models))
     .route("/healthz", get(health))
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     .layer(middleware::from_fn(crate::request_id::propagate_request_id))
@@ -972,6 +1039,26 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> &'static str {
   "ok"
+}
+
+async fn list_providers(
+  State(state): State<Arc<AppState>>,
+  Extension(access): Extension<AccessContext>,
+  uri: Uri,
+  headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+  let profiles = state.discovery_profiles(&uri, &headers)?;
+  Ok(axum::Json(state.discovery.providers(&profiles, &access)))
+}
+
+async fn list_models(
+  State(state): State<Arc<AppState>>,
+  Extension(access): Extension<AccessContext>,
+  uri: Uri,
+  headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+  let profiles = state.discovery_profiles(&uri, &headers)?;
+  state.discovery.models(&profiles, &access).await.map(axum::Json)
 }
 
 async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
@@ -1286,7 +1373,7 @@ fn wire_agent(identity: &WireIdentity) -> Option<AgentId> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use axum::body::Body;
+  use axum::body::{to_bytes, Body};
   use tokn_core::account::{AccountTier, AuthType, Secret};
   use tokn_core::request_event::StageEvent;
   use tokn_policy::{HostPattern, OperationId, WireIdentityId};
@@ -1585,6 +1672,162 @@ base_url = "http://127.0.0.1:1/v1"
     assert!(converted);
     assert!(stopped);
     assert!(!sent);
+  }
+
+  #[tokio::test]
+  async fn discovery_lists_listener_provider_and_falls_back_to_local_models() {
+    let plan = tokn_config::v2::parse(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "managed" }
+
+[profiles.managed]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = { kind = "fixed", provider = "local" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+
+[account_pools.primary]
+accounts = ["missing"]
+providers = ["local"]
+
+[providers.local]
+driver = "openai"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+      std::path::Path::new("discovery.toml"),
+    )
+    .unwrap();
+    let mut states = build_states(
+      plan,
+      &[account_for_provider("local")],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+    let state = states.pop().unwrap();
+    let discovery_profiles = state
+      .discovery_profiles(&"/v1/providers".parse().unwrap(), &HeaderMap::new())
+      .unwrap();
+    let restricted = AccessContext {
+      key_id: Some("restricted".into()),
+      key_name: Some("restricted".into()),
+      providers: tokn_access::ProviderAccess::from_provider_ids(vec!["other".into()]).unwrap(),
+    };
+    assert!(state.discovery.providers(&discovery_profiles, &restricted)["data"]
+      .as_array()
+      .unwrap()
+      .is_empty());
+    let app = router(state);
+
+    let response = app
+      .clone()
+      .oneshot(Request::get("/v1/providers").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["route_mode"], "route");
+    assert_eq!(body["data"][0]["id"], "local");
+    assert_eq!(body["data"][0]["driver"], "openai");
+    assert_eq!(body["data"][0]["accounts"], 1);
+
+    let response = app
+      .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let models = body["data"].as_array().unwrap();
+    assert!(models.iter().any(|model| model["id"] == "gpt-4o"));
+    assert!(models.iter().all(|model| model["x_tokn_router"]["provider"] == "local"));
+  }
+
+  #[tokio::test]
+  async fn profile_compatibility_routes_use_the_bound_exact_policy() {
+    let plan = tokn_config::v2::parse(
+      r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+
+[[bindings]]
+id = "work"
+listener = "api"
+action = { kind = "route", profile = "exact" }
+path_prefixes = ["/work/v1/"]
+methods = ["POST"]
+
+[profiles.exact]
+route = "exact"
+
+[routes.exact]
+kind = "managed"
+account_pool = "primary"
+provider = { kind = "fixed", provider = "local" }
+model = { kind = "qualified", namespace = "provider" }
+operation = "translate_compatible"
+
+[account_pools.primary]
+accounts = ["missing"]
+providers = ["local"]
+
+[providers.local]
+driver = "openai"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+      std::path::Path::new("profile-discovery.toml"),
+    )
+    .unwrap();
+    let mut states = build_dry_run_states(
+      plan,
+      &[account_for_provider("local")],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+    let app = router(states.pop().unwrap());
+
+    let response = app
+      .clone()
+      .oneshot(Request::get("/work/v1/models").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["route_mode"], "exact");
+    assert!(body["data"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|model| model["id"] == "local/gpt-4o"));
+
+    let response = app
+      .oneshot(
+        Request::post("/work/v1/responses")
+          .header("content-type", "application/json")
+          .body(Body::from(r#"{"model":"local/gpt-4o","input":"hello"}"#))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
   }
 
   #[tokio::test]
