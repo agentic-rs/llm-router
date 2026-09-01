@@ -37,8 +37,8 @@ use tokn_core::AgentId;
 use tokn_policy::{
   CanonicalAuthority, CanonicalHost, ClientAuthPlan, ConnectAction, CredentialPolicy, ForwardProxyListenerPlan,
   GatewayPlan, HttpAction, HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry,
-  ModelSelector, ProfileId, ProviderId, RelayCredentials, RelayDestination, RelayRetry, RouteKind, RoutePlan,
-  WireIdentity,
+  ModelSelector, ProfileId, ProviderId, RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind,
+  RoutePlan, WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
@@ -673,9 +673,10 @@ fn build_profile_runtimes(
     let agent_id = wire_agent(profile_plan.wire_identity());
     let (api_service, proxy_service, api_destination, proxy_destination) = match route {
       RoutePlan::Managed(route) => {
-        if route.header_patches().is_some() || !matches!(route.retry(), ManagedRetry::Never) {
-          anyhow::bail!("profile '{profile_id}' uses unsupported managed patches or retry policy");
+        if route.header_patches().is_some() {
+          anyhow::bail!("profile '{profile_id}' uses unsupported managed header patches");
         }
+        let retry = managed_retry_policy(&plan, route.retry())?;
         let (selector, selection_state) = V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
         let name = format!("v2-{profile_id}");
         let extract = Arc::new(DefaultExtract);
@@ -694,13 +695,18 @@ fn build_profile_runtimes(
           ),
           PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
         };
-        let service = RequestService::http_from_pipeline(Arc::new(Pipeline::new(Arc::new(profile), events.clone())));
+        let service = RequestService::http_from_pipeline(Arc::new(Pipeline::new_with_retry(
+          Arc::new(profile),
+          events.clone(),
+          retry,
+        )));
         (Some(service.clone()), Some(service), None, ProxyDestination::Managed)
       }
       RoutePlan::Relay(route) => {
-        if route.header_patches().is_some() || !matches!(route.retry(), RelayRetry::Never) {
-          anyhow::bail!("profile '{profile_id}' uses unsupported relay patches or retry policy");
+        if route.header_patches().is_some() {
+          anyhow::bail!("profile '{profile_id}' uses unsupported relay header patches");
         }
+        let retry = relay_retry_policy(&plan, route.retry())?;
         let proxy_service = build_proxy_relay_service(
           &profile_id,
           route,
@@ -742,9 +748,10 @@ fn build_profile_runtimes(
               PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
             };
             (
-              Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
+              Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new_with_retry(
                 Arc::new(profile),
                 events.clone(),
+                retry,
               )))),
               None,
             )
@@ -768,9 +775,10 @@ fn build_profile_runtimes(
               PipelineMode::DryRun => Profile::without_send(name, extract, resolve, build_headers, convert_request),
             };
             (
-              Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
+              Some(RequestService::http_from_pipeline(Arc::new(Pipeline::new_with_retry(
                 Arc::new(profile),
                 events.clone(),
+                retry,
               )))),
               linked_destination.clone(),
             )
@@ -813,6 +821,7 @@ fn build_proxy_relay_service(
   http: reqwest::Client,
   events: Arc<EventBus>,
 ) -> anyhow::Result<tokn_service::HttpService> {
+  let retry = relay_retry_policy(plan, route.retry())?;
   let name = format!("v2-{profile_id}-proxy");
   let profile = match route.credentials() {
     RelayCredentials::AccountPool(account_pool) => {
@@ -855,10 +864,43 @@ fn build_proxy_relay_service(
       )
     }
   };
-  Ok(RequestService::http_from_pipeline(Arc::new(Pipeline::new(
+  Ok(RequestService::http_from_pipeline(Arc::new(Pipeline::new_with_retry(
     Arc::new(profile),
     events,
+    retry,
   ))))
+}
+
+fn managed_retry_policy(plan: &GatewayPlan, retry: &ManagedRetry) -> anyhow::Result<tokn_requests::RetryPolicy> {
+  match retry {
+    ManagedRetry::Never => Ok(tokn_requests::RetryPolicy::default()),
+    ManagedRetry::Recoverable(policy_id) => retry_policy(plan, policy_id, false),
+  }
+}
+
+fn relay_retry_policy(plan: &GatewayPlan, retry: &RelayRetry) -> anyhow::Result<tokn_requests::RetryPolicy> {
+  match retry {
+    RelayRetry::Never => Ok(tokn_requests::RetryPolicy::default()),
+    RelayRetry::SafeMethods(policy_id) => retry_policy(plan, policy_id, true),
+    RelayRetry::Buffered(policy_id) => retry_policy(plan, policy_id, false),
+  }
+}
+
+fn retry_policy(
+  plan: &GatewayPlan,
+  policy_id: &RetryPolicyId,
+  safe_methods: bool,
+) -> anyhow::Result<tokn_requests::RetryPolicy> {
+  let policy = plan
+    .retry_policy(policy_id)
+    .ok_or_else(|| anyhow::anyhow!("route references missing retry policy '{policy_id}'"))?;
+  let max_retries = policy.max_retries();
+  let initial_backoff = policy.initial_backoff();
+  Ok(if safe_methods {
+    tokn_requests::RetryPolicy::safe_methods(max_retries, initial_backoff)
+  } else {
+    tokn_requests::RetryPolicy::new(max_retries, initial_backoff)
+  })
 }
 
 fn provider_origins(

@@ -48,6 +48,8 @@ pub struct RawConfig {
   #[serde(default)]
   pub routes: BTreeMap<String, RawRoute>,
   #[serde(default)]
+  pub retry_policies: BTreeMap<String, RawRetryPolicy>,
+  #[serde(default)]
   pub account_pools: BTreeMap<String, RawAccountPool>,
   #[serde(default)]
   pub providers: BTreeMap<String, RawProvider>,
@@ -297,11 +299,40 @@ pub enum RawRoute {
     provider: RawProviderSelector,
     model: RawModelSelector,
     operation: RawOperationPolicy,
+    #[serde(default)]
+    retry: RawRouteRetry,
   },
   Relay {
     destination: RawRelayDestination,
     credentials: RawRelayCredentials,
+    #[serde(default)]
+    retry: RawRouteRetry,
   },
+}
+
+/// One reusable exponential-backoff policy. Route-specific replay safety is
+/// selected by the route's `retry.kind`, not by this timing resource.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRetryPolicy {
+  pub max_retries: u32,
+  pub initial_backoff_ms: u64,
+}
+
+/// Retry and replay-safety behavior selected by a route.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RawRouteRetry {
+  Never {},
+  Recoverable { policy: String },
+  SafeMethods { policy: String },
+  Buffered { policy: String },
+}
+
+impl Default for RawRouteRetry {
+  fn default() -> Self {
+    Self::Never {}
+  }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

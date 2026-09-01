@@ -14,6 +14,7 @@
 //!
 //! Construct via [`RunConfig::builder`] or [`RunConfig::default`].
 
+use http::Method;
 use serde_json::Value;
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
@@ -26,6 +27,7 @@ pub struct RunConfig {
   inner: BTreeMap<SmolStr, Value>,
   agent_id: Option<AgentId>,
   generation_options: Option<GenerationOptions>,
+  request_method: Option<Method>,
 }
 
 impl RunConfig {
@@ -53,8 +55,21 @@ impl RunConfig {
     self.generation_options.as_ref()
   }
 
+  pub fn request_method(&self) -> Option<&Method> {
+    self.request_method.as_ref()
+  }
+
+  #[must_use]
+  pub fn with_request_method(mut self, method: Method) -> Self {
+    self.request_method = Some(method);
+    self
+  }
+
   pub fn is_empty(&self) -> bool {
-    self.inner.is_empty() && self.agent_id.is_none() && self.generation_options.is_none()
+    self.inner.is_empty()
+      && self.agent_id.is_none()
+      && self.generation_options.is_none()
+      && self.request_method.is_none()
   }
 
   pub fn len(&self) -> usize {
@@ -67,6 +82,7 @@ pub struct RunConfigBuilder {
   inner: BTreeMap<SmolStr, Value>,
   agent_id: Option<AgentId>,
   generation_options: Option<GenerationOptions>,
+  request_method: Option<Method>,
 }
 
 impl RunConfigBuilder {
@@ -102,11 +118,17 @@ impl RunConfigBuilder {
     self
   }
 
+  pub fn with_request_method(mut self, method: Method) -> Self {
+    self.request_method = Some(method);
+    self
+  }
+
   pub fn build(self) -> RunConfig {
     RunConfig {
       inner: self.inner,
       agent_id: self.agent_id,
       generation_options: self.generation_options,
+      request_method: self.request_method,
     }
   }
 }
@@ -121,12 +143,14 @@ mod tests {
       .with_str("proxy.host", "api.openai.com")
       .with_str("proxy.path", "/v1/chat/completions")
       .with_agent_id(AgentId::CodexCli)
+      .with_request_method(Method::POST)
       .with("proxy.attempt", 0u64)
       .build();
     assert_eq!(cfg.get_str("proxy.host"), Some("api.openai.com"));
     assert_eq!(cfg.get_str("proxy.path"), Some("/v1/chat/completions"));
     assert_eq!(cfg.get("proxy.attempt").and_then(|v| v.as_u64()), Some(0));
     assert_eq!(cfg.agent_id(), Some(&AgentId::CodexCli));
+    assert_eq!(cfg.request_method(), Some(&Method::POST));
     assert!(cfg.get("missing").is_none());
     assert_eq!(cfg.len(), 3);
   }

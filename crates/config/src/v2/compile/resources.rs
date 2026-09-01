@@ -1,7 +1,7 @@
 use crate::v2::{
   CompileError, RawAccountPool, RawConfig, RawModelSelector, RawOperationPolicy, RawPoolStrategy, RawProfile,
-  RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRoute,
-  RawWireIdentity,
+  RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination,
+  RawRetryPolicy, RawRoute, RawRouteRetry, RawWireIdentity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -11,16 +11,19 @@ use tokn_policy::{
   AccountPoolId, AccountPoolPlan, AccountSelectionStrategy, AccountSelector, DriverId, ManagedRetry, ManagedRoute,
   ManagedTarget, ModelFamily, ModelSelector, OperationPolicy, ProfileId, ProfilePlan, ProviderId, ProviderOrigin,
   ProviderPlan, ProviderSelector, QualificationNamespace, RelayCredentials, RelayDestination, RelayRetry, RelayRoute,
-  RouteId, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
+  RetryPolicyId, RetryPolicyPlan, RouteId, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
 };
 
 const MAX_FAILURE_COOLDOWN_SECS: u64 = 86_400;
 const MAX_SESSION_DURATION_SECS: u64 = 31_536_000;
+const MAX_RETRIES: u32 = 10;
+const MAX_INITIAL_BACKOFF_MS: u64 = 60_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CompiledResources {
   pub(super) profiles: BTreeMap<ProfileId, ProfilePlan>,
   pub(super) routes: BTreeMap<RouteId, RoutePlan>,
+  pub(super) retry_policies: BTreeMap<RetryPolicyId, RetryPolicyPlan>,
   pub(super) account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
   pub(super) providers: BTreeMap<ProviderId, ProviderPlan>,
 }
@@ -28,15 +31,47 @@ pub(super) struct CompiledResources {
 pub(super) fn compile_resources(raw: &RawConfig) -> Result<CompiledResources, CompileError> {
   let providers = compile_providers(&raw.providers)?;
   let account_pools = compile_account_pools(&raw.account_pools, &providers)?;
-  let routes = compile_routes(&raw.routes, &account_pools, &providers)?;
+  let retry_policies = compile_retry_policies(&raw.retry_policies)?;
+  let routes = compile_routes(&raw.routes, &account_pools, &providers, &retry_policies)?;
   let profiles = compile_profiles(&raw.profiles, &routes)?;
 
   Ok(CompiledResources {
     profiles,
     routes,
+    retry_policies,
     account_pools,
     providers,
   })
+}
+
+fn compile_retry_policies(
+  raw_policies: &BTreeMap<String, RawRetryPolicy>,
+) -> Result<BTreeMap<RetryPolicyId, RetryPolicyPlan>, CompileError> {
+  raw_policies
+    .iter()
+    .map(|(raw_id, raw_policy)| {
+      let id = parse_id::<RetryPolicyId>("retry policy id", raw_id)?;
+      if raw_policy.max_retries == 0 || raw_policy.max_retries > MAX_RETRIES {
+        return Err(invalid_value(
+          format!("retry_policies.{raw_id}.max_retries"),
+          format!("must be between 1 and {MAX_RETRIES}"),
+        ));
+      }
+      if raw_policy.initial_backoff_ms > MAX_INITIAL_BACKOFF_MS {
+        return Err(invalid_value(
+          format!("retry_policies.{raw_id}.initial_backoff_ms"),
+          format!("must not exceed {MAX_INITIAL_BACKOFF_MS}"),
+        ));
+      }
+      Ok((
+        id,
+        RetryPolicyPlan::new(
+          raw_policy.max_retries,
+          Duration::from_millis(raw_policy.initial_backoff_ms),
+        ),
+      ))
+    })
+    .collect()
 }
 
 fn compile_account_pools(
@@ -306,6 +341,7 @@ fn compile_routes(
   raw_routes: &BTreeMap<String, RawRoute>,
   pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
   providers: &BTreeMap<ProviderId, ProviderPlan>,
+  retry_policies: &BTreeMap<RetryPolicyId, RetryPolicyPlan>,
 ) -> Result<BTreeMap<RouteId, RoutePlan>, CompileError> {
   raw_routes
     .iter()
@@ -317,6 +353,7 @@ fn compile_routes(
           provider,
           model,
           operation,
+          retry,
         } => {
           let pool_id = resolve_pool(raw_id, "account_pool", account_pool, pools)?;
           let provider_selector = match provider {
@@ -335,16 +372,18 @@ fn compile_routes(
             RawOperationPolicy::Preserve => OperationPolicy::Preserve,
             RawOperationPolicy::TranslateCompatible => OperationPolicy::TranslateCompatible,
           };
+          let retry = compile_managed_retry(raw_id, retry, retry_policies)?;
           RoutePlan::Managed(ManagedRoute::new(
             ManagedTarget::new(pool_id, provider_selector, model),
             operation,
             None,
-            ManagedRetry::Never,
+            retry,
           ))
         }
         RawRoute::Relay {
           destination,
           credentials,
+          retry,
         } => {
           let destination = match destination {
             RawRelayDestination::Original {} => RelayDestination::Original,
@@ -371,13 +410,67 @@ fn compile_routes(
             }
             (_, RelayCredentials::Client) => {}
           }
-          RoutePlan::Relay(RelayRoute::new(destination, credentials, None, RelayRetry::Never))
+          let retry = compile_relay_retry(raw_id, retry, retry_policies)?;
+          RoutePlan::Relay(RelayRoute::new(destination, credentials, None, retry))
         }
       };
 
       Ok((id, plan))
     })
     .collect()
+}
+
+fn compile_managed_retry(
+  route_id: &str,
+  raw: &RawRouteRetry,
+  policies: &BTreeMap<RetryPolicyId, RetryPolicyPlan>,
+) -> Result<ManagedRetry, CompileError> {
+  match raw {
+    RawRouteRetry::Never {} => Ok(ManagedRetry::Never),
+    RawRouteRetry::Recoverable { policy } => {
+      resolve_retry_policy(route_id, policy, policies).map(ManagedRetry::Recoverable)
+    }
+    RawRouteRetry::SafeMethods { .. } | RawRouteRetry::Buffered { .. } => Err(invalid_value(
+      format!("routes.{route_id}.retry.kind"),
+      "managed routes use `recoverable`; replay safety is guaranteed by structured request buffering",
+    )),
+  }
+}
+
+fn compile_relay_retry(
+  route_id: &str,
+  raw: &RawRouteRetry,
+  policies: &BTreeMap<RetryPolicyId, RetryPolicyPlan>,
+) -> Result<RelayRetry, CompileError> {
+  match raw {
+    RawRouteRetry::Never {} => Ok(RelayRetry::Never),
+    RawRouteRetry::SafeMethods { policy } => {
+      resolve_retry_policy(route_id, policy, policies).map(RelayRetry::SafeMethods)
+    }
+    RawRouteRetry::Buffered { policy } => resolve_retry_policy(route_id, policy, policies).map(RelayRetry::Buffered),
+    RawRouteRetry::Recoverable { .. } => Err(invalid_value(
+      format!("routes.{route_id}.retry.kind"),
+      "relay routes must choose `safe_methods` or explicitly acknowledge buffered replay with `buffered`",
+    )),
+  }
+}
+
+fn resolve_retry_policy(
+  route_id: &str,
+  raw_policy: &str,
+  policies: &BTreeMap<RetryPolicyId, RetryPolicyPlan>,
+) -> Result<RetryPolicyId, CompileError> {
+  let policy = parse_id::<RetryPolicyId>("retry policy reference", raw_policy)?;
+  require_reference(
+    policies,
+    &policy,
+    "route",
+    route_id,
+    "retry.policy",
+    "retry policy",
+    raw_policy,
+  )?;
+  Ok(policy)
 }
 
 fn resolve_pool(

@@ -410,6 +410,32 @@ falling back silently to the old server runtime. For legacy configs,
 route mode. Native v2 configs continue to declare their listeners in config
 and reject these compatibility flags.
 
+Native v2 retries are opt-in route policy. Define a bounded exponential
+backoff policy once, then reference it from each route that may retry:
+
+```toml
+[retry_policies.standard]
+max_retries = 2
+initial_backoff_ms = 100
+
+[routes.default]
+kind = "managed"
+account_pool = "default"
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+retry = { kind = "recoverable", policy = "standard" }
+```
+
+Only recoverable send failures consume the retry budget. Managed requests are
+buffered and use `kind = "recoverable"`. Opaque relay routes must either use
+`kind = "safe_methods"` (GET, HEAD, OPTIONS, and TRACE only) or explicitly
+acknowledge body replay with `kind = "buffered"`; omitting `retry` means
+`never`. Policies accept 1–10 retries and an initial backoff from 0–60000 ms.
+The generated v2 config and in-memory legacy projection use two retries with a
+100 ms initial backoff, preserving the former API retry behavior. Projected
+legacy forward-proxy passthrough and switch routes remain non-retrying.
+
 Every v2 `llm_api` listener serves `GET /v1/providers` and `GET /v1/models`
 alongside the three inference endpoints. Discovery is derived from the
 profiles and account pools reachable through that listener, filtered by the
@@ -422,7 +448,7 @@ surface at `/{profile}/v1/*`; native v2 configs must create matching path
 bindings before those profile-compatible paths are active.
 
 The remaining legacy-to-v2 behavior differences are intentional and reported
-at startup: retry behavior, per-request route-mode overrides, CORS, agent
+at startup: per-request route-mode overrides, CORS, agent
 binding metadata, selection-order details, proxy authentication/override
 semantics, LAN bootstrap helpers, percent-decoded profile aliases, HTTP
 rejection behavior, and the admin config reload endpoint. Legacy listener,

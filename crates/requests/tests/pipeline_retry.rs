@@ -1,5 +1,6 @@
 mod support;
 
+use http::Method;
 use std::sync::Arc;
 use std::time::Duration;
 use support::*;
@@ -9,7 +10,7 @@ use tokn_requests::pipeline::stages::ConvertedBody;
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, DefaultSend, PoolResolve,
 };
-use tokn_requests::{PipelineRunner, Profile, RetryPolicy};
+use tokn_requests::{PipelineRunner, Profile, RetryPolicy, RunConfig};
 
 #[tokio::test]
 async fn pipeline_send_failure_preserves_partial_outcome() {
@@ -287,4 +288,98 @@ async fn pipeline_does_not_retry_permanent_send_failures() {
     })
     .collect();
   assert_eq!(started_attempts, vec![0]);
+}
+
+#[tokio::test]
+async fn safe_method_policy_retries_get_requests() {
+  let (bus, log) = capture_bus();
+  let handle = sequenced_handle(
+    "zai-coding-plan",
+    "acct-1",
+    vec![
+      ScriptedResponse::Http {
+        status: 503,
+        body: "retry me",
+      },
+      ScriptedResponse::Http {
+        status: 200,
+        body: r#"{"id":"resp-safe","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+      },
+    ],
+  );
+  let runner = retry_runner(
+    "safe-method-get",
+    handle,
+    bus,
+    RetryPolicy::safe_methods(1, Duration::ZERO),
+  );
+
+  let response = runner
+    .run_with(raw_chat("glm-4"), RunConfig::new().with_request_method(Method::GET))
+    .await
+    .expect("safe GET should be retried");
+  assert!(matches!(response.body, ConvertedBody::Buffered { .. }));
+
+  let events = drain_until_completed_attempts(&log, 2).await;
+  assert_eq!(started_attempts(&events), vec![0, 1]);
+}
+
+#[tokio::test]
+async fn safe_method_policy_does_not_retry_post_or_unknown_methods() {
+  for (label, method) in [("post", Some(Method::POST)), ("unknown", None)] {
+    let bus = Arc::new(tokn_requests::EventBus::new(256));
+    let mut events = bus.subscribe();
+    let handle = sequenced_handle(
+      "zai-coding-plan",
+      "acct-1",
+      vec![ScriptedResponse::Http {
+        status: 503,
+        body: "do not replay",
+      }],
+    );
+    let runner = retry_runner(
+      &format!("safe-method-{label}"),
+      handle,
+      bus,
+      RetryPolicy::safe_methods(1, Duration::ZERO),
+    );
+    let config = method.map_or_else(RunConfig::new, |method| RunConfig::new().with_request_method(method));
+
+    let error = runner
+      .run_with(raw_chat("glm-4"), config)
+      .await
+      .expect_err("unsafe or unknown methods must not be replayed");
+    assert!(error.recoverable);
+
+    let events = drain_received_events(&mut events);
+    assert_eq!(started_attempts(&events), vec![0], "method case: {label}");
+  }
+}
+
+fn retry_runner(
+  name: &str,
+  handle: Arc<tokn_accounts::AccountHandle>,
+  events: Arc<tokn_requests::EventBus>,
+  retry_policy: RetryPolicy,
+) -> PipelineRunner {
+  let profile = Arc::new(Profile::full(
+    name,
+    Arc::new(DefaultExtract),
+    Arc::new(PoolResolve::new(Arc::new(CannedSelector { handle }))),
+    Arc::new(DefaultBuildHeaders::with_provider_defaults()),
+    Arc::new(DefaultConvertRequest),
+    Arc::new(DefaultSend::new(reqwest::Client::new())),
+    Arc::new(DefaultConvertResponse::new()),
+  ));
+  PipelineRunner::new_with_retry(profile, events, retry_policy)
+}
+
+fn started_attempts(events: &[tokn_requests::Event]) -> Vec<u32> {
+  events
+    .iter()
+    .filter_map(|event| match &event.payload {
+      EventPayload::Stage(StageEvent::Started { .. }) => Some(event.attempt),
+      _ => None,
+    })
+    .collect()
 }

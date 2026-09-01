@@ -68,7 +68,6 @@ pub enum V2BehaviorChange {
   AuxiliaryApiEndpoints,
   RequestModeOverrides,
   ManagedSelectionOrder,
-  RetryPolicy,
   Cors,
   AgentBindings,
   PercentDecodedProfileAliases,
@@ -84,7 +83,6 @@ impl std::fmt::Display for V2BehaviorChange {
       Self::AuxiliaryApiEndpoints => "the legacy admin config reload endpoint is not available in v2",
       Self::RequestModeOverrides => "per-request legacy route-mode overrides are not projected",
       Self::ManagedSelectionOrder => "managed account and provider selection follows v2 ordering",
-      Self::RetryPolicy => "legacy retry policy is not projected",
       Self::Cors => "legacy CORS settings are not projected",
       Self::AgentBindings => "legacy agent bindings are not projected",
       Self::PercentDecodedProfileAliases => "profile paths use canonical v2 percent-encoding semantics",
@@ -299,10 +297,6 @@ mod tests {
     assert_eq!(
       V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AuxiliaryApiEndpoints).to_string(),
       "the legacy admin config reload endpoint is not available in v2"
-    );
-    assert_eq!(
-      V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RetryPolicy).to_string(),
-      "legacy retry policy is not projected"
     );
     assert_eq!(
       V2ProjectionWarning::RemoteApiBindAllowed {

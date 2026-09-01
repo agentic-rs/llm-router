@@ -356,9 +356,125 @@ base_url = "http://{upstream_addr}/v1"
   server.abort();
 }
 
+#[tokio::test]
+async fn managed_retry_reselects_after_a_recoverable_account_failure() {
+  let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(2);
+  let upstream = Router::new()
+    .route(
+      "/{*path}",
+      any(
+        |State(capture_tx): State<tokio::sync::mpsc::Sender<String>>, headers: HeaderMap| async move {
+          let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+          capture_tx.send(authorization.clone()).await.unwrap();
+          if authorization == "Bearer sk-primary" {
+            Response::builder()
+              .status(StatusCode::SERVICE_UNAVAILABLE)
+              .header("content-type", "application/json")
+              .body(Body::from(r#"{"error":"try another account"}"#))
+              .unwrap()
+          } else {
+            Response::builder()
+              .header("content-type", "application/json")
+              .body(Body::from(
+                r#"{"id":"chatcmpl-failover","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+              ))
+              .unwrap()
+          }
+        },
+      ),
+    )
+    .with_state(capture_tx);
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let upstream_addr = listener.local_addr().unwrap();
+  let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "managed" }}
+
+[profiles.managed]
+route = "managed"
+
+[routes.managed]
+kind = "managed"
+account_pool = "primary"
+provider = {{ kind = "fixed", provider = "local" }}
+model = {{ kind = "capability" }}
+operation = "preserve"
+retry = {{ kind = "recoverable", policy = "failover" }}
+
+[retry_policies.failover]
+max_retries = 1
+initial_backoff_ms = 0
+
+[account_pools.primary]
+accounts = ["a-primary", "b-secondary"]
+providers = ["local"]
+failure_cooldown_secs = 60
+
+[providers.local]
+driver = "openai"
+base_url = "http://{upstream_addr}/v1"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-retry.toml")).unwrap();
+  let accounts = [
+    account_with_credentials("a-primary", "sk-primary"),
+    account_with_credentials("b-secondary", "sk-secondary"),
+  ];
+  let states = tokn_router::v2::build_states(
+    plan,
+    &accounts,
+    Arc::new(AccessStore::disabled()),
+    Arc::new(EventBus::noop()),
+  )
+  .unwrap();
+  let app = tokn_router::v2::router(states.into_iter().next().unwrap());
+
+  let response = app
+    .oneshot(
+      Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(br#"{"model":"gpt-4o","messages":[]}"#.as_slice()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  let status = response.status();
+  let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+  assert_eq!(
+    status,
+    StatusCode::OK,
+    "retry response: {}",
+    String::from_utf8_lossy(&body)
+  );
+  assert_eq!(
+    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"],
+    "chatcmpl-failover"
+  );
+  assert_eq!(capture_rx.recv().await.as_deref(), Some("Bearer sk-primary"));
+  assert_eq!(capture_rx.recv().await.as_deref(), Some("Bearer sk-secondary"));
+
+  server.abort();
+}
+
 fn account() -> AccountConfig {
+  account_with_credentials("acct", "sk-v2-test")
+}
+
+fn account_with_credentials(id: &str, api_key: &str) -> AccountConfig {
   AccountConfig {
-    id: "acct".into(),
+    id: id.into(),
     provider: "local".into(),
     enabled: true,
     tier: AccountTier::Active,
@@ -368,7 +484,7 @@ fn account() -> AccountConfig {
     headers: Default::default(),
     auth_type: Some(AuthType::Bearer),
     username: None,
-    api_key: Some(Secret::new("sk-v2-test".into())),
+    api_key: Some(Secret::new(api_key.into())),
     api_key_expires_at: None,
     access_token: None,
     access_token_expires_at: None,
