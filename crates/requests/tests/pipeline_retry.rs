@@ -327,7 +327,8 @@ async fn safe_method_policy_retries_get_requests() {
 #[tokio::test]
 async fn safe_method_policy_does_not_retry_post_or_unknown_methods() {
   for (label, method) in [("post", Some(Method::POST)), ("unknown", None)] {
-    let (bus, log) = capture_bus();
+    let bus = Arc::new(tokn_requests::EventBus::new(256));
+    let mut events = bus.subscribe();
     let handle = sequenced_handle(
       "zai-coding-plan",
       "acct-1",
@@ -350,7 +351,7 @@ async fn safe_method_policy_does_not_retry_post_or_unknown_methods() {
       .expect_err("unsafe or unknown methods must not be replayed");
     assert!(error.recoverable);
 
-    let events = drain_until_completed(&log).await;
+    let events = drain_received_events(&mut events);
     assert_eq!(started_attempts(&events), vec![0], "method case: {label}");
   }
 }

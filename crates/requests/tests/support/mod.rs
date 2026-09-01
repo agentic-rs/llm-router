@@ -148,6 +148,25 @@ pub fn capture_bus() -> (Arc<EventBus>, Arc<Mutex<Vec<Event>>>) {
   (bus, log)
 }
 
+pub fn drain_received_events(rx: &mut tokio::sync::broadcast::Receiver<Arc<tokn_core::event::Event>>) -> Vec<Event> {
+  let mut events = Vec::new();
+  loop {
+    match rx.try_recv() {
+      Ok(event) => {
+        if let tokn_core::event::Event::Requests(event) = &*event {
+          events.push(event.clone());
+        }
+      }
+      Err(tokio::sync::broadcast::error::TryRecvError::Empty | tokio::sync::broadcast::error::TryRecvError::Closed) => {
+        return events;
+      }
+      Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+        panic!("event receiver lagged by {skipped} events");
+      }
+    }
+  }
+}
+
 pub fn raw_chat(model: &str) -> RawInbound {
   let body = serde_json::json!({"model": model, "messages": []});
   let decoded = Bytes::from(serde_json::to_vec(&body).unwrap());
