@@ -1,5 +1,5 @@
 use axum::body::{to_bytes, Body, Bytes};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Extension, State};
 use axum::http::{HeaderMap, Request, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::any;
@@ -69,21 +69,21 @@ base_url = "http://{upstream_addr}/v1"
   let events = Arc::new(EventBus::new(64));
   let mut event_rx = events.subscribe();
   let states = tokn_router::v2::build_states(plan, &[], Arc::new(AccessStore::disabled()), events).unwrap();
-  let app = tokn_router::v2::router(states.into_iter().next().unwrap());
+  let local_addr = "127.0.0.1:4141".parse::<std::net::SocketAddr>().unwrap();
+  let peer_addr = "127.0.0.1:5151".parse::<std::net::SocketAddr>().unwrap();
+  let app = tokn_router::v2::router(states.into_iter().next().unwrap()).layer(Extension(local_addr));
   let body = Bytes::from_static(br#"{"model":"gpt-4o","input":"hello","opaque":true}"#);
 
-  let response = app
-    .oneshot(
-      Request::post("/v1/responses")
-        .header("host", "gateway.example")
-        .header("content-type", "application/json")
-        .header("authorization", "Bearer client-secret")
-        .header("x-api-key", "client-key")
-        .body(Body::from(body.clone()))
-        .unwrap(),
-    )
-    .await
+  let mut request = Request::post("/v1/responses")
+    .header("host", "gateway.example")
+    .header("x-tokn-router-local-addr", "spoofed.example")
+    .header("content-type", "application/json")
+    .header("authorization", "Bearer client-secret")
+    .header("x-api-key", "client-key")
+    .body(Body::from(body.clone()))
     .unwrap();
+  request.extensions_mut().insert(ConnectInfo(peer_addr));
+  let response = app.oneshot(request).await.unwrap();
   let request_id = response
     .headers()
     .get("x-request-id")
@@ -141,8 +141,8 @@ base_url = "http://{upstream_addr}/v1"
   assert_eq!(event_request_id.as_str(), request_id);
   assert!(user.is_none());
   assert!(api_key_id.is_none());
-  assert_eq!(local_addr.as_deref(), Some("gateway.example"));
-  assert!(peer_addr.is_none());
+  assert_eq!(local_addr.as_deref(), Some("127.0.0.1:4141"));
+  assert_eq!(peer_addr.as_deref(), Some("127.0.0.1:5151"));
   assert_eq!(mode.as_str(), "passthrough");
   assert_eq!(pipeline_id.as_str(), "requests");
   assert_eq!(inbound_method.as_str(), "POST");

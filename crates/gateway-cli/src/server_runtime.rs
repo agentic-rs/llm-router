@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::db::archive::{ArchiveEventHandler, ArchiveRuntime};
 use crate::progress::{ArchiveProgressEventHandler, ProgressEventHandler, ProgressLogEventHandler};
 use anyhow::Result;
+use axum::extract::Extension;
 use axum::Router;
 use std::future::Future;
 use std::io::IsTerminal;
@@ -150,8 +151,12 @@ where
   F: Future<Output = ()> + Send + 'static,
 {
   let listener = tokio::net::TcpListener::bind(addr).await?;
-  tracing::info!(%addr, "tokn-router listening");
-  axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
+  let local_addr = listener.local_addr()?;
+  tracing::info!(addr = %local_addr, "tokn-router listening");
+  let app = app.layer(Extension(local_addr));
+  axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+    .with_graceful_shutdown(shutdown)
+    .await?;
   Ok(())
 }
 

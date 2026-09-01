@@ -1,6 +1,6 @@
 use super::connect_proxy::{connect_upstream, ConnectProxy};
 use crate::api::error::ApiError;
-use crate::v2::{ForwardProxyState, ProxyAuthenticationError, ProxyConnectionInfo};
+use crate::v2::{ForwardProxyState, InboundConnectionInfo, ProxyAuthenticationError};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
@@ -29,7 +29,7 @@ enum PreparedConnect {
 struct ConnectUpgrade {
   ingress: IngressAuthority,
   access: AccessContext,
-  connection: ProxyConnectionInfo,
+  connection: InboundConnectionInfo,
   on_upgrade: hyper::upgrade::OnUpgrade,
   transport: PreparedConnect,
 }
@@ -41,7 +41,7 @@ pub(super) async fn handle_v2_client(
   outbound_proxy: Arc<ConnectProxy>,
   mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-  let connection = ProxyConnectionInfo::new(stream.local_addr().ok(), peer);
+  let connection = InboundConnectionInfo::new(stream.local_addr().ok(), peer);
   let (upgrades, mut upgrade_receiver) = mpsc::channel(1);
   let service_state = state.clone();
   let service_proxy = outbound_proxy.clone();
@@ -77,7 +77,7 @@ async fn handle_request(
   state: Arc<ForwardProxyState>,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
-  connection: ProxyConnectionInfo,
+  connection: InboundConnectionInfo,
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
   if request.method() != Method::CONNECT {
@@ -94,7 +94,7 @@ async fn handle_request_inner(
   state: Arc<ForwardProxyState>,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
-  connection: ProxyConnectionInfo,
+  connection: InboundConnectionInfo,
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
   if is_websocket_upgrade(request.headers()) {

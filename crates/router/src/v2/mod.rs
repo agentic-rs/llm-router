@@ -4,7 +4,8 @@ use crate::api::error::ApiError;
 use crate::api::identity::AccountIdentityResolver;
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::{Extension, Request, State};
+use axum::extract::{ConnectInfo, Extension, FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -15,6 +16,7 @@ use selector::{
 };
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::error::Error as _;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -233,7 +235,7 @@ impl ForwardProxyState {
     ingress: &IngressAuthority,
     scheme: &'static str,
     access: AccessContext,
-    connection: ProxyConnectionInfo,
+    connection: InboundConnectionInfo,
     request: Request<hyper::body::Incoming>,
   ) -> Response {
     match self
@@ -250,7 +252,7 @@ impl ForwardProxyState {
     ingress: &IngressAuthority,
     scheme: &'static str,
     access: AccessContext,
-    connection: ProxyConnectionInfo,
+    connection: InboundConnectionInfo,
     request: Request<hyper::body::Incoming>,
   ) -> Result<Response, ApiError> {
     let (parts, body) = request.into_parts();
@@ -386,17 +388,39 @@ impl ForwardProxyState {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ProxyConnectionInfo {
+pub(crate) struct InboundConnectionInfo {
   local_addr: Option<SocketAddr>,
   peer_addr: Option<SocketAddr>,
 }
 
-impl ProxyConnectionInfo {
+struct ApiRequestContext {
+  access: AccessContext,
+  connection: InboundConnectionInfo,
+}
+
+impl InboundConnectionInfo {
   pub(crate) fn new(local_addr: Option<SocketAddr>, peer_addr: SocketAddr) -> Self {
     Self {
       local_addr,
       peer_addr: Some(peer_addr),
     }
+  }
+}
+
+impl<S> FromRequestParts<S> for InboundConnectionInfo
+where
+  S: Send + Sync,
+{
+  type Rejection = Infallible;
+
+  async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    Ok(Self {
+      local_addr: parts.extensions.get::<SocketAddr>().copied(),
+      peer_addr: parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr),
+    })
   }
 }
 
@@ -1009,39 +1033,69 @@ fn collect_profile(action: &HttpAction, profiles: &mut BTreeSet<ProfileId>) {
 async fn chat_completions(
   State(state): State<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
+  connection: InboundConnectionInfo,
   method: Method,
   uri: Uri,
   headers: HeaderMap,
   body: Bytes,
 ) -> Result<Response, ApiError> {
-  handle(state, access, method, uri, headers, body, Endpoint::ChatCompletions).await
+  handle(
+    state,
+    ApiRequestContext { access, connection },
+    method,
+    uri,
+    headers,
+    body,
+    Endpoint::ChatCompletions,
+  )
+  .await
 }
 
 async fn responses(
   State(state): State<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
+  connection: InboundConnectionInfo,
   method: Method,
   uri: Uri,
   headers: HeaderMap,
   body: Bytes,
 ) -> Result<Response, ApiError> {
-  handle(state, access, method, uri, headers, body, Endpoint::Responses).await
+  handle(
+    state,
+    ApiRequestContext { access, connection },
+    method,
+    uri,
+    headers,
+    body,
+    Endpoint::Responses,
+  )
+  .await
 }
 
 async fn messages(
   State(state): State<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
+  connection: InboundConnectionInfo,
   method: Method,
   uri: Uri,
   headers: HeaderMap,
   body: Bytes,
 ) -> Result<Response, ApiError> {
-  handle(state, access, method, uri, headers, body, Endpoint::Messages).await
+  handle(
+    state,
+    ApiRequestContext { access, connection },
+    method,
+    uri,
+    headers,
+    body,
+    Endpoint::Messages,
+  )
+  .await
 }
 
 async fn handle(
   state: Arc<AppState>,
-  access: AccessContext,
+  context: ApiRequestContext,
   method: Method,
   uri: Uri,
   headers: HeaderMap,
@@ -1049,17 +1103,12 @@ async fn handle(
   endpoint: Endpoint,
 ) -> Result<Response, ApiError> {
   let runtime = state.select_profile(&method, &uri, &headers, endpoint)?;
-  let local_addr = headers
-    .get("x-tokn-router-local-addr")
-    .or_else(|| headers.get(axum::http::header::HOST))
-    .and_then(|value| value.to_str().ok())
-    .map(SmolStr::new);
   emit_inbound_connection(
     &state.events,
-    &access,
+    &context.access,
     request_id(&headers)?,
-    local_addr,
-    None,
+    context.connection.local_addr.map(|addr| SmolStr::new(addr.to_string())),
+    context.connection.peer_addr.map(|addr| SmolStr::new(addr.to_string())),
     runtime.record_mode,
     "requests",
     &method,
@@ -1106,7 +1155,7 @@ async fn handle(
       .with_str(tokn_requests::stages::send::proxy::send_keys::METHOD, method.as_str())
       .with_str(tokn_requests::stages::send::proxy::send_keys::SCHEME, scheme);
   }
-  if let Some(providers) = access.providers.provider_ids() {
+  if let Some(providers) = context.access.providers.provider_ids() {
     config = config.with(
       tokn_requests::stages::ACCESS_ALLOWED_PROVIDERS_KEY,
       serde_json::Value::Array(providers.iter().cloned().map(serde_json::Value::String).collect()),
