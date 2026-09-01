@@ -150,7 +150,7 @@ where
 pub(crate) async fn serve_v2_policy<F>(
   addr: SocketAddr,
   outbound_proxy: HttpClientOptions,
-  state: Arc<crate::v2::ForwardProxyState>,
+  state: crate::v2::LiveForwardProxyState,
   shutdown: F,
 ) -> Result<()>
 where
