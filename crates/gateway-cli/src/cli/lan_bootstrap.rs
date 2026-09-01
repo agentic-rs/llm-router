@@ -1,11 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use axum::extract::{Query, State};
-use axum::http::header::{CONTENT_TYPE, HOST};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use tokn_router::proxy::{ProxyCa, ProxyPlainHttpHandler, ProxyPlainHttpRequest, ProxyPlainHttpResponse};
 
@@ -23,10 +17,6 @@ pub struct BootstrapState {
 }
 
 impl BootstrapState {
-  pub fn new(ca: &ProxyCa, api_port: u16, proxy_port: u16) -> Result<Self> {
-    Self::from_ca(ca, Some(api_port), proxy_port)
-  }
-
   pub fn proxy_only(ca: &ProxyCa, proxy_port: u16) -> Result<Self> {
     Self::from_ca(ca, None, proxy_port)
   }
@@ -42,14 +32,6 @@ impl BootstrapState {
       proxy_port,
     })
   }
-}
-
-pub fn router(state: BootstrapState) -> Router {
-  Router::new()
-    .route(BOOTSTRAP_JSON_PATH, get(bootstrap_json))
-    .route(CA_CERT_PATH, get(ca_cert))
-    .route(ENV_PATH, get(env_script))
-    .with_state(state)
 }
 
 pub fn proxy_plain_http_handler(state: BootstrapState) -> ProxyPlainHttpHandler {
@@ -72,36 +54,6 @@ struct BootstrapMetadata {
   ca_cert_url: String,
   env_url: String,
   ca_sha256: String,
-}
-
-async fn bootstrap_json(
-  State(state): State<BootstrapState>,
-  headers: HeaderMap,
-) -> std::result::Result<Json<BootstrapMetadata>, BootstrapError> {
-  let api_port = state.api_port.ok_or_else(|| anyhow!("missing API port"))?;
-  let urls = urls_from_headers(&headers, state.api_port, state.proxy_port, api_port)?;
-  Ok(Json(bootstrap_metadata(urls, &state.ca_fingerprint)))
-}
-
-async fn ca_cert(State(state): State<BootstrapState>) -> Response {
-  ([(CONTENT_TYPE, "application/x-pem-file")], state.ca_cert_pem.clone()).into_response()
-}
-
-#[derive(Deserialize)]
-struct EnvQuery {
-  shell: Option<String>,
-}
-
-async fn env_script(
-  State(state): State<BootstrapState>,
-  headers: HeaderMap,
-  Query(query): Query<EnvQuery>,
-) -> std::result::Result<Response, BootstrapError> {
-  let shell = Shell::parse(query.shell.as_deref())?;
-  let api_port = state.api_port.ok_or_else(|| anyhow!("missing API port"))?;
-  let urls = urls_from_headers(&headers, state.api_port, state.proxy_port, api_port)?;
-  let script = render_env_script(shell, &urls, &state.ca_fingerprint);
-  Ok(([(CONTENT_TYPE, shell.content_type())], script).into_response())
 }
 
 fn proxy_plain_http_response(request: ProxyPlainHttpRequest, state: &BootstrapState) -> Option<ProxyPlainHttpResponse> {
@@ -177,21 +129,6 @@ fn bootstrap_bad_request(err: anyhow::Error) -> ProxyPlainHttpResponse {
   }
 }
 
-#[derive(Debug)]
-struct BootstrapError(anyhow::Error);
-
-impl From<anyhow::Error> for BootstrapError {
-  fn from(value: anyhow::Error) -> Self {
-    Self(value)
-  }
-}
-
-impl IntoResponse for BootstrapError {
-  fn into_response(self) -> Response {
-    (StatusCode::BAD_REQUEST, self.0.to_string()).into_response()
-  }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Shell {
   Sh,
@@ -229,20 +166,6 @@ struct BootstrapUrls {
   ca_cert_url: String,
   host_for_no_proxy: String,
   host_dir_name: String,
-}
-
-fn urls_from_headers(
-  headers: &HeaderMap,
-  api_port: Option<u16>,
-  proxy_port: u16,
-  bootstrap_port: u16,
-) -> Result<BootstrapUrls> {
-  let raw = headers
-    .get(HOST)
-    .ok_or_else(|| anyhow!("missing Host header"))?
-    .to_str()
-    .context("Host header must be valid ASCII")?;
-  urls_from_host(raw, api_port, proxy_port, bootstrap_port)
 }
 
 fn urls_from_proxy_host(
@@ -699,9 +622,6 @@ fn pwsh_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use axum::body::to_bytes;
-  use axum::http::Request;
-  use tower::ServiceExt;
 
   fn test_state() -> BootstrapState {
     BootstrapState {
@@ -964,98 +884,8 @@ mod tests {
   fn bootstrap_state_loads_public_ca_from_generated_ca() {
     let dir = tempfile::tempdir().unwrap();
     let ca = tokn_router::proxy::load_or_generate_ca(dir.path(), false).unwrap();
-    let state = BootstrapState::new(&ca, 4141, 4142).unwrap();
+    let state = BootstrapState::proxy_only(&ca, 4142).unwrap();
     assert!(state.ca_cert_pem.contains("BEGIN CERTIFICATE"));
     assert_eq!(state.ca_fingerprint, ca.fingerprint_sha256());
-  }
-
-  #[tokio::test]
-  async fn bootstrap_json_endpoint_uses_request_host() {
-    let response = router(test_state())
-      .oneshot(
-        Request::builder()
-          .uri(BOOTSTRAP_JSON_PATH)
-          .header(HOST, "lan-router.local:4141")
-          .body(axum::body::Body::empty())
-          .unwrap(),
-      )
-      .await
-      .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["api_url"], "http://lan-router.local:4141/v1");
-    assert_eq!(json["proxy_url"], "http://lan-router.local:4142");
-    assert_eq!(json["ca_cert_url"], "http://lan-router.local:4141/-/lan/ca.crt");
-    assert_eq!(json["env_url"], "http://lan-router.local:4141/-/lan/env?shell=sh");
-    assert_eq!(json["ca_sha256"], "abc123");
-  }
-
-  #[tokio::test]
-  async fn env_endpoint_renders_requested_shell() {
-    let response = router(test_state())
-      .oneshot(
-        Request::builder()
-          .uri("/-/lan/env?shell=pwsh")
-          .header(HOST, "lan-router.local:4141")
-          .body(axum::body::Body::empty())
-          .unwrap(),
-      )
-      .await
-      .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-      response.headers().get(CONTENT_TYPE).unwrap(),
-      "text/plain; charset=utf-8"
-    );
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let body = std::str::from_utf8(&body).unwrap();
-    assert!(body.contains("$Env:OPENAI_BASE_URL = 'http://lan-router.local:4141/v1'"));
-    assert!(body.contains("Invoke-WebRequest"));
-  }
-
-  #[tokio::test]
-  async fn bootstrap_endpoints_reject_bad_host_or_shell() {
-    let missing_host = router(test_state())
-      .oneshot(
-        Request::builder()
-          .uri(BOOTSTRAP_JSON_PATH)
-          .body(axum::body::Body::empty())
-          .unwrap(),
-      )
-      .await
-      .unwrap();
-    assert_eq!(missing_host.status(), StatusCode::BAD_REQUEST);
-
-    let bad_shell = router(test_state())
-      .oneshot(
-        Request::builder()
-          .uri("/-/lan/env?shell=cmd")
-          .header(HOST, "lan-router.local:4141")
-          .body(axum::body::Body::empty())
-          .unwrap(),
-      )
-      .await
-      .unwrap();
-    assert_eq!(bad_shell.status(), StatusCode::BAD_REQUEST);
-  }
-
-  #[tokio::test]
-  async fn ca_endpoint_serves_only_public_certificate() {
-    let response = router(test_state())
-      .oneshot(
-        Request::builder()
-          .uri(CA_CERT_PATH)
-          .header(HOST, "lan-router.local:4141")
-          .body(axum::body::Body::empty())
-          .unwrap(),
-      )
-      .await
-      .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let body = std::str::from_utf8(&body).unwrap();
-    assert!(body.contains("BEGIN CERTIFICATE"));
-    assert!(!body.contains("PRIVATE KEY"));
   }
 }

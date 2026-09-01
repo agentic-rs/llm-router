@@ -1,14 +1,16 @@
 use crate::cli::config_cmd::RouteModeArg;
-use crate::cli::lan_bootstrap;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::Args;
 use futures::future::BoxFuture;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex};
-use tokn_config::{RouteMode, DEFAULT_HOST};
+use tokio::sync::watch;
 use tokn_core::event::EventBus;
+use tokn_router_legacy_config::v2::{
+  project_v2_config, V2ForwardProxyProjectionOptions, V2ProjectionOptions, V2ProjectionWarning,
+};
 
 #[derive(Args, Debug)]
 pub struct ServeArgs {
@@ -16,13 +18,13 @@ pub struct ServeArgs {
   pub host: Option<String>,
   #[arg(long)]
   pub port: Option<u16>,
-  /// Also run the local MITM proxy in the same process.
+  /// Also project and run the legacy proxy as a v2 forward-proxy listener.
   #[arg(long)]
   pub with_proxy: bool,
-  /// Override the proxy listener's default route mode when `--with-proxy` is enabled.
+  /// Override the projected proxy listener's static route mode.
   #[arg(long, value_enum, requires = "with_proxy")]
   pub proxy_route_mode: Option<RouteModeArg>,
-  /// Allow non-loopback binding. Enable [api_key] for managed API and intercepted proxy requests.
+  /// Allow non-loopback binding. Projected v2 listeners also require [api_key].
   #[arg(long)]
   pub insecure_allow_remote: bool,
   /// Skip outbound proxy for this run.
@@ -31,115 +33,19 @@ pub struct ServeArgs {
 }
 
 pub async fn run(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
-  let resolved_cfg_path = cfg_path
-    .clone()
-    .map(Ok)
-    .unwrap_or_else(tokn_config::paths::config_path)?;
-  if tokn_config::detect_config_schema(&resolved_cfg_path)? == tokn_config::ConfigSchema::V2 {
-    return run_v2(resolved_cfg_path, args).await;
+  let resolved_cfg_path = cfg_path.map(Ok).unwrap_or_else(tokn_config::paths::config_path)?;
+  match tokn_config::detect_config_schema(&resolved_cfg_path)? {
+    tokn_config::ConfigSchema::Legacy => run_projected_legacy(resolved_cfg_path, args).await,
+    tokn_config::ConfigSchema::V2 => run_v2(resolved_cfg_path, args).await,
   }
-  run_legacy(cfg_path, args).await
 }
 
-async fn run_legacy(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
-  let (mut cfg, resolved_cfg_path) = Config::load(cfg_path.as_deref())?;
-  if args.no_proxy {
-    cfg.proxy = crate::config::ProxyConfig::default();
-  }
-  let accounts = crate::server_runtime::load_accounts(Some(&resolved_cfg_path))?;
-  let access = crate::server_runtime::load_access_store(cfg.api_key.enabled)?;
-
-  let host = args.host.unwrap_or_else(|| cfg.server.host.clone());
-  let port = args.port.unwrap_or(cfg.server.port);
-  let addr = crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
-    .with_context(|| format!("parse bind addr {host}:{port}"))?;
-
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&cfg)?;
-  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let server_mode = effective_server_mode(&cfg);
-  let proxy_route_override = args.proxy_route_mode.map(Into::into);
-  let proxy_mode = proxy_route_override.unwrap_or(cfg.proxy_mode.route_mode);
-  let mut app_state = crate::server_runtime::build_state_for_route_mode(&cfg, &accounts, events.clone(), server_mode)?;
-  app_state.access = access.clone();
-  let n = app_state.pool.len();
-  let app_live = tokn_router::api::LiveAppState::new(app_state);
-  let proxy_live = if args.with_proxy {
-    let mut proxy_state =
-      crate::server_runtime::build_proxy_state_for_route_mode(&cfg, &accounts, events.clone(), proxy_mode)?;
-    proxy_state.access = access;
-    Some(tokn_router::api::LiveAppState::new(proxy_state))
-  } else {
-    None
-  };
-  if !args.insecure_allow_remote {
-    install_reload_endpoint(
-      &app_live,
-      proxy_live.clone(),
-      resolved_cfg_path.clone(),
-      args.no_proxy,
-      args.with_proxy,
-      proxy_route_override,
-      events.clone(),
-    );
-  }
-  let mut app = tokn_router::api::router_live(app_live);
-
-  tracing::info!(%addr, accounts = n, route_mode = route_mode_name(server_mode), "tokn-router listening");
-
-  let result = if args.with_proxy {
-    let proxy_host = proxy_host_for_with_proxy(&host, &cfg.proxy_mode.host, args.insecure_allow_remote);
-    let proxy_port = cfg.proxy_mode.port;
-    let proxy_addr = crate::server_runtime::resolve_bind_addr(&proxy_host, proxy_port, args.insecure_allow_remote)
-      .with_context(|| format!("parse bind addr {proxy_host}:{proxy_port}"))?;
-    let ca_dir = cfg.proxy_mode.resolved_ca_dir()?;
-    let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, false)?;
-    let ca_fingerprint = ca.fingerprint_sha256();
-    let bootstrap = if args.insecure_allow_remote {
-      Some(lan_bootstrap::BootstrapState::new(&ca, port, proxy_port)?)
-    } else {
-      None
-    };
-    let plain_http_handler = bootstrap.clone().map(lan_bootstrap::proxy_plain_http_handler);
-    if let Some(bootstrap) = bootstrap {
-      app = app.merge(lan_bootstrap::router(bootstrap));
-      println!("LAN bootstrap: {}", lan_bootstrap::display_bootstrap_url(&host, port));
-      println!(
-        "LAN proxy bootstrap: {}",
-        lan_bootstrap::display_bootstrap_url(&proxy_host, proxy_port)
-      );
-      println!("LAN bootstrap CA sha256: {ca_fingerprint}");
-    }
-    println!("tokn-router proxy listening on http://{proxy_addr}");
-    println!("CA: {} (sha256:{ca_fingerprint})", ca.cert_path().display());
-    println!("Proxy route mode: {}", route_mode_name(proxy_mode));
-
-    let proxy_state = proxy_live.expect("proxy live state is constructed when --with-proxy is set");
-    let proxy_options = tokn_router::proxy::ProxyOptions {
-      addr: proxy_addr,
-      ca_dir,
-      intercept_hosts: cfg.proxy_mode.intercept_hosts.clone(),
-      passthrough_hosts: cfg.proxy_mode.passthrough_hosts.clone(),
-      outbound_proxy: cfg.proxy.to_http_options(),
-      plain_http_handler,
-    };
-    let shutdown = shutdown_channel();
-    tokio::try_join!(
-      crate::server_runtime::serve_http(app, addr, wait_for_shutdown(shutdown.clone())),
-      tokn_router::proxy::serve_live(proxy_state, proxy_options, wait_for_shutdown(shutdown)),
-    )
-    .map(|_| ())
-  } else {
-    crate::server_runtime::serve_http(app, addr, async {
-      let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
-  };
-
-  if let Some(archive_runtime) = archive_runtime {
-    archive_runtime.shutdown().await;
-  }
-  events.shutdown().await;
-  result
+async fn run_projected_legacy(config_path: PathBuf, args: ServeArgs) -> Result<()> {
+  let (legacy, resolved_config_path) = Config::load(Some(&config_path))?;
+  let accounts = crate::server_runtime::load_accounts(Some(&resolved_config_path))?;
+  let (compiled, accounts, warnings, args) = prepare_projected_legacy_runtime(legacy, accounts, args)?;
+  log_projection_warnings(&resolved_config_path, &warnings);
+  run_v2_runtime(compiled, accounts, args).await
 }
 
 async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
@@ -150,8 +56,94 @@ async fn run_v2(config_path: PathBuf, args: ServeArgs) -> Result<()> {
   }
 
   let compiled = tokn_config::v2::load_config(&config_path)?;
-  let (plan, service) = compiled.into_parts();
   let accounts = crate::server_runtime::load_accounts(Some(&config_path))?;
+  run_v2_runtime(compiled, accounts, args).await
+}
+
+fn prepare_projected_legacy_runtime(
+  mut legacy: Config,
+  accounts: Vec<tokn_core::account::AccountConfig>,
+  mut args: ServeArgs,
+) -> Result<(
+  tokn_config::v2::CompiledConfig,
+  Vec<tokn_core::account::AccountConfig>,
+  Vec<V2ProjectionWarning>,
+  ServeArgs,
+)> {
+  if !args.with_proxy && args.proxy_route_mode.is_some() {
+    anyhow::bail!("--proxy-route-mode requires --with-proxy");
+  }
+  if let Some(host) = args.host.take() {
+    legacy.server.host = host;
+  }
+  if let Some(port) = args.port.take() {
+    legacy.server.port = port;
+  }
+  if args.no_proxy {
+    legacy.proxy = crate::config::ProxyConfig::default();
+  }
+  if args.with_proxy && args.insecure_allow_remote && legacy.proxy_mode.host == tokn_config::DEFAULT_HOST {
+    legacy.proxy_mode.host = legacy.server.host.clone();
+  }
+  let forward_proxy = if args.with_proxy {
+    let route_mode = args
+      .proxy_route_mode
+      .take()
+      .map(Into::into)
+      .unwrap_or(legacy.proxy_mode.route_mode);
+    let registry = tokn_router::accounts::registry::Registry::builtin();
+    let provider_hosts = registry
+      .iter()
+      .map(|descriptor| {
+        (
+          descriptor.id.to_string(),
+          descriptor.hosts.iter().map(|host| (*host).to_string()).collect(),
+        )
+      })
+      .collect::<BTreeMap<_, _>>();
+    Some(V2ForwardProxyProjectionOptions {
+      route_mode,
+      default_intercept_hosts: tokn_router::proxy_default_intercept_hosts()
+        .map(str::to_string)
+        .collect(),
+      provider_hosts,
+    })
+  } else {
+    None
+  };
+  args.with_proxy = false;
+
+  let projection = project_v2_config(
+    &legacy,
+    &accounts,
+    V2ProjectionOptions {
+      allow_insecure_public_listener: args.insecure_allow_remote,
+      forward_proxy,
+      ..V2ProjectionOptions::default()
+    },
+  )
+  .context("project legacy config into the in-memory v2 runtime")?;
+  let (_, compiled, accounts, warnings) = projection.into_parts();
+  Ok((compiled, accounts, warnings, args))
+}
+
+fn log_projection_warnings(config_path: &std::path::Path, warnings: &[V2ProjectionWarning]) {
+  tracing::warn!(
+    config = %config_path.display(),
+    warning_count = warnings.len(),
+    "legacy config is running through the in-memory v2 runtime"
+  );
+  for warning in warnings {
+    tracing::warn!(config = %config_path.display(), warning = %warning, "legacy-to-v2 projection warning");
+  }
+}
+
+async fn run_v2_runtime(
+  compiled: tokn_config::v2::CompiledConfig,
+  accounts: Vec<tokn_core::account::AccountConfig>,
+  args: ServeArgs,
+) -> Result<()> {
+  let (plan, service) = compiled.into_parts();
   let needs_access = plan
     .listeners()
     .values()
@@ -231,101 +223,6 @@ async fn serve_v2_plan(
   futures::future::try_join_all(servers).await.map(|_| ())
 }
 
-struct ReloadState {
-  generation: u64,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn install_reload_endpoint(
-  app_live: &tokn_router::api::LiveAppState,
-  proxy_live: Option<tokn_router::api::LiveAppState>,
-  config_path: PathBuf,
-  no_proxy: bool,
-  with_proxy: bool,
-  proxy_route_override: Option<RouteMode>,
-  events: Arc<EventBus>,
-) {
-  let lock = Arc::new(Mutex::new(ReloadState { generation: 0 }));
-  let app_live_for_reload = app_live.clone();
-  let reloader = tokn_router::api::AdminReloader::new(move || {
-    let app_live = app_live_for_reload.clone();
-    let proxy_live = proxy_live.clone();
-    let config_path = config_path.clone();
-    let events = events.clone();
-    let lock = lock.clone();
-    async move {
-      let mut guard = lock.lock().await;
-      let (mut cfg, resolved_cfg_path) = Config::load(Some(&config_path)).map_err(|e| e.to_string())?;
-      if no_proxy {
-        cfg.proxy = crate::config::ProxyConfig::default();
-      }
-      let accounts = crate::server_runtime::load_accounts(Some(&resolved_cfg_path)).map_err(|e| e.to_string())?;
-      let server_mode = effective_server_mode(&cfg);
-      let proxy_mode = proxy_route_override.unwrap_or(cfg.proxy_mode.route_mode);
-      let mut app_state =
-        crate::server_runtime::build_state_for_route_mode(&cfg, &accounts, events.clone(), server_mode)
-          .map_err(|e| e.to_string())?;
-      let access = crate::server_runtime::load_access_store(cfg.api_key.enabled).map_err(|e| e.to_string())?;
-      app_state.access = access.clone();
-      let proxy_state = if with_proxy {
-        let mut state =
-          crate::server_runtime::build_proxy_state_for_route_mode(&cfg, &accounts, events.clone(), proxy_mode)
-            .map_err(|e| e.to_string())?;
-        state.access = access;
-        Some(state)
-      } else {
-        None
-      };
-
-      app_live.swap(app_state);
-      if let (Some(live), Some(state)) = (proxy_live, proxy_state) {
-        live.swap(state);
-      }
-      guard.generation = guard.generation.saturating_add(1);
-      tracing::info!(
-        generation = guard.generation,
-        accounts = accounts.len(),
-        route_mode = route_mode_name(server_mode),
-        "config reloaded"
-      );
-      Ok(tokn_router::api::ReloadReport {
-        status: "reloaded",
-        generation: guard.generation,
-        accounts: accounts.len(),
-        route_mode: route_mode_name(server_mode),
-      })
-    }
-  });
-  if app_live.set_admin_reloader(reloader).is_err() {
-    tracing::warn!("admin config reload endpoint was already configured");
-  }
-}
-
-fn effective_server_mode(cfg: &Config) -> RouteMode {
-  if cfg.defaults.mode == RouteMode::Route && cfg.server.route_mode != RouteMode::Route {
-    cfg.server.route_mode
-  } else {
-    cfg.defaults.mode
-  }
-}
-
-#[cfg(test)]
-fn shared_route_mode(server_mode: RouteMode, proxy_mode: RouteMode, with_proxy: bool) -> RouteMode {
-  if !with_proxy || server_mode != RouteMode::Passthrough {
-    server_mode
-  } else {
-    proxy_mode
-  }
-}
-
-fn proxy_host_for_with_proxy(server_host: &str, configured_proxy_host: &str, insecure_allow_remote: bool) -> String {
-  if insecure_allow_remote && configured_proxy_host == DEFAULT_HOST {
-    server_host.to_string()
-  } else {
-    configured_proxy_host.to_string()
-  }
-}
-
 fn shutdown_channel() -> watch::Receiver<bool> {
   let (tx, rx) = watch::channel(false);
   tokio::spawn(async move {
@@ -342,22 +239,12 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
   let _ = shutdown.changed().await;
 }
 
-fn route_mode_name(mode: RouteMode) -> &'static str {
-  match mode {
-    RouteMode::Passthrough => "passthrough",
-    RouteMode::Switch => "switch",
-    RouteMode::Exact => "exact",
-    RouteMode::Route => "route",
-    RouteMode::Fuzzy => "fuzzy",
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use std::path::Path;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
-  use tokio::net::TcpStream;
+  use tokio::net::{TcpListener, TcpStream};
 
   fn unused_loopback_addr() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -373,6 +260,13 @@ mod tests {
       insecure_allow_remote: false,
       no_proxy: false,
     }
+  }
+
+  fn account(id: &str, provider: &str) -> tokn_core::account::AccountConfig {
+    toml::from_str(&format!(
+      "id = {id:?}\nprovider = {provider:?}\nenabled = true\napi_key = \"test-key\"\n"
+    ))
+    .unwrap()
   }
 
   fn v2_listener_plan(api_addr: std::net::SocketAddr, proxy_addr: std::net::SocketAddr) -> tokn_policy::GatewayPlan {
@@ -447,6 +341,199 @@ default_connect = "reject"
     std::fs::write(&path, "schema_version = [").unwrap();
 
     assert!(tokn_config::detect_config_schema(&path).is_err());
+  }
+
+  #[test]
+  fn legacy_serve_prepares_a_linkable_v2_runtime_without_proxy_settings() {
+    let mut legacy = Config::default();
+    legacy.server.port = 5151;
+    legacy.proxy.url = Some("http://proxy.example:8080".into());
+    let mut args = v2_serve_args();
+    args.port = Some(5252);
+    args.no_proxy = true;
+
+    let (compiled, accounts, warnings, args) =
+      prepare_projected_legacy_runtime(legacy, vec![account("primary", "openai")], args).unwrap();
+
+    assert_eq!(compiled.gateway().listeners()["api"].bind().port(), 5252);
+    assert!(compiled.service().outbound().proxy_url().is_none());
+    assert_eq!(accounts.len(), 1);
+    assert!(args.host.is_none());
+    assert!(args.port.is_none());
+    assert!(warnings.iter().any(|warning| matches!(
+      warning,
+      V2ProjectionWarning::BehaviorChange(tokn_router_legacy_config::v2::V2BehaviorChange::ManagedSelectionOrder)
+    )));
+
+    let (plan, service) = compiled.into_parts();
+    let states = tokn_router::v2::build_runtime_states_with_service(
+      plan,
+      service,
+      &accounts,
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+    assert_eq!(states.llm_api.len(), 1);
+    assert!(states.forward_proxy.is_empty());
+  }
+
+  #[test]
+  fn projected_legacy_serve_requires_explicit_authenticated_remote_bind() {
+    let mut legacy = Config::default();
+    legacy.server.host = "0.0.0.0".into();
+    let accounts = vec![account("primary", "openai")];
+
+    let error = prepare_projected_legacy_runtime(legacy.clone(), accounts.clone(), v2_serve_args()).unwrap_err();
+    assert!(format!("{error:#}").contains("requires an explicit public-listener review"));
+
+    legacy.api_key.enabled = true;
+    let mut args = v2_serve_args();
+    args.insecure_allow_remote = true;
+    let (compiled, _, warnings, _) = prepare_projected_legacy_runtime(legacy, accounts, args).unwrap();
+    assert_eq!(
+      compiled.gateway().listeners()["api"].bind(),
+      "0.0.0.0:4141".parse().unwrap()
+    );
+    assert!(warnings
+      .iter()
+      .any(|warning| matches!(warning, V2ProjectionWarning::RemoteApiBindAllowed { .. })));
+  }
+
+  #[test]
+  fn projected_legacy_serve_builds_both_v2_listeners() {
+    let ca = tempfile::tempdir().unwrap();
+    let mut legacy = Config::default();
+    legacy.proxy_mode.ca_dir = Some(ca.path().to_path_buf());
+    let mut args = v2_serve_args();
+    args.with_proxy = true;
+    args.proxy_route_mode = Some(RouteModeArg::Passthrough);
+    let (compiled, accounts, warnings, args) =
+      prepare_projected_legacy_runtime(legacy, vec![account("primary", "openai")], args).unwrap();
+
+    assert_eq!(compiled.gateway().listeners().len(), 2);
+    assert!(warnings.iter().any(|warning| matches!(
+      warning,
+      V2ProjectionWarning::BehaviorChange(tokn_router_legacy_config::v2::V2BehaviorChange::ProxyRequestModeOverrides)
+    )));
+    assert!(!args.with_proxy);
+    assert!(args.proxy_route_mode.is_none());
+
+    let (plan, service) = compiled.into_parts();
+    let states = tokn_router::v2::build_runtime_states_with_service(
+      plan,
+      service,
+      &accounts,
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+    assert_eq!(states.llm_api.len(), 1);
+    assert_eq!(states.forward_proxy.len(), 1);
+    assert!(ca.path().join("ca.crt").exists());
+  }
+
+  #[test]
+  fn projected_remote_legacy_proxy_follows_api_host_and_requires_authentication() {
+    let mut legacy = Config::default();
+    legacy.server.host = "0.0.0.0".into();
+    let mut args = v2_serve_args();
+    args.with_proxy = true;
+    args.insecure_allow_remote = true;
+
+    let error = prepare_projected_legacy_runtime(legacy.clone(), vec![account("primary", "openai")], args).unwrap_err();
+    assert!(format!("{error:#}").contains("unauthenticated listeners must bind to a loopback address"));
+
+    legacy.api_key.enabled = true;
+    let mut args = v2_serve_args();
+    args.with_proxy = true;
+    args.insecure_allow_remote = true;
+    let (compiled, _, warnings, _) =
+      prepare_projected_legacy_runtime(legacy, vec![account("primary", "openai")], args).unwrap();
+    assert_eq!(
+      compiled.gateway().listeners()["proxy"].bind(),
+      "0.0.0.0:4142".parse().unwrap()
+    );
+    assert!(warnings
+      .iter()
+      .any(|warning| matches!(warning, V2ProjectionWarning::RemoteForwardProxyBindAllowed { .. })));
+  }
+
+  #[tokio::test]
+  async fn projected_legacy_proxy_serves_passthrough_http() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let received = tokio::spawn(async move {
+      let (mut stream, _) = upstream.accept().await.unwrap();
+      let mut request = Vec::new();
+      let mut buffer = [0_u8; 1024];
+      loop {
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert!(read > 0);
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") && request.ends_with(b"hello") {
+          break;
+        }
+      }
+      stream
+        .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close\r\n\r\nworld")
+        .await
+        .unwrap();
+      request
+    });
+
+    let ca = tempfile::tempdir().unwrap();
+    let api_addr = unused_loopback_addr();
+    let proxy_addr = unused_loopback_addr();
+    let mut legacy = Config::default();
+    legacy.server.host = api_addr.ip().to_string();
+    legacy.server.port = api_addr.port();
+    legacy.proxy_mode.host = proxy_addr.ip().to_string();
+    legacy.proxy_mode.port = proxy_addr.port();
+    legacy.proxy_mode.ca_dir = Some(ca.path().to_path_buf());
+    let mut args = v2_serve_args();
+    args.with_proxy = true;
+    args.proxy_route_mode = Some(RouteModeArg::Passthrough);
+    let (compiled, accounts, _, args) =
+      prepare_projected_legacy_runtime(legacy, vec![account("primary", "openai")], args).unwrap();
+    let (plan, service) = compiled.into_parts();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(async move {
+      serve_v2_plan(
+        plan,
+        service,
+        &accounts,
+        Arc::new(tokn_access::AccessStore::disabled()),
+        Arc::new(EventBus::noop()),
+        args,
+        shutdown_rx,
+      )
+      .await
+    });
+    wait_for_listener(api_addr).await;
+    wait_for_listener(proxy_addr).await;
+
+    let mut proxy = TcpStream::connect(proxy_addr).await.unwrap();
+    proxy
+      .write_all(
+        format!(
+          "POST http://{upstream_addr}/custom HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer client-secret\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        )
+        .as_bytes(),
+      )
+      .await
+      .unwrap();
+    let mut response = Vec::new();
+    proxy.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 201 Created"));
+
+    let request = String::from_utf8(received.await.unwrap()).unwrap();
+    assert!(request.starts_with("POST /custom HTTP/1.1\r\n"));
+    assert!(request
+      .to_ascii_lowercase()
+      .contains("authorization: bearer client-secret\r\n"));
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
   }
 
   #[tokio::test]
@@ -557,39 +644,5 @@ default_connect = "reject"
 
     shutdown_tx.send(true).unwrap();
     server.await.unwrap().unwrap();
-  }
-
-  #[test]
-  fn shared_mode_prefers_non_passthrough_listener_when_needed() {
-    assert_eq!(
-      shared_route_mode(RouteMode::Passthrough, RouteMode::Exact, true),
-      RouteMode::Exact
-    );
-    assert_eq!(
-      shared_route_mode(RouteMode::Route, RouteMode::Passthrough, true),
-      RouteMode::Route
-    );
-    assert_eq!(
-      shared_route_mode(RouteMode::Passthrough, RouteMode::Passthrough, true),
-      RouteMode::Passthrough
-    );
-  }
-
-  #[test]
-  fn lan_mode_proxy_host_follows_server_host_when_proxy_host_is_default() {
-    assert_eq!(proxy_host_for_with_proxy("0.0.0.0", DEFAULT_HOST, true), "0.0.0.0");
-  }
-
-  #[test]
-  fn lan_mode_proxy_host_preserves_explicit_proxy_host() {
-    assert_eq!(
-      proxy_host_for_with_proxy("0.0.0.0", "192.168.1.22", true),
-      "192.168.1.22"
-    );
-  }
-
-  #[test]
-  fn local_mode_proxy_host_keeps_default_loopback() {
-    assert_eq!(proxy_host_for_with_proxy("0.0.0.0", DEFAULT_HOST, false), DEFAULT_HOST);
   }
 }

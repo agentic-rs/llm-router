@@ -1,21 +1,27 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use tokn_config::v2::{
-  CompiledConfig, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawListener, RawModelSelector,
-  RawOperationPolicy, RawOutbound, RawPersistence, RawProfile, RawProviderSelector, RawQualificationNamespace,
-  RawRelayCredentials, RawRelayDestination, RawRequestLimits, RawRoute, RawService, SCHEMA_VERSION,
+  CompiledConfig, RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction,
+  RawConnectRule, RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawProfile,
+  RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRequestLimits, RawRoute,
+  RawService, RawWireIdentity, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES, SCHEMA_VERSION,
 };
-use tokn_config::{Config, RouteMode};
+use tokn_config::{Config, ProxyProviderMode, RouteMode};
 use tokn_core::account::AccountConfig;
 
 use super::analysis::{
-  api_bind, base_warnings, effective_policies, profile_path, wire_identity, EffectivePolicy, IdentifierAllocator,
+  api_bind, base_warnings, effective_policies, forward_proxy_bind, profile_path, wire_identity, EffectivePolicy,
+  IdentifierAllocator,
 };
 use super::resources::{index_accounts, project_accounts_and_providers, raw_pool_for_policy};
-use super::{V2ProjectionError, V2ProjectionOptions, V2ProjectionWarning};
+use super::{
+  LegacyPolicyLocation, V2BehaviorChange, V2ForwardProxyProjectionOptions, V2ProjectionError, V2ProjectionOptions,
+  V2ProjectionWarning,
+};
 
 const API_LISTENER_ID: &str = "api";
+const FORWARD_PROXY_LISTENER_ID: &str = "proxy";
 const DEFAULT_POLICY_ID: &str = "default";
 const GENERATED_SOURCE: &str = "in-memory-v1-projection.toml";
 const LLM_ENDPOINTS: [(&str, &str, &str); 3] = [
@@ -24,7 +30,7 @@ const LLM_ENDPOINTS: [(&str, &str, &str); 3] = [
   ("messages", "messages", "messages"),
 ];
 
-/// A read-only projection ready for a future opt-in v2 runtime path.
+/// A read-only projection ready for the v2 runtime path.
 #[derive(Clone, Debug)]
 pub struct V2Projection {
   raw_config: RawConfig,
@@ -78,17 +84,26 @@ pub fn project_v2_config(
 
   let mut warnings = base_warnings(legacy);
   let policies = effective_policies(legacy, &mut warnings)?;
+  let default_policy = policies
+    .first()
+    .expect("effective legacy policies always include defaults")
+    .clone();
   if accounts.is_empty() {
     return Err(V2ProjectionError::NoAccounts);
   }
   let account_index = index_accounts(accounts)?;
-  let (projected_accounts, providers) = project_accounts_and_providers(accounts, options, &mut warnings)?;
+  let (projected_accounts, providers) = project_accounts_and_providers(accounts, &options, &mut warnings)?;
+  let api_bind = api_bind(legacy, options.allow_insecure_public_listener)?;
+  if !api_bind.ip().is_loopback() {
+    warnings.push(V2ProjectionWarning::RemoteApiBindAllowed { bind: api_bind });
+  }
 
   let mut ids = IdentifierAllocator::with_reserved(DEFAULT_POLICY_ID);
   let mut profiles = BTreeMap::new();
   let mut routes = BTreeMap::new();
   let mut account_pools = BTreeMap::new();
   let mut bindings = Vec::new();
+  let mut connect_rules = Vec::new();
 
   for policy in policies {
     let resource_id = match policy.legacy_profile.as_deref() {
@@ -123,6 +138,37 @@ pub fn project_v2_config(
     append_api_bindings(&mut bindings, &resource_id, &path_prefix);
   }
 
+  let mut listeners = BTreeMap::from([(
+    API_LISTENER_ID.to_string(),
+    RawListener::LlmApi {
+      bind: api_bind.to_string(),
+      client_auth: if legacy.api_key.enabled {
+        RawClientAuth::LocalKeys
+      } else {
+        RawClientAuth::None
+      },
+      allow_insecure_public: options.allow_insecure_public_listener,
+      default_http_action: RawBindingAction::Reject {},
+    },
+  )]);
+  if let Some(proxy_options) = options.forward_proxy.as_ref() {
+    let proxy = project_forward_proxy(
+      legacy,
+      proxy_options,
+      &default_policy,
+      &account_index,
+      &mut ids,
+      options.allow_insecure_public_listener,
+    )?;
+    listeners.insert(FORWARD_PROXY_LISTENER_ID.to_string(), proxy.listener);
+    profiles.extend(proxy.profiles);
+    routes.extend(proxy.routes);
+    account_pools.extend(proxy.account_pools);
+    bindings.extend(proxy.bindings);
+    connect_rules.extend(proxy.connect_rules);
+    warnings.extend(proxy.warnings);
+  }
+
   let raw_config = RawConfig {
     schema_version: SCHEMA_VERSION,
     service: RawService {
@@ -142,21 +188,9 @@ pub fn project_v2_config(
         ..RawPersistence::default()
       },
     },
-    listeners: BTreeMap::from([(
-      API_LISTENER_ID.to_string(),
-      RawListener::LlmApi {
-        bind: api_bind(legacy)?.to_string(),
-        client_auth: if legacy.api_key.enabled {
-          RawClientAuth::LocalKeys
-        } else {
-          RawClientAuth::None
-        },
-        allow_insecure_public: false,
-        default_http_action: RawBindingAction::Reject {},
-      },
-    )]),
+    listeners,
     bindings,
-    connect_rules: Vec::new(),
+    connect_rules,
     profiles,
     routes,
     account_pools,
@@ -171,6 +205,249 @@ pub fn project_v2_config(
     accounts: projected_accounts,
     warnings,
   })
+}
+
+struct ProjectedForwardProxy {
+  listener: RawListener,
+  bindings: Vec<RawBinding>,
+  connect_rules: Vec<RawConnectRule>,
+  profiles: BTreeMap<String, RawProfile>,
+  routes: BTreeMap<String, RawRoute>,
+  account_pools: BTreeMap<String, RawAccountPool>,
+  warnings: Vec<V2ProjectionWarning>,
+}
+
+fn project_forward_proxy(
+  legacy: &Config,
+  options: &V2ForwardProxyProjectionOptions,
+  default_policy: &EffectivePolicy,
+  account_index: &BTreeMap<&str, &AccountConfig>,
+  ids: &mut IdentifierAllocator,
+  allow_insecure_public: bool,
+) -> Result<ProjectedForwardProxy, V2ProjectionError> {
+  let bind = forward_proxy_bind(legacy, allow_insecure_public)?;
+  let mut warnings = vec![V2ProjectionWarning::BehaviorChange(
+    V2BehaviorChange::ProxyRequestModeOverrides,
+  )];
+  if legacy.api_key.enabled {
+    warnings.push(V2ProjectionWarning::BehaviorChange(
+      V2BehaviorChange::ProxyAuthentication,
+    ));
+  }
+  if !bind.ip().is_loopback() {
+    warnings.push(V2ProjectionWarning::RemoteForwardProxyBindAllowed { bind });
+    warnings.push(V2ProjectionWarning::BehaviorChange(V2BehaviorChange::ProxyLanBootstrap));
+  }
+
+  let mut policy = default_policy.clone();
+  policy.location = LegacyPolicyLocation::ForwardProxy;
+  policy.legacy_profile = None;
+  policy.mode = options.route_mode;
+
+  let account_pool_id = ids.allocate("proxy-pool");
+  let account_pool = raw_pool_for_policy(legacy, &policy, account_index)?;
+  let mut profiles = BTreeMap::new();
+  let mut routes = BTreeMap::new();
+  let default_profile_id = insert_proxy_profile(
+    &policy,
+    options.route_mode,
+    &account_pool_id,
+    "proxy-default",
+    ids,
+    &mut profiles,
+    &mut routes,
+  )?;
+  let mut mode_profiles = vec![(options.route_mode, default_profile_id.clone())];
+
+  let mut provider_host_owners = BTreeMap::<String, Vec<String>>::new();
+  for (provider, hosts) in &options.provider_hosts {
+    for host in hosts {
+      let owners = provider_host_owners.entry(canonical_proxy_host(host)?).or_default();
+      if !owners.contains(provider) {
+        owners.push(provider.clone());
+      }
+    }
+  }
+  let mut host_assignments = BTreeMap::<String, (ProxyProviderMode, Vec<String>)>::new();
+  for (provider, mode) in &legacy.proxy_mode.provider_modes {
+    let Some(hosts) = options.provider_hosts.get(provider) else {
+      warnings.push(V2ProjectionWarning::UnknownProxyProviderModeIgnored {
+        provider: provider.clone(),
+      });
+      continue;
+    };
+    for host in hosts {
+      let host = canonical_proxy_host(host)?;
+      if let Some(owners) = provider_host_owners.get(&host).filter(|owners| owners.len() > 1) {
+        return Err(V2ProjectionError::AmbiguousProxyProviderHost {
+          provider: provider.clone(),
+          host,
+          owners: owners.clone(),
+        });
+      }
+      host_assignments
+        .entry(host)
+        .and_modify(|(_, providers)| providers.push(provider.clone()))
+        .or_insert_with(|| (*mode, vec![provider.clone()]));
+    }
+  }
+
+  let mut bindings = Vec::new();
+  for mode in [ProxyProviderMode::Passthrough, ProxyProviderMode::Switch] {
+    let hosts = host_assignments
+      .iter()
+      .filter_map(|(host, (assigned_mode, _))| (*assigned_mode == mode).then_some(host.clone()))
+      .collect::<Vec<_>>();
+    if hosts.is_empty() {
+      continue;
+    }
+    let route_mode = mode.as_route_mode();
+    let profile_id = if let Some((_, profile_id)) = mode_profiles.iter().find(|(found, _)| *found == route_mode) {
+      profile_id.clone()
+    } else {
+      let profile_id = insert_proxy_profile(
+        &policy,
+        route_mode,
+        &account_pool_id,
+        &format!("proxy-{}", route_mode_name(route_mode)),
+        ids,
+        &mut profiles,
+        &mut routes,
+      )?;
+      mode_profiles.push((route_mode, profile_id.clone()));
+      profile_id
+    };
+    bindings.push(RawBinding {
+      id: format!("proxy-provider-{}", route_mode_name(route_mode)),
+      listener: FORWARD_PROXY_LISTENER_ID.to_string(),
+      action: RawBindingAction::Route { profile: profile_id },
+      hosts,
+      path_prefixes: Vec::new(),
+      methods: Vec::new(),
+      operations: Vec::new(),
+    });
+  }
+
+  let mut intercept_hosts = BTreeSet::new();
+  for host in options
+    .default_intercept_hosts
+    .iter()
+    .chain(legacy.proxy_mode.intercept_hosts.iter())
+  {
+    intercept_hosts.insert(canonical_proxy_host(host)?);
+  }
+  for host in &legacy.proxy_mode.passthrough_hosts {
+    intercept_hosts.remove(&canonical_proxy_host(host)?);
+  }
+  let connect_rules = (!intercept_hosts.is_empty())
+    .then(|| RawConnectRule {
+      id: "proxy-intercept".to_string(),
+      listener: FORWARD_PROXY_LISTENER_ID.to_string(),
+      action: RawConnectAction::Intercept,
+      hosts: intercept_hosts.into_iter().collect(),
+      ports: Vec::new(),
+    })
+    .into_iter()
+    .collect();
+
+  let ca_dir = legacy
+    .proxy_mode
+    .resolved_ca_dir()
+    .map_err(|source| V2ProjectionError::ResolveForwardProxyCaDir { source })?;
+  let listener = RawListener::ForwardProxy {
+    bind: bind.to_string(),
+    client_auth: if legacy.api_key.enabled {
+      RawClientAuth::LocalKeys
+    } else {
+      RawClientAuth::None
+    },
+    allow_insecure_public,
+    request_body_max_bytes: DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
+    default_http_action: RawBindingAction::Route {
+      profile: default_profile_id,
+    },
+    default_connect: RawConnectAction::Tunnel,
+    ca_dir: Some(ca_dir),
+  };
+
+  Ok(ProjectedForwardProxy {
+    listener,
+    bindings,
+    connect_rules,
+    profiles,
+    routes,
+    account_pools: BTreeMap::from([(account_pool_id, account_pool)]),
+    warnings,
+  })
+}
+
+fn insert_proxy_profile(
+  policy: &EffectivePolicy,
+  mode: RouteMode,
+  account_pool_id: &str,
+  requested_id: &str,
+  ids: &mut IdentifierAllocator,
+  profiles: &mut BTreeMap<String, RawProfile>,
+  routes: &mut BTreeMap<String, RawRoute>,
+) -> Result<String, V2ProjectionError> {
+  let resource_id = ids.allocate(requested_id);
+  let route = proxy_route_recipe(policy, mode, account_pool_id)?;
+  let wire_identity = if mode == RouteMode::Passthrough {
+    RawWireIdentity::None
+  } else {
+    wire_identity(policy)
+  };
+  profiles.insert(
+    resource_id.clone(),
+    RawProfile {
+      route: resource_id.clone(),
+      wire_identity,
+    },
+  );
+  routes.insert(resource_id.clone(), route);
+  Ok(resource_id)
+}
+
+fn proxy_route_recipe(
+  policy: &EffectivePolicy,
+  mode: RouteMode,
+  account_pool: &str,
+) -> Result<RawRoute, V2ProjectionError> {
+  match mode {
+    RouteMode::Passthrough => Ok(RawRoute::Relay {
+      destination: RawRelayDestination::Original {},
+      credentials: RawRelayCredentials::Client {},
+    }),
+    RouteMode::Switch => Ok(RawRoute::Relay {
+      destination: RawRelayDestination::Original {},
+      credentials: RawRelayCredentials::AccountPool {
+        account_pool: account_pool.to_string(),
+      },
+    }),
+    RouteMode::Route | RouteMode::Exact | RouteMode::Fuzzy => {
+      let mut policy = policy.clone();
+      policy.mode = mode;
+      route_recipe(&policy, account_pool)
+    }
+  }
+}
+
+fn canonical_proxy_host(host: &str) -> Result<String, V2ProjectionError> {
+  let host = host.trim().to_ascii_lowercase();
+  if host.contains('*') {
+    return Err(V2ProjectionError::UnsupportedProxyHostPattern { host });
+  }
+  Ok(host)
+}
+
+fn route_mode_name(mode: RouteMode) -> &'static str {
+  match mode {
+    RouteMode::Passthrough => "passthrough",
+    RouteMode::Switch => "switch",
+    RouteMode::Exact => "exact",
+    RouteMode::Route => "route",
+    RouteMode::Fuzzy => "fuzzy",
+  }
 }
 
 fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute, V2ProjectionError> {
@@ -293,6 +570,21 @@ mod tests {
       .expect("binding for path")
   }
 
+  fn forward_proxy_options(route_mode: RouteMode) -> V2ProjectionOptions {
+    V2ProjectionOptions {
+      forward_proxy: Some(V2ForwardProxyProjectionOptions {
+        route_mode,
+        default_intercept_hosts: vec!["api.openai.com".into(), "chatgpt.com".into()],
+        provider_hosts: BTreeMap::from([
+          ("openai".into(), vec!["api.openai.com".into()]),
+          ("codex".into(), vec!["chatgpt.com".into()]),
+          ("github-copilot".into(), vec!["api.githubcopilot.com".into()]),
+        ]),
+      }),
+      ..V2ProjectionOptions::default()
+    }
+  }
+
   #[test]
   fn projects_route_exact_and_profile_inheritance_into_a_compiled_graph() {
     let mut legacy = Config::default();
@@ -384,6 +676,151 @@ mod tests {
         .kind(),
       RouteKind::Relay
     );
+  }
+
+  #[test]
+  fn projects_static_forward_proxy_listener_and_host_policy() {
+    let mut legacy = Config::default();
+    legacy.proxy_mode.intercept_hosts = vec!["custom.example".into()];
+    legacy.proxy_mode.passthrough_hosts = vec!["API.OPENAI.COM".into()];
+
+    let projection = project_v2_config(
+      &legacy,
+      &[account("primary", "openai", None)],
+      forward_proxy_options(RouteMode::Exact),
+    )
+    .unwrap();
+    let raw = projection.raw_config();
+    let RawListener::ForwardProxy {
+      bind,
+      default_http_action,
+      default_connect,
+      ca_dir,
+      ..
+    } = &raw.listeners[FORWARD_PROXY_LISTENER_ID]
+    else {
+      panic!("forward proxy listener")
+    };
+    assert_eq!(bind, "127.0.0.1:4142");
+    assert_eq!(*default_connect, RawConnectAction::Tunnel);
+    assert!(ca_dir.is_some());
+    let RawBindingAction::Route { profile } = default_http_action else {
+      panic!("proxy default route")
+    };
+    assert!(matches!(
+      raw.routes[profile],
+      RawRoute::Managed {
+        model: RawModelSelector::Qualified { .. },
+        ..
+      }
+    ));
+    assert_eq!(raw.connect_rules.len(), 1);
+    assert_eq!(raw.connect_rules[0].action, RawConnectAction::Intercept);
+    assert_eq!(raw.connect_rules[0].hosts, ["chatgpt.com", "custom.example"]);
+    assert!(projection
+      .compiled_config()
+      .gateway()
+      .listeners()
+      .contains_key(FORWARD_PROXY_LISTENER_ID));
+  }
+
+  #[test]
+  fn projects_provider_specific_passthrough_and_switch_modes() {
+    let mut legacy = Config::default();
+    legacy
+      .proxy_mode
+      .provider_modes
+      .insert("openai".into(), ProxyProviderMode::Passthrough);
+    legacy
+      .proxy_mode
+      .provider_modes
+      .insert("github-copilot".into(), ProxyProviderMode::Switch);
+
+    let projection = project_v2_config(
+      &legacy,
+      &[
+        account("openai", "openai", None),
+        account("copilot", "github-copilot", None),
+      ],
+      forward_proxy_options(RouteMode::Route),
+    )
+    .unwrap();
+    let raw = projection.raw_config();
+    let passthrough = raw
+      .bindings
+      .iter()
+      .find(|binding| binding.id == "proxy-provider-passthrough")
+      .unwrap();
+    let switch = raw
+      .bindings
+      .iter()
+      .find(|binding| binding.id == "proxy-provider-switch")
+      .unwrap();
+    assert_eq!(passthrough.hosts, ["api.openai.com"]);
+    assert_eq!(switch.hosts, ["api.githubcopilot.com"]);
+
+    let RawBindingAction::Route {
+      profile: passthrough_profile,
+    } = &passthrough.action
+    else {
+      panic!("passthrough profile")
+    };
+    let RawBindingAction::Route {
+      profile: switch_profile,
+    } = &switch.action
+    else {
+      panic!("switch profile")
+    };
+    assert!(matches!(
+      raw.routes[passthrough_profile],
+      RawRoute::Relay {
+        destination: RawRelayDestination::Original {},
+        credentials: RawRelayCredentials::Client {},
+      }
+    ));
+    assert!(matches!(
+      raw.routes[switch_profile],
+      RawRoute::Relay {
+        destination: RawRelayDestination::Original {},
+        credentials: RawRelayCredentials::AccountPool { .. },
+      }
+    ));
+  }
+
+  #[test]
+  fn rejects_ambiguous_or_semantically_different_proxy_host_patterns() {
+    let mut legacy = Config::default();
+    legacy.proxy_mode.intercept_hosts = vec!["*.example.com".into()];
+    assert!(matches!(
+      project_v2_config(
+        &legacy,
+        &[account("primary", "openai", None)],
+        forward_proxy_options(RouteMode::Route),
+      ),
+      Err(V2ProjectionError::UnsupportedProxyHostPattern { .. })
+    ));
+
+    legacy.proxy_mode.intercept_hosts.clear();
+    legacy
+      .proxy_mode
+      .provider_modes
+      .insert("openai".into(), ProxyProviderMode::Passthrough);
+    legacy
+      .proxy_mode
+      .provider_modes
+      .insert("codex".into(), ProxyProviderMode::Switch);
+    let mut options = forward_proxy_options(RouteMode::Route);
+    let proxy = options.forward_proxy.as_mut().unwrap();
+    proxy
+      .provider_hosts
+      .insert("openai".into(), vec!["shared.example".into()]);
+    proxy
+      .provider_hosts
+      .insert("codex".into(), vec!["shared.example".into()]);
+    assert!(matches!(
+      project_v2_config(&legacy, &[account("primary", "openai", None)], options),
+      Err(V2ProjectionError::AmbiguousProxyProviderHost { host, .. }) if host == "shared.example"
+    ));
   }
 
   #[test]
@@ -521,6 +958,40 @@ mod tests {
     assert_eq!(compiled.service().persistence().body_max_bytes(), 1234);
     assert_eq!(accounts.len(), 1);
     assert!(!warnings.is_empty());
+  }
+
+  #[test]
+  fn explicitly_projects_an_authenticated_remote_listener() {
+    let mut legacy = Config::default();
+    legacy.api_key.enabled = true;
+    legacy.server.host = "0.0.0.0".into();
+
+    let projection = project_v2_config(
+      &legacy,
+      &[account("primary", "openai", None)],
+      V2ProjectionOptions {
+        allow_insecure_public_listener: true,
+        ..V2ProjectionOptions::default()
+      },
+    )
+    .unwrap();
+    let RawListener::LlmApi {
+      bind,
+      client_auth,
+      allow_insecure_public,
+      ..
+    } = &projection.raw_config().listeners["api"]
+    else {
+      panic!("API listener")
+    };
+    assert_eq!(bind, "0.0.0.0:4141");
+    assert_eq!(*client_auth, RawClientAuth::LocalKeys);
+    assert!(*allow_insecure_public);
+    assert!(projection
+      .warnings()
+      .contains(&V2ProjectionWarning::RemoteApiBindAllowed {
+        bind: "0.0.0.0:4141".parse().unwrap(),
+      }));
   }
 
   #[test]

@@ -136,6 +136,20 @@ does not remove `Authorization` or `x-api-key`. Raw CONNECT tunnels and hosts in
 `proxy_mode.passthrough_hosts` cannot be inspected, so they are also left
 untouched and unauthenticated.
 
+The projected v2 proxy created by legacy `serve --with-proxy` uses the v2
+admission boundary instead: when `[api_key].enabled = true`, every proxy
+request, including CONNECT, must provide exactly one
+`Proxy-Authorization: Bearer <key>` header. For example:
+
+```sh
+curl --proxy http://127.0.0.1:4142 \
+  --proxy-header "Proxy-Authorization: Bearer $TOKN_API_KEY" \
+  https://api.openai.com/v1/models
+```
+
+This stronger behavior applies only to the v2 proxy path; standalone legacy
+`proxy start` retains the legacy authentication behavior described above.
+
 For authenticated managed requests, persistence records the key name as the
 request `user` and its non-secret key id as `ctx_json.api_key_id` in request and
 usage data. The token and its hash are never copied into those databases.
@@ -353,8 +367,8 @@ tokn-gateway account list [--no-quota]
 tokn-gateway account status [ID]
 tokn-gateway account switch --only ID
 tokn-gateway headers [--account ID]
-tokn-gateway serve [--host HOST] [--port PORT] [--with-proxy] [--no-proxy]
-tokn-gateway proxy start [--host HOST] [--port PORT] [--route-mode MODE] [--passthrough]
+tokn-gateway serve [--host HOST] [--port PORT] [--with-proxy] [--proxy-route-mode MODE] [--insecure-allow-remote] [--no-proxy]
+tokn-gateway proxy start [--host HOST] [--port PORT] [--route-mode MODE] [--passthrough] [--insecure-allow-remote]
 tokn-gateway proxy env [--shell sh|bash|zsh|fish|pwsh]
 tokn-gateway proxy shell [--shell /path/to/shell]
 tokn-gateway proxy codex|opencode|pi [--npx] [ARGS...]
@@ -382,6 +396,19 @@ tokn-gateway smoke provider|model|send ...
 request through the selected `llm_api` listener in memory. Pass `--listener`
 when the config contains more than one LLM API listener. `smoke model` remains
 a catalogue-only lookup and does not load the gateway config.
+
+`serve` always runs the v2 request runtime. A native `schema_version = 2`
+config is compiled directly. An unversioned legacy config is merged with its
+fragments, projected into v2 together with the current account store, and
+compiled entirely in memory; neither config nor auth files are rewritten.
+Projection warnings are logged at startup. Legacy `route`, `exact`, `fuzzy`,
+and `switch` policies are supported when their referenced accounts and
+providers can be represented. Legacy API `passthrough` is rejected instead of
+falling back silently to the old server runtime. For legacy configs,
+`--with-proxy` adds an in-memory v2 `forward_proxy` listener using
+`[proxy_mode]`; `--proxy-route-mode` overrides only that listener's static
+route mode. Native v2 configs continue to declare their listeners in config
+and reject these compatibility flags.
 
 Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`. A
 fresh link defaults to `route`; a relink or sync preserves the binding's
@@ -500,12 +527,25 @@ route_mode = "route"
 # passthrough_hosts = ["api.githubcopilot.com"]
 ```
 
-`tokn-gateway serve --with-proxy` runs both the API listener and proxy in one
-process. API routes use `[defaults]` or a named profile; proxy interception uses
-`[proxy_mode].route_mode` unless overridden with `--proxy-route-mode`. With
-`[api_key].enabled = true`, intercepted requests in any managed mode require a
-client key. Passthrough requests and non-intercepted CONNECT tunnels preserve
-the client's credentials and bypass the check.
+Run the legacy-configured proxy as a separate process with `tokn-gateway proxy
+start`, or serve it with the API through the v2 runtime:
+
+```sh
+tokn-gateway serve --with-proxy
+tokn-gateway serve --with-proxy --proxy-route-mode exact
+```
+
+The projection preserves the proxy bind, CA directory, built-in/custom
+interception hosts, passthrough hosts, static route mode, and resolvable
+provider-specific `switch`/`passthrough` modes. Proxy `passthrough` preserves
+the original destination and client credentials; proxy `switch` preserves the
+destination and injects a matching account credential. Wildcard host entries
+are rejected because the legacy proxy treated them as literal strings while
+v2 treats them as patterns.
+
+Per-request `x-route-mode` and Basic proxy-auth username mode overrides are not
+projected. Native v2 configs can declare one or more `forward_proxy` listeners
+and serve them together with API listeners without compatibility flags.
 
 ## LAN Bootstrap
 
@@ -513,16 +553,21 @@ By default, listeners must bind to loopback. To expose a trusted LAN gateway,
 bind explicitly and opt into the risk:
 
 ```sh
-tokn-gateway serve --host 0.0.0.0 --with-proxy --insecure-allow-remote
+tokn-gateway proxy start --host 0.0.0.0 --insecure-allow-remote
 ```
 
-This exposes helper routes on the API listener:
+Standalone `proxy start` exposes helper routes through plain HTTP requests to
+the proxy listener:
 
 - `/-/lan/bootstrap.json`
 - `/-/lan/ca.crt`
 - `/-/lan/env?shell=sh|bash|zsh|fish|pwsh`
 
-The server prints the CA SHA-256 fingerprint at startup. Verify that fingerprint
+The projected v2 listener created by `serve --with-proxy` does not expose these
+bootstrap helpers. Distribute and trust the configured CA separately when
+using that listener from another machine.
+
+The proxy prints the CA SHA-256 fingerprint at startup. Verify that fingerprint
 before trusting a CA fetched over the LAN. The private CA key is never served.
 
 ## Development

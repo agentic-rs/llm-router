@@ -19,6 +19,14 @@ pub fn proxy_intercept_hosts() -> &'static [&'static str] {
   proxy::INTERCEPT_HOSTS
 }
 
+/// Complete default interception set used by the legacy forward proxy.
+pub fn proxy_default_intercept_hosts() -> impl Iterator<Item = &'static str> {
+  proxy::INTERCEPT_HOSTS
+    .iter()
+    .chain(proxy::EXTRA_INTERCEPT_HOSTS)
+    .copied()
+}
+
 pub fn install_rustls_crypto_provider() -> Result<()> {
   rustls::crypto::ring::default_provider()
     .install_default()

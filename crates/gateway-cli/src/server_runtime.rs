@@ -128,26 +128,6 @@ pub fn load_access_store(enabled: bool) -> Result<Arc<tokn_access::AccessStore>>
   }
 }
 
-pub fn build_state(
-  cfg: &Config,
-  accounts: &[AccountConfig],
-  events: Arc<EventBus>,
-) -> Result<tokn_router::api::AppState> {
-  tokn_router::api::build_state(cfg, accounts, events)
-}
-
-pub fn build_state_for_route_mode(
-  cfg: &Config,
-  accounts: &[AccountConfig],
-  events: Arc<EventBus>,
-  route_mode: RouteMode,
-) -> Result<tokn_router::api::AppState> {
-  let mut cfg = cfg.clone();
-  cfg.server.route_mode = route_mode;
-  cfg.defaults.mode = route_mode;
-  build_state(&cfg, accounts, events)
-}
-
 pub fn build_proxy_state_for_route_mode(
   cfg: &Config,
   accounts: &[AccountConfig],
