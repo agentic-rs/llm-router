@@ -371,33 +371,7 @@ ca_dir = {ca_dir}
   }));
   wait_for_listener(proxy_addr).await;
 
-  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-  client
-    .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
-    .await
-    .unwrap();
-  let head = read_response_head(&mut client).await;
-  assert!(head.starts_with("HTTP/1.1 200"));
-
-  let cert_file = std::fs::File::open(cert_path).unwrap();
-  let mut cert_reader = std::io::BufReader::new(cert_file);
-  let certs = rustls_pemfile::certs(&mut cert_reader)
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
-  let mut roots = rustls::RootCertStore::empty();
-  roots.add(certs[0].clone()).unwrap();
-  let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-  let server_name = rustls::pki_types::ServerName::try_from("api.example.test")
-    .unwrap()
-    .to_owned();
-  let mut tls = tokio_rustls::TlsConnector::from(Arc::new(tls))
-    .connect(server_name, client)
-    .await
-    .unwrap();
+  let mut tls = connect_intercepted_tls(proxy_addr, "api.example.test", &cert_path).await;
   tls
     .write_all(
       b"POST /v1/responses HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -422,6 +396,88 @@ ca_dir = {ca_dir}
 
   shutdown_tx.send(()).unwrap();
   proxy_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn v2_forward_proxy_rejects_intercepted_websocket_before_dispatch() {
+  let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let upstream_addr = upstream.local_addr().unwrap();
+  let (upstream_tx, mut upstream_rx) = tokio::sync::mpsc::channel(1);
+  let upstream_task = tokio::spawn(async move {
+    let (mut stream, _) = upstream.accept().await.unwrap();
+    upstream_tx.send(()).await.unwrap();
+    stream
+      .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+      .await
+      .unwrap();
+  });
+
+  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = probe.local_addr().unwrap();
+  drop(probe);
+  let ca = tempfile::tempdir().unwrap();
+  let ca_dir = toml_string(&ca.path().to_string_lossy());
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "transparent" }}
+default_connect = "intercept"
+ca_dir = {ca_dir}
+
+[profiles.transparent]
+route = "transparent"
+
+[routes.transparent]
+kind = "relay"
+destination = {{ kind = "fixed_provider", provider = "local" }}
+credentials = {{ kind = "client" }}
+
+[providers.local]
+driver = "openai"
+base_url = "http://{upstream_addr}/v1"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
+  let events = Arc::new(EventBus::new(16));
+  let mut event_rx = events.subscribe();
+  let state = tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), events)
+    .unwrap()
+    .forward_proxy
+    .pop()
+    .unwrap();
+  let cert_path = ca.path().join("ca.crt");
+  let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let _ = shutdown_rx.await;
+  }));
+  wait_for_listener(proxy_addr).await;
+
+  let mut tls = connect_intercepted_tls(proxy_addr, "api.example.test", &cert_path).await;
+  tls
+    .write_all(
+      b"GET /backend-api/wham/remote/control/server HTTP/1.1\r\nHost: api.example.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test-key\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .await
+    .unwrap();
+  let response = read_response_head(&mut tls).await;
+  assert!(
+    response.starts_with("HTTP/1.1 426 Upgrade Required"),
+    "unexpected response: {response:?}"
+  );
+  let response_lower = response.to_ascii_lowercase();
+  assert!(response_lower.contains("connection: upgrade\r\n"));
+  assert!(response_lower.contains("upgrade: websocket\r\n"));
+  assert!(upstream_rx.try_recv().is_err(), "websocket request reached upstream");
+  assert!(event_rx.try_recv().is_err(), "websocket request entered the pipeline");
+
+  shutdown_tx.send(()).unwrap();
+  proxy_task.await.unwrap().unwrap();
+  upstream_task.abort();
 }
 
 #[tokio::test]
@@ -629,7 +685,7 @@ async fn connect_with_authorization(
   read_response_head(&mut stream).await
 }
 
-async fn read_response_head(stream: &mut TcpStream) -> String {
+async fn read_response_head(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
   let mut response = Vec::new();
   let mut byte = [0_u8; 1];
   while !response.ends_with(b"\r\n\r\n") {
@@ -637,6 +693,41 @@ async fn read_response_head(stream: &mut TcpStream) -> String {
     response.push(byte[0]);
   }
   String::from_utf8(response).unwrap()
+}
+
+async fn connect_intercepted_tls(
+  proxy_addr: std::net::SocketAddr,
+  host: &str,
+  cert_path: &Path,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  client
+    .write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let head = read_response_head(&mut client).await;
+  assert!(
+    head.starts_with("HTTP/1.1 200"),
+    "unexpected CONNECT response: {head:?}"
+  );
+
+  let cert_file = std::fs::File::open(cert_path).unwrap();
+  let mut cert_reader = std::io::BufReader::new(cert_file);
+  let certs = rustls_pemfile::certs(&mut cert_reader)
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(certs[0].clone()).unwrap();
+  let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+  let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+  tokio_rustls::TlsConnector::from(Arc::new(tls))
+    .connect(server_name, client)
+    .await
+    .unwrap()
 }
 
 async fn wait_for_listener(addr: std::net::SocketAddr) {
