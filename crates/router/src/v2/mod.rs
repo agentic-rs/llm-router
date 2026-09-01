@@ -1,6 +1,7 @@
 mod selector;
 
 use crate::api::error::ApiError;
+use crate::api::identity::AccountIdentityResolver;
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Request, State};
@@ -38,7 +39,7 @@ use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
   PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve, ProxySend,
 };
-use tokn_requests::{ExecutionRequest, Pipeline, Profile, RawInbound, RequestService, RunConfig};
+use tokn_requests::{ExecutionRequest, Pipeline, Profile, RawInbound, RequestService, RunConfig, RunConfigBuilder};
 use tower_http::request_id::SetRequestIdLayer;
 
 use crate::request_id::REQUEST_ID_HEADER;
@@ -123,6 +124,8 @@ pub struct ForwardProxyState {
   listener: ForwardProxyListenerPlan,
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   access: Arc<tokn_access::AccessStore>,
+  identity: Arc<AccountIdentityResolver>,
+  provider_registry: Arc<Registry>,
   ca: Option<Arc<crate::proxy::ProxyCa>>,
   outbound: tokn_core::util::http::HttpClientOptions,
   request_limits: tokn_config::v2::RequestLimitsPlan,
@@ -286,20 +289,15 @@ impl ForwardProxyState {
       )?;
       (decoded, serde_json::Value::Null)
     };
-    let (destination_scheme, destination_authority, destination_path) =
-      proxy_destination(runtime, ingress, scheme, path_and_query)?;
+    let destination = proxy_destination(runtime, ingress, scheme, path_and_query)?;
+    let (destination_scheme, destination_authority, destination_path) = url_destination(&destination);
     let origin = canonical_origin(scheme, ingress);
-    let provider_id = match &runtime.proxy_destination {
-      ProxyDestination::Fixed { provider, .. } => provider.to_string(),
-      ProxyDestination::Managed | ProxyDestination::Original => origin.clone(),
-    };
     let mut config = RunConfig::builder()
       .with_agent_id_opt(runtime.agent_id.clone())
       .with_str(
         tokn_requests::stages::resolve::proxy::keys::HOST,
         destination_authority.clone(),
       )
-      .with_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID, provider_id)
       .with_str(
         tokn_requests::stages::resolve::proxy::keys::PATH,
         destination_path.clone(),
@@ -313,7 +311,26 @@ impl ForwardProxyState {
         tokn_requests::stages::send::proxy::send_keys::SCHEME,
         destination_scheme,
       )
-      .with_str(V2_PROXY_ORIGIN_KEY, origin);
+      .with_str(V2_PROXY_ORIGIN_KEY, origin.clone());
+    config = match &runtime.proxy_destination {
+      ProxyDestination::Fixed { provider, .. } => config.with_str(
+        tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID,
+        provider.to_string(),
+      ),
+      ProxyDestination::Original if runtime.credential_policy == CredentialPolicy::Client => {
+        with_original_proxy_identity(
+          config,
+          &parts.headers,
+          &destination,
+          ingress.host().as_str(),
+          &self.identity,
+          &self.provider_registry,
+        )
+      }
+      ProxyDestination::Managed | ProxyDestination::Original => {
+        config.with_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID, origin)
+      }
+    };
     if runtime.credential_policy == CredentialPolicy::Account {
       config = config.with(tokn_requests::stages::send::proxy::send_keys::INJECT_AUTH, true);
     }
@@ -391,6 +408,8 @@ pub fn build_runtime_states_with_service(
   let outbound = service.outbound().to_http_client_options();
   let request_limits = service.request_limits();
   let profiles = build_profile_runtimes(plan.clone(), accounts, events, &outbound, PipelineMode::Full)?;
+  let identity = Arc::new(AccountIdentityResolver::from_accounts(accounts));
+  let provider_registry = Arc::new(Registry::builtin());
   let mut llm_api = Vec::new();
   let mut forward_proxy = Vec::new();
   for (listener_id, listener) in plan.listeners() {
@@ -413,6 +432,8 @@ pub fn build_runtime_states_with_service(
           listener: listener.clone(),
           profiles: profiles.clone(),
           access: access.clone(),
+          identity: identity.clone(),
+          provider_registry: provider_registry.clone(),
           ca,
           outbound: outbound.clone(),
           request_limits,
@@ -769,7 +790,7 @@ fn proxy_destination(
   ingress: &IngressAuthority,
   scheme: &'static str,
   path_and_query: &str,
-) -> Result<(String, String, String), ApiError> {
+) -> Result<reqwest::Url, ApiError> {
   let path_and_query = path_and_query
     .parse::<axum::http::uri::PathAndQuery>()
     .map_err(|error| ApiError::bad_request(format!("invalid proxy request path: {error}")))?;
@@ -780,18 +801,38 @@ fn proxy_destination(
       let url = origin
         .request_url(&path_and_query)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-      Ok(url_destination(url))
+      Ok(url)
     }
     ProxyDestination::Fixed { base, .. } => {
       let url = base
         .relay_url(&path_and_query)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-      Ok(url_destination(url))
+      Ok(url)
     }
   }
 }
 
-fn url_destination(url: reqwest::Url) -> (String, String, String) {
+fn with_original_proxy_identity(
+  config: RunConfigBuilder,
+  headers: &HeaderMap,
+  destination: &reqwest::Url,
+  fallback_provider_id: &str,
+  identity: &AccountIdentityResolver,
+  provider_registry: &Registry,
+) -> RunConfigBuilder {
+  let resolved = identity.resolve(headers, destination.as_str(), provider_registry);
+  config
+    .with_str(
+      tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID,
+      resolved.provider_id.unwrap_or_else(|| fallback_provider_id.to_string()),
+    )
+    .with_str_opt(
+      tokn_requests::stages::resolve::proxy::keys::ACCOUNT_ID,
+      resolved.account_id,
+    )
+}
+
+fn url_destination(url: &reqwest::Url) -> (String, String, String) {
   let authority = url.authority().to_string();
   let mut path = url.path().to_string();
   if let Some(query) = url.query() {
@@ -996,7 +1037,7 @@ async fn handle(
         destination.provider_id()
       ))
     })?;
-    let (scheme, authority, path) = url_destination(url);
+    let (scheme, authority, path) = url_destination(&url);
     config = config
       .with_str(tokn_requests::stages::resolve::proxy::keys::HOST, authority)
       .with_str(
@@ -1190,6 +1231,73 @@ mod tests {
     assert!(profiles.is_empty());
     collect_profile(&HttpAction::Route(profile.clone()), &mut profiles);
     assert_eq!(profiles, BTreeSet::from([profile]));
+  }
+
+  #[test]
+  fn original_client_proxy_identity_resolves_codex_account_from_full_url_and_bearer() {
+    let token = "codex-access-token-that-is-long-enough-to-fingerprint";
+    let mut account = account_for_provider(tokn_core::provider::ID_CODEX);
+    account.id = "codex-primary".into();
+    account.api_key = None;
+    account.access_token = Some(Secret::new(token.into()));
+    let identity = AccountIdentityResolver::from_accounts(&[account]);
+    let registry = Registry::builtin();
+    let destination = reqwest::Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+      axum::http::header::AUTHORIZATION,
+      format!("Bearer {token}").parse().unwrap(),
+    );
+
+    let config = with_original_proxy_identity(
+      RunConfig::builder(),
+      &headers,
+      &destination,
+      "chatgpt.com",
+      &identity,
+      &registry,
+    )
+    .build();
+
+    assert_eq!(
+      config.get_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID),
+      Some(tokn_core::provider::ID_CODEX)
+    );
+    assert_eq!(
+      config.get_str(tokn_requests::stages::resolve::proxy::keys::ACCOUNT_ID),
+      Some("codex-primary")
+    );
+  }
+
+  #[test]
+  fn original_client_proxy_identity_fingerprints_unknown_bearer_and_uses_bare_host_fallback() {
+    let token = "unknown-client-token-that-is-long-enough-to-fingerprint";
+    let identity = AccountIdentityResolver::default();
+    let registry = Registry::builtin();
+    let destination = reqwest::Url::parse("https://unregistered.example/v1/responses").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+      axum::http::header::AUTHORIZATION,
+      format!("Bearer {token}").parse().unwrap(),
+    );
+
+    let config = with_original_proxy_identity(
+      RunConfig::builder(),
+      &headers,
+      &destination,
+      "unregistered.example",
+      &identity,
+      &registry,
+    )
+    .build();
+
+    assert_eq!(
+      config.get_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID),
+      Some("unregistered.example")
+    );
+    assert!(config
+      .get_str(tokn_requests::stages::resolve::proxy::keys::ACCOUNT_ID)
+      .is_some_and(|account_id| account_id.starts_with("account_fp_")));
   }
 
   #[tokio::test]
