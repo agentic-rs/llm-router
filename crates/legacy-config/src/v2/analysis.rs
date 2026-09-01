@@ -140,6 +140,25 @@ pub(super) fn api_bind(legacy: &Config, allow_insecure_public: bool) -> Result<S
   Ok(bind)
 }
 
+pub(super) fn forward_proxy_bind(
+  legacy: &Config,
+  allow_insecure_public: bool,
+) -> Result<SocketAddr, V2ProjectionError> {
+  let ip =
+    legacy
+      .proxy_mode
+      .host
+      .parse::<IpAddr>()
+      .map_err(|_| V2ProjectionError::UnsupportedForwardProxyBindHost {
+        host: legacy.proxy_mode.host.clone(),
+      })?;
+  let bind = SocketAddr::new(ip, legacy.proxy_mode.port);
+  if !ip.is_loopback() && !allow_insecure_public {
+    return Err(V2ProjectionError::UnsupportedRemoteForwardProxyBind { bind });
+  }
+  Ok(bind)
+}
+
 pub(super) fn profile_path(profile: &str) -> Result<String, V2ProjectionError> {
   if matches!(profile, "." | "..") {
     return Err(V2ProjectionError::UnsupportedProfilePath {
@@ -295,5 +314,25 @@ mod tests {
       Err(V2ProjectionError::UnsupportedProfilePath { .. })
     ));
     assert_eq!(profile_path("team blue").unwrap(), "/team%20blue/v1/");
+  }
+
+  #[test]
+  fn validates_forward_proxy_bind_safety() {
+    let mut legacy = Config::default();
+    legacy.proxy_mode.host = "localhost".into();
+    assert!(matches!(
+      forward_proxy_bind(&legacy, false),
+      Err(V2ProjectionError::UnsupportedForwardProxyBindHost { .. })
+    ));
+
+    legacy.proxy_mode.host = "0.0.0.0".into();
+    assert!(matches!(
+      forward_proxy_bind(&legacy, false),
+      Err(V2ProjectionError::UnsupportedRemoteForwardProxyBind { .. })
+    ));
+    assert_eq!(
+      forward_proxy_bind(&legacy, true).unwrap(),
+      "0.0.0.0:4142".parse::<SocketAddr>().unwrap()
+    );
   }
 }

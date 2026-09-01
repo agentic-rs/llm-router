@@ -29,7 +29,7 @@ pub(super) fn index_accounts(accounts: &[AccountConfig]) -> Result<BTreeMap<&str
 
 pub(super) fn project_accounts_and_providers(
   accounts: &[AccountConfig],
-  options: V2ProjectionOptions,
+  options: &V2ProjectionOptions,
   warnings: &mut Vec<V2ProjectionWarning>,
 ) -> Result<(Vec<AccountConfig>, BTreeMap<String, RawProvider>), V2ProjectionError> {
   let mut destinations = BTreeMap::<String, Vec<AccountDestination>>::new();
@@ -260,7 +260,7 @@ mod tests {
     ];
     let mut warnings = Vec::new();
     let (projected, providers) =
-      project_accounts_and_providers(&accounts, V2ProjectionOptions::default(), &mut warnings).unwrap();
+      project_accounts_and_providers(&accounts, &V2ProjectionOptions::default(), &mut warnings).unwrap();
 
     assert!(projected.iter().all(|account| account.base_url.is_none()));
     assert_eq!(
@@ -281,7 +281,7 @@ mod tests {
     disabled.enabled = false;
 
     let (projected, providers) =
-      project_accounts_and_providers(&[enabled, disabled], V2ProjectionOptions::default(), &mut Vec::new()).unwrap();
+      project_accounts_and_providers(&[enabled, disabled], &V2ProjectionOptions::default(), &mut Vec::new()).unwrap();
 
     assert_eq!(
       providers["openai"].base_url.as_deref(),
@@ -301,7 +301,7 @@ mod tests {
     assert!(matches!(
       project_accounts_and_providers(
         &accounts,
-        V2ProjectionOptions::default(),
+        &V2ProjectionOptions::default(),
         &mut Vec::new()
       ),
       Err(V2ProjectionError::ConflictingProviderDestinations { provider, .. }) if provider == "openai"
@@ -390,14 +390,14 @@ mod tests {
   fn validates_and_explicitly_allows_remote_cleartext_destinations() {
     let remote = [account("remote", "openai", Some("http://upstream.example/v1"))];
     assert!(matches!(
-      project_accounts_and_providers(&remote, V2ProjectionOptions::default(), &mut Vec::new()),
+      project_accounts_and_providers(&remote, &V2ProjectionOptions::default(), &mut Vec::new()),
       Err(V2ProjectionError::InsecureProviderRequiresOptIn { .. })
     ));
 
     let mut warnings = Vec::new();
     let (_, providers) = project_accounts_and_providers(
       &remote,
-      V2ProjectionOptions {
+      &V2ProjectionOptions {
         allow_insecure_http: true,
         ..V2ProjectionOptions::default()
       },
@@ -413,7 +413,7 @@ mod tests {
     assert!(matches!(
       project_accounts_and_providers(
         &[account("invalid", "openai", Some("not a URL"))],
-        V2ProjectionOptions::default(),
+        &V2ProjectionOptions::default(),
         &mut Vec::new()
       ),
       Err(V2ProjectionError::InvalidAccountBaseUrl { .. })
@@ -425,7 +425,7 @@ mod tests {
       Some("https://sensitive-user:super-secret@gateway.example/v1"),
     )];
     let error =
-      project_accounts_and_providers(&credentialed, V2ProjectionOptions::default(), &mut Vec::new()).unwrap_err();
+      project_accounts_and_providers(&credentialed, &V2ProjectionOptions::default(), &mut Vec::new()).unwrap_err();
     let message = error.to_string();
     assert!(message.contains("credentialed"));
     assert!(!message.contains("sensitive-user"));
