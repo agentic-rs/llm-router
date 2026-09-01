@@ -1,6 +1,6 @@
 use super::connect_proxy::{connect_upstream, ConnectProxy};
 use crate::api::error::ApiError;
-use crate::v2::{ForwardProxyState, ProxyAuthenticationError};
+use crate::v2::{ForwardProxyState, ProxyAuthenticationError, ProxyConnectionInfo};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
@@ -29,6 +29,7 @@ enum PreparedConnect {
 struct ConnectUpgrade {
   ingress: IngressAuthority,
   access: AccessContext,
+  connection: ProxyConnectionInfo,
   on_upgrade: hyper::upgrade::OnUpgrade,
   transport: PreparedConnect,
 }
@@ -40,6 +41,7 @@ pub(super) async fn handle_v2_client(
   outbound_proxy: Arc<ConnectProxy>,
   mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+  let connection = ProxyConnectionInfo::new(stream.local_addr().ok(), peer);
   let (upgrades, mut upgrade_receiver) = mpsc::channel(1);
   let service_state = state.clone();
   let service_proxy = outbound_proxy.clone();
@@ -47,7 +49,7 @@ pub(super) async fn handle_v2_client(
     let state = service_state.clone();
     let outbound_proxy = service_proxy.clone();
     let upgrades = upgrades.clone();
-    async move { Ok::<_, Infallible>(handle_request(state, outbound_proxy, upgrades, request).await) }
+    async move { Ok::<_, Infallible>(handle_request(state, outbound_proxy, upgrades, connection, request).await) }
   });
   let builder = http1_builder();
   let connection = builder.serve_connection(TokioIo::new(stream), service).with_upgrades();
@@ -75,22 +77,24 @@ async fn handle_request(
   state: Arc<ForwardProxyState>,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
+  connection: ProxyConnectionInfo,
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
   if request.method() != Method::CONNECT {
     let request_id = crate::request_id::ensure_request_id(request.headers_mut());
-    let mut response = handle_request_inner(state, outbound_proxy, upgrades, request).await;
+    let mut response = handle_request_inner(state, outbound_proxy, upgrades, connection, request).await;
     crate::request_id::set_response_request_id(&mut response, request_id);
     return response;
   }
 
-  handle_request_inner(state, outbound_proxy, upgrades, request).await
+  handle_request_inner(state, outbound_proxy, upgrades, connection, request).await
 }
 
 async fn handle_request_inner(
   state: Arc<ForwardProxyState>,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
+  connection: ProxyConnectionInfo,
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
   if is_websocket_upgrade(request.headers()) {
@@ -121,7 +125,7 @@ async fn handle_request_inner(
       if let Err(error) = strip_hop_by_hop_headers(request.headers_mut()) {
         return ApiError::bad_request(error.to_string()).into_response();
       }
-      state.dispatch_http(&ingress, "http", access, request).await
+      state.dispatch_http(&ingress, "http", access, connection, request).await
     }
     Admission::Connect(ingress) => {
       let transport = match state.connect_action_for(&ingress) {
@@ -140,6 +144,7 @@ async fn handle_request_inner(
       let upgrade = ConnectUpgrade {
         ingress,
         access,
+        connection,
         on_upgrade,
         transport,
       };
@@ -210,6 +215,7 @@ async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> 
         .context("intercepted TLS handshake failed")?;
       let ingress = upgrade.ingress;
       let access = upgrade.access;
+      let connection = upgrade.connection;
       let service = service_fn(move |mut request| {
         let state = state.clone();
         let ingress = ingress.clone();
@@ -223,7 +229,11 @@ async fn run_connect(upgrade: ConnectUpgrade, state: Arc<ForwardProxyState>) -> 
               Ok(()) => {
                 request.headers_mut().remove(header::PROXY_AUTHORIZATION);
                 match strip_hop_by_hop_headers(request.headers_mut()) {
-                  Ok(()) => state.dispatch_http(&ingress, "https", access, request).await,
+                  Ok(()) => {
+                    state
+                      .dispatch_http(&ingress, "https", access, connection, request)
+                      .await
+                  }
                   Err(error) => ApiError::bad_request(error.to_string()).into_response(),
                 }
               }

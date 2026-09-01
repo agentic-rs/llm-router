@@ -26,14 +26,16 @@ use tokn_accounts::link::{
 };
 use tokn_accounts::registry::Registry;
 use tokn_core::account::AccountConfig;
-use tokn_core::event::EventBus;
+use tokn_core::event::{Event as CoreEvent, EventBus};
 use tokn_core::provider::Endpoint;
+use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_core::AgentId;
 use tokn_policy::{
   CanonicalAuthority, CanonicalHost, ClientAuthPlan, ConnectAction, CredentialPolicy, ForwardProxyListenerPlan,
   GatewayPlan, HttpAction, HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry,
-  ProfileId, ProviderId, RelayCredentials, RelayDestination, RelayRetry, RouteKind, RoutePlan, WireIdentity,
+  ModelSelector, ProfileId, ProviderId, RelayCredentials, RelayDestination, RelayRetry, RouteKind, RoutePlan,
+  WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
@@ -49,6 +51,7 @@ struct ProfileRuntime {
   api_service: Option<tokn_service::HttpService>,
   proxy_service: Option<tokn_service::HttpService>,
   route_kind: RouteKind,
+  record_mode: &'static str,
   credential_policy: CredentialPolicy,
   agent_id: Option<AgentId>,
   api_destination: Option<ProviderDestination>,
@@ -76,6 +79,7 @@ pub struct AppState {
   listener: LlmApiListenerPlan,
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
   request_limits: tokn_config::v2::RequestLimitsPlan,
 }
 
@@ -124,6 +128,7 @@ pub struct ForwardProxyState {
   listener: ForwardProxyListenerPlan,
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
   identity: Arc<AccountIdentityResolver>,
   provider_registry: Arc<Registry>,
   ca: Option<Arc<crate::proxy::ProxyCa>>,
@@ -228,9 +233,13 @@ impl ForwardProxyState {
     ingress: &IngressAuthority,
     scheme: &'static str,
     access: AccessContext,
+    connection: ProxyConnectionInfo,
     request: Request<hyper::body::Incoming>,
   ) -> Response {
-    match self.dispatch_http_inner(ingress, scheme, access, request).await {
+    match self
+      .dispatch_http_inner(ingress, scheme, access, connection, request)
+      .await
+    {
       Ok(response) => response,
       Err(error) => error.into_response(),
     }
@@ -241,6 +250,7 @@ impl ForwardProxyState {
     ingress: &IngressAuthority,
     scheme: &'static str,
     access: AccessContext,
+    connection: ProxyConnectionInfo,
     request: Request<hyper::body::Incoming>,
   ) -> Result<Response, ApiError> {
     let (parts, body) = request.into_parts();
@@ -250,6 +260,19 @@ impl ForwardProxyState {
       .as_ref()
       .ok_or_else(|| ApiError::internal("selected profile cannot run on a forward-proxy listener"))?;
     let path_and_query = parts.uri.path_and_query().map_or("/", |value| value.as_str());
+    let origin = canonical_origin(scheme, ingress);
+    let inbound_url = format!("{origin}{path_and_query}");
+    emit_inbound_connection(
+      &self.events,
+      &access,
+      request_id(&parts.headers)?,
+      connection.local_addr.map(|addr| SmolStr::new(addr.to_string())),
+      connection.peer_addr.map(|addr| SmolStr::new(addr.to_string())),
+      runtime.record_mode,
+      "proxy",
+      &parts.method,
+      Some(SmolStr::new(inbound_url)),
+    );
     let request_endpoint = tokn_core::request_event::RequestEndpoint::infer_from_path(parts.uri.path());
     let max_wire_bytes = self
       .listener
@@ -291,7 +314,6 @@ impl ForwardProxyState {
     };
     let destination = proxy_destination(runtime, ingress, scheme, path_and_query)?;
     let (destination_scheme, destination_authority, destination_path) = url_destination(&destination);
-    let origin = canonical_origin(scheme, ingress);
     let mut config = RunConfig::builder()
       .with_agent_id_opt(runtime.agent_id.clone())
       .with_str(
@@ -364,6 +386,21 @@ impl ForwardProxyState {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct ProxyConnectionInfo {
+  local_addr: Option<SocketAddr>,
+  peer_addr: Option<SocketAddr>,
+}
+
+impl ProxyConnectionInfo {
+  pub(crate) fn new(local_addr: Option<SocketAddr>, peer_addr: SocketAddr) -> Self {
+    Self {
+      local_addr,
+      peer_addr: Some(peer_addr),
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ProxyAuthenticationError {
   Rejected,
   Unavailable,
@@ -407,7 +444,7 @@ pub fn build_runtime_states_with_service(
   let plan = Arc::new(plan);
   let outbound = service.outbound().to_http_client_options();
   let request_limits = service.request_limits();
-  let profiles = build_profile_runtimes(plan.clone(), accounts, events, &outbound, PipelineMode::Full)?;
+  let profiles = build_profile_runtimes(plan.clone(), accounts, events.clone(), &outbound, PipelineMode::Full)?;
   let identity = Arc::new(AccountIdentityResolver::from_accounts(accounts));
   let provider_registry = Arc::new(Registry::builtin());
   let mut llm_api = Vec::new();
@@ -419,6 +456,7 @@ pub fn build_runtime_states_with_service(
         listener: listener.clone(),
         profiles: profiles.clone(),
         access: access.clone(),
+        events: events.clone(),
         request_limits,
       }),
       ListenerPlan::ForwardProxy(listener) => {
@@ -432,6 +470,7 @@ pub fn build_runtime_states_with_service(
           listener: listener.clone(),
           profiles: profiles.clone(),
           access: access.clone(),
+          events: events.clone(),
           identity: identity.clone(),
           provider_registry: provider_registry.clone(),
           ca,
@@ -497,7 +536,7 @@ fn build_api_states(
   let plan = Arc::new(plan);
   let outbound = service.outbound().to_http_client_options();
   let request_limits = service.request_limits();
-  let profiles = build_profile_runtimes(plan.clone(), accounts, events, &outbound, mode)?;
+  let profiles = build_profile_runtimes(plan.clone(), accounts, events.clone(), &outbound, mode)?;
   Ok(
     plan
       .listeners()
@@ -508,6 +547,7 @@ fn build_api_states(
           listener: listener.clone(),
           profiles: profiles.clone(),
           access: access.clone(),
+          events: events.clone(),
           request_limits,
         }),
         ListenerPlan::ForwardProxy(_) => None,
@@ -669,6 +709,7 @@ fn build_profile_runtimes(
       api_service,
       proxy_service,
       route_kind: route.kind(),
+      record_mode: request_record_mode(route),
       credential_policy: route.credential_policy(),
       agent_id,
       api_destination,
@@ -1008,6 +1049,22 @@ async fn handle(
   endpoint: Endpoint,
 ) -> Result<Response, ApiError> {
   let runtime = state.select_profile(&method, &uri, &headers, endpoint)?;
+  let local_addr = headers
+    .get("x-tokn-router-local-addr")
+    .or_else(|| headers.get(axum::http::header::HOST))
+    .and_then(|value| value.to_str().ok())
+    .map(SmolStr::new);
+  emit_inbound_connection(
+    &state.events,
+    &access,
+    request_id(&headers)?,
+    local_addr,
+    None,
+    runtime.record_mode,
+    "requests",
+    &method,
+    None,
+  );
   let (raw_body, decoded_body, body_json) = if runtime.route_kind == RouteKind::Managed {
     let mut decoded =
       crate::api::codec::decode_json_request_with_limit(&headers, body, state.request_limits.max_decoded_bytes())?;
@@ -1067,6 +1124,57 @@ async fn handle(
     .await
     .map(crate::api::response::converted_to_axum)
     .map_err(crate::api::endpoints::request_error_to_api_error)
+}
+
+fn request_id(headers: &HeaderMap) -> Result<SmolStr, ApiError> {
+  headers
+    .get(REQUEST_ID_HEADER)
+    .and_then(|value| value.to_str().ok())
+    .map(SmolStr::new)
+    .ok_or_else(|| ApiError::internal("request id missing after transport admission"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inbound_connection(
+  events: &EventBus,
+  access: &AccessContext,
+  request_id: SmolStr,
+  local_addr: Option<SmolStr>,
+  peer_addr: Option<SmolStr>,
+  mode: &str,
+  pipeline_id: &str,
+  inbound_method: &Method,
+  url: Option<SmolStr>,
+) {
+  events.emit(CoreEvent::Requests(RequestEvent {
+    request_id,
+    attempt: 0,
+    ts: tokn_core::util::now_unix_ms(),
+    payload: RequestEventPayload::Record(RecordEvent::InboundConnection {
+      user: access.key_name.clone().map(SmolStr::from),
+      api_key_id: access.key_id.clone().map(SmolStr::from),
+      local_addr,
+      peer_addr,
+      mode: SmolStr::new(mode),
+      method: SmolStr::new(pipeline_id),
+      inbound_method: SmolStr::new(inbound_method.as_str()),
+      url,
+    }),
+  }));
+}
+
+fn request_record_mode(route: &RoutePlan) -> &'static str {
+  match route {
+    RoutePlan::Managed(route) => match route.target().model() {
+      ModelSelector::Capability => "route",
+      ModelSelector::Qualified { .. } => "exact",
+      ModelSelector::Family(_) => "fuzzy",
+    },
+    RoutePlan::Relay(route) => match route.credentials() {
+      RelayCredentials::Client => "passthrough",
+      RelayCredentials::AccountPool(_) => "switch",
+    },
+  }
 }
 
 fn request_host(uri: &Uri, headers: &HeaderMap) -> Result<Option<tokn_policy::CanonicalHost>, ApiError> {
@@ -1137,6 +1245,44 @@ mod tests {
 
   fn canonical_host(value: &str) -> tokn_policy::CanonicalHost {
     CanonicalAuthority::parse(value).unwrap().host().clone()
+  }
+
+  #[test]
+  fn request_record_modes_preserve_legacy_route_labels() {
+    let pool = tokn_policy::AccountPoolId::new("primary").unwrap();
+    let managed = |model| {
+      RoutePlan::Managed(tokn_policy::ManagedRoute::new(
+        tokn_policy::ManagedTarget::new(pool.clone(), tokn_policy::ProviderSelector::Any, model),
+        tokn_policy::OperationPolicy::TranslateCompatible,
+        None,
+        ManagedRetry::Never,
+      ))
+    };
+    let relay = |credentials| {
+      RoutePlan::Relay(tokn_policy::RelayRoute::new(
+        RelayDestination::Original,
+        credentials,
+        None,
+        RelayRetry::Never,
+      ))
+    };
+
+    assert_eq!(request_record_mode(&managed(ModelSelector::Capability)), "route");
+    assert_eq!(
+      request_record_mode(&managed(ModelSelector::Qualified {
+        namespace: tokn_policy::QualificationNamespace::Provider,
+      })),
+      "exact"
+    );
+    assert_eq!(
+      request_record_mode(&managed(ModelSelector::Family(Box::new([])))),
+      "fuzzy"
+    );
+    assert_eq!(request_record_mode(&relay(RelayCredentials::Client)), "passthrough");
+    assert_eq!(
+      request_record_mode(&relay(RelayCredentials::AccountPool(pool))),
+      "switch"
+    );
   }
 
   #[test]
