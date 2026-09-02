@@ -29,18 +29,29 @@ impl CompiledConfig {
 /// Process-wide serving settings independent of the routing graph.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ServicePlan {
+  logging: crate::LoggingConfig,
   outbound: OutboundPlan,
   request_limits: RequestLimitsPlan,
   persistence: PersistencePlan,
 }
 
 impl ServicePlan {
-  pub(super) fn new(outbound: OutboundPlan, request_limits: RequestLimitsPlan, persistence: PersistencePlan) -> Self {
+  pub(super) fn new(
+    logging: crate::LoggingConfig,
+    outbound: OutboundPlan,
+    request_limits: RequestLimitsPlan,
+    persistence: PersistencePlan,
+  ) -> Self {
     Self {
+      logging,
       outbound,
       request_limits,
       persistence,
     }
+  }
+
+  pub fn logging(&self) -> &crate::LoggingConfig {
+    &self.logging
   }
 
   pub fn outbound(&self) -> &OutboundPlan {

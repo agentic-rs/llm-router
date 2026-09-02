@@ -25,6 +25,7 @@ pub const DEFAULT_PORT: u16 = 4141;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PROXY_PORT: u16 = 4142;
 pub const DEFAULT_PROVIDER: &str = ID_GITHUB_COPILOT;
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 18_000;
 
 #[derive(Clone, Copy)]
 enum ConfigEditPreimage<'a> {
@@ -586,7 +587,7 @@ fn default_cooldown() -> u64 {
 }
 
 fn default_session_ttl() -> u64 {
-  18000
+  DEFAULT_SESSION_TTL_SECS
 }
 
 fn default_session_tombstone() -> u64 {
@@ -762,7 +763,7 @@ impl ProxyModeConfig {
   }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LoggingConfig {
   #[serde(default = "default_log_level")]
   pub level: String,

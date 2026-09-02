@@ -316,6 +316,61 @@ mod tests {
   }
 
   #[test]
+  fn migrated_session_plans_preserve_legacy_expiration_boundaries() {
+    for (ttl, absolute_retention, additional_retention) in [
+      (0, 0, 0),
+      (100, 0, 0),
+      (100, 40, 0),
+      (100, 100, 0),
+      (100, 140, 40),
+      (1800, 7200, 5400),
+      (18_000, 0, 0),
+    ] {
+      let legacy = Affinity::<String>::with_legacy_absolute_retention(
+        Duration::from_secs(ttl),
+        Duration::from_secs(absolute_retention),
+      );
+      let native = Affinity::<String>::from_session_plan(SessionAffinityPlan::new(
+        Duration::from_secs(ttl),
+        Duration::from_secs(additional_retention),
+      ));
+      assert_eq!(legacy.ttl, native.ttl);
+      assert_eq!(legacy.retained_ttl, native.retained_ttl);
+
+      for settings in [legacy, native] {
+        let affinity = test_affinity(settings.ttl.as_secs(), settings.retained_ttl.as_secs());
+        affinity.record("session", "account");
+        if ttl == 0 {
+          assert_eq!(affinity.lookup("session"), Lookup::Unknown);
+          continue;
+        }
+        affinity.clock.advance(ttl - 1);
+        assert_eq!(affinity.lookup("session"), Lookup::Hit("account".into()));
+        affinity.clock.advance(1);
+        if additional_retention > 0 {
+          assert_eq!(affinity.lookup("session"), Lookup::Expired);
+          affinity.clock.advance(additional_retention - 1);
+          assert_eq!(affinity.lookup("session"), Lookup::Expired);
+          affinity.clock.advance(1);
+        }
+        assert_eq!(affinity.lookup("session"), Lookup::Unknown);
+      }
+    }
+  }
+
+  #[test]
+  fn lookup_does_not_extend_affinity_or_retention() {
+    let affinity = test_affinity(100, 140);
+    affinity.record("session", "account");
+    affinity.clock.advance(99);
+    assert_eq!(affinity.lookup("session"), Lookup::Hit("account".into()));
+    affinity.clock.advance(1);
+    assert_eq!(affinity.lookup("session"), Lookup::Expired);
+    affinity.clock.advance(40);
+    assert_eq!(affinity.lookup("session"), Lookup::Unknown);
+  }
+
+  #[test]
   fn session_plan_retention_addition_saturates() {
     let a = Affinity::<String>::from_session_plan(SessionAffinityPlan::new(Duration::MAX, Duration::from_nanos(1)));
     assert_eq!(a.retained_ttl, Duration::MAX);

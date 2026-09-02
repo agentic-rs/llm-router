@@ -176,6 +176,7 @@ pub fn project_v2_config(
   let raw_config = RawConfig {
     schema_version: SCHEMA_VERSION,
     service: RawService {
+      logging: legacy.logging.clone().into(),
       outbound: projected_outbound(legacy, &mut warnings)?,
       request_limits: RawRequestLimits::default(),
       persistence: RawPersistence {
@@ -962,7 +963,17 @@ mod tests {
 
   #[test]
   fn preserves_service_pool_listener_and_outbound_settings() {
-    let mut legacy = Config::default();
+    let mut legacy = Config {
+      logging: tokn_config::LoggingConfig {
+        level: "warn,tokn_router=debug".into(),
+        format: tokn_config::LogFormat::Json,
+        target: tokn_config::LogTarget::File,
+        dir: Some("state/logs".into()),
+        ansi: false,
+        include_spans: true,
+      },
+      ..Config::default()
+    };
     legacy.api_key.enabled = true;
     legacy.server.port = 5151;
     legacy.pool.failure_cooldown_secs = 12;
@@ -1009,6 +1020,7 @@ mod tests {
     let (raw, compiled, accounts, warnings) = projection.into_parts();
     assert_eq!(raw.schema_version, SCHEMA_VERSION);
     assert_eq!(compiled.service().persistence().body_max_bytes(), 1234);
+    assert_eq!(compiled.service().logging(), &legacy.logging);
     assert_eq!(accounts.len(), 1);
     assert!(!warnings.is_empty());
   }

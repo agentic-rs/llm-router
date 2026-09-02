@@ -8,10 +8,10 @@ use tokn_core::account::AccountConfig;
 use tokn_core::provider::official_provider_preset;
 use tokn_policy::{AccountPoolPlan, GatewayPlan, RelayCredentials, RoutePlan};
 
-/// The configuration details needed by account and credential commands.
+/// Schema-aware configuration details needed by CLI startup and account commands.
 ///
-/// This intentionally does not expose either complete schema. Account
-/// management only needs the auth store location, outbound HTTP policy,
+/// This intentionally does not expose either complete schema. These callers
+/// only need logging, the auth store location, outbound HTTP policy,
 /// configured-provider mapping, and read-only account selection views.
 pub struct ConfigContext {
   path: PathBuf,
@@ -49,6 +49,13 @@ impl ConfigContext {
 
   pub fn path(&self) -> &Path {
     &self.path
+  }
+
+  pub fn logging(&self) -> &tokn_config::LoggingConfig {
+    match &self.source {
+      ConfigSource::Legacy(config) => &config.logging,
+      ConfigSource::V2(config) => config.service().logging(),
+    }
   }
 
   pub fn build_http_client(&self, no_proxy: bool) -> Result<reqwest::Client> {
@@ -327,6 +334,35 @@ impl ResolvedProviderAuth {
 mod tests {
   use super::*;
   use tokn_core::account::{AccountTier, AuthType};
+
+  #[test]
+  fn logging_settings_load_identically_from_both_schemas() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let expected = tokn_config::LoggingConfig {
+      level: "warn,tokn_router=debug".into(),
+      format: tokn_config::LogFormat::Json,
+      target: tokn_config::LogTarget::File,
+      dir: Some("logs/custom".into()),
+      ansi: false,
+      include_spans: true,
+    };
+    let settings = toml::to_string(&expected).unwrap();
+    for prefix in [
+      "[logging]",
+      r#"schema_version = 2
+[listeners.local]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "reject" }
+[service.logging]"#,
+    ] {
+      std::fs::write(&path, format!("{prefix}\n{settings}")).unwrap();
+      let context = ConfigContext::load(Some(&path)).unwrap();
+      assert_eq!(context.logging(), &expected);
+    }
+  }
 
   fn account(provider: &str, base_url: Option<&str>) -> AccountConfig {
     AccountConfig {

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 pub(super) fn compile_service(raw: &RawService) -> Result<ServicePlan, CompileError> {
   Ok(ServicePlan::new(
+    (&raw.logging).into(),
     compile_outbound(&raw.outbound)?,
     compile_request_limits(&raw.request_limits)?,
     compile_persistence(&raw.persistence)?,

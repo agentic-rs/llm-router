@@ -198,6 +198,18 @@ mod tests {
       r#"
 [defaults]
 accounts = ["primary"]
+
+[logging]
+level = "warn,tokn_router=debug"
+format = "json"
+target = "file"
+dir = "migration-test-logs"
+ansi = false
+include_spans = true
+
+[pool]
+session_ttl_secs = 1800
+session_tombstone_secs = 7200
 "#,
     )
     .unwrap();
@@ -228,6 +240,14 @@ accounts = ["primary"]
     assert!(raw.profiles.contains_key("default"));
     assert!(raw.profiles.contains_key("opencode"));
     assert!(!rendered.contains("migration-secret"));
+    let legacy = Config::load(Some(&config_path)).unwrap().0;
+    let compiled = tokn_config::v2::parse_config(rendered, &config_path).unwrap();
+    assert_eq!(compiled.service().logging(), &legacy.logging);
+    for pool in compiled.gateway().account_pools().values() {
+      let affinity = pool.session_affinity().unwrap();
+      assert_eq!(affinity.ttl().as_secs(), 1800);
+      assert_eq!(affinity.expired_retention().as_secs(), 5400);
+    }
     assert_eq!(
       rendered,
       toml::to_string_pretty(&tokn_config::v2::decode(rendered, &config_path).unwrap()).unwrap()

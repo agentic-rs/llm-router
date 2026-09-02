@@ -2,7 +2,7 @@
 //!
 //! Resolution precedence for filter directive (high → low):
 //! 1. `RUST_LOG` env var
-//! 2. `[logging].level` from config
+//! 2. `[logging].level` (v1) or `[service.logging].level` (v2) from config
 //! 3. Per-[`RunMode`] default
 //!
 //! Output composition is config-driven via [`crate::config::LoggingConfig`]:

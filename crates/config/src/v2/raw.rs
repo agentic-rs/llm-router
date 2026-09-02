@@ -60,6 +60,8 @@ pub struct RawConfig {
 #[serde(deny_unknown_fields)]
 pub struct RawService {
   #[serde(default)]
+  pub logging: super::RawLogging,
+  #[serde(default)]
   pub outbound: RawOutbound,
   #[serde(default)]
   pub request_limits: RawRequestLimits,
@@ -411,7 +413,7 @@ const fn default_failure_cooldown_secs() -> u64 {
 }
 
 const fn default_session_ttl_secs() -> u64 {
-  18_000
+  crate::DEFAULT_SESSION_TTL_SECS
 }
 
 /// A configured provider endpoint. An omitted `base_url` is retained so the

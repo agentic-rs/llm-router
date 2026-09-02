@@ -313,12 +313,22 @@ mod tests {
     let account = account("primary", "openai", None);
     let index = index_accounts(std::slice::from_ref(&account)).unwrap();
     let mut legacy = Config::default();
-    legacy.pool.session_ttl_secs = 100;
-    legacy.pool.session_tombstone_secs = 140;
-
-    let pool = raw_pool_for_policy(&legacy, &policy(), &index).unwrap();
-    assert_eq!(pool.session_ttl_secs, 100);
-    assert_eq!(pool.session_expired_retention_secs, 40);
+    for (ttl, absolute_retention, additional_retention) in [
+      (0, 0, 0),
+      (100, 0, 0),
+      (100, 40, 0),
+      (100, 100, 0),
+      (100, 140, 40),
+      (1800, 7200, 5400),
+      (18_000, 0, 0),
+    ] {
+      legacy.pool.session_ttl_secs = ttl;
+      legacy.pool.session_tombstone_secs = absolute_retention;
+      let pool = raw_pool_for_policy(&legacy, &policy(), &index).unwrap();
+      assert_eq!(pool.session_ttl_secs, ttl);
+      assert_eq!(pool.session_expired_retention_secs, additional_retention);
+      assert_eq!(ttl + additional_retention, ttl.max(absolute_retention));
+    }
 
     legacy.pool.session_ttl_secs = 0;
     legacy.pool.session_tombstone_secs = 1;
