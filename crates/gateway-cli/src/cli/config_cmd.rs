@@ -10,9 +10,15 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
-use toml_edit::{value, Array, DocumentMut, Item, Table, Value as EditValue};
+use toml_edit::{value, Array, DocumentMut, Item, Value as EditValue};
 
+mod document;
 mod migrate_v2;
+
+use document::{insert, lookup, remove};
+
+#[cfg(test)]
+mod edit_tests;
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
@@ -724,169 +730,6 @@ fn ensure_root_key_is_not_fragment_managed(
     }
   }
   Ok(())
-}
-
-fn lookup<'a>(doc: &'a DocumentMut, segments: &[String]) -> Option<&'a Item> {
-  if segments.is_empty() {
-    return None;
-  }
-  // Special-case [[accounts]] array-of-tables when first two segments are
-  // "accounts" "<id>".
-  if segments.len() >= 2 && segments[0] == "accounts" {
-    let arr = doc.get("accounts")?.as_array_of_tables()?;
-    let entry = arr
-      .iter()
-      .find(|t| t.get("id").and_then(|i| i.as_str()) == Some(segments[1].as_str()))?;
-    return descend_table(entry, &segments[2..]);
-  }
-  let first = doc.get(&segments[0])?;
-  descend_item(first, &segments[1..])
-}
-
-fn descend_item<'a>(item: &'a Item, rest: &[String]) -> Option<&'a Item> {
-  if rest.is_empty() {
-    return Some(item);
-  }
-  match item {
-    Item::Table(t) => descend_table(t, rest),
-    Item::Value(EditValue::InlineTable(t)) => {
-      // Convert path manually
-      let next = t.get(&rest[0])?;
-      // Wrap as Item temporarily — but lifetime hard; just stop traversal here.
-      if rest.len() == 1 {
-        // We can't return &Item from &Value cheaply; build a borrowed-shaped thing.
-        // Safe shortcut: only support flat lookup inside inline tables via map_value path.
-        return inline_value_as_item(next);
-      }
-      None
-    }
-    _ => None,
-  }
-}
-
-fn inline_value_as_item(_v: &EditValue) -> Option<&Item> {
-  // toml_edit doesn't let us cheaply borrow Item from inside a Value; for
-  // CLI purposes we don't expect deep inline-table reads, so we return None
-  // and let the caller report "key not found".
-  None
-}
-
-fn descend_table<'a>(t: &'a Table, rest: &[String]) -> Option<&'a Item> {
-  if rest.is_empty() {
-    // Need an Item; manufacture by going through the underlying entry. We
-    // can't, so just return None; callers handle "table" path via table
-    // reference upstream. For our needs, only leaf reads matter.
-    return None;
-  }
-  let item = t.get(&rest[0])?;
-  descend_item(item, &rest[1..])
-}
-
-fn insert(doc: &mut DocumentMut, segments: &[String], new: Item) -> Result<()> {
-  if segments.is_empty() {
-    bail!("empty key");
-  }
-  if segments.len() >= 2 && segments[0] == "accounts" {
-    let entry = ensure_account(doc, &segments[1])?;
-    return insert_into_table(entry, &segments[2..], new);
-  }
-  if segments.len() == 1 {
-    doc.insert(&segments[0], new);
-    return Ok(());
-  }
-  let head = &segments[0];
-  if doc.get(head).is_none() {
-    doc.insert(head, Item::Table(Table::new()));
-  }
-  let item = doc.get_mut(head).unwrap();
-  let table = item.as_table_mut().ok_or_else(|| anyhow!("`{head}` is not a table"))?;
-  insert_into_table(table, &segments[1..], new)
-}
-
-fn insert_into_table(t: &mut Table, segments: &[String], new: Item) -> Result<()> {
-  if segments.is_empty() {
-    bail!("empty key");
-  }
-  if segments.len() == 1 {
-    t.insert(&segments[0], new);
-    return Ok(());
-  }
-  let head = &segments[0];
-  if t.get(head).is_none() {
-    t.insert(head, Item::Table(Table::new()));
-  }
-  let next = t
-    .get_mut(head)
-    .and_then(|i| i.as_table_mut())
-    .ok_or_else(|| anyhow!("`{head}` is not a table"))?;
-  insert_into_table(next, &segments[1..], new)
-}
-
-fn remove(doc: &mut DocumentMut, segments: &[String]) -> bool {
-  if segments.is_empty() {
-    return false;
-  }
-  if segments.len() >= 2 && segments[0] == "accounts" {
-    let Some(arr) = doc.get_mut("accounts").and_then(|i| i.as_array_of_tables_mut()) else {
-      return false;
-    };
-    let Some(entry) = arr
-      .iter_mut()
-      .find(|t| t.get("id").and_then(|i| i.as_str()) == Some(segments[1].as_str()))
-    else {
-      return false;
-    };
-    return remove_from_table(entry, &segments[2..]);
-  }
-  if segments.len() == 1 {
-    return doc.remove(&segments[0]).is_some();
-  }
-  let Some(item) = doc.get_mut(&segments[0]) else {
-    return false;
-  };
-  let Some(t) = item.as_table_mut() else {
-    return false;
-  };
-  remove_from_table(t, &segments[1..])
-}
-
-fn remove_from_table(t: &mut Table, segments: &[String]) -> bool {
-  if segments.is_empty() {
-    return false;
-  }
-  if segments.len() == 1 {
-    return t.remove(&segments[0]).is_some();
-  }
-  let Some(item) = t.get_mut(&segments[0]) else {
-    return false;
-  };
-  let Some(inner) = item.as_table_mut() else {
-    return false;
-  };
-  remove_from_table(inner, &segments[1..])
-}
-
-fn ensure_account<'a>(doc: &'a mut DocumentMut, id: &str) -> Result<&'a mut Table> {
-  if doc.get("accounts").is_none() {
-    doc.insert("accounts", Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
-  }
-  let arr = doc
-    .get_mut("accounts")
-    .and_then(|i| i.as_array_of_tables_mut())
-    .ok_or_else(|| anyhow!("`accounts` is not an array of tables"))?;
-  let pos = arr
-    .iter()
-    .position(|t| t.get("id").and_then(|i| i.as_str()) == Some(id));
-  if pos.is_none() {
-    let mut t = Table::new();
-    t.insert("id", value(id));
-    arr.push(t);
-  }
-  let idx = arr
-    .iter()
-    .position(|t| t.get("id").and_then(|i| i.as_str()) == Some(id))
-    .unwrap();
-  Ok(arr.get_mut(idx).unwrap())
 }
 
 fn load_doc(path: &std::path::Path) -> Result<DocumentMut> {
