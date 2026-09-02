@@ -12,10 +12,18 @@ use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value as EditValue};
 
+mod migrate_v2;
+
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
   #[command(subcommand)]
   pub cmd: ConfigCmd,
+}
+
+impl ConfigArgs {
+  pub(super) fn requires_pristine_startup(&self) -> bool {
+    matches!(self.cmd, ConfigCmd::MigrateV2(_))
+  }
 }
 
 #[derive(Subcommand, Debug)]
@@ -34,6 +42,25 @@ pub enum ConfigCmd {
   Path,
   /// Initialize a new version 2 config with the onboarding wizard
   Init(InitArgs),
+  /// Render a validated version 2 config without modifying any files
+  #[command(name = "migrate-v2")]
+  MigrateV2(MigrateV2Args),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct MigrateV2Args {
+  /// Include a forward-proxy listener projected from legacy [proxy_mode]
+  #[arg(long)]
+  pub with_proxy: bool,
+  /// Override the projected forward-proxy listener's static route mode
+  #[arg(long, value_enum, requires = "with_proxy")]
+  pub proxy_route_mode: Option<RouteModeArg>,
+  /// Permit reviewed non-loopback listener binds
+  #[arg(long)]
+  pub insecure_allow_remote: bool,
+  /// Permit account credentials to use reviewed non-loopback cleartext HTTP providers
+  #[arg(long)]
+  pub allow_insecure_http: bool,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -128,6 +155,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
     ConfigCmd::Edit => cmd_edit(&path),
     ConfigCmd::Path => cmd_path(&path),
     ConfigCmd::Init(a) => cmd_init(&path, a).await,
+    ConfigCmd::MigrateV2(a) => migrate_v2::run(&path, &a),
   }
 }
 
