@@ -6,6 +6,7 @@
 //! aliases.
 
 mod authority;
+mod cors;
 mod id;
 mod route;
 mod topology;
@@ -14,6 +15,7 @@ pub use authority::{
   AuthorityMismatch, CanonicalAuthority, CanonicalHost, IngressAuthority, IngressAuthoritySource, InvalidAuthority,
   InvalidHost, ResolvedAuthority,
 };
+pub use cors::CorsPlan;
 pub use id::{
   AccountPoolId, BindingId, DriverId, HeaderPatchSetId, InvalidIdentifier, ListenerId, OperationId, ProfileId,
   ProviderId, RetryPolicyId, RouteId, WireIdentityId,

@@ -152,6 +152,7 @@ impl ListenerPlan {
 pub struct LlmApiListenerPlan {
   bind: SocketAddr,
   client_auth: ClientAuthPlan,
+  cors: crate::CorsPlan,
   http_bindings: Box<[HttpBindingPlan]>,
   default_http_action: HttpAction,
 }
@@ -166,6 +167,7 @@ impl LlmApiListenerPlan {
     Self {
       bind,
       client_auth,
+      cors: crate::CorsPlan::default(),
       http_bindings,
       default_http_action,
     }
@@ -177,6 +179,17 @@ impl LlmApiListenerPlan {
 
   pub fn client_auth(&self) -> ClientAuthPlan {
     self.client_auth
+  }
+
+  /// Attach independently reloadable browser-access permissions to this listener.
+  pub fn with_cors(mut self, cors: crate::CorsPlan) -> Self {
+    self.cors = cors;
+    self
+  }
+
+  /// CORS is disabled unless explicitly configured.
+  pub fn cors(&self) -> &crate::CorsPlan {
+    &self.cors
   }
 
   pub fn http_bindings(&self) -> &[HttpBindingPlan] {

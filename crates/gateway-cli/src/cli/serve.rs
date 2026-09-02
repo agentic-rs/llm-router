@@ -397,6 +397,9 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 }
 
 #[cfg(test)]
+mod cors_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
   use axum::body::{to_bytes, Body};

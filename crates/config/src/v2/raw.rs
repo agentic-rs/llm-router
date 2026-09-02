@@ -177,6 +177,8 @@ pub enum RawListener {
   LlmApi {
     bind: String,
     client_auth: RawClientAuth,
+    #[serde(default)]
+    cors: super::RawCors,
     /// Explicitly acknowledge plaintext client traffic on a non-loopback
     /// bind. Remote listeners must still use `local_keys`; unauthenticated
     /// public listeners are never accepted.

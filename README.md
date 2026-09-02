@@ -428,6 +428,28 @@ preserves these settings. When omitted, logging defaults to compact stderr
 and daily log files under the gateway logs directory; `RUST_LOG` still takes
 precedence over the configured level.
 
+Native v2 API listeners support opt-in CORS:
+
+```toml
+[listeners.api.cors]
+enabled = true
+allow_localhost = false
+allowed_origins = ["https://app.example.com"]
+```
+
+Migration preserves legacy `[server.cors]` on the generated API listener.
+CORS remains disabled when omitted or when `enabled = false`; enabling it
+requires an exact HTTP(S) origin allowlist, `allow_localhost = true`, or both.
+Localhost permission includes `localhost`, subdomains of `.localhost`,
+`127.0.0.1`, and `[::1]` on any port. CORS does not apply to forward proxies.
+
+Allowed origins can call the inference and discovery endpoints, including
+profile-prefixed paths. Browser preflight does not require an API key, but
+actual requests retain client authentication and routing policy. Cookie-based
+CORS credentials are not enabled. Health and admin endpoints never receive
+CORS permission. Origin permissions can reload without restarting the listener;
+invalid edits leave the current permissions and generation unchanged.
+
 Both schemas default session affinity to 18,000 seconds. Migration preserves
 explicit `session_ttl_secs` values instead of replacing them with this default.
 Legacy `session_tombstone_secs` is total retention from the last successful
@@ -506,11 +528,11 @@ surface at `/{profile}/v1/*`; native v2 configs must create matching path
 bindings before those profile-compatible paths are active.
 
 The remaining legacy-to-v2 behavior differences are intentional and reported
-at startup: per-request route-mode overrides, CORS, agent binding metadata,
+at startup: per-request route-mode overrides, agent binding metadata,
 selection-order details, proxy
 authentication/override semantics, LAN bootstrap helpers, percent-decoded
 profile aliases, and HTTP rejection behavior. Legacy listener,
-outbound-proxy, persistence, account-pool cooldown, and session-affinity
+outbound-proxy, CORS, logging, persistence, account-pool cooldown, and session-affinity
 settings are projected; they do not fall back wholesale to v2 defaults.
 
 Route modes are `passthrough`, `switch`, `exact`, `route`, and `fuzzy`. A

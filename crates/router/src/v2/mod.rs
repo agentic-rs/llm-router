@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod cors_tests;
 mod discovery;
 mod selector;
 
@@ -1424,6 +1426,12 @@ pub fn router(state: AppState) -> Router {
 pub fn router_live(state: LiveAppState) -> Router {
   let max_wire_bytes = state.current().request_limits.max_wire_bytes();
   let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
+  let cors_state = state.clone();
+  let cors = crate::cors::layer(move |origin| {
+    let current = cors_state.current();
+    let policy = current.listener.cors();
+    policy.allowed_origins().contains(origin) || (policy.allow_localhost() && crate::cors::is_localhost_origin(origin))
+  });
   let client_routes = Router::new()
     .route("/v1/chat/completions", post(chat_completions))
     .route("/v1/responses", post(responses))
@@ -1435,7 +1443,10 @@ pub fn router_live(state: LiveAppState) -> Router {
     .route("/{profile}/v1/messages", post(messages))
     .route("/{profile}/v1/providers", get(list_providers))
     .route("/{profile}/v1/models", get(list_models))
-    .layer(middleware::from_fn_with_state(state.clone(), authenticate));
+    .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+    // Preflight must not require client credentials. The origin predicate
+    // reads live listener policy, including after enabling/disabling CORS.
+    .route_layer(cors);
   let mut router = Router::new().merge(client_routes).route("/healthz", get(health));
   if state.bind().ip().is_loopback() {
     router = router.route("/admin/config/reload", post(admin_config_reload));
