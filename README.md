@@ -417,9 +417,10 @@ It merges legacy fragments and uses the current effective account store while
 keeping credentials out of the generated config. Warnings are written to
 stderr, so the preview can be redirected safely. `--with-proxy` materializes
 the legacy `[proxy_mode]` listener, and `--proxy-route-mode` overrides only its
-static route mode. Reviewed non-loopback listeners and cleartext HTTP provider
-destinations require `--insecure-allow-remote` and `--allow-insecure-http`,
-respectively. The command rejects native v2 input and never applies its output.
+static route mode. Non-loopback listeners require `--insecure-allow-remote`;
+non-loopback cleartext HTTP provider destinations require
+`--allow-insecure-http`. The command rejects native v2 input and never applies
+its output.
 
 Every loopback-bound v2 `llm_api` listener exposes the local control endpoint
 `POST /admin/config/reload`. It is deliberately absent from non-loopback
