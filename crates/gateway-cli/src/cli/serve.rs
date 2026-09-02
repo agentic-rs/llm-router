@@ -3,14 +3,11 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::Args;
 use futures::future::BoxFuture;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokn_core::event::EventBus;
-use tokn_router_legacy_config::v2::{
-  project_v2_config, V2ForwardProxyProjectionOptions, V2ProjectionOptions, V2ProjectionWarning,
-};
+use tokn_router_legacy_config::v2::{project_v2_config, V2ProjectionOptions, V2ProjectionWarning};
 
 #[derive(Args, Clone, Debug)]
 pub struct ServeArgs {
@@ -188,23 +185,7 @@ fn prepare_projected_legacy_runtime(
       .take()
       .map(Into::into)
       .unwrap_or(legacy.proxy_mode.route_mode);
-    let registry = tokn_router::accounts::registry::Registry::builtin();
-    let provider_hosts = registry
-      .iter()
-      .map(|descriptor| {
-        (
-          descriptor.id.to_string(),
-          descriptor.hosts.iter().map(|host| (*host).to_string()).collect(),
-        )
-      })
-      .collect::<BTreeMap<_, _>>();
-    Some(V2ForwardProxyProjectionOptions {
-      route_mode,
-      default_intercept_hosts: tokn_router::proxy_default_intercept_hosts()
-        .map(str::to_string)
-        .collect(),
-      provider_hosts,
-    })
+    Some(crate::cli::v2_projection::forward_proxy_options(route_mode))
   } else {
     None
   };

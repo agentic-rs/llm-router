@@ -379,6 +379,7 @@ tokn-gateway usage [--since 24h] [--account ID] [--provider PROVIDER]
 tokn-gateway inspect [--port PORT] [--requests-dir PATH] [--sessions-db PATH]
 tokn-gateway config get|set|unset KEY [--account ID] [--add]
 tokn-gateway config list|edit|path|init
+tokn-gateway config migrate-v2 [--with-proxy] [--proxy-route-mode MODE] [--insecure-allow-remote] [--allow-insecure-http]
 tokn-gateway agent list
 tokn-gateway agent show codex-cli|opencode
 tokn-gateway agent import codex-cli|opencode [--yes]
@@ -409,6 +410,17 @@ falling back silently to the old server runtime. For legacy configs,
 `[proxy_mode]`; `--proxy-route-mode` overrides only that listener's static
 route mode. Native v2 configs continue to declare their listeners in config
 and reject these compatibility flags.
+
+`config migrate-v2` renders the same legacy-to-v2 projection as validated TOML
+on stdout without changing `config.toml`, `config.d`, `auth.yaml`, or `auth.d`.
+It merges legacy fragments and uses the current effective account store while
+keeping credentials out of the generated config. Warnings are written to
+stderr, so the preview can be redirected safely. `--with-proxy` materializes
+the legacy `[proxy_mode]` listener, and `--proxy-route-mode` overrides only its
+static route mode. Non-loopback listeners require `--insecure-allow-remote`;
+non-loopback cleartext HTTP provider destinations require
+`--allow-insecure-http`. The command rejects native v2 input and never applies
+its output.
 
 Every loopback-bound v2 `llm_api` listener exposes the local control endpoint
 `POST /admin/config/reload`. It is deliberately absent from non-loopback
@@ -479,8 +491,8 @@ surface at `/{profile}/v1/*`; native v2 configs must create matching path
 bindings before those profile-compatible paths are active.
 
 The remaining legacy-to-v2 behavior differences are intentional and reported
-at startup: admin reload authentication, per-request route-mode overrides,
-CORS, agent binding metadata, selection-order details, proxy
+at startup: per-request route-mode overrides, CORS, agent binding metadata,
+selection-order details, proxy
 authentication/override semantics, LAN bootstrap helpers, percent-decoded
 profile aliases, and HTTP rejection behavior. Legacy listener,
 outbound-proxy, persistence, account-pool cooldown, and session-affinity

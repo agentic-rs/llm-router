@@ -25,6 +25,7 @@ mod sessions;
 mod smoke;
 mod update;
 mod usage;
+mod v2_projection;
 
 pub use error::{Error, Result};
 
@@ -82,6 +83,12 @@ impl Cli {
     let cfg_path = self.config.clone();
     let is_inspect = matches!(&self.cmd, Cmd::Inspect(_));
     let uses_v2_config = matches!(&self.cmd, Cmd::Requests(_) | Cmd::Smoke(_));
+    if matches!(&self.cmd, Cmd::Config(args) if args.requires_pristine_startup()) {
+      let Cmd::Config(args) = self.cmd else {
+        unreachable!("the pristine startup predicate only matches config commands")
+      };
+      return config_cmd::run(cfg_path, args).await.map_err(Error::from);
+    }
     if !is_inspect && !uses_v2_config {
       prepare_default_config_home(cfg_path.as_deref())?;
     }

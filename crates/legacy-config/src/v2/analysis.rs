@@ -23,11 +23,6 @@ pub(super) fn base_warnings(legacy: &Config) -> Vec<V2ProjectionWarning> {
     V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RequestModeOverrides),
     V2ProjectionWarning::BehaviorChange(V2BehaviorChange::HttpRejectionBehavior),
   ];
-  if legacy.api_key.enabled {
-    warnings.push(V2ProjectionWarning::BehaviorChange(
-      V2BehaviorChange::AdminReloadAuthentication,
-    ));
-  }
   if legacy.server.cors.enabled {
     warnings.push(V2ProjectionWarning::BehaviorChange(V2BehaviorChange::Cors));
   }
@@ -284,9 +279,6 @@ mod tests {
     legacy.pool.strategy = "random".into();
 
     let warnings = base_warnings(&legacy);
-    assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(
-      V2BehaviorChange::AdminReloadAuthentication
-    )));
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(V2BehaviorChange::Cors)));
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AgentBindings)));
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(
