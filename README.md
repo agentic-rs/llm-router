@@ -422,6 +422,21 @@ non-loopback cleartext HTTP provider destinations require
 `--allow-insecure-http`. The command rejects native v2 input and never applies
 its output.
 
+Native v2 uses `[service.logging]` for the same settings as legacy `[logging]`:
+`level`, `format`, `target`, `dir`, `ansi`, and `include_spans`. Migration
+preserves these settings. When omitted, logging defaults to compact stderr
+and daily log files under the gateway logs directory; `RUST_LOG` still takes
+precedence over the configured level.
+
+Both schemas default session affinity to 18,000 seconds. Migration preserves
+explicit `session_ttl_secs` values instead of replacing them with this default.
+Legacy `session_tombstone_secs` is total retention from the last successful
+touch; v2 `session_expired_retention_secs` is additional retention after the
+affinity TTL. For example, legacy TTL `1800` and tombstone `7200` become v2 TTL
+`1800` and extra retention `5400`, preserving the same two-hour total window.
+Zero TTL disables v2 affinity and requires zero extra retention; legacy zero
+TTL with a nonzero tombstone is rejected rather than silently losing retention.
+
 Every loopback-bound v2 `llm_api` listener exposes the local control endpoint
 `POST /admin/config/reload`. It is deliberately absent from non-loopback
 listeners because ordinary client keys do not grant gateway-administration
@@ -447,7 +462,7 @@ either failure leaves the active generation untouched.
 
 Listener ids, kinds, bind addresses, client authentication, and proxy TLS/CA
 settings require a restart. Service-level outbound transport, request limits,
-persistence settings, and switching between legacy and native-v2 config
+persistence and logging settings, and switching between legacy and native-v2 config
 schemas also require a restart. A forward-proxy listener's
 `request_body_max_bytes` is request policy and can reload. A native config with
 only `forward_proxy` listeners, or with no loopback `llm_api` listener, has no

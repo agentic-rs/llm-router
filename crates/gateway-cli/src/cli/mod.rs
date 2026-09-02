@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::config::{Config, LogTarget};
+use crate::config::LogTarget;
 use crate::logging::{self, RunMode};
 
 mod account;
@@ -93,14 +93,14 @@ impl Cli {
       prepare_default_config_home(cfg_path.as_deref())?;
     }
 
-    // Initialize logging *before* dispatching: load just enough config to
-    // pick up the [logging] section, then install the real subscriber. If
+    // Initialize logging *before* dispatching with the schema-aware settings:
+    // legacy [logging] or native-v2 [service.logging]. If
     // config loading fails we fall back to a stderr-only emergency
     // subscriber so the resulting error still gets logged sanely.
     let mode = run_mode_for(&self.cmd);
-    let _guard = match Config::load(cfg_path.as_deref()) {
-      Ok((cfg, _)) => {
-        let mut logging_cfg = cfg.logging.clone();
+    let _guard = match config_context::ConfigContext::load(cfg_path.as_deref()) {
+      Ok(context) => {
+        let mut logging_cfg = context.logging().clone();
         if is_inspect {
           logging_cfg.target = LogTarget::Stderr;
         }

@@ -82,6 +82,7 @@ fn service_defaults_match_v2_operational_defaults() {
   let compiled = parse_config(MINIMAL_MANAGED, Path::new("config.toml")).unwrap();
   let service = compiled.service();
 
+  assert_eq!(service.logging(), &tokn_config::LoggingConfig::default());
   assert_eq!(service.outbound().proxy_url(), None);
   assert!(service.outbound().no_proxy().is_empty());
   assert!(!service.outbound().use_system_proxy());
@@ -105,6 +106,41 @@ fn service_defaults_match_v2_operational_defaults() {
   assert_eq!(persistence.archive_extension(), None);
   assert_eq!(persistence.archive_after_days(), DEFAULT_ARCHIVE_AFTER_DAYS as i64);
   assert_eq!(persistence.prune_after_days(), DEFAULT_PRUNE_AFTER_DAYS as i64);
+}
+
+#[test]
+fn session_ttl_defaults_and_explicit_values_survive_native_round_trip() {
+  let source = Path::new("config.toml");
+  let mut raw = decode(MINIMAL_MANAGED, source).unwrap();
+  let legacy = tokn_config::PoolConfig::default();
+  assert_eq!(legacy.session_ttl_secs, 18_000);
+  assert_eq!(raw.account_pools["default"].session_ttl_secs, legacy.session_ttl_secs);
+  assert_eq!(raw.account_pools["default"].session_expired_retention_secs, 0);
+
+  for (ttl, retention) in [(0, 0), (1, 0), (1800, 5400), (18_000, 0)] {
+    let pool = raw.account_pools.get_mut("default").unwrap();
+    pool.session_ttl_secs = ttl;
+    pool.session_expired_retention_secs = retention;
+    let rendered = toml::to_string_pretty(&raw).unwrap();
+    let compiled = parse_config(&rendered, source).unwrap();
+    let affinity = compiled.gateway().account_pools()["default"].session_affinity();
+    if ttl == 0 {
+      assert!(affinity.is_none());
+    } else {
+      let affinity = affinity.unwrap();
+      assert_eq!(affinity.ttl().as_secs(), ttl);
+      assert_eq!(affinity.expired_retention().as_secs(), retention);
+    }
+  }
+
+  let pool = raw.account_pools.get_mut("default").unwrap();
+  pool.session_ttl_secs = 0;
+  pool.session_expired_retention_secs = 1;
+  assert!(matches!(
+    *unwrap_compile_error(compile(&raw, source).unwrap_err()),
+    CompileError::InvalidValue { location, .. }
+      if location == "account_pools.default.session_expired_retention_secs"
+  ));
 }
 
 #[test]

@@ -7,6 +7,7 @@
 mod compile;
 mod compiled;
 mod error;
+mod logging;
 mod raw;
 
 use std::path::Path;
@@ -16,6 +17,7 @@ use crate::schema::{ConfigSchema, SchemaMarkerError};
 
 pub use compiled::{CompiledConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan, ServicePlan};
 pub use error::{CompileError, Error, Result};
+pub use logging::RawLogging;
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
   RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawPoolStrategy, RawProfile,

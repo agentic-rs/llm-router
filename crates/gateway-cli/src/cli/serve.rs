@@ -308,6 +308,8 @@ fn ensure_service_reload_compatible(
     "request limits changed"
   } else if current.persistence() != replacement.persistence() {
     "persistence settings changed"
+  } else if current.logging() != replacement.logging() {
+    "logging settings changed"
   } else {
     return Ok(());
   };
@@ -803,6 +805,43 @@ default_connect = "{default_connect}"
       .contains("request limits changed"));
     assert_eq!(live.generation(), 2);
 
+    for setting in [
+      "level = 'debug'",
+      "format = 'json'",
+      "target = 'stderr'",
+      "dir = 'custom-logs'",
+      "ansi = false",
+      "include_spans = true",
+    ] {
+      std::fs::write(
+        &config_path,
+        format!(
+          "{}\n[service.logging]\n{setting}\n",
+          v2_reload_config(api_addr, proxy_addr, "tunnel", 1_048_576)
+        ),
+      )
+      .unwrap();
+      let response = app
+        .clone()
+        .oneshot(
+          Request::post("/admin/config/reload")
+            .header("x-tokn-admin", "reload")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::CONFLICT, "{setting}");
+      let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+      assert_eq!(body["error"]["type"], "restart_required");
+      assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("logging settings changed"));
+      assert_eq!(live.generation(), 2);
+    }
+
     std::fs::write(&config_path, "[server]\nport = 4141\n").unwrap();
     let schema_change = app
       .oneshot(
@@ -871,6 +910,7 @@ default_connect = "{default_connect}"
     auth.upsert(account("secondary", "openai"));
     auth.save().unwrap();
     let response = app
+      .clone()
       .oneshot(
         Request::post("/admin/config/reload")
           .header("x-tokn-admin", "reload")
@@ -885,6 +925,28 @@ default_connect = "{default_connect}"
       serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["generation"], 2);
     assert_eq!(body["accounts"], 2);
+    assert_eq!(live.generation(), 2);
+    assert_eq!(live.accounts(), 2);
+
+    legacy.logging.target = tokn_config::LogTarget::Stderr;
+    legacy.save(&config_path).unwrap();
+    let response = app
+      .oneshot(
+        Request::post("/admin/config/reload")
+          .header("x-tokn-admin", "reload")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+      serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "restart_required");
+    assert!(body["error"]["message"]
+      .as_str()
+      .unwrap()
+      .contains("logging settings changed"));
     assert_eq!(live.generation(), 2);
     assert_eq!(live.accounts(), 2);
   }
