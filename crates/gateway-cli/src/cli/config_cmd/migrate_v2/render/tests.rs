@@ -21,7 +21,11 @@ fn account() -> AccountConfig {
 fn assert_equivalent(raw: &RawConfig) -> (String, String) {
   let compact = render(raw, false).unwrap();
   let expanded = render(raw, true).unwrap();
-  assert_eq!(expanded, toml::to_string_pretty(raw).unwrap());
+  // Expanded output keeps every serialized field, including defaults.
+  assert_eq!(
+    toml::from_str::<toml::Value>(&expanded).unwrap(),
+    toml::Value::try_from(raw).unwrap()
+  );
   assert_eq!(v2::decode(&compact, source_path()).unwrap(), *raw);
   assert_eq!(v2::decode(&expanded, source_path()).unwrap(), *raw);
   let expected = v2::compile_config(raw, source_path()).unwrap();
@@ -38,7 +42,7 @@ fn assert_equivalent(raw: &RawConfig) -> (String, String) {
 fn default_migration_is_compact_and_retains_an_empty_named_pool() {
   let projection = project_v2_config(&Config::default(), &[account()], V2ProjectionOptions::default()).unwrap();
   let (compact, expanded) = assert_equivalent(projection.raw_config());
-  assert_eq!(compact, include_str!("fixtures/default.toml"));
+  assert_eq!(compact, include_str!("fixtures/default.toml").replace("\r\n", "\n"));
   assert!(compact.lines().count() < expanded.lines().count() / 2);
   assert!(!compact.contains("[service"));
   assert!(!compact.contains("hosts = []"));
@@ -55,6 +59,80 @@ fn default_migration_is_compact_and_retains_an_empty_named_pool() {
   assert!(compact.contains("model = { kind = \"capability\" }"));
   assert!(compact.contains("retry = { kind = \"recoverable\", policy = \"legacy-recoverable\" }"));
   assert!(!compact.contains("not-a-real-secret"));
+}
+
+#[test]
+fn multiline_arrays_use_two_spaces_in_both_output_modes() {
+  let mut raw = native_config();
+  raw.service.outbound =
+    toml::from_str("proxy_url = 'http://127.0.0.1:7890'\nno_proxy = ['localhost', 'example.com']").unwrap();
+  raw.bindings.push(
+    toml::from_str(
+      r#"
+id = "multi-host"
+listener = "api"
+hosts = ["api.example.com", "other.example.com"]
+action = { kind = "route", profile = "default" }
+"#,
+    )
+    .unwrap(),
+  );
+  let RawRoute::Managed { model, .. } = raw.routes.get_mut("default").unwrap() else {
+    panic!("managed route");
+  };
+  *model = RawModelSelector::Family {
+    families: BTreeMap::from([("coding".into(), vec!["gpt-5".into(), "gpt-5-mini".into()])]),
+  };
+
+  let (compact, expanded) = assert_equivalent(&raw);
+  for output in [&compact, &expanded] {
+    for expected in [
+      "no_proxy = [\n  \"localhost\",\n  \"example.com\",\n]",
+      "hosts = [\n  \"api.example.com\",\n  \"other.example.com\",\n]",
+      "coding = [\n  \"gpt-5\",\n  \"gpt-5-mini\",\n]",
+      "accounts = [\"*\"]",
+      "[listeners.api]\nkind = \"llm_api\"",
+    ] {
+      assert!(output.contains(expected), "missing {expected:?} in {output}");
+    }
+    assert!(!output.lines().any(|line| line.starts_with("    ")));
+  }
+  assert!(expanded.contains("allowed_origins = []"));
+}
+
+#[test]
+fn array_indentation_preserves_string_contents_and_inline_values() {
+  let source = r#"single = ["some"]
+empty = []
+inline = { values = ["some", "another"] }
+multiline = [
+    "    leading spaces",
+    '''first
+    second''',
+]
+"#;
+  let expected = r#"single = ["some"]
+empty = []
+inline = { values = ["some", "another"] }
+multiline = [
+  "    leading spaces",
+  '''first
+    second''',
+]
+"#;
+  let mut document: DocumentMut = source.parse().unwrap();
+  TwoSpaceArrayIndent.visit_document_mut(&mut document);
+  assert_eq!(document.to_string(), expected);
+  assert_eq!(
+    toml::from_str::<toml::Value>(&document.to_string()).unwrap(),
+    toml::from_str::<toml::Value>(source).unwrap()
+  );
+}
+
+#[test]
+fn expanded_output_is_unchanged_without_multiline_arrays() {
+  let raw = native_config();
+  assert_eq!(render(&raw, true).unwrap(), toml::to_string_pretty(&raw).unwrap());
 }
 
 #[test]
@@ -276,14 +354,16 @@ default_connect = "reject"
     id: "first".into(),
     listener: "proxy".into(),
     action: v2::RawConnectAction::Tunnel,
-    hosts: vec!["api.example.com".into()],
-    ports: vec![443],
+    hosts: vec!["api.example.com".into(), "other.example.com".into()],
+    ports: vec![443, 8443],
   });
-  let (compact, _) = assert_equivalent(&raw);
+  let (compact, expanded) = assert_equivalent(&raw);
   assert!(compact.contains("request_body_max_bytes = 123456"));
   assert!(compact.contains("allow_insecure_public = true"));
-  assert!(compact.contains("hosts = [\"api.example.com\"]"));
-  assert!(compact.contains("ports = [443]"));
+  for output in [&compact, &expanded] {
+    assert!(output.contains("hosts = [\n  \"api.example.com\",\n  \"other.example.com\",\n]"));
+    assert!(output.contains("ports = [\n  443,\n  8443,\n]"));
+  }
   assert!(compact.contains("default_connect = \"reject\""));
 }
 

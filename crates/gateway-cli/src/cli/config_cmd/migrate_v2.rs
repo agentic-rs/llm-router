@@ -215,7 +215,7 @@ accounts = ["primary"]
 [server.cors]
 enabled = true
 allow_localhost = true
-allowed_origins = ["https://APP.example:443/"]
+allowed_origins = ["https://APP.example:443/", "https://other.example"]
 
 [logging]
 level = "warn,tokn_router=debug"
@@ -290,7 +290,13 @@ accounts = ["primary"]
     )
     .unwrap();
     let expanded = std::str::from_utf8(&expanded_stdout).unwrap();
-    assert_eq!(expanded, toml::to_string_pretty(&raw).unwrap());
+    assert_eq!(
+      toml::from_str::<toml::Value>(expanded).unwrap(),
+      toml::Value::try_from(&raw).unwrap()
+    );
+    for output in [rendered, expanded] {
+      assert!(output.contains("allowed_origins = [\n  \"https://APP.example:443/\",\n  \"https://other.example\",\n]"));
+    }
     assert_eq!(compiled, tokn_config::v2::parse_config(expanded, &config_path).unwrap());
     assert!(rendered.lines().count() < expanded.lines().count());
     assert_eq!(stderr, expanded_stderr);

@@ -10,25 +10,33 @@ use tokn_config::v2::{
   RawAccountPool, RawConfig, RawCors, RawListener, RawProvider, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
   DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
 };
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::visit_mut::{self, VisitMut};
+use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 const INLINE_WIDTH: usize = 120;
 
 pub(super) fn render(raw: &RawConfig, expanded: bool) -> Result<String> {
   let source = toml::to_string_pretty(raw).context("render generated version 2 config")?;
-  if expanded {
-    return Ok(source);
+  let mut document: DocumentMut = source.parse().context("parse generated config for rendering")?;
+  if !expanded {
+    compact(&mut document, raw)?;
   }
+  TwoSpaceArrayIndent.visit_document_mut(&mut document);
 
-  let mut document: DocumentMut = source.parse().context("parse generated config for compact rendering")?;
-  omit_defaults(
-    table_at(&mut document, &["service"])?,
-    &raw.service,
-    &RawService::default(),
-  )?;
+  let rendered = document.to_string();
+  let decoded: RawConfig = toml::from_str(&rendered).context("decode rendered migration output")?;
+  ensure!(
+    decoded == *raw,
+    "rendered migration output changed projected config settings"
+  );
+  Ok(rendered)
+}
+
+fn compact(document: &mut DocumentMut, raw: &RawConfig) -> Result<()> {
+  omit_defaults(table_at(document, &["service"])?, &raw.service, &RawService::default())?;
 
   for (id, listener) in &raw.listeners {
-    let table = table_at(&mut document, &["listeners", id])?;
+    let table = table_at(document, &["listeners", id])?;
     match listener {
       RawListener::LlmApi {
         cors,
@@ -64,14 +72,14 @@ pub(super) fn render(raw: &RawConfig, expanded: bool) -> Result<String> {
   }
 
   for (id, profile) in &raw.profiles {
-    let table = table_at(&mut document, &["profiles", id])?;
+    let table = table_at(document, &["profiles", id])?;
     if profile.wire_identity == RawWireIdentity::default() {
       table.remove("wire_identity");
     }
     inline_small_fields(table, &["wire_identity"]);
   }
   for (id, route) in &raw.routes {
-    let table = table_at(&mut document, &["routes", id])?;
+    let table = table_at(document, &["routes", id])?;
     let (RawRoute::Managed { retry, .. } | RawRoute::Relay { retry, .. }) = route;
     if retry == &RawRouteRetry::default() {
       table.remove("retry");
@@ -83,15 +91,11 @@ pub(super) fn render(raw: &RawConfig, expanded: bool) -> Result<String> {
   // defaults remain the source of truth instead of copying TTLs or flags.
   let pool_defaults: RawAccountPool = toml::from_str("").context("read account-pool schema defaults")?;
   for (id, pool) in &raw.account_pools {
-    omit_defaults(table_at(&mut document, &["account_pools", id])?, pool, &pool_defaults)?;
+    omit_defaults(table_at(document, &["account_pools", id])?, pool, &pool_defaults)?;
   }
   let provider_defaults: RawProvider = toml::from_str("").context("read provider schema defaults")?;
   for (id, provider) in &raw.providers {
-    omit_defaults(
-      table_at(&mut document, &["providers", id])?,
-      provider,
-      &provider_defaults,
-    )?;
+    omit_defaults(table_at(document, &["providers", id])?, provider, &provider_defaults)?;
   }
 
   for (section, matchers) in [
@@ -119,13 +123,27 @@ pub(super) fn render(raw: &RawConfig, expanded: bool) -> Result<String> {
   document.as_table_mut().retain(|_, item| {
     !item.as_table().is_some_and(Table::is_empty) && !item.as_array().is_some_and(|array| array.is_empty())
   });
-  let rendered = document.to_string();
-  let decoded: RawConfig = toml::from_str(&rendered).context("decode compact migration output")?;
-  ensure!(
-    decoded == *raw,
-    "compact migration output changed projected config settings"
-  );
-  Ok(rendered)
+  Ok(())
+}
+
+struct TwoSpaceArrayIndent;
+
+impl VisitMut for TwoSpaceArrayIndent {
+  fn visit_array_mut(&mut self, array: &mut Array) {
+    visit_mut::visit_array_mut(self, array);
+    for value in array.iter_mut() {
+      // Change syntax whitespace only. Replacing indentation in the rendered
+      // text could corrupt multiline strings or other literal content.
+      if value
+        .decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .is_some_and(|prefix| prefix.contains('\n'))
+      {
+        value.decor_mut().set_prefix("\n  ");
+      }
+    }
+  }
 }
 
 fn table_at<'a>(document: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut Table> {

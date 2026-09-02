@@ -443,9 +443,11 @@ Custom TTL, logging, CORS, retry, and security settings are preserved;
 long or nested policies stay expanded. Empty named resources such as
 `[account_pools.default]` remain declared, and routing-rule order is unchanged.
 Use `config migrate-v2 --expanded` for the full representation, including
-default values. Both forms decode to the same config and are validated before
-anything is written to stdout. This changes only migration presentation, not
-the schema, runtime defaults, or `config list` output.
+default values. Both forms use two-space indentation for multiline arrays,
+with section headers and their fields left-aligned. They decode to the same
+config and are validated before anything is written to stdout. This changes
+only migration presentation, not the schema, runtime defaults, or `config list`
+output.
 
 Native v2 uses `[service.logging]` for the same settings as legacy `[logging]`:
 `level`, `format`, `target`, `dir`, `ansi`, and `include_spans`. Migration
