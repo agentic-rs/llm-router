@@ -392,6 +392,21 @@ tokn-gateway update
 tokn-gateway smoke provider|model|send ...
 ```
 
+`config get`, `config set`, and `config unset` accept dotted paths through
+both regular TOML tables and inline tables, including nested v2 policies:
+
+```sh
+tokn-gateway config get routes.default.retry.policy
+tokn-gateway config set routes.default.retry.policy standard
+tokn-gateway config set listeners.api.cors.allowed_origins https://app.example.com --add
+```
+
+Edits preserve surrounding comments and table layout. `set --add` appends to
+an array (or creates a missing array). Set and unset validate the complete
+result before writing; invalid values, missing references, and removal of
+required fields leave the original file unchanged. `--account` remains a
+legacy-only selector for inline account entries.
+
 `smoke provider` and `smoke send` require a `schema_version = 2` config.
 `smoke provider` accepts a configured provider name, and `smoke send` runs a
 request through the selected `llm_api` listener in memory. Pass `--listener`
