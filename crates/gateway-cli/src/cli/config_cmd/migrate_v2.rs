@@ -199,6 +199,11 @@ mod tests {
 [defaults]
 accounts = ["primary"]
 
+[server.cors]
+enabled = true
+allow_localhost = true
+allowed_origins = ["https://APP.example:443/"]
+
 [logging]
 level = "warn,tokn_router=debug"
 format = "json"
@@ -243,6 +248,15 @@ accounts = ["primary"]
     let legacy = Config::load(Some(&config_path)).unwrap().0;
     let compiled = tokn_config::v2::parse_config(rendered, &config_path).unwrap();
     assert_eq!(compiled.service().logging(), &legacy.logging);
+    let tokn_policy::ListenerPlan::LlmApi(listener) = &compiled.gateway().listeners()["api"] else {
+      panic!("expected projected API listener");
+    };
+    assert!(listener.cors().allow_localhost());
+    assert_eq!(
+      listener.cors().allowed_origins(),
+      &legacy.server.cors.canonical_allowed_origins().unwrap()
+    );
+    assert!(!String::from_utf8_lossy(&stderr).contains("CORS"));
     for pool in compiled.gateway().account_pools().values() {
       let affinity = pool.session_affinity().unwrap();
       assert_eq!(affinity.ttl().as_secs(), 1800);

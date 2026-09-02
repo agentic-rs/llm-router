@@ -67,7 +67,6 @@ impl std::fmt::Display for LegacyPolicyLocation {
 pub enum V2BehaviorChange {
   RequestModeOverrides,
   ManagedSelectionOrder,
-  Cors,
   AgentBindings,
   PercentDecodedProfileAliases,
   HttpRejectionBehavior,
@@ -81,7 +80,6 @@ impl std::fmt::Display for V2BehaviorChange {
     formatter.write_str(match self {
       Self::RequestModeOverrides => "per-request legacy route-mode overrides are not projected",
       Self::ManagedSelectionOrder => "managed account and provider selection follows v2 ordering",
-      Self::Cors => "legacy CORS settings are not projected",
       Self::AgentBindings => "legacy agent bindings are not projected",
       Self::PercentDecodedProfileAliases => "profile paths use canonical v2 percent-encoding semantics",
       Self::HttpRejectionBehavior => "HTTP rejection behavior follows v2 listener rules",

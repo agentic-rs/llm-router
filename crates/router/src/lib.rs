@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 
 pub mod api;
+mod cors;
 pub mod pipeline;
 pub mod proxy;
 mod request_id;

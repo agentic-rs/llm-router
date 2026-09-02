@@ -19,6 +19,7 @@ struct ListenerDraft {
   flavor: ListenerFlavor,
   bind: SocketAddr,
   client_auth: ClientAuthPlan,
+  cors: tokn_policy::CorsPlan,
   request_body_max_bytes: Option<NonZeroUsize>,
   default_http_action: HttpAction,
   default_connect_action: Option<ConnectAction>,
@@ -122,6 +123,7 @@ pub(super) fn compile_listeners(
       flavor,
       raw_bind,
       raw_client_auth,
+      cors,
       allow_insecure_public,
       request_body_max_bytes,
       raw_default_http_action,
@@ -131,12 +133,14 @@ pub(super) fn compile_listeners(
       RawListener::LlmApi {
         bind,
         client_auth,
+        cors,
         allow_insecure_public,
         default_http_action,
       } => (
         ListenerFlavor::LlmApi,
         bind,
         client_auth,
+        cors.compile(raw_id)?,
         *allow_insecure_public,
         None,
         default_http_action,
@@ -155,6 +159,7 @@ pub(super) fn compile_listeners(
         ListenerFlavor::ForwardProxy,
         bind,
         client_auth,
+        tokn_policy::CorsPlan::default(),
         *allow_insecure_public,
         NonZeroUsize::new(*request_body_max_bytes),
         default_http_action,
@@ -216,6 +221,7 @@ pub(super) fn compile_listeners(
         flavor,
         bind,
         client_auth,
+        cors,
         request_body_max_bytes,
         default_http_action,
         default_connect_action,
@@ -310,12 +316,15 @@ pub(super) fn compile_listeners(
     .map(|(id, draft)| {
       let listener_http_bindings = http_bindings.remove(&id).unwrap_or_default().into_boxed_slice();
       let plan = match draft.flavor {
-        ListenerFlavor::LlmApi => ListenerPlan::LlmApi(LlmApiListenerPlan::new(
-          draft.bind,
-          draft.client_auth,
-          listener_http_bindings,
-          draft.default_http_action,
-        )),
+        ListenerFlavor::LlmApi => ListenerPlan::LlmApi(
+          LlmApiListenerPlan::new(
+            draft.bind,
+            draft.client_auth,
+            listener_http_bindings,
+            draft.default_http_action,
+          )
+          .with_cors(draft.cors),
+        ),
         ListenerFlavor::ForwardProxy => {
           let listener_connect_rules = connect_rules.remove(&id).unwrap_or_default().into_boxed_slice();
           let default_connect_action = draft

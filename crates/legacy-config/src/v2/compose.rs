@@ -146,6 +146,7 @@ pub fn project_v2_config(
     API_LISTENER_ID.to_string(),
     RawListener::LlmApi {
       bind: api_bind.to_string(),
+      cors: (&legacy.server.cors).into(),
       client_auth: if legacy.api_key.enabled {
         RawClientAuth::LocalKeys
       } else {
@@ -959,6 +960,43 @@ mod tests {
         mode: RouteMode::Passthrough,
       })
     ));
+  }
+
+  #[test]
+  fn preserves_enabled_and_disabled_cors_without_a_behavior_warning() {
+    for (enabled, allow_localhost) in [(false, true), (true, false), (true, true)] {
+      let mut legacy = Config::default();
+      legacy.server.cors = tokn_config::CorsConfig {
+        enabled,
+        allow_localhost,
+        allowed_origins: vec!["https://APP.example:443/".into()],
+      };
+      let projection = project_v2_config(
+        &legacy,
+        &[account("primary", "openai", None)],
+        V2ProjectionOptions::default(),
+      )
+      .unwrap();
+      let raw = projection.raw_config();
+      let RawListener::LlmApi { cors, .. } = &raw.listeners["api"] else {
+        panic!("API listener");
+      };
+      assert_eq!(*cors, (&legacy.server.cors).into());
+      let rendered = toml::to_string_pretty(raw).unwrap();
+      let compiled = tokn_config::v2::parse_config(&rendered, std::path::Path::new("cors.toml")).unwrap();
+      let tokn_policy::ListenerPlan::LlmApi(listener) = &compiled.gateway().listeners()["api"] else {
+        panic!("compiled API listener");
+      };
+      assert_eq!(listener.cors().allow_localhost(), enabled && allow_localhost);
+      assert_eq!(
+        listener.cors().allowed_origins().contains("https://app.example"),
+        enabled
+      );
+      assert!(projection
+        .warnings()
+        .iter()
+        .all(|warning| !warning.to_string().contains("CORS")));
+    }
   }
 
   #[test]

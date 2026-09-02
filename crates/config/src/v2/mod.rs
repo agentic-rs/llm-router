@@ -6,6 +6,7 @@
 
 mod compile;
 mod compiled;
+mod cors;
 mod error;
 mod logging;
 mod raw;
@@ -16,6 +17,7 @@ use tokn_policy::GatewayPlan;
 use crate::schema::{ConfigSchema, SchemaMarkerError};
 
 pub use compiled::{CompiledConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan, ServicePlan};
+pub use cors::RawCors;
 pub use error::{CompileError, Error, Result};
 pub use logging::RawLogging;
 pub use raw::{

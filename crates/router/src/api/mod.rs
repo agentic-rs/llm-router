@@ -10,7 +10,7 @@ pub mod response;
 use crate::api::identity::AccountIdentityResolver;
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response};
+use axum::http::{HeaderMap, HeaderName, Request, Response};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
@@ -35,7 +35,7 @@ use tokn_core::event::EventBus;
 
 const PIPELINE_RETRY_POLICY: tokn_requests::RetryPolicy =
   tokn_requests::RetryPolicy::new(2, Duration::from_millis(100));
-use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::request_id::SetRequestIdLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{Level, Span};
@@ -345,7 +345,7 @@ pub fn router_live(state: LiveAppState) -> Router {
     // CORS must be outside authentication so browser preflight requests do
     // not need an API key. The origin predicate reads the live state, which
     // lets config reloads replace the allowlist without rebuilding the router.
-    .layer(cors);
+    .route_layer(cors);
 
   Router::new()
     .merge(client_routes)
@@ -367,35 +367,10 @@ pub fn router_live(state: LiveAppState) -> Router {
 }
 
 fn cors_layer(state: LiveAppState) -> CorsLayer {
-  let allowed_origins = AllowOrigin::predicate(move |origin: &HeaderValue, _| {
-    origin.to_str().ok().is_some_and(|origin| {
-      let state = state.current();
-      state.cors_allowed_origins.contains(origin) || (state.cors_allow_localhost && is_localhost_origin(origin))
-    })
-  });
-  CorsLayer::new()
-    .allow_origin(allowed_origins)
-    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-    .allow_headers(AllowHeaders::mirror_request())
-    .expose_headers([HeaderName::from_static(REQUEST_ID_HEADER)])
-    .max_age(Duration::from_secs(600))
-}
-
-fn is_localhost_origin(origin: &str) -> bool {
-  let Ok(origin) = reqwest::Url::parse(origin) else {
-    return false;
-  };
-  if !matches!(origin.scheme(), "http" | "https")
-    || !origin.username().is_empty()
-    || origin.password().is_some()
-    || origin.path() != "/"
-    || origin.query().is_some()
-    || origin.fragment().is_some()
-  {
-    return false;
-  }
-  origin.host_str().is_some_and(|host| {
-    host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || matches!(host, "::1" | "[::1]")
+  crate::cors::layer(move |origin| {
+    let state = state.current();
+    state.cors_allowed_origins.contains(origin)
+      || (state.cors_allow_localhost && crate::cors::is_localhost_origin(origin))
   })
 }
 
@@ -912,7 +887,7 @@ mod tests {
   use crate::config::{Account as AccountCfg, Config, ProfileConfig, RouteMode};
   use crate::util::secret::Secret;
   use axum::body::{to_bytes, Body};
-  use axum::http::{header, Method, Request, StatusCode};
+  use axum::http::{header, HeaderValue, Method, Request, StatusCode};
   use axum::routing::get;
   use bytes::Bytes;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1221,22 +1196,25 @@ mod tests {
       .unwrap();
     assert!(health.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
 
-    let admin_preflight = app
-      .oneshot(
-        Request::builder()
-          .method(Method::OPTIONS)
-          .uri("/admin/config/reload")
-          .header(header::ORIGIN, origin)
-          .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-          .body(Body::empty())
-          .unwrap(),
-      )
-      .await
-      .unwrap();
-    assert!(admin_preflight
-      .headers()
-      .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-      .is_none());
+    for path in ["/admin/config/reload", "/healthz", "/unknown"] {
+      let preflight = app
+        .clone()
+        .oneshot(
+          Request::builder()
+            .method(Method::OPTIONS)
+            .uri(path)
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+      assert!(
+        preflight.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "{path}"
+      );
+    }
   }
 
   #[tokio::test]
