@@ -416,16 +416,14 @@ listeners because ordinary client keys do not grant gateway-administration
 capability. The endpoint re-reads the selected config plus `auth.yaml` and
 `auth.d`; for an unversioned legacy config it also merges fragments and repeats
 the in-memory v2 projection with the original `serve` flags. Listener
-authentication still applies, so include the same Bearer token when
-`client_auth = "local_keys"` (or `[api_key].enabled = true` in a projected
-legacy config). Every call must also include `x-tokn-admin: reload`; this
-explicit non-simple header prevents ambient browser requests from triggering a
-reload on an unauthenticated loopback listener:
+client authentication does not apply to this control endpoint: ordinary client
+keys neither grant nor gate gateway administration. Every call must include
+`x-tokn-admin: reload`; this explicit non-simple header prevents ambient browser
+requests from triggering a reload on a loopback listener:
 
 ```sh
 curl -X POST http://127.0.0.1:4141/admin/config/reload \
-  -H "x-tokn-admin: reload" \
-  -H "authorization: Bearer $TOKN_API_KEY"
+  -H "x-tokn-admin: reload"
 ```
 
 A successful reload replaces routes, bindings, profiles, retry policies,

@@ -1424,7 +1424,7 @@ pub fn router(state: AppState) -> Router {
 pub fn router_live(state: LiveAppState) -> Router {
   let max_wire_bytes = state.current().request_limits.max_wire_bytes();
   let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
-  let mut router = Router::new()
+  let client_routes = Router::new()
     .route("/v1/chat/completions", post(chat_completions))
     .route("/v1/responses", post(responses))
     .route("/v1/messages", post(messages))
@@ -1435,12 +1435,12 @@ pub fn router_live(state: LiveAppState) -> Router {
     .route("/{profile}/v1/messages", post(messages))
     .route("/{profile}/v1/providers", get(list_providers))
     .route("/{profile}/v1/models", get(list_models))
-    .route("/healthz", get(health));
+    .layer(middleware::from_fn_with_state(state.clone(), authenticate));
+  let mut router = Router::new().merge(client_routes).route("/healthz", get(health));
   if state.bind().ip().is_loopback() {
     router = router.route("/admin/config/reload", post(admin_config_reload));
   }
   router
-    .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     .layer(middleware::from_fn(crate::request_id::propagate_request_id))
     .layer(SetRequestIdLayer::new(
       request_id_header,
@@ -1477,11 +1477,6 @@ async fn list_models(
 async fn authenticate(State(live): State<LiveAppState>, mut request: Request, next: Next) -> Response {
   let state = live.current();
   request.extensions_mut().insert(state.clone());
-  if request.uri().path() == "/healthz" {
-    request.extensions_mut().insert(AccessContext::unrestricted());
-    return next.run(request).await;
-  }
-
   if let Some(endpoint) = Endpoint::infer_from(request.uri().path()) {
     match state.select_profile(request.method(), request.uri(), request.headers(), endpoint) {
       Ok(runtime) if runtime.credential_policy == CredentialPolicy::Client => {
@@ -2009,7 +2004,7 @@ default_connect = "{default_connect}"
   }
 
   #[tokio::test]
-  async fn admin_reload_endpoint_uses_listener_authentication() {
+  async fn admin_reload_endpoint_is_independent_from_listener_authentication() {
     let config = r#"
 schema_version = 2
 
@@ -2022,7 +2017,6 @@ default_http_action = { kind = "reject" }
     let plan = tokn_config::v2::parse(config, std::path::Path::new("reload-auth-test.toml")).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let access = tokn_access::AccessStore::open(directory.path().join("access.db")).unwrap();
-    let key = access.create_key("reload operator", vec!["*".into()]).unwrap();
     let states = build_runtime_states(plan, &[], Arc::new(access), Arc::new(EventBus::noop())).unwrap();
     let live = LiveRuntime::new(states, 0);
     assert!(live
@@ -2036,29 +2030,23 @@ default_http_action = { kind = "reject" }
       .is_ok());
     let app = router_live(live.llm_api_listeners().pop().unwrap());
 
-    let unauthorized = app
+    let client_request = app
       .clone()
-      .oneshot(
-        Request::post("/admin/config/reload")
-          .header(ADMIN_ACTION_HEADER, ADMIN_RELOAD_ACTION)
-          .body(Body::empty())
-          .unwrap(),
-      )
+      .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
       .await
       .unwrap();
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(client_request.status(), StatusCode::UNAUTHORIZED);
 
-    let authorized = app
+    let reload = app
       .oneshot(
         Request::post("/admin/config/reload")
-          .header("authorization", format!("Bearer {}", key.token))
           .header(ADMIN_ACTION_HEADER, ADMIN_RELOAD_ACTION)
           .body(Body::empty())
           .unwrap(),
       )
       .await
       .unwrap();
-    assert_eq!(authorized.status(), StatusCode::OK);
+    assert_eq!(reload.status(), StatusCode::OK);
   }
 
   #[tokio::test]
