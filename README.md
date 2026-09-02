@@ -379,7 +379,7 @@ tokn-gateway usage [--since 24h] [--account ID] [--provider PROVIDER]
 tokn-gateway inspect [--port PORT] [--requests-dir PATH] [--sessions-db PATH]
 tokn-gateway config get|set|unset KEY [--account ID] [--add]
 tokn-gateway config list|edit|path|init
-tokn-gateway config migrate-v2 [--with-proxy] [--proxy-route-mode MODE] [--insecure-allow-remote] [--allow-insecure-http]
+tokn-gateway config migrate-v2 [--expanded] [--with-proxy] [--proxy-route-mode MODE] [--insecure-allow-remote] [--allow-insecure-http]
 tokn-gateway agent list
 tokn-gateway agent show codex-cli|opencode
 tokn-gateway agent import codex-cli|opencode [--yes]
@@ -436,6 +436,16 @@ static route mode. Non-loopback listeners require `--insecure-allow-remote`;
 non-loopback cleartext HTTP provider destinations require
 `--allow-insecure-http`. The command rejects native v2 input and never applies
 its output.
+
+Migration output is compact by default: redundant defaults and empty
+containers are omitted, and short selectors/actions use inline tables.
+Custom TTL, logging, CORS, retry, and security settings are preserved;
+long or nested policies stay expanded. Empty named resources such as
+`[account_pools.default]` remain declared, and routing-rule order is unchanged.
+Use `config migrate-v2 --expanded` for the full representation, including
+default values. Both forms decode to the same config and are validated before
+anything is written to stdout. This changes only migration presentation, not
+the schema, runtime defaults, or `config list` output.
 
 Native v2 uses `[service.logging]` for the same settings as legacy `[logging]`:
 `level`, `format`, `target`, `dir`, `ansi`, and `include_spans`. Migration

@@ -55,6 +55,9 @@ pub enum ConfigCmd {
 
 #[derive(Args, Debug, Default)]
 pub struct MigrateV2Args {
+  /// Include all default values and expanded policy tables instead of compact output
+  #[arg(long)]
+  pub expanded: bool,
   /// Include a forward-proxy listener projected from legacy [proxy_mode]
   #[arg(long)]
   pub with_proxy: bool,
