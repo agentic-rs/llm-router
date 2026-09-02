@@ -7,6 +7,8 @@ use tokn_config::{Config, ConfigSchema};
 use tokn_core::account::AccountConfig;
 use tokn_router_legacy_config::v2::{project_v2_config, V2ProjectionOptions, V2ProjectionWarning};
 
+mod render;
+
 struct PreparedMigration {
   rendered: String,
   warnings: Vec<V2ProjectionWarning>,
@@ -58,7 +60,7 @@ fn prepare(config_path: &Path, args: &MigrateV2Args, auth_path: Option<&Path>) -
   )
   .context("project effective legacy config into version 2")?;
 
-  let rendered = toml::to_string_pretty(projection.raw_config()).context("render generated version 2 config")?;
+  let rendered = render::render(projection.raw_config(), args.expanded)?;
   validate_rendered(config_path, &rendered, projection.accounts())?;
 
   Ok(PreparedMigration {
@@ -166,6 +168,7 @@ mod tests {
       "passthrough",
       "--insecure-allow-remote",
       "--allow-insecure-http",
+      "--expanded",
     ])
     .unwrap();
     let Cmd::Config(config) = cli.cmd else {
@@ -182,6 +185,16 @@ mod tests {
     ));
     assert!(parsed.insecure_allow_remote);
     assert!(parsed.allow_insecure_http);
+    assert!(parsed.expanded);
+
+    let cli = Cli::try_parse_from(["tokn-router", "config", "migrate-v2"]).unwrap();
+    let Cmd::Config(super::super::ConfigArgs {
+      cmd: super::super::ConfigCmd::MigrateV2(parsed),
+    }) = cli.cmd
+    else {
+      panic!("expected migrate-v2 command");
+    };
+    assert!(!parsed.expanded);
 
     let error =
       Cli::try_parse_from(["tokn-router", "config", "migrate-v2", "--proxy-route-mode", "route"]).unwrap_err();
@@ -202,7 +215,7 @@ accounts = ["primary"]
 [server.cors]
 enabled = true
 allow_localhost = true
-allowed_origins = ["https://APP.example:443/"]
+allowed_origins = ["https://APP.example:443/", "https://other.example"]
 
 [logging]
 level = "warn,tokn_router=debug"
@@ -262,10 +275,32 @@ accounts = ["primary"]
       assert_eq!(affinity.ttl().as_secs(), 1800);
       assert_eq!(affinity.expired_retention().as_secs(), 5400);
     }
+    let expanded_args = MigrateV2Args {
+      expanded: true,
+      ..args()
+    };
+    let mut expanded_stdout = Vec::new();
+    let mut expanded_stderr = Vec::new();
+    execute(
+      &config_path,
+      &expanded_args,
+      Some(&auth_path),
+      &mut expanded_stdout,
+      &mut expanded_stderr,
+    )
+    .unwrap();
+    let expanded = std::str::from_utf8(&expanded_stdout).unwrap();
     assert_eq!(
-      rendered,
-      toml::to_string_pretty(&tokn_config::v2::decode(rendered, &config_path).unwrap()).unwrap()
+      toml::from_str::<toml::Value>(expanded).unwrap(),
+      toml::Value::try_from(&raw).unwrap()
     );
+    for output in [rendered, expanded] {
+      assert!(output.contains("allowed_origins = [\n  \"https://APP.example:443/\",\n  \"https://other.example\",\n]"));
+    }
+    assert_eq!(compiled, tokn_config::v2::parse_config(expanded, &config_path).unwrap());
+    assert!(rendered.lines().count() < expanded.lines().count());
+    assert_eq!(stderr, expanded_stderr);
+    assert_eq!(snapshot_tree(directory.path()), before);
     let diagnostics = std::str::from_utf8(&stderr).unwrap();
     assert!(diagnostics.lines().all(|line| line.starts_with("warning: ")));
     assert!(diagnostics.contains("legacy agent bindings"));
