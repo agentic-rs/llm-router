@@ -11,7 +11,7 @@ fn source_path() -> &'static Path {
 }
 
 fn native_config() -> RawConfig {
-  v2::decode(crate::cli::config_cmd::V2_INIT_TEMPLATE, source_path()).unwrap()
+  v2::decode(crate::cli::config_cmd::V2_EXPLICIT_TEST_CONFIG, source_path()).unwrap()
 }
 
 fn account() -> AccountConfig {

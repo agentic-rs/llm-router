@@ -176,6 +176,7 @@ pub fn project_v2_config(
 
   let raw_config = RawConfig {
     schema_version: SCHEMA_VERSION,
+    defaults: None,
     service: RawService {
       logging: legacy.logging.clone().into(),
       outbound: projected_outbound(legacy, &mut warnings)?,

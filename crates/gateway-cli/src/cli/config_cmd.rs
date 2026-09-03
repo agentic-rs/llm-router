@@ -530,33 +530,23 @@ fn init_listener_bind(host: Option<&str>, port: Option<u16>) -> Result<SocketAdd
 
 const V2_INIT_TEMPLATE: &str = r#"schema_version = 2
 
+[defaults]
+retry = { kind = "recoverable", policy = "standard" }
+
 [listeners.api]
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "route", profile = "default" }
 
-[profiles.default]
-route = "default"
-wire_identity = "auto"
-
-[routes.default]
-kind = "managed"
-account_pool = "default"
-provider = { kind = "any" }
-model = { kind = "capability" }
-operation = "translate_compatible"
-retry = { kind = "recoverable", policy = "standard" }
-
 [retry_policies.standard]
 max_retries = 2
 initial_backoff_ms = 100
-
-[account_pools.default]
-accounts = ["*"]
-providers = ["*"]
-strategy = "round_robin"
 "#;
+
+// Keep explicit-resource regressions independent of the changing init format.
+#[cfg(test)]
+const V2_EXPLICIT_TEST_CONFIG: &str = include_str!("config_cmd/fixtures/explicit_v2.toml");
 
 fn build_v2_init_config(path: &Path, bind: SocketAddr) -> Result<(String, tokn_config::v2::CompiledConfig)> {
   let mut document = V2_INIT_TEMPLATE
@@ -953,13 +943,20 @@ default_http_action = { kind = "reject" }
 
     assert_eq!(raw.schema_version, 2);
     assert_eq!(raw.listeners.len(), 1);
-    assert_eq!(raw.profiles.len(), 1);
-    assert_eq!(raw.routes.len(), 1);
-    assert_eq!(raw.account_pools.len(), 1);
+    assert!(raw.defaults.is_some());
+    assert!(raw.profiles.is_empty());
+    assert!(raw.routes.is_empty());
+    assert!(raw.account_pools.is_empty());
     assert!(raw.bindings.is_empty());
     assert!(raw.connect_rules.is_empty());
     assert!(raw.providers.is_empty());
     assert!(contents.contains("bind = \"[::1]:5151\""));
+    assert_eq!(compiled.gateway().profiles().len(), 1);
+    assert_eq!(compiled.gateway().routes().len(), 1);
+    assert_eq!(compiled.gateway().account_pools().len(), 1);
+    let explicit = V2_EXPLICIT_TEST_CONFIG.replace("127.0.0.1:4141", "[::1]:5151");
+    assert_eq!(compiled, tokn_config::v2::parse_config(&explicit, path).unwrap());
+    assert!(contents.lines().count() < explicit.lines().count());
 
     let context = ConfigContext::from_v2(path.to_path_buf(), compiled);
     let provider = context.resolve_provider("zai-coding-plan").unwrap();
