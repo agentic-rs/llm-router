@@ -7,8 +7,8 @@
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use tokn_config::v2::{
-  RawAccountPool, RawConfig, RawCors, RawListener, RawProvider, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
-  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
+  RawAccountPool, RawBindingAction, RawConfig, RawCors, RawListener, RawProvider, RawRoute, RawRouteRetry, RawService,
+  RawWireIdentity, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
 };
 use toml_edit::visit_mut::{self, VisitMut};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
@@ -41,8 +41,12 @@ fn compact(document: &mut DocumentMut, raw: &RawConfig) -> Result<()> {
       RawListener::LlmApi {
         cors,
         allow_insecure_public,
+        default_http_action,
         ..
       } => {
+        if matches!(default_http_action, RawBindingAction::Reject {}) {
+          table.remove("default_http_action");
+        }
         if !allow_insecure_public {
           table.remove("allow_insecure_public");
         }
@@ -76,7 +80,14 @@ fn compact(document: &mut DocumentMut, raw: &RawConfig) -> Result<()> {
     if profile.wire_identity == RawWireIdentity::default() {
       table.remove("wire_identity");
     }
-    inline_small_fields(table, &["wire_identity"]);
+    if let Some(pool) = &profile.account_pool {
+      let pool_table = table
+        .get_mut("account_pool")
+        .and_then(Item::as_table_mut)
+        .context("generated profile has no account-pool table")?;
+      omit_defaults(pool_table, pool, &RawAccountPool::default())?;
+    }
+    inline_small_fields(table, &["wire_identity", "account_pool", "binding"]);
   }
   for (id, route) in &raw.routes {
     let table = table_at(document, &["routes", id])?;

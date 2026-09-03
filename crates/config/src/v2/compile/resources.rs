@@ -1,7 +1,7 @@
 use crate::v2::{
-  CompileError, RawAccountPool, RawConfig, RawModelSelector, RawOperationPolicy, RawPoolStrategy, RawProfile,
-  RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination,
-  RawRetryPolicy, RawRoute, RawRouteRetry, RawWireIdentity,
+  CompileError, RawAccountPool, RawConfig, RawModelSelector, RawOperationPolicy, RawPoolStrategy, RawProvider,
+  RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRetryPolicy, RawRoute,
+  RawRouteRetry, RawWireIdentity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -13,6 +13,8 @@ use tokn_policy::{
   ProviderPlan, ProviderSelector, QualificationNamespace, RelayCredentials, RelayDestination, RelayRetry, RelayRoute,
   RetryPolicyId, RetryPolicyPlan, RouteId, RoutePlan, SessionAffinityPlan, WireIdentity, WireIdentityId,
 };
+
+mod profiles;
 
 const MAX_FAILURE_COOLDOWN_SECS: u64 = 86_400;
 const MAX_SESSION_DURATION_SECS: u64 = 31_536_000;
@@ -30,10 +32,10 @@ pub(super) struct CompiledResources {
 
 pub(super) fn compile_resources(raw: &RawConfig) -> Result<CompiledResources, CompileError> {
   let providers = compile_providers(&raw.providers)?;
-  let account_pools = compile_account_pools(&raw.account_pools, &providers)?;
+  let mut account_pools = compile_account_pools(&raw.account_pools, &providers)?;
   let retry_policies = compile_retry_policies(&raw.retry_policies)?;
   let routes = compile_routes(&raw.routes, &account_pools, &providers, &retry_policies)?;
-  let profiles = compile_profiles(&raw.profiles, &routes)?;
+  let profiles = profiles::compile_profiles(raw, &routes, &providers, &mut account_pools)?;
 
   Ok(CompiledResources {
     profiles,
@@ -350,20 +352,28 @@ fn compile_routes(
       let plan = match raw_route {
         RawRoute::Managed {
           account_pool,
+          providers: _,
           provider,
           model,
           operation,
           retry,
         } => {
-          let pool_id = resolve_pool(raw_id, "account_pool", account_pool, pools)?;
+          let pool_id = account_pool
+            .as_deref()
+            .map(|pool| resolve_pool(raw_id, "account_pool", pool, pools))
+            .transpose()?;
           let provider_selector = match provider {
             RawProviderSelector::Any {} => {
-              ensure_any_provider_viable(raw_id, &pool_id, pools, providers)?;
+              if let Some(pool_id) = &pool_id {
+                ensure_any_provider_viable(raw_id, pool_id, pools, providers)?;
+              }
               ProviderSelector::Any
             }
             RawProviderSelector::Fixed { provider } => {
               let provider_id = resolve_provider("route", raw_id, "provider", provider, providers)?;
-              ensure_fixed_provider_compatible(raw_id, "provider", &pool_id, &provider_id, pools)?;
+              if let Some(pool_id) = &pool_id {
+                ensure_fixed_provider_compatible(raw_id, "provider", pool_id, &provider_id, pools)?;
+              }
               ProviderSelector::Fixed(provider_id)
             }
           };
@@ -374,13 +384,14 @@ fn compile_routes(
           };
           let retry = compile_managed_retry(raw_id, retry, retry_policies)?;
           RoutePlan::Managed(ManagedRoute::new(
-            ManagedTarget::new(pool_id, provider_selector, model),
+            ManagedTarget::new(provider_selector, model),
             operation,
             None,
             retry,
           ))
         }
         RawRoute::Relay {
+          providers: _,
           destination,
           credentials,
           retry,
@@ -398,23 +409,45 @@ fn compile_routes(
           let credentials = match credentials {
             RawRelayCredentials::Client {} => RelayCredentials::Client,
             RawRelayCredentials::AccountPool { account_pool } => {
-              RelayCredentials::AccountPool(resolve_pool(raw_id, "credentials.account_pool", account_pool, pools)?)
+              if let Some(pool) = account_pool {
+                resolve_pool(raw_id, "credentials.account_pool", pool, pools)?;
+              }
+              RelayCredentials::AccountPool
             }
           };
-          match (&destination, &credentials) {
-            (RelayDestination::FixedProvider(provider), RelayCredentials::AccountPool(pool)) => {
-              ensure_fixed_provider_compatible(raw_id, "destination.provider", pool, provider, pools)?;
+          if let Some(pool) = raw_route.legacy_account_pool() {
+            let pool = parse_id::<AccountPoolId>("route account pool reference", pool)?;
+            match &destination {
+              RelayDestination::FixedProvider(provider) => {
+                ensure_fixed_provider_compatible(raw_id, "destination.provider", &pool, provider, pools)?
+              }
+              RelayDestination::Original => ensure_origin_relay_viable(raw_id, &pool, pools, providers)?,
             }
-            (RelayDestination::Original, RelayCredentials::AccountPool(pool)) => {
-              ensure_origin_relay_viable(raw_id, pool, pools, providers)?;
-            }
-            (_, RelayCredentials::Client) => {}
           }
           let retry = compile_relay_retry(raw_id, retry, retry_policies)?;
           RoutePlan::Relay(RelayRoute::new(destination, credentials, None, retry))
         }
       };
 
+      let (RawRoute::Managed { providers: allowed, .. } | RawRoute::Relay { providers: allowed, .. }) = raw_route;
+      let allowed = compile_route_providers(raw_id, allowed.as_deref(), providers)?;
+      let plan = plan.with_providers(allowed);
+      let fixed = match &plan {
+        RoutePlan::Managed(route) => match route.target().provider() {
+          ProviderSelector::Fixed(id) => Some(id),
+          _ => None,
+        },
+        RoutePlan::Relay(route) => match route.destination() {
+          RelayDestination::FixedProvider(id) => Some(id),
+          _ => None,
+        },
+      };
+      if fixed.is_some_and(|provider| !plan.allows_provider(provider)) {
+        return Err(invalid_value(
+          format!("routes.{raw_id}.providers"),
+          "the fixed destination is excluded by this route's provider restrictions",
+        ));
+      }
       Ok((id, plan))
     })
     .collect()
@@ -630,26 +663,27 @@ fn ensure_origin_relay_viable(
   Ok(())
 }
 
-fn compile_profiles(
-  raw_profiles: &BTreeMap<String, RawProfile>,
-  routes: &BTreeMap<RouteId, RoutePlan>,
-) -> Result<BTreeMap<ProfileId, ProfilePlan>, CompileError> {
-  raw_profiles
-    .iter()
-    .map(|(raw_id, raw_profile)| {
-      let id = parse_id::<ProfileId>("profile id", raw_id)?;
-      let route_id = parse_id::<RouteId>("profile route reference", &raw_profile.route)?;
-      let route = routes.get(&route_id).ok_or_else(|| CompileError::UnresolvedReference {
-        owner_kind: "profile",
-        owner: raw_id.clone(),
-        field: "route",
-        target_kind: "route",
-        target: raw_profile.route.clone(),
-      })?;
-      let wire_identity = compile_wire_identity(raw_id, &raw_profile.wire_identity, route)?;
-      Ok((id, ProfilePlan::new(route_id, wire_identity)))
-    })
-    .collect()
+fn compile_route_providers(
+  route_id: &str,
+  values: Option<&[String]>,
+  providers: &BTreeMap<ProviderId, ProviderPlan>,
+) -> Result<Option<BTreeSet<ProviderId>>, CompileError> {
+  let Some(values) = values else {
+    return Ok(None);
+  };
+  let location = format!("routes.{route_id}.providers");
+  validate_selector_shape(values, location.clone())?;
+  if values == ["*"] {
+    return Ok(None);
+  }
+  let mut ids = BTreeSet::new();
+  for value in values {
+    let id = resolve_provider("route", route_id, "providers", value, providers)?;
+    if !ids.insert(id) {
+      return Err(duplicate_value(location.clone(), value));
+    }
+  }
+  Ok(Some(ids))
 }
 
 fn compile_wire_identity(

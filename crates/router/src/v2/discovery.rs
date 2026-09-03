@@ -119,17 +119,20 @@ impl DiscoveryRuntime {
         providers: BTreeMap::new(),
       };
       match route {
-        RoutePlan::Managed(route) => {
-          let pool = pools.pool(route.target().account_pool()).ok_or_else(|| {
-            anyhow::anyhow!(
-              "profile '{profile_id}' references missing account pool '{}'",
-              route.target().account_pool()
-            )
-          })?;
-          let qualified = matches!(route.target().model(), ModelSelector::Qualified { .. });
+        RoutePlan::Managed(managed) => {
+          let pool_id = profile
+            .account_pool()
+            .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' has no account pool"))?;
+          let pool = pools
+            .pool(pool_id)
+            .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' references missing account pool '{}'", pool_id))?;
+          let qualified = matches!(managed.target().model(), ModelSelector::Qualified { .. });
           for account in pool.active().iter().chain(pool.fallback()) {
             let binding = account.binding();
-            if matches!(route.target().provider(), ProviderSelector::Fixed(provider) if provider != binding.provider_id())
+            if !route.allows_provider(binding.provider_id()) {
+              continue;
+            }
+            if matches!(managed.target().provider(), ProviderSelector::Fixed(provider) if provider != binding.provider_id())
             {
               continue;
             }
@@ -149,7 +152,10 @@ impl DiscoveryRuntime {
                 .or_default()
                 .plain_model_ids = true;
             }
-            RelayCredentials::AccountPool(pool_id) => {
+            RelayCredentials::AccountPool => {
+              let pool_id = profile
+                .account_pool()
+                .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' has no account pool"))?;
               let pool = pools
                 .pool(pool_id)
                 .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' references missing account pool '{pool_id}'"))?;

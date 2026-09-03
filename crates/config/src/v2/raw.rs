@@ -188,6 +188,7 @@ pub enum RawListener {
     /// public listeners are never accepted.
     #[serde(default)]
     allow_insecure_public: bool,
+    #[serde(default)]
     default_http_action: RawBindingAction,
   },
   ForwardProxy {
@@ -249,6 +250,12 @@ pub enum RawBindingAction {
   Reject {},
 }
 
+impl Default for RawBindingAction {
+  fn default() -> Self {
+    Self::Reject {}
+  }
+}
+
 /// One ordered forward-proxy CONNECT negotiation rule. Matcher dimensions
 /// are combined with AND, while entries inside a dimension are alternatives.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -274,14 +281,30 @@ pub enum RawConnectAction {
   Reject,
 }
 
-/// Client-facing policy selection. A profile deliberately contains no
-/// account, provider, matching, or retry controls.
+/// A named execution context with its own account selection state and API mount.
+/// Legacy route-owned pools remain readable for existing explicit v2 documents.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawProfile {
   pub route: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub account_pool: Option<RawAccountPool>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub binding: Option<RawProfileBinding>,
   #[serde(default)]
   pub wire_identity: RawWireIdentity,
+}
+
+/// Global API exposure for a profile, independent of forward-proxy selection.
+/// Omitted endpoints enable all supported generation operations. Discovery
+/// remains available even when the generation allowlist is empty.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawProfileBinding {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub path: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub endpoints: Option<Vec<String>>,
 }
 
 /// Wire identity is a string for built-ins and an externally tagged value for
@@ -303,7 +326,11 @@ pub enum RawWireIdentity {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawRoute {
   Managed {
-    account_pool: String,
+    /// Compatibility input only. New routes use the selected profile's pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    providers: Option<Vec<String>>,
     provider: RawProviderSelector,
     model: RawModelSelector,
     operation: RawOperationPolicy,
@@ -311,6 +338,8 @@ pub enum RawRoute {
     retry: RawRouteRetry,
   },
   Relay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    providers: Option<Vec<String>>,
     destination: RawRelayDestination,
     credentials: RawRelayCredentials,
     #[serde(default)]
@@ -383,7 +412,35 @@ pub enum RawRelayDestination {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawRelayCredentials {
   Client {},
-  AccountPool { account_pool: String },
+  AccountPool {
+    /// Compatibility input only; omission selects the profile-owned pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_pool: Option<String>,
+  },
+}
+
+impl RawRoute {
+  pub(crate) fn legacy_account_pool(&self) -> Option<&str> {
+    match self {
+      Self::Managed { account_pool, .. }
+      | Self::Relay {
+        credentials: RawRelayCredentials::AccountPool { account_pool },
+        ..
+      } => account_pool.as_deref(),
+      Self::Relay { .. } => None,
+    }
+  }
+
+  pub(crate) fn uses_accounts(&self) -> bool {
+    matches!(
+      self,
+      Self::Managed { .. }
+        | Self::Relay {
+          credentials: RawRelayCredentials::AccountPool { .. },
+          ..
+        }
+    )
+  }
 }
 
 /// Account selection and affinity settings for one independently managed

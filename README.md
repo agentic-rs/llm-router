@@ -412,6 +412,9 @@ legacy-only selector for inline account entries.
 request through the selected `llm_api` listener in memory. Pass `--listener`
 when the config contains more than one LLM API listener. `smoke model` remains
 a catalogue-only lookup and does not load the gateway config.
+`smoke send --profile NAME` selects a profile-owned API mount, including its
+custom path; when omitted, the default profile's mount is used (or `/v1` for
+legacy explicit bindings).
 
 `serve` always runs the v2 request runtime. A native `schema_version = 2`
 config is compiled directly. An unversioned legacy config is merged with its
@@ -439,34 +442,85 @@ retry = { kind = "recoverable", policy = "standard" }
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
 [retry_policies.standard]
 max_retries = 2
 initial_backoff_ms = 100
 ```
 
-At compile time, `[defaults]` creates `profiles.default`, `routes.default`,
-and `account_pools.default`. It is not global inheritance or a legacy route
-mode: other profiles and pools remain independent. Combining the shorthand
-with an explicit declaration of any of those three resources is an error;
-existing explicit v2 configs remain supported unchanged.
+At compile time, `[defaults]` creates `profiles.default` with its own account
+pool and `routes.default`. The profile is exposed at `/v1` on every API
+listener. It is not global inheritance or a legacy route mode: other profiles
+and pools remain independent. The shorthand cannot be combined with an
+explicit `profiles.default`, `routes.default`, or legacy `account_pools.default`.
 
 An empty `[defaults]` selects any eligible provider, capability-based model
 matching, compatible operation translation, automatic wire identity, and a
 pool with the normal v2 settings. Omitted retry policy means **no retries**;
 the init template explicitly preserves its two-retry policy. Optional fields
-are `provider`, `model`, `operation`, `wire_identity`, `retry`, and
-`account_pool`, using the existing v2 policy types. Pool settings belong under
-`[defaults.account_pool]`, including `accounts`, `providers`, cooldown, TTL,
-and expired-session retention.
+are `provider`, `providers`, `model`, `operation`, `wire_identity`, `retry`,
+`account_pool`, and `binding`, using the v2 policy types. Account selection,
+cooldown, TTL, and expired-session retention belong under
+`[defaults.account_pool]`; provider restrictions use `defaults.providers`.
 
-Listeners, bindings, CONNECT rules, authentication, and insecure opt-ins stay
+Listeners, proxy bindings, CONNECT rules, authentication, and insecure opt-ins stay
 explicit. No agent link/sync metadata is accepted. Config edits address the
 authored keys, such as `config set defaults.account_pool.session_ttl_secs 1800`
 or `config set defaults.retry.policy standard`, not the generated resource
 paths. Reloading uses the same expansion and validation as initial startup.
 Migration still emits explicit resources.
+
+Profiles own account pools and API exposure; routes define reusable managed
+or relay policy and provider restrictions. For example:
+
+```toml
+[profiles.work]
+route = "coding"
+account_pool = { accounts = ["work-primary", "work-backup"], session_ttl_secs = 1800 }
+binding = { endpoints = ["chat_completions", "responses"] }
+
+[profiles.personal]
+route = "coding"
+account_pool = { accounts = ["personal"] }
+binding = { path = "/my/api" }
+
+[routes.coding]
+kind = "managed"
+providers = ["openai", "deepseek"]
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+```
+
+Both profiles reuse the route while keeping independent round-robin,
+cooldown, and session-affinity state. Omitting `account_pool` on a managed
+profile uses the normal pool defaults and all eligible accounts. A route's
+optional `providers` list restricts configured provider IDs; a fixed provider
+or destination must also be in that list. Existing managed/relay, model,
+operation, credential, and retry semantics are unchanged.
+
+All API-capable profiles using this syntax are visible on every `llm_api`
+listener. Named profiles default to `/{profile}/v1`; `default` uses `/v1`.
+`binding.path` replaces this mount, without keeping an implicit alias.
+`binding.endpoints` accepts only `chat_completions`, `responses`, and
+`messages`: omitted means all three, and `[]` disables generation entirely.
+Disabled endpoints return 404 and never fall through to another profile.
+`GET <mount>/models` and `GET <mount>/providers` remain available automatically,
+scoped to that profile's accounts, route, and the client's permissions.
+Paths and endpoint lists can reload without restarting listeners.
+
+Forward proxies still select profiles using host bindings and their default
+action, not profile URL mounts. Original-destination relays remain proxy-only
+and cannot declare an API binding. A fixed-provider client-credential relay
+can opt into API mounts with `binding = {}` and has no account pool.
+
+Legacy explicit v2 configs with route-owned `account_pool` references and
+top-level `[[bindings]]` remain supported with their existing exposure and
+pool-sharing behavior. To adopt the new form, move the pool settings into
+each profile, remove the route's pool reference, and replace its API bindings
+with the profile's `binding` field. Legacy API rules cannot override or alias
+a new profile mount; conflicting rules fail validation. Legacy pool-level
+`providers` filters remain accepted, but new configs should put them on routes.
 
 `config migrate-v2` renders the same legacy-to-v2 projection as validated TOML
 on stdout without changing `config.toml`, `config.d`, `auth.yaml`, or `auth.d`.
@@ -479,17 +533,17 @@ non-loopback cleartext HTTP provider destinations require
 `--allow-insecure-http`. The command rejects native v2 input and never applies
 its output.
 
-Migration output is compact by default: redundant defaults and empty
-containers are omitted, and short selectors/actions use inline tables.
+Migration output uses profile-owned pools and mounts, without repeated API
+binding entries or top-level pools. Original legacy profile paths are retained
+as custom mounts when needed. Output is compact by default: redundant defaults
+and empty containers are omitted, and short policies use inline tables.
 Custom TTL, logging, CORS, retry, and security settings are preserved;
-long or nested policies stay expanded. Empty named resources such as
-`[account_pools.default]` remain declared, and routing-rule order is unchanged.
+long or nested policies stay expanded. An all-default pool is shown as
+`account_pool = {}`, and proxy routing-rule order is unchanged.
 Use `config migrate-v2 --expanded` for the full representation, including
 default values. Both forms use two-space indentation for multiline arrays,
 with section headers and their fields left-aligned. They decode to the same
-config and are validated before anything is written to stdout. This changes
-only migration presentation, not the schema, runtime defaults, or `config list`
-output.
+config and are validated before anything is written to stdout.
 
 Native v2 uses `[service.logging]` for the same settings as legacy `[logging]`:
 `level`, `format`, `target`, `dir`, `ansi`, and `include_spans`. Migration
@@ -569,7 +623,6 @@ initial_backoff_ms = 100
 
 [routes.default]
 kind = "managed"
-account_pool = "default"
 provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "translate_compatible"
@@ -585,16 +638,15 @@ The generated v2 config and in-memory legacy projection use two retries with a
 100 ms initial backoff, preserving the former API retry behavior. Projected
 legacy forward-proxy passthrough and switch routes remain non-retrying.
 
-Every v2 `llm_api` listener serves `GET /v1/providers` and `GET /v1/models`
-alongside the three inference endpoints. Discovery is derived from the
-profiles and account pools reachable through that listener, filtered by the
-authenticated key's provider allowlist. Model discovery queries eligible
+Every mounted profile serves `GET <mount>/providers` and `GET <mount>/models`
+alongside its enabled inference endpoints. Discovery is derived from the
+profile's accounts and route restrictions, filtered by the authenticated
+key's provider allowlist. Model discovery queries eligible
 upstream accounts and falls back to the local catalogue. When the selected
 profiles use different routing policies, the response reports
 `"route_mode": "mixed"` and lists the individual values in `route_modes`.
-Projected legacy profile paths also expose the same discovery and inference
-surface at `/{profile}/v1/*`; native v2 configs must create matching path
-bindings before those profile-compatible paths are active.
+Legacy explicit API bindings retain their listener-scoped discovery behavior;
+new profile mounts do not need separate discovery bindings.
 
 The remaining legacy-to-v2 behavior differences are intentional and reported
 at startup: per-request route-mode overrides, agent binding metadata,

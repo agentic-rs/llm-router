@@ -6,8 +6,8 @@ use tokn_accounts::link::{AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, 
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_policy::{
-  AccountPoolId, DriverId, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProviderId, ProviderSelector,
-  QualificationNamespace, RelayCredentials, RelayDestination, RelayRoute, RouteId, RoutePlan,
+  AccountPoolId, DriverId, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProfileId, ProviderId,
+  ProviderSelector, QualificationNamespace, RelayDestination, RelayRoute, RouteId, RoutePlan,
 };
 use tokn_requests::event::Stage;
 use tokn_requests::pipeline::ctx::PipelineCtx;
@@ -58,14 +58,16 @@ pub(super) struct V2AccountSelector {
 impl V2AccountSelector {
   pub(super) fn new(
     plan: Arc<GatewayPlan>,
-    route_id: RouteId,
+    profile_id: &ProfileId,
     pools: &AccountPoolRuntimes,
   ) -> anyhow::Result<(Self, Arc<SelectionState>)> {
-    let route = plan
-      .route(&route_id)
-      .ok_or_else(|| anyhow::anyhow!("profile references missing route '{route_id}'"))?;
-    let pool_id =
-      route_pool(route).ok_or_else(|| anyhow::anyhow!("route '{route_id}' does not use account-pool credentials"))?;
+    let profile = plan
+      .profile(profile_id)
+      .ok_or_else(|| anyhow::anyhow!("missing profile '{profile_id}'"))?;
+    let route_id = profile.route().clone();
+    let pool_id = profile
+      .account_pool()
+      .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' does not use account-pool credentials"))?;
     let pool = pools
       .runtime(pool_id)
       .cloned()
@@ -104,13 +106,16 @@ impl V2AccountSelector {
     for candidate in candidates {
       for operation in operations.iter().copied() {
         for binding in &self.state.bindings {
-          if managed_binding_matches(route, &candidate, operation, binding) {
+          if self.route().allows_provider(binding.provider_id())
+            && managed_binding_matches(route, &candidate, operation, binding)
+          {
             matching_binding_exists = true;
             allowed_matching_binding_exists |= provider_allowed(binding.provider_id().as_str(), allowed.as_ref());
           }
         }
         match self.state.pool.acquire(extracted.session_id.as_deref(), |binding| {
-          managed_binding_matches(route, &candidate, operation, binding)
+          self.route().allows_provider(binding.provider_id())
+            && managed_binding_matches(route, &candidate, operation, binding)
             && provider_allowed(binding.provider_id().as_str(), allowed.as_ref())
         }) {
           PoolAcquire::Selected(binding) => {
@@ -166,17 +171,39 @@ impl AccountSelector for V2AccountSelector {
 
 pub(super) struct V2ClientResolve {
   fixed_provider: Option<ProviderId>,
+  allowed_origins: Option<BTreeMap<String, ProviderId>>,
 }
 
 impl V2ClientResolve {
   pub(super) fn new(fixed_provider: Option<ProviderId>) -> Self {
-    Self { fixed_provider }
+    Self {
+      fixed_provider,
+      allowed_origins: None,
+    }
+  }
+
+  pub(super) fn with_allowed_origins(mut self, origins: Option<BTreeMap<String, ProviderId>>) -> Self {
+    self.allowed_origins = origins;
+    self
   }
 }
 
 #[async_trait]
 impl ResolveStage for V2ClientResolve {
   async fn resolve(&self, ctx: &PipelineCtx, extracted: &Extracted) -> Result<Resolved, PipelineError> {
+    if let Some(origins) = &self.allowed_origins {
+      let allowed = allowed_provider_ids(ctx)?;
+      let provider = ctx
+        .config
+        .get_str(V2_PROXY_ORIGIN_KEY)
+        .and_then(|origin| origins.get(origin));
+      if !provider.is_some_and(|id| provider_allowed(id.as_str(), allowed.as_ref())) {
+        return Err(PipelineError::permanent(
+          Stage::Resolve,
+          RequestsError::ProviderAccessDenied,
+        ));
+      }
+    }
     if let Some(provider) = &self.fixed_provider {
       let allowed = allowed_provider_ids(ctx)?;
       if !provider_allowed(provider.as_str(), allowed.as_ref()) {
@@ -217,13 +244,10 @@ enum ProxyRelayTarget {
 impl V2ProxyResolve {
   pub(super) fn new(
     route: &RelayRoute,
+    pool_id: &AccountPoolId,
     pools: &AccountPoolRuntimes,
     origins: BTreeMap<String, ProviderId>,
   ) -> anyhow::Result<(Self, Arc<SelectionState>)> {
-    let pool_id = route
-      .credentials()
-      .account_pool()
-      .ok_or_else(|| anyhow::anyhow!("client-credential relay route does not have an account pool"))?;
     let pool = pools
       .runtime(pool_id)
       .cloned()
@@ -410,16 +434,6 @@ impl SendStage for PoolAwareSend {
       Err(_) => {}
     }
     result
-  }
-}
-
-fn route_pool(route: &RoutePlan) -> Option<&AccountPoolId> {
-  match route {
-    RoutePlan::Managed(route) => Some(route.target().account_pool()),
-    RoutePlan::Relay(route) => match route.credentials() {
-      RelayCredentials::Client => None,
-      RelayCredentials::AccountPool(account_pool) => Some(account_pool),
-    },
   }
 }
 

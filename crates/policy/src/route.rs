@@ -1,5 +1,6 @@
-use crate::{AccountPoolId, HeaderPatchSetId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
+use crate::{AccountPoolId, HeaderPatchSetId, OperationId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
 use smol_str::SmolStr;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// The request-handling families supported by the gateway.
@@ -105,31 +106,22 @@ pub enum ModelSelector {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderSelector {
-  /// Select from named providers represented by the route's account pool.
+  /// Select from named providers represented by the profile's account pool.
   Any,
   Fixed(ProviderId),
 }
 
-/// Managed selection keeps its three inputs together so a fixed provider does
+/// Managed selection keeps provider and model policy together so a fixed provider does
 /// not accidentally discard model-selection behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedTarget {
-  account_pool: AccountPoolId,
   provider: ProviderSelector,
   model: ModelSelector,
 }
 
 impl ManagedTarget {
-  pub fn new(account_pool: AccountPoolId, provider: ProviderSelector, model: ModelSelector) -> Self {
-    Self {
-      account_pool,
-      provider,
-      model,
-    }
-  }
-
-  pub fn account_pool(&self) -> &AccountPoolId {
-    &self.account_pool
+  pub fn new(provider: ProviderSelector, model: ModelSelector) -> Self {
+    Self { provider, model }
   }
 
   pub fn provider(&self) -> &ProviderSelector {
@@ -153,17 +145,8 @@ pub enum RelayDestination {
 pub enum RelayCredentials {
   /// Preserve credentials supplied by the client.
   Client,
-  /// Replace client credentials with an account selected from this pool.
-  AccountPool(AccountPoolId),
-}
-
-impl RelayCredentials {
-  pub fn account_pool(&self) -> Option<&AccountPoolId> {
-    match self {
-      Self::Client => None,
-      Self::AccountPool(account_pool) => Some(account_pool),
-    }
-  }
+  /// Replace client credentials with an account from the selected profile.
+  AccountPool,
 }
 
 /// Bounded exponential-backoff policy referenced by one or more routes.
@@ -212,13 +195,14 @@ pub enum WireIdentity {
 }
 
 /// A managed route always uses structured request handling and account-owned
-/// credentials. The target makes its account pool explicit.
+/// credentials. The selected profile supplies its independently owned pool.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedRoute {
   target: ManagedTarget,
   operation: OperationPolicy,
   header_patches: Option<HeaderPatchSetId>,
   retry: ManagedRetry,
+  providers: Option<BTreeSet<ProviderId>>,
 }
 
 impl ManagedRoute {
@@ -233,6 +217,7 @@ impl ManagedRoute {
       operation,
       header_patches,
       retry,
+      providers: None,
     }
   }
 
@@ -261,6 +246,7 @@ pub struct RelayRoute {
   credentials: RelayCredentials,
   header_patches: Option<HeaderPatchSetId>,
   retry: RelayRetry,
+  providers: Option<BTreeSet<ProviderId>>,
 }
 
 impl RelayRoute {
@@ -275,6 +261,7 @@ impl RelayRoute {
       credentials,
       header_patches,
       retry,
+      providers: None,
     }
   }
 
@@ -302,6 +289,25 @@ pub enum RoutePlan {
 }
 
 impl RoutePlan {
+  pub fn with_providers(mut self, providers: Option<BTreeSet<ProviderId>>) -> Self {
+    match &mut self {
+      Self::Managed(route) => route.providers = providers,
+      Self::Relay(route) => route.providers = providers,
+    }
+    self
+  }
+
+  pub fn providers(&self) -> Option<&BTreeSet<ProviderId>> {
+    match self {
+      Self::Managed(route) => route.providers.as_ref(),
+      Self::Relay(route) => route.providers.as_ref(),
+    }
+  }
+
+  pub fn allows_provider(&self, provider: &ProviderId) -> bool {
+    self.providers().is_none_or(|allowed| allowed.contains(provider))
+  }
+
   pub fn kind(&self) -> RouteKind {
     match self {
       Self::Managed(_) => RouteKind::Managed,
@@ -325,7 +331,7 @@ impl RoutePlan {
       Self::Managed(_) => CredentialPolicy::Account,
       Self::Relay(route) => match route.credentials() {
         RelayCredentials::Client => CredentialPolicy::Client,
-        RelayCredentials::AccountPool(_) => CredentialPolicy::Account,
+        RelayCredentials::AccountPool => CredentialPolicy::Account,
       },
     }
   }
@@ -351,11 +357,11 @@ impl RoutePlan {
     match self {
       Self::Managed(_) => HeaderStrategy::ProviderOwned,
       Self::Relay(route) => match (route.destination(), route.credentials()) {
-        (RelayDestination::FixedProvider(_), RelayCredentials::AccountPool(_)) => {
+        (RelayDestination::FixedProvider(_), RelayCredentials::AccountPool) => {
           HeaderStrategy::CrossOriginReplaceCredentials
         }
         (RelayDestination::FixedProvider(_), RelayCredentials::Client) => HeaderStrategy::CrossOriginForward,
-        (RelayDestination::Original, RelayCredentials::AccountPool(_)) => HeaderStrategy::SameOriginReplaceCredentials,
+        (RelayDestination::Original, RelayCredentials::AccountPool) => HeaderStrategy::SameOriginReplaceCredentials,
         (RelayDestination::Original, RelayCredentials::Client) => HeaderStrategy::SameOriginForward,
       },
     }
@@ -369,17 +375,42 @@ impl RoutePlan {
   }
 }
 
-/// A client-facing profile is intentionally limited to a route reference and
-/// wire identity. Routing filters and account selection belong to the route.
+/// A named execution context. Routes are reusable policies; account selection
+/// state and API exposure belong to profiles.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfilePlan {
   route: RouteId,
   wire_identity: WireIdentity,
+  account_pool: Option<AccountPoolId>,
+  api_binding: Option<ApiBindingPlan>,
 }
 
 impl ProfilePlan {
   pub fn new(route: RouteId, wire_identity: WireIdentity) -> Self {
-    Self { route, wire_identity }
+    Self {
+      route,
+      wire_identity,
+      account_pool: None,
+      api_binding: None,
+    }
+  }
+
+  pub fn with_account_pool(mut self, pool: AccountPoolId) -> Self {
+    self.account_pool = Some(pool);
+    self
+  }
+
+  pub fn account_pool(&self) -> Option<&AccountPoolId> {
+    self.account_pool.as_ref()
+  }
+
+  pub fn with_api_binding(mut self, binding: ApiBindingPlan) -> Self {
+    self.api_binding = Some(binding);
+    self
+  }
+
+  pub fn api_binding(&self) -> Option<&ApiBindingPlan> {
+    self.api_binding.as_ref()
   }
 
   pub fn route(&self) -> &RouteId {
@@ -388,6 +419,31 @@ impl ProfilePlan {
 
   pub fn wire_identity(&self) -> &WireIdentity {
     &self.wire_identity
+  }
+}
+
+/// A canonical API base path and incoming generation-operation allowlist.
+/// All API listeners expose this mount. Discovery is not filtered by the list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApiBindingPlan {
+  path: SmolStr,
+  endpoints: BTreeSet<OperationId>,
+}
+
+impl ApiBindingPlan {
+  pub fn new(path: impl Into<SmolStr>, endpoints: BTreeSet<OperationId>) -> Self {
+    Self {
+      path: path.into(),
+      endpoints,
+    }
+  }
+
+  pub fn path(&self) -> &str {
+    &self.path
+  }
+
+  pub fn endpoints(&self) -> &BTreeSet<OperationId> {
+    &self.endpoints
   }
 }
 
@@ -406,7 +462,7 @@ mod tests {
   #[test]
   fn managed_route_exposes_structured_account_owned_axes() {
     let route = RoutePlan::Managed(ManagedRoute::new(
-      ManagedTarget::new(id("default"), ProviderSelector::Any, ModelSelector::Capability),
+      ManagedTarget::new(ProviderSelector::Any, ModelSelector::Capability),
       OperationPolicy::TranslateCompatible,
       None,
       ManagedRetry::Recoverable(id("standard")),
@@ -425,7 +481,7 @@ mod tests {
   fn fixed_relay_exposes_cross_origin_account_owned_axes() {
     let route = RoutePlan::Relay(RelayRoute::new(
       RelayDestination::FixedProvider(id("openai-public")),
-      RelayCredentials::AccountPool(id("default")),
+      RelayCredentials::AccountPool,
       None,
       RelayRetry::Never,
     ));
@@ -442,7 +498,7 @@ mod tests {
   fn origin_relay_preserves_destination_and_replaces_credentials() {
     let route = RoutePlan::Relay(RelayRoute::new(
       RelayDestination::Original,
-      RelayCredentials::AccountPool(id("default")),
+      RelayCredentials::AccountPool,
       None,
       RelayRetry::SafeMethods(id("conservative")),
     ));

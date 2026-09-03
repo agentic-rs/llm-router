@@ -25,8 +25,8 @@ pub use logging::RawLogging;
 pub use raw::{
   RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawConnectRule,
   RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawPoolStrategy, RawProfile,
-  RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination,
-  RawRequestLimits, RawRetryPolicy, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
+  RawProfileBinding, RawProvider, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials,
+  RawRelayDestination, RawRequestLimits, RawRetryPolicy, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
 };
 pub use raw::{
   DEFAULT_ARCHIVE_AFTER_DAYS, DEFAULT_BODY_MAX_BYTES, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,

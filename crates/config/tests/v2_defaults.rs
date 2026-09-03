@@ -17,12 +17,11 @@ route = "default"
 
 [routes.default]
 kind = "managed"
-account_pool = "default"
 provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "translate_compatible"
 
-[account_pools.default]
+[profiles.default.account_pool]
 "#;
 
 fn source() -> &'static Path {
@@ -85,7 +84,6 @@ fn omitting_defaults_preserves_the_explicit_schema_and_serialization() {
     "provider = { kind = \"any\" }\n",
     "model = { kind = \"capability\" }\n",
     "operation = \"translate_compatible\"\n",
-    "account_pool = \"default\"\n",
   ] {
     assert!(v2::decode(&config.replace(required, ""), source()).is_err());
   }
@@ -118,13 +116,12 @@ wire_identity = "none"
 
 [routes.default]
 kind = "managed"
-account_pool = "default"
 provider = { kind = "fixed", provider = "openai" }
 model = { kind = "qualified", namespace = "provider" }
 operation = "preserve"
 retry = { kind = "recoverable", policy = "standard" }
 
-[account_pools.default]
+[profiles.default.account_pool]
 accounts = ["work", "personal"]
 providers = ["openai"]
 session_ttl_secs = 1800
@@ -203,9 +200,12 @@ fn other_profiles_keep_independent_pools_and_do_not_inherit_defaults() {
     assert_eq!(plan.account_pools().len(), 2);
     assert_eq!(plan.profiles()["other"], original.profiles()["other"]);
     assert_eq!(plan.routes()["other"], original.routes()["other"]);
-    assert_eq!(plan.account_pools()["other"], original.account_pools()["other"]);
     assert_eq!(
-      plan.account_pools()["default"]
+      plan.account_pools()["profile.other"],
+      original.account_pools()["profile.other"]
+    );
+    assert_eq!(
+      plan.account_pools()["profile.default"]
         .session_affinity()
         .unwrap()
         .ttl()
@@ -238,7 +238,7 @@ fn defaults_do_not_create_listeners_or_relax_public_listener_authentication() {
     &shorthand("").replace("default_http_action = { kind = \"route\", profile = \"default\" }", ""),
     source()
   )
-  .is_err());
+  .is_ok());
 }
 
 #[test]
@@ -246,13 +246,13 @@ fn bindings_and_proxy_connect_behavior_remain_explicit_and_ordered() {
   let extra = r#"
 [[bindings]]
 id = "first"
-listener = "api"
+listener = "proxy"
 hosts = ["blocked.example"]
 action = { kind = "reject" }
 
 [[bindings]]
 id = "second"
-listener = "api"
+listener = "proxy"
 hosts = ["*.example"]
 action = { kind = "route", profile = "default" }
 
@@ -338,12 +338,12 @@ fn invalid_values_point_to_authored_default_keys_without_changing_other_errors()
     ));
   }
   let explicit_invalid = explicit(EXPLICIT_POLICY).replace(
-    "[account_pools.default]",
-    "[account_pools.default]\nfailure_cooldown_secs = 86401",
+    "[profiles.default.account_pool]",
+    "[profiles.default.account_pool]\nfailure_cooldown_secs = 86401",
   );
   assert!(matches!(
     *compile_error(&explicit_invalid),
-    CompileError::InvalidValue { location, .. } if location == "account_pools.default.failure_cooldown_secs"
+    CompileError::InvalidValue { location, .. } if location == "profiles.default.account_pool.failure_cooldown_secs"
   ));
 }
 
@@ -378,7 +378,7 @@ fn reloading_shorthand_and_explicit_configs_produces_the_same_plan() {
   std::fs::write(&path, shorthand("[defaults.account_pool]\nsession_ttl_secs = 1800")).unwrap();
   let updated = v2::load_config(&path).unwrap();
   assert_eq!(
-    updated.gateway().account_pools()["default"]
+    updated.gateway().account_pools()["profile.default"]
       .session_affinity()
       .unwrap()
       .ttl()
@@ -386,7 +386,7 @@ fn reloading_shorthand_and_explicit_configs_produces_the_same_plan() {
     1800
   );
   assert_eq!(
-    first.gateway().account_pools()["default"]
+    first.gateway().account_pools()["profile.default"]
       .session_affinity()
       .unwrap()
       .ttl()

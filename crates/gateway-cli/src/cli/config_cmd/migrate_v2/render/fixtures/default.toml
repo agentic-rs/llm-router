@@ -4,38 +4,13 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
-
-[[bindings]]
-id = "default-chat-completions"
-listener = "api"
-path_prefixes = ["/v1/chat/completions"]
-methods = ["POST"]
-operations = ["chat_completions"]
-action = { kind = "route", profile = "default" }
-
-[[bindings]]
-id = "default-responses"
-listener = "api"
-path_prefixes = ["/v1/responses"]
-methods = ["POST"]
-operations = ["responses"]
-action = { kind = "route", profile = "default" }
-
-[[bindings]]
-id = "default-messages"
-listener = "api"
-path_prefixes = ["/v1/messages"]
-methods = ["POST"]
-operations = ["messages"]
-action = { kind = "route", profile = "default" }
 
 [profiles.default]
 route = "default"
+account_pool = {}
 
 [routes.default]
 kind = "managed"
-account_pool = "default"
 operation = "translate_compatible"
 provider = { kind = "any" }
 model = { kind = "capability" }
@@ -44,5 +19,3 @@ retry = { kind = "recoverable", policy = "legacy-recoverable" }
 [retry_policies.legacy-recoverable]
 max_retries = 2
 initial_backoff_ms = 100
-
-[account_pools.default]

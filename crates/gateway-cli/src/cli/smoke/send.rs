@@ -41,6 +41,10 @@ pub struct SendArgs {
   #[arg(long)]
   pub listener: Option<String>,
 
+  /// Profile-owned API mount to exercise. Defaults to the default profile.
+  #[arg(long)]
+  pub profile: Option<String>,
+
   /// Model to use for the smoke request.
   #[arg(long)]
   pub model: Option<String>,
@@ -80,6 +84,8 @@ pub struct SendArgs {
 pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
   let (compiled, config_path) = super::load_v2_config(cfg_path.as_deref())?;
   let (plan, service) = compiled.into_parts();
+  let endpoint: Endpoint = args.endpoint.into();
+  let path = request_path(&plan, args.profile.as_deref(), endpoint)?;
   let accounts = crate::server_runtime::load_accounts(Some(&config_path))?;
   let access = Arc::new(tokn_access::AccessStore::disabled());
 
@@ -104,7 +110,6 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
   let state = select_listener(states, args.listener.as_deref())?;
   let listener_id = state.listener_id().to_string();
 
-  let endpoint: Endpoint = args.endpoint.into();
   let mut body = match args.body_file.as_deref() {
     Some(path) => load_body_file(path)?,
     None => {
@@ -130,7 +135,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     .ok_or_else(|| anyhow!("request body does not contain a string `model`; pass --model"))?
     .to_string();
   let request_id = new_request_id();
-  let mut request = http::Request::post(endpoint_path(endpoint))
+  let mut request = http::Request::post(path)
     .header(http::header::CONTENT_TYPE, "application/json")
     .header("x-request-id", &request_id)
     .body(Body::from(serde_json::to_vec(&body)?))?;
@@ -204,6 +209,23 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     anyhow::bail!("v2 smoke request failed with HTTP {status}");
   }
   Ok(())
+}
+
+fn request_path(plan: &tokn_policy::GatewayPlan, requested: Option<&str>, endpoint: Endpoint) -> Result<String> {
+  let id = requested.unwrap_or("default");
+  let profile = plan.profiles().get(id);
+  match profile.and_then(|profile| profile.api_binding()) {
+    Some(binding) => Ok(format!(
+      "{}{}",
+      binding.path(),
+      endpoint_path(endpoint)
+        .strip_prefix("/v1")
+        .expect("built-in API prefix")
+    )),
+    None if requested.is_none() => Ok(endpoint_path(endpoint).into()),
+    None if profile.is_none() => anyhow::bail!("unknown profile '{id}'"),
+    None => anyhow::bail!("profile '{id}' has no profile-owned API mount; it uses legacy bindings or is proxy-only"),
+  }
 }
 
 fn select_listener(
@@ -640,6 +662,42 @@ fn redact_header(name: &str, value: &str, redact: bool) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn smoke_uses_custom_profile_mounts_and_preserves_the_legacy_default_path() {
+    let config = r#"
+schema_version = 2
+[defaults]
+binding = { path = "/custom/default" }
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+[profiles.work]
+route = "default"
+binding = { path = "/custom/work" }
+"#;
+    let plan = tokn_config::v2::parse(config, std::path::Path::new("smoke.toml")).unwrap();
+    assert_eq!(
+      request_path(&plan, None, Endpoint::Responses).unwrap(),
+      "/custom/default/responses"
+    );
+    assert_eq!(
+      request_path(&plan, Some("work"), Endpoint::Messages).unwrap(),
+      "/custom/work/messages"
+    );
+    assert!(request_path(&plan, Some("missing"), Endpoint::Responses).is_err());
+    let legacy = tokn_config::v2::parse(
+      include_str!("../config_cmd/fixtures/explicit_v2.toml"),
+      std::path::Path::new("smoke.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+      request_path(&legacy, None, Endpoint::Responses).unwrap(),
+      "/v1/responses"
+    );
+    assert!(request_path(&legacy, Some("default"), Endpoint::Responses).is_err());
+  }
 
   #[test]
   fn builds_endpoint_specific_request_bodies() {

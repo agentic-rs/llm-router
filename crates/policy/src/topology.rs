@@ -917,9 +917,9 @@ mod tests {
       Vec::new().into_boxed_slice(),
       HttpAction::Route(profile_id.clone()),
     ));
-    let profile = ProfilePlan::new(route_id.clone(), WireIdentity::ProviderDefault);
+    let profile = ProfilePlan::new(route_id.clone(), WireIdentity::ProviderDefault).with_account_pool(pool_id.clone());
     let route = RoutePlan::Managed(ManagedRoute::new(
-      ManagedTarget::new(pool_id.clone(), ProviderSelector::Any, ModelSelector::Capability),
+      ManagedTarget::new(ProviderSelector::Any, ModelSelector::Capability),
       OperationPolicy::TranslateCompatible,
       None,
       ManagedRetry::Never,

@@ -537,7 +537,6 @@ retry = { kind = "recoverable", policy = "standard" }
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
 [retry_policies.standard]
 max_retries = 2
@@ -954,7 +953,14 @@ default_http_action = { kind = "reject" }
     assert_eq!(compiled.gateway().profiles().len(), 1);
     assert_eq!(compiled.gateway().routes().len(), 1);
     assert_eq!(compiled.gateway().account_pools().len(), 1);
-    let explicit = V2_EXPLICIT_TEST_CONFIG.replace("127.0.0.1:4141", "[::1]:5151");
+    let explicit = V2_EXPLICIT_TEST_CONFIG
+      .replace("127.0.0.1:4141", "[::1]:5151")
+      .replace("account_pool = \"default\"\n", "")
+      .replace("[account_pools.default]", "[profiles.default.account_pool]")
+      .replace(
+        "default_http_action = { kind = \"route\", profile = \"default\" }\n",
+        "",
+      );
     assert_eq!(compiled, tokn_config::v2::parse_config(&explicit, path).unwrap());
     assert!(contents.lines().count() < explicit.lines().count());
 

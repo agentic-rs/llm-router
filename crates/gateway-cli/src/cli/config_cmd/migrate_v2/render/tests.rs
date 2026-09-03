@@ -39,7 +39,7 @@ fn assert_equivalent(raw: &RawConfig) -> (String, String) {
 }
 
 #[test]
-fn default_migration_is_compact_and_retains_an_empty_named_pool() {
+fn default_migration_is_compact_and_owns_its_pool_without_api_bindings() {
   let projection = project_v2_config(&Config::default(), &[account()], V2ProjectionOptions::default()).unwrap();
   let (compact, expanded) = assert_equivalent(projection.raw_config());
   assert_eq!(compact, include_str!("fixtures/default.toml").replace("\r\n", "\n"));
@@ -49,12 +49,10 @@ fn default_migration_is_compact_and_retains_an_empty_named_pool() {
   assert!(!compact.contains("connect_rules = []"));
   assert!(!compact.contains("session_ttl_secs"));
   assert!(!compact.contains("wire_identity"));
-  assert!(compact.contains("[account_pools.default]"));
-  assert!(
-    compact.contains("default_http_action = { kind = \"reject\" }"),
-    "{compact}"
-  );
-  assert!(compact.contains("action = { kind = \"route\", profile = \"default\" }"));
+  assert!(compact.contains("account_pool = {}"));
+  assert!(!compact.contains("[account_pools."));
+  assert!(!compact.contains("[[bindings]]"));
+  assert!(!compact.contains("default_http_action"));
   assert!(compact.contains("provider = { kind = \"any\" }"));
   assert!(compact.contains("model = { kind = \"capability\" }"));
   assert!(compact.contains("retry = { kind = \"recoverable\", policy = \"legacy-recoverable\" }"));

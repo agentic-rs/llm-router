@@ -238,6 +238,22 @@ pub(super) fn compile_listeners(
     let listener_id = resolve_listener(&raw_binding.listener, "binding", &raw_binding.id, "listener", &drafts)?;
     let listener = &drafts[&listener_id];
     let (matcher, key) = compile_http_match(raw_binding)?;
+    if listener.flavor == ListenerFlavor::LlmApi {
+      for (profile_id, profile) in profiles {
+        let Some(mount) = profile.api_binding() else {
+          continue;
+        };
+        let overlaps = ["chat/completions", "responses", "messages", "models", "providers"]
+          .into_iter()
+          .any(|suffix| {
+            let path = format!("{}/{suffix}", mount.path());
+            key.path_prefixes.is_empty() || key.path_prefixes.iter().any(|prefix| path.starts_with(prefix))
+          });
+        if overlaps {
+          return Err(invalid_value(format!("bindings.{}", raw_binding.id), format!("API matcher overlaps the global mount for profile `{profile_id}`; configure profiles.{profile_id}.binding instead")));
+        }
+      }
+    }
     let prior_matchers = http_matchers.entry(listener_id.clone()).or_default();
     if let Some((_, first)) = prior_matchers.iter().find(|(prior, _)| prior.subsumes(&key)) {
       return Err(invalid_value(
@@ -461,6 +477,12 @@ fn compile_http_action(
     })?;
 
   if context.listener_flavor == ListenerFlavor::LlmApi {
+    if context.owner_kind == "binding" && profile.api_binding().is_some() {
+      return Err(invalid_value(
+        context.location,
+        "profile-owned API mounts cannot be selected through legacy API bindings",
+      ));
+    }
     let route = routes
       .get(profile.route())
       .ok_or_else(|| CompileError::UnresolvedReference {
@@ -649,7 +671,7 @@ fn compile_path_prefixes(raw_paths: &[String], binding_id: &str) -> Result<(Vec<
   Ok((values.clone(), values))
 }
 
-fn canonical_path_prefix(raw: &str, location: &str) -> Result<String, CompileError> {
+pub(super) fn canonical_path_prefix(raw: &str, location: &str) -> Result<String, CompileError> {
   if raw.is_empty() || !raw.starts_with('/') {
     return Err(invalid_value(
       location.to_string(),

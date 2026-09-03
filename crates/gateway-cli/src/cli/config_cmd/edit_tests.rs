@@ -38,7 +38,7 @@ fn init_template_nested_values_can_be_read_and_updated() {
   .unwrap();
 
   for (key, expected) in [
-    ("listeners.api.default_http_action.profile", "default"),
+    ("listeners.api.client_auth", "none"),
     ("defaults.retry.policy", "standard"),
   ] {
     cmd_get(
@@ -89,10 +89,17 @@ fn default_policy_edit_errors_leave_the_original_file_unchanged() {
     assert!(set_key(&path, key, value, false).is_err(), "{key}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_INIT_TEMPLATE);
   }
-  for key in ["defaults", "defaults.retry.policy"] {
+  for key in ["defaults.retry.policy", "listeners.api.client_auth"] {
     assert!(unset_key(&path, key).is_err(), "{key}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_INIT_TEMPLATE);
   }
+  // Removing all profiles is valid: the listener then exposes no generation routes.
+  unset_key(&path, "defaults").unwrap();
+  assert!(tokn_config::v2::load_config(&path)
+    .unwrap()
+    .gateway()
+    .profiles()
+    .is_empty());
 }
 
 #[test]
