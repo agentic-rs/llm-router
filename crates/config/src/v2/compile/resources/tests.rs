@@ -5,6 +5,12 @@ fn parse_config(contents: &str) -> RawConfig {
   toml::from_str(contents).unwrap()
 }
 
+fn set_providers(config: &mut RawConfig, allowed: Option<Vec<String>>) {
+  let (RawRoute::Managed { providers, .. } | RawRoute::Relay { providers, .. }) =
+    config.routes.get_mut("default").unwrap();
+  *providers = allowed;
+}
+
 fn base_config(extra: &str) -> RawConfig {
   parse_config(&format!(
     r#"
@@ -13,16 +19,15 @@ schema_version = 2
 [profiles.default]
 route = "default"
 
+[profiles.default.account_pool]
+accounts = ["*"]
+
 [routes.default]
 kind = "managed"
-account_pool = "default"
+providers = ["*"]
 provider = {{ kind = "any" }}
 model = {{ kind = "capability" }}
 operation = "translate_compatible"
-
-[account_pools.default]
-accounts = ["*"]
-providers = ["*"]
 
 [providers.default]
 driver = "openai"
@@ -49,7 +54,7 @@ fn transport_only_gateway_may_have_no_routing_resources() {
 #[test]
 fn compiles_wildcards_and_managed_auto_identity() {
   let compiled = compile_resources(&base_config("")).unwrap();
-  let pool = &compiled.account_pools[&AccountPoolId::new("default").unwrap()];
+  let pool = &compiled.account_pools[&AccountPoolId::new("profile.default").unwrap()];
   let profile = &compiled.profiles[&ProfileId::new("default").unwrap()];
 
   assert_eq!(pool.selector(), &AccountSelector::all());
@@ -70,7 +75,6 @@ fn compiles_retry_policies_for_managed_and_relay_routes() {
     "managed".into(),
     RawRoute::Managed {
       providers: None,
-      account_pool: Some("default".into()),
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::TranslateCompatible,
@@ -99,9 +103,7 @@ fn compiles_retry_policies_for_managed_and_relay_routes() {
       destination: RawRelayDestination::FixedProvider {
         provider: "default".into(),
       },
-      credentials: RawRelayCredentials::AccountPool {
-        account_pool: Some("default".into()),
-      },
+      credentials: RawRelayCredentials::AccountPool {},
       retry: RawRouteRetry::Buffered {
         policy: "standard".into(),
       },
@@ -223,9 +225,7 @@ fn compiles_relay_destination_and_credentials_independently() {
         destination: RawRelayDestination::FixedProvider {
           provider: "default".into(),
         },
-        credentials: RawRelayCredentials::AccountPool {
-          account_pool: Some("default".into()),
-        },
+        credentials: RawRelayCredentials::AccountPool {},
         retry: RawRouteRetry::Never {},
       },
     ),
@@ -243,9 +243,7 @@ fn compiles_relay_destination_and_credentials_independently() {
       RawRoute::Relay {
         providers: None,
         destination: RawRelayDestination::Original {},
-        credentials: RawRelayCredentials::AccountPool {
-          account_pool: Some("default".into()),
-        },
+        credentials: RawRelayCredentials::AccountPool {},
         retry: RawRouteRetry::Never {},
       },
     ),
@@ -312,9 +310,7 @@ origins = ["https://example.com"]
     RawRoute::Relay {
       providers: None,
       destination: RawRelayDestination::Original {},
-      credentials: RawRelayCredentials::AccountPool {
-        account_pool: Some("default".into()),
-      },
+      credentials: RawRelayCredentials::AccountPool {},
       retry: RawRouteRetry::Never {},
     },
   );
@@ -346,7 +342,7 @@ driver = "zai"
 }
 
 #[test]
-fn rejects_fixed_provider_excluded_by_pool() {
+fn rejects_fixed_provider_excluded_by_route() {
   let mut config = base_config(
     r#"
 [providers.public]
@@ -357,12 +353,10 @@ base_url = "https://api.openai.com/v1"
 driver = "zai"
 "#,
   );
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
       providers: None,
-      account_pool: Some("default".into()),
       provider: RawProviderSelector::Fixed {
         provider: "public".into(),
       },
@@ -371,6 +365,7 @@ driver = "zai"
       retry: RawRouteRetry::Never {},
     },
   );
+  set_providers(&mut config, Some(vec!["zai".into()]));
 
   assert!(matches!(
     compile_resources(&config),
@@ -381,6 +376,7 @@ driver = "zai"
 #[test]
 fn client_credentials_auto_is_none_but_explicit_identity_is_rejected() {
   let mut config = base_config("");
+  config.profiles.get_mut("default").unwrap().account_pool = None;
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
@@ -410,7 +406,6 @@ fn model_families_require_ordered_unambiguous_members() {
     "default".into(),
     RawRoute::Managed {
       providers: None,
-      account_pool: Some("default".into()),
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Family {
         families: BTreeMap::from([("coding".into(), vec!["gpt-5".into(), "gpt-4o".into()])]),
@@ -479,18 +474,16 @@ origins = ["https://api.openai.com"]
 driver = "zai"
 "#,
   );
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
       providers: None,
       destination: RawRelayDestination::Original {},
-      credentials: RawRelayCredentials::AccountPool {
-        account_pool: Some("default".into()),
-      },
+      credentials: RawRelayCredentials::AccountPool {},
       retry: RawRouteRetry::Never {},
     },
   );
+  set_providers(&mut config, Some(vec!["zai".into()]));
 
   compile_resources(&config).unwrap();
 }
@@ -503,24 +496,22 @@ fn origin_relay_defers_provider_default_origin_resolution() {
 driver = "openai"
 "#,
   );
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["default-provider".into()]);
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
       providers: None,
       destination: RawRelayDestination::Original {},
-      credentials: RawRelayCredentials::AccountPool {
-        account_pool: Some("default".into()),
-      },
+      credentials: RawRelayCredentials::AccountPool {},
       retry: RawRouteRetry::Never {},
     },
   );
+  set_providers(&mut config, Some(vec!["default-provider".into()]));
 
   compile_resources(&config).unwrap();
 }
 
 #[test]
-fn managed_any_uses_official_presets_and_validates_pool_references() {
+fn managed_any_uses_official_presets_and_validates_provider_references() {
   let mut config = base_config("");
   config.providers.clear();
   let compiled = compile_resources(&config).unwrap();
@@ -536,10 +527,10 @@ fn managed_any_uses_official_presets_and_validates_pool_references() {
       allow_insecure_http: false,
     },
   );
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["zai".into()]);
+  set_providers(&mut config, Some(vec!["zai".into()]));
   assert!(compile_resources(&config).is_ok());
 
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["not-installed".into()]);
+  set_providers(&mut config, Some(vec!["not-installed".into()]));
   assert!(matches!(
     compile_resources(&config),
     Err(CompileError::UnresolvedReference { field: "providers", target, .. }) if target == "not-installed"
@@ -572,15 +563,13 @@ base_url = "https://gateway.example/v1"
 }
 
 #[test]
-fn fixed_routes_and_pools_can_reference_an_implicit_official_provider() {
+fn fixed_routes_can_reference_an_implicit_official_provider() {
   let mut config = base_config("");
   config.providers.clear();
-  config.account_pools.get_mut("default").unwrap().providers = Some(vec!["openai".into()]);
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
       providers: None,
-      account_pool: Some("default".into()),
       provider: RawProviderSelector::Fixed {
         provider: "openai".into(),
       },
@@ -589,6 +578,7 @@ fn fixed_routes_and_pools_can_reference_an_implicit_official_provider() {
       retry: RawRouteRetry::Never {},
     },
   );
+  set_providers(&mut config, Some(vec!["openai".into()]));
 
   let compiled = compile_resources(&config).unwrap();
   assert!(compiled.providers.contains_key("openai"));
@@ -622,7 +612,7 @@ enable = false
   referenced
     .providers
     .insert("openai".into(), config.providers["openai"].clone());
-  referenced.account_pools.get_mut("default").unwrap().providers = Some(vec!["openai".into()]);
+  set_providers(&mut referenced, Some(vec!["openai".into()]));
   assert!(matches!(
     compile_resources(&referenced),
     Err(CompileError::UnresolvedReference { target, .. }) if target == "openai"
@@ -749,18 +739,39 @@ fn provider_urls_reject_port_zero_and_normalize_base_prefixes() {
 #[test]
 fn pool_durations_have_operational_bounds() {
   let mut config = base_config("");
-  config.account_pools.get_mut("default").unwrap().failure_cooldown_secs = MAX_FAILURE_COOLDOWN_SECS + 1;
+  config
+    .profiles
+    .get_mut("default")
+    .unwrap()
+    .account_pool
+    .as_mut()
+    .unwrap()
+    .failure_cooldown_secs = MAX_FAILURE_COOLDOWN_SECS + 1;
   assert!(matches!(
     compile_resources(&config),
     Err(CompileError::InvalidValue { location, .. })
-      if location == "account_pools.default.failure_cooldown_secs"
+      if location == "profiles.default.account_pool.failure_cooldown_secs"
   ));
 
-  config.account_pools.get_mut("default").unwrap().failure_cooldown_secs = 60;
-  config.account_pools.get_mut("default").unwrap().session_ttl_secs = MAX_SESSION_DURATION_SECS + 1;
+  config
+    .profiles
+    .get_mut("default")
+    .unwrap()
+    .account_pool
+    .as_mut()
+    .unwrap()
+    .failure_cooldown_secs = 60;
+  config
+    .profiles
+    .get_mut("default")
+    .unwrap()
+    .account_pool
+    .as_mut()
+    .unwrap()
+    .session_ttl_secs = MAX_SESSION_DURATION_SECS + 1;
   assert!(matches!(
     compile_resources(&config),
-    Err(CompileError::InvalidValue { location, .. }) if location == "account_pools.default.session_ttl_secs"
+    Err(CompileError::InvalidValue { location, .. }) if location == "profiles.default.account_pool.session_ttl_secs"
   ));
 }
 
@@ -771,7 +782,6 @@ fn family_route_rejects_duplicate_members() {
     "default".into(),
     RawRoute::Managed {
       providers: None,
-      account_pool: Some("default".into()),
       provider: RawProviderSelector::Fixed {
         provider: "default".into(),
       },

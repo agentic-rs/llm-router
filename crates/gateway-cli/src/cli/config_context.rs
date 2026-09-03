@@ -367,7 +367,6 @@ mod tests {
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 [service.logging]"#,
     ] {
       std::fs::write(&path, format!("{prefix}\n{settings}")).unwrap();
@@ -415,7 +414,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 
 [providers.company-openai]
 driver = "openai"
@@ -458,7 +456,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 
 [providers.openai]
 enable = false
@@ -525,7 +522,6 @@ no_proxy = ["auth.example.test"]
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 "#,
     )
     .unwrap();
@@ -555,21 +551,20 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "coding" }
 
 [profiles.coding]
 route = "managed"
+binding = { path = "/v1" }
+
+[profiles.coding.account_pool]
+accounts = ["primary"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["company-openai"]
 provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "preserve"
-
-[account_pools.primary]
-accounts = ["primary"]
-providers = ["company-openai"]
 
 [providers.company-openai]
 driver = "openai"
@@ -588,8 +583,11 @@ base_url = "https://llm.example.test/v1"
     };
     let other_provider = account("openai", None);
 
-    let pool = context.resolve_account_view(Some("primary"), None).unwrap().unwrap();
-    assert_eq!(pool.description(), "pool 'primary'");
+    let pool = context
+      .resolve_account_view(Some("profile.coding"), None)
+      .unwrap()
+      .unwrap();
+    assert_eq!(pool.description(), "pool 'profile.coding'");
     assert!(pool.contains(&selected));
     assert!(!pool.contains(&other_account));
     assert!(!pool.contains(&other_provider));
@@ -597,11 +595,13 @@ base_url = "https://llm.example.test/v1"
     let profile = context.resolve_account_view(None, Some("coding")).unwrap().unwrap();
     assert_eq!(
       profile.description(),
-      "profile 'coding' -> pool 'primary' (route 'managed')"
+      "profile 'coding' -> pool 'profile.coding' (route 'managed')"
     );
     assert!(profile.contains(&selected));
     assert!(context.resolve_account_view(Some("missing"), None).is_err());
-    assert!(context.resolve_account_view(Some("primary"), Some("coding")).is_err());
+    assert!(context
+      .resolve_account_view(Some("profile.coding"), Some("coding"))
+      .is_err());
   }
 
   #[test]

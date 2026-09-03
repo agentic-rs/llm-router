@@ -413,8 +413,8 @@ request through the selected `llm_api` listener in memory. Pass `--listener`
 when the config contains more than one LLM API listener. `smoke model` remains
 a catalogue-only lookup and does not load the gateway config.
 `smoke send --profile NAME` selects a profile-owned API mount, including its
-custom path; when omitted, the default profile's mount is used (or `/v1` for
-legacy explicit bindings).
+custom path; when omitted, the default profile's mount is used. A missing
+default or proxy-only profile is reported as an error.
 
 `serve` always runs the v2 request runtime. A native `schema_version = 2`
 config is compiled directly. An unversioned legacy config is merged with its
@@ -452,7 +452,7 @@ At compile time, `[defaults]` creates `profiles.default` with its own account
 pool and `routes.default`. The profile is exposed at `/v1` on every API
 listener. It is not global inheritance or a legacy route mode: other profiles
 and pools remain independent. The shorthand cannot be combined with an
-explicit `profiles.default`, `routes.default`, or legacy `account_pools.default`.
+explicit `profiles.default` or `routes.default`.
 
 An empty `[defaults]` selects any eligible provider, capability-based model
 matching, compatible operation translation, automatic wire identity, and a
@@ -499,7 +499,7 @@ optional `providers` list restricts configured provider IDs; a fixed provider
 or destination must also be in that list. Existing managed/relay, model,
 operation, credential, and retry semantics are unchanged.
 
-All API-capable profiles using this syntax are visible on every `llm_api`
+All API-capable profiles are visible on every `llm_api`
 listener. Named profiles default to `/{profile}/v1`; `default` uses `/v1`.
 `binding.path` replaces this mount, without keeping an implicit alias.
 `binding.endpoints` accepts only `chat_completions`, `responses`, and
@@ -512,15 +512,13 @@ Paths and endpoint lists can reload without restarting listeners.
 Forward proxies still select profiles using host bindings and their default
 action, not profile URL mounts. Original-destination relays remain proxy-only
 and cannot declare an API binding. A fixed-provider client-credential relay
-can opt into API mounts with `binding = {}` and has no account pool.
+gets an API mount by default and has no account pool.
 
-Legacy explicit v2 configs with route-owned `account_pool` references and
-top-level `[[bindings]]` remain supported with their existing exposure and
-pool-sharing behavior. To adopt the new form, move the pool settings into
-each profile, remove the route's pool reference, and replace its API bindings
-with the profile's `binding` field. Legacy API rules cannot override or alias
-a new profile mount; conflicting rules fail validation. Legacy pool-level
-`providers` filters remain accepted, but new configs should put them on routes.
+V2 has one configuration model: profiles own pools and API bindings, and
+routes own provider restrictions. Top-level account pools, route-owned pool
+references, pool-level provider filters, and API listener fallback actions
+are rejected. Top-level `[[bindings]]` are for forward proxies only.
+V1 loading and migration remain supported.
 
 `config migrate-v2` renders the same legacy-to-v2 projection as validated TOML
 on stdout without changing `config.toml`, `config.d`, `auth.yaml`, or `auth.d`.

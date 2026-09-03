@@ -14,7 +14,7 @@ fn parse_config(contents: &str) -> RawConfig {
 
 fn compile_config(raw: &RawConfig, source: &Path) -> Result<BTreeMap<ListenerId, ListenerPlan>, CompileError> {
   let resources = super::super::resources::compile_resources(raw).unwrap();
-  compile_listeners(raw, source, &resources.profiles, &resources.routes)
+  compile_listeners(raw, source, &resources.profiles)
 }
 
 fn assert_invalid_message(raw: &RawConfig, expected: &str) {
@@ -33,7 +33,8 @@ fn compiles_normalized_http_matchers_in_source_order() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -55,8 +56,8 @@ path_prefixes = ["/v1"]
   );
 
   let listeners = compile_config(&raw, Path::new("config.toml")).unwrap();
-  let ListenerPlan::LlmApi(listener) = &listeners["api"] else {
-    panic!("expected LLM API listener");
+  let ListenerPlan::ForwardProxy(listener) = &listeners["api"] else {
+    panic!("expected forward-proxy listener");
   };
   assert_eq!(listener.http_bindings()[0].id().as_str(), "specific");
   assert_eq!(listener.http_bindings()[1].id().as_str(), "fallback");
@@ -124,7 +125,8 @@ fn rejects_empty_duplicate_and_equivalent_http_matchers() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -145,7 +147,8 @@ action = { kind = "reject" }
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -167,7 +170,8 @@ hosts = ["api.example.com", "API.EXAMPLE.COM"]
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -200,7 +204,8 @@ fn rejects_http_matcher_shadowed_by_an_earlier_binding() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -234,7 +239,8 @@ fn rejects_http_matcher_covered_by_the_union_of_earlier_bindings() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -269,7 +275,8 @@ fn preserves_http_matcher_with_an_atom_not_covered_by_earlier_bindings() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -295,8 +302,8 @@ methods = ["GET", "POST", "PUT"]
   );
 
   let listeners = compile_config(&raw, Path::new("config.toml")).unwrap();
-  let ListenerPlan::LlmApi(listener) = &listeners["api"] else {
-    panic!("expected LLM API listener");
+  let ListenerPlan::ForwardProxy(listener) = &listeners["api"] else {
+    panic!("expected forward-proxy listener");
   };
   assert_eq!(listener.http_bindings().len(), 3);
 }
@@ -308,7 +315,8 @@ fn preserves_legitimate_partial_http_matcher_overlap() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -330,8 +338,8 @@ methods = ["GET"]
   );
 
   let listeners = compile_config(&raw, Path::new("config.toml")).unwrap();
-  let ListenerPlan::LlmApi(listener) = &listeners["api"] else {
-    panic!("expected LLM API listener");
+  let ListenerPlan::ForwardProxy(listener) = &listeners["api"] else {
+    panic!("expected forward-proxy listener");
   };
   assert_eq!(listener.http_bindings().len(), 2);
 }
@@ -348,7 +356,8 @@ fn rejects_redundant_alternatives_inside_an_http_matcher() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = {{ kind = "reject" }}
@@ -371,7 +380,8 @@ fn rejects_root_path_prefix_as_an_unconstrained_matcher() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -427,7 +437,8 @@ fn allows_wildcard_and_apex_host_alternatives() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
 bind = "127.0.0.1:4141"
 client_auth = "none"
 default_http_action = { kind = "reject" }
@@ -570,7 +581,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "{bind}"
 client_auth = "none"
-default_http_action = {{ kind = "reject" }}
 "#
     ));
     assert!(matches!(
@@ -587,7 +597,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "0.0.0.0:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 "#,
   );
   assert!(matches!(
@@ -603,7 +612,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "0.0.0.0:4141"
 client_auth = "local_keys"
-default_http_action = { kind = "reject" }
 "#,
   );
   assert!(matches!(
@@ -624,7 +632,6 @@ kind = "llm_api"
 bind = "0.0.0.0:4141"
 client_auth = "local_keys"
 allow_insecure_public = true
-default_http_action = { kind = "reject" }
 "#,
   );
   compile_config(&acknowledged_public_listener, Path::new("config.toml")).unwrap();
@@ -637,7 +644,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 
 [listeners.proxy]
 kind = "forward_proxy"
@@ -801,7 +807,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 
 [[connect_rules]]
 id = "invalid"
@@ -817,7 +822,7 @@ ports = [443]
 }
 
 #[test]
-fn llm_bindings_reject_routes_that_need_an_original_destination() {
+fn llm_listeners_reject_proxy_http_bindings() {
   let raw = parse_config(
     r#"
 schema_version = 2
@@ -826,7 +831,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 
 [[bindings]]
 id = "transparent"

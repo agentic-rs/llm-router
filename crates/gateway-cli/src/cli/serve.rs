@@ -441,7 +441,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "{api_addr}"
 client_auth = "none"
-default_http_action = {{ kind = "reject" }}
 
 [listeners.proxy]
 kind = "forward_proxy"
@@ -471,7 +470,6 @@ max_wire_bytes = {max_wire_bytes}
 kind = "llm_api"
 bind = "{api_addr}"
 client_auth = "none"
-default_http_action = {{ kind = "reject" }}
 
 [listeners.proxy]
 kind = "forward_proxy"
@@ -997,7 +995,7 @@ default_connect = "{default_connect}"
       .unwrap();
     let mut api_response = Vec::new();
     api.read_to_end(&mut api_response).await.unwrap();
-    assert!(api_response.starts_with(b"HTTP/1.1 403 Forbidden"));
+    assert!(api_response.starts_with(b"HTTP/1.1 404 Not Found"));
 
     assert_connect_rejected(proxy_addr).await;
 

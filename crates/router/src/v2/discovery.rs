@@ -38,14 +38,6 @@ struct ProfileProvider {
   qualified_model_ids: bool,
 }
 
-#[derive(Default)]
-struct ScopedProvider {
-  bindings: BTreeMap<ProviderBindingKey, Arc<ProviderBinding>>,
-  plain_model_ids: bool,
-  qualified_model_ids: bool,
-  modes: BTreeSet<&'static str>,
-}
-
 impl DiscoveryRuntime {
   pub(super) fn new(
     plan: &GatewayPlan,
@@ -179,10 +171,10 @@ impl DiscoveryRuntime {
     })
   }
 
-  pub(super) fn providers(&self, profile_ids: &BTreeSet<ProfileId>, access: &AccessContext) -> Value {
-    let (modes, providers) = self.scope(profile_ids, access);
+  pub(super) fn providers(&self, profile_id: &ProfileId, access: &AccessContext) -> Result<Value, ApiError> {
+    let profile = self.profile(profile_id)?;
+    let providers = profile.allowed_providers(access);
     let data = providers
-      .iter()
       .filter_map(|(provider_id, provider)| {
         let metadata = self.metadata.get(provider_id)?;
         Some(json!({
@@ -194,26 +186,23 @@ impl DiscoveryRuntime {
           "upstream_url": metadata.upstream_url,
           "accounts": provider.bindings.len(),
           "endpoints": metadata.endpoints,
-          "route_modes": provider.modes,
+          "route_modes": [profile.mode],
         }))
       })
       .collect::<Vec<_>>();
-    list_response(modes, data)
+    Ok(list_response(profile.mode, data))
   }
 
-  pub(super) async fn models(
-    &self,
-    profile_ids: &BTreeSet<ProfileId>,
-    access: &AccessContext,
-  ) -> Result<Value, ApiError> {
-    let (modes, providers) = self.scope(profile_ids, access);
+  pub(super) async fn models(&self, profile_id: &ProfileId, access: &AccessContext) -> Result<Value, ApiError> {
+    let profile = self.profile(profile_id)?;
+    let providers = profile.allowed_providers(access);
     let mut data = Vec::new();
     let mut seen = HashSet::new();
     let mut queried_account = false;
     let mut last_error = None;
 
     for (provider_id, provider) in providers {
-      let Some(metadata) = self.metadata.get(&provider_id) else {
+      let Some(metadata) = self.metadata.get(provider_id) else {
         continue;
       };
       let mut provider_models = Vec::new();
@@ -254,7 +243,7 @@ impl DiscoveryRuntime {
         &mut data,
         &mut seen,
         provider_models,
-        &provider_id,
+        provider_id,
         metadata,
         provider.plain_model_ids,
         provider.qualified_model_ids,
@@ -267,38 +256,26 @@ impl DiscoveryRuntime {
         last_error.unwrap_or_else(|| "no models available".into()),
       ));
     }
-    Ok(list_response(modes, data))
+    Ok(list_response(profile.mode, data))
   }
 
-  fn scope(
-    &self,
-    profile_ids: &BTreeSet<ProfileId>,
-    access: &AccessContext,
-  ) -> (BTreeSet<&'static str>, BTreeMap<ProviderId, ScopedProvider>) {
-    let mut modes = BTreeSet::new();
-    let mut providers = BTreeMap::<ProviderId, ScopedProvider>::new();
-    for profile_id in profile_ids {
-      let Some(profile) = self.profiles.get(profile_id) else {
-        continue;
-      };
-      modes.insert(profile.mode);
-      for (provider_id, source) in &profile.providers {
-        if !access.providers.allows(provider_id.as_str()) {
-          continue;
-        }
-        let target = providers.entry(provider_id.clone()).or_default();
-        target.plain_model_ids |= source.plain_model_ids;
-        target.qualified_model_ids |= source.qualified_model_ids;
-        target.modes.insert(profile.mode);
-        target.bindings.extend(
-          source
-            .bindings
-            .iter()
-            .map(|(key, binding)| (key.clone(), binding.clone())),
-        );
-      }
-    }
-    (modes, providers)
+  fn profile(&self, id: &ProfileId) -> Result<&ProfileDiscovery, ApiError> {
+    self
+      .profiles
+      .get(id)
+      .ok_or_else(|| ApiError::internal("API mount references a missing discovery profile"))
+  }
+}
+
+impl ProfileDiscovery {
+  fn allowed_providers<'a>(
+    &'a self,
+    access: &'a AccessContext,
+  ) -> impl Iterator<Item = (&'a ProviderId, &'a ProfileProvider)> {
+    self
+      .providers
+      .iter()
+      .filter(|(id, _)| access.providers.allows(id.as_str()))
   }
 }
 
@@ -431,16 +408,11 @@ fn enrich(
   }
 }
 
-fn list_response(modes: BTreeSet<&'static str>, data: Vec<Value>) -> Value {
-  let route_mode = match modes.len() {
-    0 => "none",
-    1 => modes.first().copied().expect("one route mode"),
-    _ => "mixed",
-  };
+fn list_response(mode: &str, data: Vec<Value>) -> Value {
   json!({
     "object": "list",
-    "route_mode": route_mode,
-    "route_modes": modes,
+    "route_mode": mode,
+    "route_modes": [mode],
     "data": data,
   })
 }

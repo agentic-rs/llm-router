@@ -64,11 +64,24 @@ fn multiline_arrays_use_two_spaces_in_both_output_modes() {
   let mut raw = native_config();
   raw.service.outbound =
     toml::from_str("proxy_url = 'http://127.0.0.1:7890'\nno_proxy = ['localhost', 'example.com']").unwrap();
+  raw.listeners.insert(
+    "proxy".into(),
+    toml::from_str(
+      r#"
+kind = "forward_proxy"
+bind = "127.0.0.1:4142"
+client_auth = "none"
+default_connect = "reject"
+default_http_action = { kind = "reject" }
+"#,
+    )
+    .unwrap(),
+  );
   raw.bindings.push(
     toml::from_str(
       r#"
 id = "multi-host"
-listener = "api"
+listener = "proxy"
 hosts = ["api.example.com", "other.example.com"]
 action = { kind = "route", profile = "default" }
 "#,
@@ -194,7 +207,7 @@ prune_after_days = 3
 fn pool_ttl_cooldown_and_retention_are_preserved_including_zero() {
   for (ttl, retention) in [(1800, 5400), (0, 0)] {
     let mut raw = native_config();
-    let pool = raw.account_pools.get_mut("default").unwrap();
+    let pool = raw.profiles.get_mut("default").unwrap().account_pool.as_mut().unwrap();
     pool.session_ttl_secs = ttl;
     pool.session_expired_retention_secs = retention;
     pool.failure_cooldown_secs = 19;
@@ -303,8 +316,8 @@ fn projection_modes_profiles_and_proxy_order_round_trip() {
       assert_eq!(decoded.bindings, raw.bindings);
       assert_eq!(decoded.connect_rules, raw.connect_rules);
       assert_eq!(
-        decoded.account_pools.keys().collect::<Vec<_>>(),
-        raw.account_pools.keys().collect::<Vec<_>>()
+        decoded.profiles.keys().collect::<Vec<_>>(),
+        raw.profiles.keys().collect::<Vec<_>>()
       );
     }
   }

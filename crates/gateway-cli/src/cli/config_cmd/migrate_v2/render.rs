@@ -7,8 +7,8 @@
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use tokn_config::v2::{
-  RawAccountPool, RawBindingAction, RawConfig, RawCors, RawListener, RawProvider, RawRoute, RawRouteRetry, RawService,
-  RawWireIdentity, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
+  RawAccountPool, RawConfig, RawCors, RawListener, RawProvider, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
+  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
 };
 use toml_edit::visit_mut::{self, VisitMut};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
@@ -41,12 +41,8 @@ fn compact(document: &mut DocumentMut, raw: &RawConfig) -> Result<()> {
       RawListener::LlmApi {
         cors,
         allow_insecure_public,
-        default_http_action,
         ..
       } => {
-        if matches!(default_http_action, RawBindingAction::Reject {}) {
-          table.remove("default_http_action");
-        }
         if !allow_insecure_public {
           table.remove("allow_insecure_public");
         }
@@ -98,10 +94,6 @@ fn compact(document: &mut DocumentMut, raw: &RawConfig) -> Result<()> {
     inline_small_fields(table, &["provider", "model", "destination", "credentials", "retry"]);
   }
 
-  let pool_defaults = RawAccountPool::default();
-  for (id, pool) in &raw.account_pools {
-    omit_defaults(table_at(document, &["account_pools", id])?, pool, &pool_defaults)?;
-  }
   // RawProvider has no Default impl. Decode its serde defaults rather than
   // copying provider flags into the presentation layer.
   let provider_defaults: RawProvider = toml::from_str("").context("read provider schema defaults")?;

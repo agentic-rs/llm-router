@@ -22,42 +22,16 @@ pub(super) fn compile_profiles(
       target_kind: "route",
       target: profile.route.clone(),
     })?;
-    let raw_route = &raw.routes[&profile.route];
-    let legacy_pool = raw_route.legacy_account_pool();
-    let native = profile.account_pool.is_some()
-      || profile.binding.is_some()
-      || (raw_route.uses_accounts() && legacy_pool.is_none());
-    if profile.account_pool.is_some() && legacy_pool.is_some() {
-      return Err(invalid_value(
-        format!("profiles.{name}.account_pool"),
-        "the route also specifies an account pool; remove the legacy route-owned pool reference",
-      ));
-    }
     let identity = compile_wire_identity(name, &profile.wire_identity, route)?;
     let mut plan = ProfilePlan::new(route_id, identity);
     if route.credential_policy() == CredentialPolicy::Account {
-      let pool_id = if native {
-        let pool_id = parse_id::<AccountPoolId>("profile account pool", &format!("profile.{name}"))?;
-        if pools.contains_key(&pool_id) {
-          return Err(invalid_value(
-            format!("profiles.{name}.account_pool"),
-            format!("generated pool `{pool_id}` conflicts with an explicit account pool"),
-          ));
-        }
-        let pool = match (profile.account_pool.as_ref(), legacy_pool) {
-          (Some(pool), _) => compile_owned_pool(name, &pool_id, pool, providers)?,
-          (None, Some(legacy)) => pools[&parse_id::<AccountPoolId>("legacy account pool", legacy)?].clone(),
-          (None, None) => compile_owned_pool(name, &pool_id, &RawAccountPool::default(), providers)?,
-        };
-        pools.insert(pool_id.clone(), pool);
-        pool_id
-      } else {
-        parse_id::<AccountPoolId>(
-          "profile account pool",
-          legacy_pool.expect("legacy account route has a pool"),
-        )?
-      };
-      validate_profile_pool(name, route, &pool_id, pools, providers)?;
+      let pool_id = parse_id::<AccountPoolId>("profile account pool", &format!("profile.{name}"))?;
+      let pool = compile_account_pool(
+        name,
+        profile.account_pool.as_ref().unwrap_or(&RawAccountPool::default()),
+      )?;
+      pools.insert(pool_id.clone(), pool);
+      validate_profile_providers(name, route, providers)?;
       plan = plan.with_account_pool(pool_id);
     } else if profile.account_pool.is_some() {
       return Err(invalid_value(
@@ -66,60 +40,34 @@ pub(super) fn compile_profiles(
       ));
     }
 
-    if native {
-      if route.destination_policy() == DestinationPolicy::Original {
-        if profile.binding.is_some() {
-          return Err(invalid_value(
-            format!("profiles.{name}.binding"),
-            "an original-destination relay is proxy-only and cannot have an API binding",
-          ));
-        }
-      } else {
-        let binding = compile_binding(name, profile.binding.as_ref())?;
-        if let Some(first) = mounts.insert(binding.path().to_string(), name.clone()) {
-          return Err(invalid_value(
-            format!("profiles.{name}.binding.path"),
-            format!("API path `{}` is already owned by profile `{first}`", binding.path()),
-          ));
-        }
-        plan = plan.with_api_binding(binding);
+    if route.destination_policy() == DestinationPolicy::Original {
+      if profile.binding.is_some() {
+        return Err(invalid_value(
+          format!("profiles.{name}.binding"),
+          "an original-destination relay is proxy-only and cannot have an API binding",
+        ));
       }
+    } else {
+      let binding = compile_binding(name, profile.binding.as_ref())?;
+      if let Some(first) = mounts.insert(binding.path().to_string(), name.clone()) {
+        return Err(invalid_value(
+          format!("profiles.{name}.binding.path"),
+          format!("API path `{}` is already owned by profile `{first}`", binding.path()),
+        ));
+      }
+      plan = plan.with_api_binding(binding);
     }
     profiles.insert(id, plan);
   }
   Ok(profiles)
 }
 
-fn compile_owned_pool(
-  profile: &str,
-  id: &AccountPoolId,
-  raw: &RawAccountPool,
-  providers: &BTreeMap<ProviderId, ProviderPlan>,
-) -> Result<AccountPoolPlan, CompileError> {
-  let generated = format!("account_pools.{id}.");
-  let pools =
-    compile_account_pools(&BTreeMap::from([(id.to_string(), raw.clone())]), providers).map_err(
-      |error| match error {
-        CompileError::InvalidValue { location, message } if location.starts_with(&generated) => invalid_value(
-          format!("profiles.{profile}.account_pool.{}", &location[generated.len()..]),
-          message,
-        ),
-        error => error,
-      },
-    )?;
-  Ok(pools.into_values().next().expect("one compiled profile pool"))
-}
-
-fn validate_profile_pool(
+fn validate_profile_providers(
   name: &str,
   route: &RoutePlan,
-  pool_id: &AccountPoolId,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
   providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<(), CompileError> {
-  let selector = pools[pool_id].selector();
-  let compatible =
-    |id: &ProviderId| route.allows_provider(id) && selector.providers().is_none_or(|allowed| allowed.contains(id));
+  let compatible = |id: &ProviderId| route.allows_provider(id);
   let viable = match route {
     RoutePlan::Managed(managed) => match managed.target().provider() {
       ProviderSelector::Any => providers.keys().any(compatible),
@@ -133,7 +81,7 @@ fn validate_profile_pool(
   if !viable {
     return Err(invalid_value(
       format!("profiles.{name}.route"),
-      "route provider restrictions have no overlap with the profile account pool",
+      "route provider restrictions allow no configured provider",
     ));
   }
   if route.destination_policy() == DestinationPolicy::Original {
@@ -142,7 +90,7 @@ fn validate_profile_pool(
       .filter(|(id, _)| compatible(id))
       .map(|(id, provider)| (id.clone(), provider.clone()))
       .collect();
-    ensure_origin_relay_viable(name, pool_id, pools, &allowed)?;
+    ensure_origin_relay_viable(name, &allowed)?;
   }
   Ok(())
 }

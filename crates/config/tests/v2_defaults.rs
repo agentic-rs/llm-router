@@ -8,7 +8,6 @@ const LISTENER: &str = r#"
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 "#;
 
 const EXPLICIT_POLICY: &str = r#"
@@ -64,7 +63,6 @@ fn empty_defaults_are_an_opt_in_equivalent_managed_policy() {
   assert_eq!(raw.defaults, Some(RawDefaultPolicy::default()));
   assert!(raw.profiles.is_empty());
   assert!(raw.routes.is_empty());
-  assert!(raw.account_pools.is_empty());
   let plan = v2::parse(&config, source()).unwrap();
   let RoutePlan::Managed(route) = &plan.routes()["default"] else {
     panic!("managed default route");
@@ -87,15 +85,14 @@ fn omitting_defaults_preserves_the_explicit_schema_and_serialization() {
   ] {
     assert!(v2::decode(&config.replace(required, ""), source()).is_err());
   }
-  assert!(matches!(
-    *compile_error(&format!("schema_version = 2\n{LISTENER}")),
-    CompileError::UnresolvedReference { .. }
-  ));
+  let empty = v2::parse(&format!("schema_version = 2\n{LISTENER}"), source()).unwrap();
+  assert!(empty.profiles().is_empty());
 }
 
 #[test]
 fn customized_defaults_match_explicit_resources_and_service_settings() {
   let settings = r#"
+providers = ["openai"]
 provider = { kind = "fixed", provider = "openai" }
 model = { kind = "qualified", namespace = "provider" }
 operation = "preserve"
@@ -104,7 +101,6 @@ retry = { kind = "recoverable", policy = "standard" }
 
 [defaults.account_pool]
 accounts = ["work", "personal"]
-providers = ["openai"]
 session_ttl_secs = 1800
 session_expired_retention_secs = 5400
 failure_cooldown_secs = 19
@@ -116,6 +112,7 @@ wire_identity = "none"
 
 [routes.default]
 kind = "managed"
+providers = ["openai"]
 provider = { kind = "fixed", provider = "openai" }
 model = { kind = "qualified", namespace = "provider" }
 operation = "preserve"
@@ -123,7 +120,6 @@ retry = { kind = "recoverable", policy = "standard" }
 
 [profiles.default.account_pool]
 accounts = ["work", "personal"]
-providers = ["openai"]
 session_ttl_secs = 1800
 session_expired_retention_secs = 5400
 failure_cooldown_secs = 19
@@ -164,7 +160,6 @@ fn shorthand_rejects_each_conflicting_resource_instead_of_overriding_it() {
   for declaration in [
     "[profiles.default]\nroute = 'other'",
     "[routes.default]\nkind = 'relay'\ndestination = { kind = 'original' }\ncredentials = { kind = 'client' }",
-    "[account_pools.default]",
   ] {
     let error = compile_error(&format!("{}\n{declaration}", shorthand("")));
     assert!(matches!(
@@ -234,11 +229,6 @@ fn defaults_do_not_create_listeners_or_relax_public_listener_authentication() {
   );
   assert!(v2::parse(&authenticated, source()).is_ok());
   assert!(v2::decode(&shorthand("").replace("client_auth = \"none\"", ""), source()).is_err());
-  assert!(v2::decode(
-    &shorthand("").replace("default_http_action = { kind = \"route\", profile = \"default\" }", ""),
-    source()
-  )
-  .is_ok());
 }
 
 #[test]
@@ -282,7 +272,7 @@ action = "tunnel"
     panic!("proxy listener");
   };
   assert_eq!(proxy.default_connect_action(), ConnectAction::Reject);
-  assert_eq!(plan.listeners()["proxy"].default_http_action(), &HttpAction::Reject);
+  assert_eq!(proxy.default_http_action(), &HttpAction::Reject);
   let missing_connect = short.replace("default_connect = \"reject\"", "");
   assert!(v2::decode(&missing_connect, source()).is_err());
 }
@@ -295,7 +285,7 @@ fn invalid_default_settings_pass_through_existing_semantic_validation() {
     "provider = { kind = 'fixed', provider = 'unknown' }",
     "model = { kind = 'family', families = { coding = [] } }",
     "[defaults.account_pool]\naccounts = []",
-    "[defaults.account_pool]\nproviders = ['*', 'openai']",
+    "providers = ['*', 'openai']",
     "[defaults.account_pool]\nsession_ttl_secs = 0\nsession_expired_retention_secs = 1",
     "[defaults.account_pool]\nfailure_cooldown_secs = 86401",
   ] {
@@ -329,12 +319,12 @@ fn invalid_values_point_to_authored_default_keys_without_changing_other_errors()
   }
   for id in ["other", "default.other"] {
     let other = format!(
-      "{}\n[account_pools.\"{id}\"]\nfailure_cooldown_secs = 86401",
+      "{}\n[profiles.\"{id}\"]\nroute = 'default'\n[profiles.\"{id}\".account_pool]\nfailure_cooldown_secs = 86401",
       shorthand("")
     );
     assert!(matches!(
       *compile_error(&other),
-      CompileError::InvalidValue { location, .. } if location == format!("account_pools.{id}.failure_cooldown_secs")
+      CompileError::InvalidValue { location, .. } if location == format!("profiles.{id}.account_pool.failure_cooldown_secs")
     ));
   }
   let explicit_invalid = explicit(EXPLICIT_POLICY).replace(

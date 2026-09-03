@@ -626,21 +626,19 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = {{ kind = "route", profile = "default" }}
 
 [profiles.default]
 route = "default"
 
+[profiles.default.account_pool]
+accounts = ["*"]
+
 [routes.default]
 kind = "managed"
-account_pool = "default"
+providers = ["*"]
 provider = {{ kind = "any" }}
 model = {model}
 operation = "translate_compatible"
-
-[account_pools.default]
-accounts = ["*"]
-providers = ["*"]
 
 [providers.local]
 driver = "openai"

@@ -12,7 +12,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = {{ kind = "route", profile = "default" }}
 [listeners.second]
 kind = "llm_api"
 bind = "127.0.0.1:4142"
@@ -104,10 +103,49 @@ async fn mounts_are_global_disabled_endpoints_never_fall_through_and_discovery_s
         .oneshot(Request::post(path).body(Body::from("{}")).unwrap())
         .await
         .unwrap();
-      assert!(
-        matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::FORBIDDEN),
-        "{path}"
-      );
+      assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+  }
+}
+
+#[tokio::test]
+async fn default_named_and_custom_mounts_share_http_method_and_head_semantics() {
+  for mount in ["/work/v1", "/teams/work/api"] {
+    let app = router(
+      states(mount, "[\"chat_completions\", \"responses\", \"messages\"]")
+        .llm_api
+        .remove(0),
+    );
+    for base in ["/v1", mount] {
+      for suffix in ["chat/completions", "responses", "messages"] {
+        let response = app
+          .clone()
+          .oneshot(Request::get(format!("{base}/{suffix}")).body(Body::empty()).unwrap())
+          .await
+          .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[axum::http::header::ALLOW], "POST");
+      }
+      for suffix in ["models", "providers"] {
+        let path = format!("{base}/{suffix}");
+        let get = app
+          .clone()
+          .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+          .await
+          .unwrap();
+        let head = app
+          .clone()
+          .oneshot(Request::head(&path).body(Body::empty()).unwrap())
+          .await
+          .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(head.status(), get.status());
+        for header in [axum::http::header::CONTENT_TYPE, axum::http::header::CONTENT_LENGTH] {
+          assert_eq!(head.headers()[&header], get.headers()[&header], "{path}: {header}");
+        }
+        assert!(!to_bytes(get.into_body(), usize::MAX).await.unwrap().is_empty());
+        assert!(to_bytes(head.into_body(), usize::MAX).await.unwrap().is_empty());
+      }
     }
   }
 }

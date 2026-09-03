@@ -25,7 +25,7 @@ fn compile_gateway(raw: &RawConfig, source: &Path) -> Result<GatewayPlan, Compil
   }
 
   let resources = resources::compile_resources(raw)?;
-  let listeners = listeners::compile_listeners(raw, source, &resources.profiles, &resources.routes)?;
+  let listeners = listeners::compile_listeners(raw, source, &resources.profiles)?;
 
   Ok(GatewayPlan::new(
     listeners,

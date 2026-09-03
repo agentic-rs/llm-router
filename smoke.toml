@@ -25,23 +25,8 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
-[profiles.default]
-route = "default"
-wire_identity = "auto"
-
-[routes.default]
-kind = "managed"
-account_pool = "default"
-provider = { kind = "any" }
-model = { kind = "capability" }
-operation = "translate_compatible"
-
-[account_pools.default]
-accounts = ["*"]
-providers = ["*"]
-strategy = "round_robin"
+[defaults]
 
 # Official providers are available automatically. Override one only to change
 # its destination or disable it, for example:

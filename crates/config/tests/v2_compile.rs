@@ -3,7 +3,7 @@ use tokn_config::v2::{
   compile, decode, load, parse, parse_config, CompileError, Error, DEFAULT_ARCHIVE_AFTER_DAYS, DEFAULT_BODY_MAX_BYTES,
   DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, DEFAULT_PRUNE_AFTER_DAYS, DEFAULT_WRITE_QUEUE_CAPACITY,
 };
-use tokn_policy::{ConnectAction, HttpAction, ListenerPlan, ManagedRetry, RetryPolicyId, RouteKind, RoutePlan};
+use tokn_policy::{ConnectAction, ListenerPlan, ManagedRetry, RetryPolicyId, RouteKind, RoutePlan};
 
 const MINIMAL_MANAGED: &str = r#"
 schema_version = 2
@@ -12,21 +12,19 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
 [profiles.default]
 route = "default"
 
+[profiles.default.account_pool]
+accounts = ["*"]
+
 [routes.default]
 kind = "managed"
-account_pool = "default"
+providers = ["*"]
 provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "translate_compatible"
-
-[account_pools.default]
-accounts = ["*"]
-providers = ["*"]
 
 [providers.default]
 driver = "openai"
@@ -45,10 +43,7 @@ fn minimal_managed_llm_listener_compiles() {
 
   let listener = plan.listeners().get("api").unwrap();
   assert!(matches!(listener, ListenerPlan::LlmApi(_)));
-  assert!(matches!(
-    listener.default_http_action(),
-    HttpAction::Route(profile) if profile.as_str() == "default"
-  ));
+  assert_eq!(plan.profiles()["default"].api_binding().unwrap().path(), "/v1");
   assert_eq!(plan.routes().get("default").unwrap().kind(), RouteKind::Managed);
   assert_eq!(plan.account_pools().len(), 1);
 }
@@ -114,16 +109,26 @@ fn session_ttl_defaults_and_explicit_values_survive_native_round_trip() {
   let mut raw = decode(MINIMAL_MANAGED, source).unwrap();
   let legacy = tokn_config::PoolConfig::default();
   assert_eq!(legacy.session_ttl_secs, 18_000);
-  assert_eq!(raw.account_pools["default"].session_ttl_secs, legacy.session_ttl_secs);
-  assert_eq!(raw.account_pools["default"].session_expired_retention_secs, 0);
+  assert_eq!(
+    raw.profiles["default"].account_pool.as_ref().unwrap().session_ttl_secs,
+    legacy.session_ttl_secs
+  );
+  assert_eq!(
+    raw.profiles["default"]
+      .account_pool
+      .as_ref()
+      .unwrap()
+      .session_expired_retention_secs,
+    0
+  );
 
   for (ttl, retention) in [(0, 0), (1, 0), (1800, 5400), (18_000, 0)] {
-    let pool = raw.account_pools.get_mut("default").unwrap();
+    let pool = raw.profiles.get_mut("default").unwrap().account_pool.as_mut().unwrap();
     pool.session_ttl_secs = ttl;
     pool.session_expired_retention_secs = retention;
     let rendered = toml::to_string_pretty(&raw).unwrap();
     let compiled = parse_config(&rendered, source).unwrap();
-    let affinity = compiled.gateway().account_pools()["default"].session_affinity();
+    let affinity = compiled.gateway().account_pools()["profile.default"].session_affinity();
     if ttl == 0 {
       assert!(affinity.is_none());
     } else {
@@ -133,13 +138,13 @@ fn session_ttl_defaults_and_explicit_values_survive_native_round_trip() {
     }
   }
 
-  let pool = raw.account_pools.get_mut("default").unwrap();
+  let pool = raw.profiles.get_mut("default").unwrap().account_pool.as_mut().unwrap();
   pool.session_ttl_secs = 0;
   pool.session_expired_retention_secs = 1;
   assert!(matches!(
     *unwrap_compile_error(compile(&raw, source).unwrap_err()),
     CompileError::InvalidValue { location, .. }
-      if location == "account_pools.default.session_expired_retention_secs"
+      if location == "profiles.default.account_pool.session_expired_retention_secs"
   ));
 }
 
@@ -342,10 +347,11 @@ fn compile_reports_unresolved_profile_references() {
 schema_version = 2
 
 [listeners.api]
-kind = "llm_api"
+kind = "forward_proxy"
+default_connect = "reject"
+default_http_action = { kind = "route", profile = "missing" }
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "missing" }
 "#,
     source,
   )
@@ -396,7 +402,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "0.0.0.0:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 "#,
       Path::new("config.toml"),
     )
@@ -451,9 +456,12 @@ hosts = ["*.internal.example"]
 }
 
 #[test]
-fn llm_listener_rejects_routes_that_need_an_original_destination() {
+fn original_destination_profiles_are_proxy_only_and_reject_api_mounts() {
   for config in [client_origin_relay_llm_config(), account_origin_relay_llm_config()] {
-    let error = unwrap_compile_error(parse(&config, Path::new("config.toml")).unwrap_err());
+    let plan = parse(&config, Path::new("config.toml")).unwrap();
+    assert!(plan.profiles()["default"].api_binding().is_none());
+    let exposed = config.replace("[profiles.default]", "[profiles.default]\nbinding = {}");
+    let error = unwrap_compile_error(parse(&exposed, Path::new("config.toml")).unwrap_err());
     assert!(matches!(*error, CompileError::InvalidValue { .. }));
   }
 }
@@ -466,7 +474,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
 [profiles.default]
 route = "default"
@@ -487,18 +494,17 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
 [profiles.default]
 route = "default"
 
+[profiles.default.account_pool]
+
 [routes.default]
 kind = "relay"
-destination = { kind = "original" }
-credentials = { kind = "account_pool", account_pool = "default" }
-
-[account_pools.default]
 providers = ["openai"]
+destination = { kind = "original" }
+credentials = { kind = "account_pool" }
 
 [providers.openai]
 driver = "openai"

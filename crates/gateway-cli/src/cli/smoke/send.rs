@@ -222,9 +222,8 @@ fn request_path(plan: &tokn_policy::GatewayPlan, requested: Option<&str>, endpoi
         .strip_prefix("/v1")
         .expect("built-in API prefix")
     )),
-    None if requested.is_none() => Ok(endpoint_path(endpoint).into()),
     None if profile.is_none() => anyhow::bail!("unknown profile '{id}'"),
-    None => anyhow::bail!("profile '{id}' has no profile-owned API mount; it uses legacy bindings or is proxy-only"),
+    None => anyhow::bail!("profile '{id}' is proxy-only and has no API mount"),
   }
 }
 
@@ -664,7 +663,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn smoke_uses_custom_profile_mounts_and_preserves_the_legacy_default_path() {
+  fn smoke_uses_only_profile_mounts_and_rejects_missing_or_proxy_only_profiles() {
     let config = r#"
 schema_version = 2
 [defaults]
@@ -687,16 +686,44 @@ binding = { path = "/custom/work" }
       "/custom/work/messages"
     );
     assert!(request_path(&plan, Some("missing"), Endpoint::Responses).is_err());
-    let legacy = tokn_config::v2::parse(
+    let explicit = tokn_config::v2::parse(
       include_str!("../config_cmd/fixtures/explicit_v2.toml"),
       std::path::Path::new("smoke.toml"),
     )
     .unwrap();
     assert_eq!(
-      request_path(&legacy, None, Endpoint::Responses).unwrap(),
+      request_path(&explicit, None, Endpoint::Responses).unwrap(),
       "/v1/responses"
     );
-    assert!(request_path(&legacy, Some("default"), Endpoint::Responses).is_err());
+    assert_eq!(
+      request_path(&explicit, Some("default"), Endpoint::Responses).unwrap(),
+      "/v1/responses"
+    );
+    let proxy_only = tokn_config::v2::parse(
+      r#"
+schema_version = 2
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+[profiles.work]
+route = "relay"
+[routes.relay]
+kind = "relay"
+destination = { kind = "original" }
+credentials = { kind = "client" }
+"#,
+      std::path::Path::new("smoke.toml"),
+    )
+    .unwrap();
+    assert!(request_path(&proxy_only, None, Endpoint::Responses)
+      .unwrap_err()
+      .to_string()
+      .contains("unknown profile"));
+    assert!(request_path(&proxy_only, Some("work"), Endpoint::Responses)
+      .unwrap_err()
+      .to_string()
+      .contains("proxy-only"));
   }
 
   #[test]

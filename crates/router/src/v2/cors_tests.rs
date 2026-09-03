@@ -23,11 +23,13 @@ fn plan(settings: &str) -> GatewayPlan {
     &format!(
       r#"
 schema_version = 2
+[defaults]
+[profiles.work]
+route = "default"
 [listeners.api]
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "local_keys"
-default_http_action = {{ kind = "reject" }}
 [listeners.api.cors]
 {settings}
 "#
@@ -106,15 +108,15 @@ async fn actual_requests_keep_authentication_and_cors_headers_on_errors() {
   for (auth, expected) in [
     (None, StatusCode::UNAUTHORIZED),
     (Some("invalid"), StatusCode::UNAUTHORIZED),
-    (Some(token.as_str()), StatusCode::BAD_REQUEST),
+    (Some(token.as_str()), StatusCode::OK),
   ] {
     let mut request = Request::get("/v1/models").header(header::ORIGIN, ORIGIN);
     if let Some(auth) = auth {
       request = request.header(header::AUTHORIZATION, format!("Bearer {auth}"));
     }
     let response = app.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
-    // A valid key reaches discovery's missing-profile error; CORS does not
-    // grant routing access or bypass client authentication.
+    // A valid key reaches the mounted profile's discovery endpoint; CORS
+    // does not bypass client authentication.
     assert_eq!(response.status(), expected);
     assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], ORIGIN);
     assert_eq!(
@@ -134,19 +136,18 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = {{ kind = "route", profile = "default" }}
 cors = {{ enabled = true, allowed_origins = [{ORIGIN:?}] }}
 [profiles.default]
 route = "default"
+
+[profiles.default.account_pool]
+accounts = ["*"]
 [routes.default]
 kind = "managed"
-account_pool = "default"
+providers = ["*"]
 provider = {{ kind = "any" }}
 model = {{ kind = "capability" }}
 operation = "translate_compatible"
-[account_pools.default]
-accounts = ["*"]
-providers = ["*"]
 "#
   );
   let plan = tokn_config::v2::parse(&source, Path::new("cors.toml")).unwrap();
@@ -327,17 +328,16 @@ async fn cors_permissions_are_isolated_between_api_listeners() {
   let source = format!(
     r#"
 schema_version = 2
+[defaults]
 [listeners.first]
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = {{ kind = "reject" }}
 cors = {{ enabled = true, allowed_origins = [{ORIGIN:?}] }}
 [listeners.second]
 kind = "llm_api"
 bind = "127.0.0.1:4142"
 client_auth = "none"
-default_http_action = {{ kind = "reject" }}
 "#
   );
   let plan = tokn_config::v2::parse(&source, Path::new("cors.toml")).unwrap();
