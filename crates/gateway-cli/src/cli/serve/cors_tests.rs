@@ -17,11 +17,11 @@ fn write_config(path: &Path, legacy: bool, cors: &tokn_config::CorsConfig) {
     let mut raw = tokn_config::v2::decode(
       r#"
 schema_version = 2
+[defaults]
 [listeners.api]
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 "#,
       path,
     )

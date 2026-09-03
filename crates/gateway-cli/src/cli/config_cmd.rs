@@ -758,7 +758,6 @@ max_decoded_bytes = 2048
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 "#,
     )
     .unwrap();
@@ -945,7 +944,6 @@ default_http_action = { kind = "reject" }
     assert!(raw.defaults.is_some());
     assert!(raw.profiles.is_empty());
     assert!(raw.routes.is_empty());
-    assert!(raw.account_pools.is_empty());
     assert!(raw.bindings.is_empty());
     assert!(raw.connect_rules.is_empty());
     assert!(raw.providers.is_empty());

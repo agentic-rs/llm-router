@@ -131,21 +131,6 @@ impl ListenerPlan {
       Self::ForwardProxy(listener) => listener.client_auth(),
     }
   }
-
-  /// HTTP match rules in evaluation order. The first matching rule wins.
-  pub fn http_bindings(&self) -> &[HttpBindingPlan] {
-    match self {
-      Self::LlmApi(listener) => listener.http_bindings(),
-      Self::ForwardProxy(listener) => listener.http_bindings(),
-    }
-  }
-
-  pub fn default_http_action(&self) -> &HttpAction {
-    match self {
-      Self::LlmApi(listener) => listener.default_http_action(),
-      Self::ForwardProxy(listener) => listener.default_http_action(),
-    }
-  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,23 +138,14 @@ pub struct LlmApiListenerPlan {
   bind: SocketAddr,
   client_auth: ClientAuthPlan,
   cors: crate::CorsPlan,
-  http_bindings: Box<[HttpBindingPlan]>,
-  default_http_action: HttpAction,
 }
 
 impl LlmApiListenerPlan {
-  pub fn new(
-    bind: SocketAddr,
-    client_auth: ClientAuthPlan,
-    http_bindings: Box<[HttpBindingPlan]>,
-    default_http_action: HttpAction,
-  ) -> Self {
+  pub fn new(bind: SocketAddr, client_auth: ClientAuthPlan) -> Self {
     Self {
       bind,
       client_auth,
       cors: crate::CorsPlan::default(),
-      http_bindings,
-      default_http_action,
     }
   }
 
@@ -190,14 +166,6 @@ impl LlmApiListenerPlan {
   /// CORS is disabled unless explicitly configured.
   pub fn cors(&self) -> &crate::CorsPlan {
     &self.cors
-  }
-
-  pub fn http_bindings(&self) -> &[HttpBindingPlan] {
-    &self.http_bindings
-  }
-
-  pub fn default_http_action(&self) -> &HttpAction {
-    &self.default_http_action
   }
 }
 
@@ -789,13 +757,13 @@ mod tests {
     ));
 
     assert_eq!(listener.kind(), ListenerKind::ForwardProxy);
-    assert_eq!(listener.http_bindings()[0].id().as_str(), "specific");
-    assert_eq!(listener.http_bindings()[1].id().as_str(), "wildcard");
-    assert_eq!(listener.default_http_action(), &HttpAction::Reject);
 
     let ListenerPlan::ForwardProxy(proxy) = listener else {
       panic!("expected forward-proxy listener");
     };
+    assert_eq!(proxy.http_bindings()[0].id().as_str(), "specific");
+    assert_eq!(proxy.http_bindings()[1].id().as_str(), "wildcard");
+    assert_eq!(proxy.default_http_action(), &HttpAction::Reject);
     assert_eq!(proxy.connect_rules()[0].id().as_str(), "tunnel-internal");
     assert_eq!(proxy.connect_rules()[0].action(), ConnectAction::Tunnel);
     assert_eq!(proxy.connect_rules()[1].id().as_str(), "intercept-public");
@@ -914,8 +882,6 @@ mod tests {
     let listener = ListenerPlan::LlmApi(LlmApiListenerPlan::new(
       "127.0.0.1:3000".parse().unwrap(),
       ClientAuthPlan::None,
-      Vec::new().into_boxed_slice(),
-      HttpAction::Route(profile_id.clone()),
     ));
     let profile = ProfilePlan::new(route_id.clone(), WireIdentity::ProviderDefault).with_account_pool(pool_id.clone());
     let route = RoutePlan::Managed(ManagedRoute::new(

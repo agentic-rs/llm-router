@@ -807,21 +807,20 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "coding" }
 
 [profiles.coding]
 route = "managed"
+binding = { path = "/v1" }
+
+[profiles.coding.account_pool]
+accounts = ["primary"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["company-openai"]
 provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "preserve"
-
-[account_pools.primary]
-accounts = ["primary"]
-providers = ["company-openai"]
 
 [providers.company-openai]
 driver = "openai"
@@ -893,7 +892,7 @@ base_url = "https://llm.example.test/v1"
       &mut store,
       ListArgs {
         view: AccountViewArgs {
-          pool: Some("primary".into()),
+          pool: Some("profile.coding".into()),
           profile: None,
         },
         no_quota: true,
@@ -920,7 +919,7 @@ base_url = "https://llm.example.test/v1"
       ShowArgs {
         id: "secondary".into(),
         view: AccountViewArgs {
-          pool: Some("primary".into()),
+          pool: Some("profile.coding".into()),
           profile: None,
         },
       },
@@ -1099,7 +1098,7 @@ base_url = "https://llm.example.test/v1"
       StatusArgs {
         id: None,
         view: AccountViewArgs {
-          pool: Some("primary".into()),
+          pool: Some("profile.coding".into()),
           profile: None,
         },
       },

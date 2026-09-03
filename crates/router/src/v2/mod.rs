@@ -42,10 +42,9 @@ use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_core::AgentId;
 use tokn_policy::{
-  CanonicalAuthority, CanonicalHost, ClientAuthPlan, ConnectAction, CredentialPolicy, ForwardProxyListenerPlan,
-  GatewayPlan, HttpAction, HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry,
-  ModelSelector, ProfileId, ProviderId, RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind,
-  RoutePlan, WireIdentity,
+  CanonicalHost, ClientAuthPlan, ConnectAction, CredentialPolicy, ForwardProxyListenerPlan, GatewayPlan, HttpAction,
+  HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ModelSelector, ProfileId,
+  ProviderId, RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind, RoutePlan, WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
@@ -83,7 +82,7 @@ enum ProxyDestination {
 
 /// Router state for one compiled v2 LLM API listener.
 ///
-/// Each profile owns a route-specific six-stage pipeline. Listener bindings
+/// Each profile owns a route-specific six-stage pipeline. Profile mounts
 /// choose among those pipelines; there is no second request engine behind the
 /// state.
 #[derive(Clone)]
@@ -160,88 +159,18 @@ impl AppState {
     self.listener.client_auth()
   }
 
-  fn select_profile(
-    &self,
-    method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
-    endpoint: Endpoint,
-  ) -> Result<&ProfileRuntime, ApiError> {
-    if let Some(entry) = self.mounts.get(uri.path()) {
-      if !entry.enabled || entry.operation != mounts::ApiOperation::Generate(endpoint) {
-        return Err(ApiError::not_found("generation endpoint is disabled for this profile"));
-      }
-      return self
-        .profiles
-        .get(&entry.profile)
-        .ok_or_else(|| ApiError::internal("API mount references a missing profile"));
+  fn select_profile(&self, uri: &Uri, endpoint: Endpoint) -> Result<&ProfileRuntime, ApiError> {
+    let entry = self
+      .mounts
+      .get(uri.path())
+      .ok_or_else(|| ApiError::not_found("API path is not exposed"))?;
+    if !entry.enabled || entry.operation != mounts::ApiOperation::Generate(endpoint) {
+      return Err(ApiError::not_found("generation endpoint is disabled for this profile"));
     }
-    let host = request_host(uri, headers)?;
-    let operation = operation_name(endpoint);
-    let action = self
-      .listener
-      .http_bindings()
-      .iter()
-      .find(|binding| http_matches(binding.matcher(), host.as_ref(), method, uri.path(), Some(operation)))
-      .map(|binding| binding.action())
-      .unwrap_or_else(|| self.listener.default_http_action());
-    match action {
-      HttpAction::Route(profile_id) if self.mounts.contains_profile(profile_id) => Err(ApiError::not_found(
-        "profile is only available at its configured API path",
-      )),
-      HttpAction::Route(profile_id) => self
-        .profiles
-        .get(profile_id)
-        .ok_or_else(|| ApiError::internal(format!("listener selected missing profile '{profile_id}'"))),
-      HttpAction::Reject => Err(ApiError::forbidden("request rejected by v2 listener policy")),
-    }
-  }
-
-  fn discovery_profiles(&self, uri: &Uri, headers: &HeaderMap) -> Result<BTreeSet<ProfileId>, ApiError> {
-    if let Some(entry) = self.mounts.get(uri.path()) {
-      return match entry.operation {
-        mounts::ApiOperation::Models | mounts::ApiOperation::Providers => Ok(BTreeSet::from([entry.profile.clone()])),
-        _ => Err(ApiError::not_found("discovery path is not exposed")),
-      };
-    }
-    let path = uri.path();
-    let prefix = path
-      .strip_suffix("models")
-      .or_else(|| path.strip_suffix("providers"))
-      .ok_or_else(|| ApiError::internal(format!("unsupported v2 discovery path '{path}'")))?;
-    let host = request_host(uri, headers)?;
-    let mut profiles = self
-      .listener
-      .http_bindings()
-      .iter()
-      .filter(|binding| {
-        let matcher = binding.matcher();
-        (matcher.hosts().is_empty()
-          || host
-            .as_ref()
-            .is_some_and(|host| matcher.hosts().iter().any(|pattern| pattern.matches(host))))
-          && (matcher.path_prefixes().is_empty()
-            || matcher
-              .path_prefixes()
-              .iter()
-              .any(|candidate| candidate.starts_with(prefix) || prefix.starts_with(candidate.as_str())))
-      })
-      .filter_map(|binding| match binding.action() {
-        HttpAction::Route(profile) => Some(profile.clone()),
-        HttpAction::Reject => None,
-      })
-      .collect::<BTreeSet<_>>();
-
-    if profiles.is_empty() && path.starts_with("/v1/") {
-      collect_profile(self.listener.default_http_action(), &mut profiles);
-    }
-    profiles.retain(|profile| !self.mounts.contains_profile(profile));
-    if profiles.is_empty() {
-      return Err(ApiError::bad_request(format!(
-        "no v2 profile is bound to discovery path '{path}'"
-      )));
-    }
-    Ok(profiles)
+    self
+      .profiles
+      .get(&entry.profile)
+      .ok_or_else(|| ApiError::internal("API mount references a missing profile"))
   }
 }
 
@@ -1016,9 +945,11 @@ fn build_profile_runtimes(
 ) -> anyhow::Result<LinkedRuntimes> {
   let mut reachable_profiles = BTreeSet::new();
   for listener in plan.listeners().values() {
-    collect_profile(listener.default_http_action(), &mut reachable_profiles);
-    for binding in listener.http_bindings() {
-      collect_profile(binding.action(), &mut reachable_profiles);
+    if let ListenerPlan::ForwardProxy(listener) = listener {
+      collect_profile(listener.default_http_action(), &mut reachable_profiles);
+      for binding in listener.http_bindings() {
+        collect_profile(binding.action(), &mut reachable_profiles);
+      }
     }
   }
   reachable_profiles.extend(
@@ -1490,25 +1421,12 @@ pub fn router_live(state: LiveAppState) -> Router {
   let cors = crate::cors::layer_for_request(move |origin, parts| {
     let current = cors_state.current();
     let policy = current.listener.cors();
-    let api_path = current
-      .mounts
-      .get(parts.uri.path())
-      .map_or_else(|| mounts::is_legacy_api_path(parts.uri.path()), |entry| entry.enabled);
+    let api_path = current.mounts.get(parts.uri.path()).is_some_and(|entry| entry.enabled);
     api_path
       && (policy.allowed_origins().contains(origin)
         || (policy.allow_localhost() && crate::cors::is_localhost_origin(origin)))
   });
   let client_routes = Router::new()
-    .route("/v1/chat/completions", post(chat_completions))
-    .route("/v1/responses", post(responses))
-    .route("/v1/messages", post(messages))
-    .route("/v1/providers", get(list_providers))
-    .route("/v1/models", get(list_models))
-    .route("/{profile}/v1/chat/completions", post(chat_completions))
-    .route("/{profile}/v1/responses", post(responses))
-    .route("/{profile}/v1/messages", post(messages))
-    .route("/{profile}/v1/providers", get(list_providers))
-    .route("/{profile}/v1/models", get(list_models))
     .fallback(mounts::dispatch)
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     // Preflight must not require client credentials. The origin predicate
@@ -1532,26 +1450,6 @@ async fn health() -> &'static str {
   "ok"
 }
 
-async fn list_providers(
-  Extension(state): Extension<Arc<AppState>>,
-  Extension(access): Extension<AccessContext>,
-  uri: Uri,
-  headers: HeaderMap,
-) -> Result<axum::Json<serde_json::Value>, ApiError> {
-  let profiles = state.discovery_profiles(&uri, &headers)?;
-  Ok(axum::Json(state.discovery.providers(&profiles, &access)))
-}
-
-async fn list_models(
-  Extension(state): Extension<Arc<AppState>>,
-  Extension(access): Extension<AccessContext>,
-  uri: Uri,
-  headers: HeaderMap,
-) -> Result<axum::Json<serde_json::Value>, ApiError> {
-  let profiles = state.discovery_profiles(&uri, &headers)?;
-  state.discovery.models(&profiles, &access).await.map(axum::Json)
-}
-
 async fn authenticate(State(live): State<LiveAppState>, mut request: Request, next: Next) -> Response {
   let state = live.current();
   request.extensions_mut().insert(state.clone());
@@ -1563,10 +1461,10 @@ async fn authenticate(State(live): State<LiveAppState>, mut request: Request, ne
       mounts::ApiOperation::Generate(endpoint) => Some(endpoint),
       _ => None,
     },
-    None => Endpoint::infer_from(request.uri().path()),
+    None => return ApiError::not_found("API path is not exposed").into_response(),
   };
   if let Some(endpoint) = endpoint {
-    match state.select_profile(request.method(), request.uri(), request.headers(), endpoint) {
+    match state.select_profile(request.uri(), endpoint) {
       Ok(runtime) if runtime.credential_policy == CredentialPolicy::Client => {
         request.extensions_mut().insert(AccessContext::unrestricted());
         return next.run(request).await;
@@ -1655,69 +1553,6 @@ fn collect_profile(action: &HttpAction, profiles: &mut BTreeSet<ProfileId>) {
   }
 }
 
-async fn chat_completions(
-  Extension(state): Extension<Arc<AppState>>,
-  Extension(access): Extension<AccessContext>,
-  connection: InboundConnectionInfo,
-  method: Method,
-  uri: Uri,
-  headers: HeaderMap,
-  body: Bytes,
-) -> Result<Response, ApiError> {
-  handle(
-    state,
-    ApiRequestContext { access, connection },
-    method,
-    uri,
-    headers,
-    body,
-    Endpoint::ChatCompletions,
-  )
-  .await
-}
-
-async fn responses(
-  Extension(state): Extension<Arc<AppState>>,
-  Extension(access): Extension<AccessContext>,
-  connection: InboundConnectionInfo,
-  method: Method,
-  uri: Uri,
-  headers: HeaderMap,
-  body: Bytes,
-) -> Result<Response, ApiError> {
-  handle(
-    state,
-    ApiRequestContext { access, connection },
-    method,
-    uri,
-    headers,
-    body,
-    Endpoint::Responses,
-  )
-  .await
-}
-
-async fn messages(
-  Extension(state): Extension<Arc<AppState>>,
-  Extension(access): Extension<AccessContext>,
-  connection: InboundConnectionInfo,
-  method: Method,
-  uri: Uri,
-  headers: HeaderMap,
-  body: Bytes,
-) -> Result<Response, ApiError> {
-  handle(
-    state,
-    ApiRequestContext { access, connection },
-    method,
-    uri,
-    headers,
-    body,
-    Endpoint::Messages,
-  )
-  .await
-}
-
 async fn handle(
   state: Arc<AppState>,
   context: ApiRequestContext,
@@ -1727,7 +1562,7 @@ async fn handle(
   body: Bytes,
   endpoint: Endpoint,
 ) -> Result<Response, ApiError> {
-  let runtime = state.select_profile(&method, &uri, &headers, endpoint)?;
+  let runtime = state.select_profile(&uri, endpoint)?;
   emit_inbound_connection(
     &state.events,
     &context.access,
@@ -1851,21 +1686,6 @@ fn request_record_mode(route: &RoutePlan) -> &'static str {
   }
 }
 
-fn request_host(uri: &Uri, headers: &HeaderMap) -> Result<Option<tokn_policy::CanonicalHost>, ApiError> {
-  let authority = uri.authority().map(|authority| authority.as_str()).or_else(|| {
-    headers
-      .get(axum::http::header::HOST)
-      .and_then(|value| value.to_str().ok())
-  });
-  authority
-    .map(|authority| {
-      CanonicalAuthority::parse(authority)
-        .map(|authority| authority.host().clone())
-        .map_err(|error| ApiError::bad_request(format!("invalid request authority: {error}")))
-    })
-    .transpose()
-}
-
 fn http_matches(
   matcher: &HttpMatch,
   host: Option<&tokn_policy::CanonicalHost>,
@@ -1918,7 +1738,7 @@ mod tests {
   use tower::ServiceExt;
 
   fn canonical_host(value: &str) -> tokn_policy::CanonicalHost {
-    CanonicalAuthority::parse(value).unwrap().host().clone()
+    tokn_policy::CanonicalAuthority::parse(value).unwrap().host().clone()
   }
 
   fn reload_test_states(api_bind: &str, proxy_bind: &str, default_connect: &str) -> RuntimeStates {
@@ -1930,7 +1750,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "{api_bind}"
 client_auth = "none"
-default_http_action = {{ kind = "reject" }}
 
 [listeners.proxy]
 kind = "forward_proxy"
@@ -2095,12 +1914,12 @@ default_connect = "{default_connect}"
   async fn admin_reload_endpoint_is_independent_from_listener_authentication() {
     let config = r#"
 schema_version = 2
+[defaults]
 
 [listeners.api]
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "local_keys"
-default_http_action = { kind = "reject" }
 "#;
     let plan = tokn_config::v2::parse(config, std::path::Path::new("reload-auth-test.toml")).unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -2147,7 +1966,6 @@ kind = "llm_api"
 bind = "0.0.0.0:4141"
 client_auth = "local_keys"
 allow_insecure_public = true
-default_http_action = { kind = "reject" }
 "#;
     let plan = tokn_config::v2::parse(config, std::path::Path::new("reload-public-test.toml")).unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -2218,26 +2036,6 @@ default_http_action = { kind = "reject" }
     );
     assert_eq!(request_record_mode(&relay(RelayCredentials::Client)), "passthrough");
     assert_eq!(request_record_mode(&relay(RelayCredentials::AccountPool)), "switch");
-  }
-
-  #[test]
-  fn request_host_prefers_uri_authority_and_validates_host_header() {
-    let uri = "https://api.example.com/v1/responses".parse::<Uri>().unwrap();
-    let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::HOST, "ignored.example.com".parse().unwrap());
-    assert_eq!(
-      request_host(&uri, &headers).unwrap(),
-      Some(canonical_host("api.example.com"))
-    );
-
-    let relative = "/v1/responses".parse::<Uri>().unwrap();
-    assert_eq!(
-      request_host(&relative, &headers).unwrap(),
-      Some(canonical_host("ignored.example.com"))
-    );
-    headers.insert(axum::http::header::HOST, "bad host".parse().unwrap());
-    assert!(request_host(&relative, &headers).is_err());
-    assert_eq!(request_host(&relative, &HeaderMap::new()).unwrap(), None);
   }
 
   #[test]
@@ -2391,21 +2189,20 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "managed" }
 
 [profiles.managed]
 route = "managed"
+binding = { path = "/v1" }
+
+[profiles.managed.account_pool]
+accounts = ["acct"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = { kind = "fixed", provider = "local" }
 model = { kind = "capability" }
 operation = "translate_compatible"
-
-[account_pools.primary]
-accounts = ["acct"]
-providers = ["local"]
 
 [providers.local]
 driver = "openai"
@@ -2483,21 +2280,20 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "managed" }
 
 [profiles.managed]
 route = "managed"
+binding = { path = "/v1" }
+
+[profiles.managed.account_pool]
+accounts = ["missing"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = { kind = "fixed", provider = "local" }
 model = { kind = "capability" }
 operation = "translate_compatible"
-
-[account_pools.primary]
-accounts = ["missing"]
-providers = ["local"]
 
 [providers.local]
 driver = "openai"
@@ -2514,18 +2310,18 @@ base_url = "http://127.0.0.1:1/v1"
     )
     .unwrap();
     let state = states.pop().unwrap();
-    let discovery_profiles = state
-      .discovery_profiles(&"/v1/providers".parse().unwrap(), &HeaderMap::new())
-      .unwrap();
+    let discovery_profile = &state.mounts.get("/v1/providers").unwrap().profile;
     let restricted = AccessContext {
       key_id: Some("restricted".into()),
       key_name: Some("restricted".into()),
       providers: tokn_access::ProviderAccess::from_provider_ids(vec!["other".into()]).unwrap(),
     };
-    assert!(state.discovery.providers(&discovery_profiles, &restricted)["data"]
-      .as_array()
-      .unwrap()
-      .is_empty());
+    assert!(
+      state.discovery.providers(discovery_profile, &restricted).unwrap()["data"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    );
     let app = router(state);
 
     let response = app
@@ -2554,7 +2350,7 @@ base_url = "http://127.0.0.1:1/v1"
   }
 
   #[tokio::test]
-  async fn profile_compatibility_routes_use_the_bound_exact_policy() {
+  async fn profile_mounts_use_their_exact_policy() {
     let plan = tokn_config::v2::parse(
       r#"
 schema_version = 2
@@ -2563,28 +2359,20 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
-
-[[bindings]]
-id = "work"
-listener = "api"
-action = { kind = "route", profile = "exact" }
-path_prefixes = ["/work/v1/"]
-methods = ["POST"]
 
 [profiles.exact]
 route = "exact"
+binding = { path = "/work/v1" }
+
+[profiles.exact.account_pool]
+accounts = ["missing"]
 
 [routes.exact]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = { kind = "fixed", provider = "local" }
 model = { kind = "qualified", namespace = "provider" }
 operation = "translate_compatible"
-
-[account_pools.primary]
-accounts = ["missing"]
-providers = ["local"]
 
 [providers.local]
 driver = "openai"
@@ -2643,21 +2431,20 @@ max_decoded_bytes = 1024
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "managed" }
 
 [profiles.managed]
 route = "managed"
+binding = { path = "/v1" }
+
+[profiles.managed.account_pool]
+accounts = ["missing"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = { kind = "fixed", provider = "local" }
 model = { kind = "capability" }
 operation = "translate_compatible"
-
-[account_pools.primary]
-accounts = ["missing"]
-providers = ["local"]
 
 [providers.local]
 driver = "openai"
@@ -2704,21 +2491,20 @@ max_decoded_bytes = 8
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "managed" }
 
 [profiles.managed]
 route = "managed"
+binding = { path = "/v1" }
+
+[profiles.managed.account_pool]
+accounts = ["missing"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = { kind = "fixed", provider = "local" }
 model = { kind = "capability" }
 operation = "translate_compatible"
-
-[account_pools.primary]
-accounts = ["missing"]
-providers = ["local"]
 
 [providers.local]
 driver = "openai"

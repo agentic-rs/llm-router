@@ -15,7 +15,7 @@ use super::analysis::{
   api_bind, base_warnings, effective_policies, forward_proxy_bind, profile_path, wire_identity, EffectivePolicy,
   IdentifierAllocator,
 };
-use super::resources::{index_accounts, project_accounts_and_providers, raw_pool_for_policy};
+use super::resources::{index_accounts, project_accounts_and_providers, raw_pool_for_policy, raw_providers_for_policy};
 use super::{
   LegacyPolicyLocation, V2BehaviorChange, V2ForwardProxyProjectionOptions, V2ProjectionError, V2ProjectionOptions,
   V2ProjectionWarning,
@@ -117,8 +117,8 @@ pub fn project_v2_config(
         allocated
       }
     };
-    let mut pool = raw_pool_for_policy(legacy, &policy, &account_index)?;
-    let route = route_recipe(&policy, pool.providers.take())?;
+    let pool = raw_pool_for_policy(legacy, &policy, &account_index)?;
+    let route = route_recipe(&policy, raw_providers_for_policy(&policy)?)?;
     let path = match policy.legacy_profile.as_deref() {
       Some(profile) => profile_path(profile)?,
       None => "/v1/".to_string(),
@@ -154,7 +154,6 @@ pub fn project_v2_config(
         RawClientAuth::None
       },
       allow_insecure_public: options.allow_insecure_public_listener,
-      default_http_action: RawBindingAction::Reject {},
     },
   )]);
   if let Some(proxy_options) = options.forward_proxy.as_ref() {
@@ -207,7 +206,6 @@ pub fn project_v2_config(
         initial_backoff_ms: LEGACY_INITIAL_BACKOFF_MS,
       },
     )]),
-    account_pools: BTreeMap::new(),
     providers,
   };
   let compiled_config = tokn_config::v2::compile_config(&raw_config, Path::new(GENERATED_SOURCE))
@@ -402,8 +400,7 @@ fn insert_proxy_profile(
   routes: &mut BTreeMap<String, RawRoute>,
 ) -> Result<String, V2ProjectionError> {
   let resource_id = ids.allocate(requested_id);
-  let mut pool = account_pool.clone();
-  let route = proxy_route_recipe(policy, mode, pool.providers.take())?;
+  let route = proxy_route_recipe(policy, mode, raw_providers_for_policy(policy)?)?;
   let wire_identity = if mode == RouteMode::Passthrough {
     RawWireIdentity::None
   } else {
@@ -414,7 +411,7 @@ fn insert_proxy_profile(
     RawProfile {
       route: resource_id.clone(),
       wire_identity,
-      account_pool: (mode != RouteMode::Passthrough).then_some(pool),
+      account_pool: (mode != RouteMode::Passthrough).then(|| account_pool.clone()),
       binding: None,
     },
   );
@@ -437,7 +434,7 @@ fn proxy_route_recipe(
     RouteMode::Switch => Ok(RawRoute::Relay {
       providers,
       destination: RawRelayDestination::Original {},
-      credentials: RawRelayCredentials::AccountPool { account_pool: None },
+      credentials: RawRelayCredentials::AccountPool {},
       retry: RawRouteRetry::Never {},
     }),
     RouteMode::Route | RouteMode::Exact | RouteMode::Fuzzy => {
@@ -469,7 +466,6 @@ fn route_mode_name(mode: RouteMode) -> &'static str {
 fn route_recipe(policy: &EffectivePolicy, providers: Option<Vec<String>>) -> Result<RawRoute, V2ProjectionError> {
   match policy.mode {
     RouteMode::Route => Ok(RawRoute::Managed {
-      account_pool: None,
       providers,
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Capability {},
@@ -479,7 +475,6 @@ fn route_recipe(policy: &EffectivePolicy, providers: Option<Vec<String>>) -> Res
       },
     }),
     RouteMode::Exact => Ok(RawRoute::Managed {
-      account_pool: None,
       providers,
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Qualified {
@@ -491,7 +486,6 @@ fn route_recipe(policy: &EffectivePolicy, providers: Option<Vec<String>>) -> Res
       },
     }),
     RouteMode::Fuzzy => Ok(RawRoute::Managed {
-      account_pool: None,
       providers,
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Family {
@@ -516,7 +510,7 @@ fn route_recipe(policy: &EffectivePolicy, providers: Option<Vec<String>>) -> Res
       Ok(RawRoute::Relay {
         providers,
         destination: RawRelayDestination::FixedProvider { provider },
-        credentials: RawRelayCredentials::AccountPool { account_pool: None },
+        credentials: RawRelayCredentials::AccountPool {},
         retry: RawRouteRetry::Buffered {
           policy: LEGACY_RETRY_POLICY_ID.to_string(),
         },
@@ -613,7 +607,6 @@ mod tests {
     assert_eq!(raw.listeners.len(), 1);
     assert_eq!(raw.profiles.len(), 2);
     assert_eq!(raw.routes.len(), 2);
-    assert!(raw.account_pools.is_empty());
     assert!(raw.bindings.is_empty());
     assert!(raw.profiles.values().all(|profile| profile.account_pool.is_some()));
     assert_eq!(

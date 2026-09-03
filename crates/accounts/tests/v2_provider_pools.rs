@@ -11,22 +11,20 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
 [profiles.default]
 route = "default"
 
+[profiles.default.account_pool]
+accounts = ["first", "second"]
+strategy = "round_robin"
+
 [routes.default]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = { kind = "fixed", provider = "local" }
 model = { kind = "capability" }
 operation = "translate_compatible"
-
-[account_pools.primary]
-accounts = ["first", "second"]
-providers = ["local"]
-strategy = "round_robin"
 
 [providers.local]
 driver = "llama-cpp"
@@ -63,7 +61,9 @@ fn compiled_v2_plan_builds_named_provider_round_robin_pool() {
 
   let pools = link_account_pools(&plan, &providers).unwrap();
   let runtimes = build_account_pool_runtimes(&pools);
-  let pool = runtimes.runtime(&AccountPoolId::new("primary").unwrap()).unwrap();
+  let pool = runtimes
+    .runtime(&AccountPoolId::new("profile.default").unwrap())
+    .unwrap();
 
   let selected = (0..4)
     .map(|_| match pool.acquire(None, |_| true) {

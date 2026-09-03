@@ -150,17 +150,6 @@ pub(super) fn raw_pool_for_policy(
   policy: &EffectivePolicy,
   account_index: &BTreeMap<&str, &AccountConfig>,
 ) -> Result<RawAccountPool, V2ProjectionError> {
-  let providers = normalized_selector(policy, "providers", policy.providers.as_deref())?;
-  if let Some(provider_ids) = &providers {
-    for provider in provider_ids {
-      if official_provider_preset(provider).is_none() {
-        return Err(V2ProjectionError::UnknownPolicyProvider {
-          policy: policy.location.clone(),
-          provider: provider.clone(),
-        });
-      }
-    }
-  }
   let accounts = normalized_selector(policy, "accounts", policy.accounts.as_deref())?;
   if let Some(account_ids) = &accounts {
     for account_id in account_ids {
@@ -189,12 +178,26 @@ pub(super) fn raw_pool_for_policy(
 
   Ok(RawAccountPool {
     accounts,
-    providers,
     strategy: RawPoolStrategy::RoundRobin,
     failure_cooldown_secs: legacy.pool.failure_cooldown_secs,
     session_ttl_secs: legacy.pool.session_ttl_secs,
     session_expired_retention_secs,
   })
+}
+
+pub(super) fn raw_providers_for_policy(policy: &EffectivePolicy) -> Result<Option<Vec<String>>, V2ProjectionError> {
+  let providers = normalized_selector(policy, "providers", policy.providers.as_deref())?;
+  if let Some(provider_ids) = &providers {
+    for provider in provider_ids {
+      if official_provider_preset(provider).is_none() {
+        return Err(V2ProjectionError::UnknownPolicyProvider {
+          policy: policy.location.clone(),
+          provider: provider.clone(),
+        });
+      }
+    }
+  }
+  Ok(providers)
 }
 
 fn normalized_selector(
@@ -358,7 +361,7 @@ mod tests {
     selected.providers = Some(vec!["openai".into(), "openai".into()]);
     selected.accounts = Some(vec!["primary".into(), "primary".into()]);
     let pool = raw_pool_for_policy(&legacy, &selected, &index).unwrap();
-    assert_eq!(pool.providers.as_deref().unwrap(), ["openai"]);
+    assert_eq!(raw_providers_for_policy(&selected).unwrap().unwrap(), ["openai"]);
     assert_eq!(pool.accounts.as_deref().unwrap(), ["primary"]);
 
     for (field, providers, accounts) in [
@@ -369,7 +372,7 @@ mod tests {
       invalid.providers = providers;
       invalid.accounts = accounts;
       assert!(matches!(
-        raw_pool_for_policy(&legacy, &invalid, &index),
+        raw_providers_for_policy(&invalid).and_then(|_| raw_pool_for_policy(&legacy, &invalid, &index)),
         Err(V2ProjectionError::EmptyPolicySelector { field: found, .. }) if found == field
       ));
     }
@@ -391,7 +394,7 @@ mod tests {
     let mut unknown_provider = policy();
     unknown_provider.providers = Some(vec!["missing".into()]);
     assert!(matches!(
-      raw_pool_for_policy(&legacy, &unknown_provider, &index),
+      raw_providers_for_policy(&unknown_provider),
       Err(V2ProjectionError::UnknownPolicyProvider { .. })
     ));
   }

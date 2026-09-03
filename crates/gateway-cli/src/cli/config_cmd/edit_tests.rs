@@ -209,10 +209,7 @@ fn inline_edit_errors_leave_the_original_file_unchanged() {
     assert!(error.contains(message), "{key}: {error}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_EXPLICIT_TEST_CONFIG);
   }
-  for key in [
-    "routes.default.retry.policy",
-    "listeners.api.default_http_action.profile",
-  ] {
+  for key in ["routes.default.retry.policy", "routes.default.provider.kind"] {
     let error = unset_key(&path, key).unwrap_err().to_string();
     assert!(error.contains("validation failed"), "{key}: {error}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_EXPLICIT_TEST_CONFIG);

@@ -560,14 +560,14 @@ default_connect = "reject"
 [profiles.relay]
 route = "relay"
 
+[profiles.relay.account_pool]
+accounts = ["acct"]
+
 [routes.relay]
 kind = "relay"
-destination = {{ kind = "original" }}
-credentials = {{ kind = "account_pool", account_pool = "primary" }}
-
-[account_pools.primary]
-accounts = ["acct"]
 providers = ["*"]
+destination = {{ kind = "original" }}
+credentials = {{ kind = "account_pool" }}
 
 [providers.local]
 driver = "llama-cpp"

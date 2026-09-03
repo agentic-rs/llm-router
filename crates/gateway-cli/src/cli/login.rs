@@ -111,7 +111,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 
 [providers.openai]
 "#,

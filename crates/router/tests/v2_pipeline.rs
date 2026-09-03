@@ -50,7 +50,6 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "local_keys"
-default_http_action = {{ kind = "route", profile = "client-relay" }}
 
 [profiles.client-relay]
 route = "client-relay"
@@ -74,7 +73,7 @@ base_url = "http://{upstream_addr}/v1"
   let app = tokn_router::v2::router(states.into_iter().next().unwrap()).layer(Extension(local_addr));
   let body = Bytes::from_static(br#"{"model":"gpt-4o","input":"hello","opaque":true}"#);
 
-  let mut request = Request::post("/v1/responses")
+  let mut request = Request::post("/client-relay/v1/responses")
     .header("host", "gateway.example")
     .header("x-tokn-router-local-addr", "spoofed.example")
     .header("content-type", "application/json")
@@ -193,41 +192,33 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "local_keys"
-default_http_action = {{ kind = "route", profile = "managed" }}
-
-[[bindings]]
-id = "relay-responses"
-listener = "api"
-action = {{ kind = "route", profile = "relay" }}
-operations = ["responses"]
-
-[[bindings]]
-id = "reject-messages"
-listener = "api"
-action = {{ kind = "reject" }}
-operations = ["messages"]
 
 [profiles.managed]
 route = "managed"
+binding = {{ path = "/v1", endpoints = ["chat_completions"] }}
+
+[profiles.managed.account_pool]
+accounts = ["acct"]
 
 [profiles.relay]
 route = "relay"
+binding = {{ endpoints = ["responses"] }}
+
+[profiles.relay.account_pool]
+accounts = ["acct"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = {{ kind = "fixed", provider = "local" }}
 model = {{ kind = "family", families = {{ smart = ["not-an-openai-model", "gpt-4o"] }} }}
 operation = "preserve"
 
 [routes.relay]
 kind = "relay"
-destination = {{ kind = "fixed_provider", provider = "local" }}
-credentials = {{ kind = "account_pool", account_pool = "primary" }}
-
-[account_pools.primary]
-accounts = ["acct"]
 providers = ["local"]
+destination = {{ kind = "fixed_provider", provider = "local" }}
+credentials = {{ kind = "account_pool" }}
 
 [providers.local]
 driver = "openai"
@@ -265,7 +256,7 @@ base_url = "http://{upstream_addr}/v1"
     )
     .await
     .unwrap();
-  assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+  assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
 
   let denied = app
     .clone()
@@ -327,7 +318,7 @@ base_url = "http://{upstream_addr}/v1"
   let relay_body = Bytes::from_static(br#"{"input":"hi","model":"gpt-4o","unusual_order":true}"#);
   let relay = app
     .oneshot(
-      Request::post("/v1/responses")
+      Request::post("/relay/v1/responses")
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {}", allowed_key.token))
         .header("x-request-id", "client-v2-request")
@@ -400,14 +391,18 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = {{ kind = "route", profile = "managed" }}
 
 [profiles.managed]
 route = "managed"
+binding = {{ path = "/v1" }}
+
+[profiles.managed.account_pool]
+accounts = ["a-primary", "b-secondary"]
+failure_cooldown_secs = 60
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = {{ kind = "fixed", provider = "local" }}
 model = {{ kind = "capability" }}
 operation = "preserve"
@@ -416,11 +411,6 @@ retry = {{ kind = "recoverable", policy = "failover" }}
 [retry_policies.failover]
 max_retries = 1
 initial_backoff_ms = 0
-
-[account_pools.primary]
-accounts = ["a-primary", "b-secondary"]
-providers = ["local"]
-failure_cooldown_secs = 60
 
 [providers.local]
 driver = "openai"
@@ -534,21 +524,20 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = {{ kind = "route", profile = "managed" }}
 
 [profiles.managed]
 route = "managed"
+binding = {{ path = "/v1" }}
+
+[profiles.managed.account_pool]
+accounts = ["acct"]
 
 [routes.managed]
 kind = "managed"
-account_pool = "primary"
+providers = ["local"]
 provider = {{ kind = "fixed", provider = "local" }}
 model = {{ kind = "capability" }}
 operation = "preserve"
-
-[account_pools.primary]
-accounts = ["acct"]
-providers = ["local"]
 
 [providers.local]
 driver = "openai"

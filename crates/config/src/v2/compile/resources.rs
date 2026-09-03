@@ -32,9 +32,9 @@ pub(super) struct CompiledResources {
 
 pub(super) fn compile_resources(raw: &RawConfig) -> Result<CompiledResources, CompileError> {
   let providers = compile_providers(&raw.providers)?;
-  let mut account_pools = compile_account_pools(&raw.account_pools, &providers)?;
+  let mut account_pools = BTreeMap::new();
   let retry_policies = compile_retry_policies(&raw.retry_policies)?;
-  let routes = compile_routes(&raw.routes, &account_pools, &providers, &retry_policies)?;
+  let routes = compile_routes(&raw.routes, &providers, &retry_policies)?;
   let profiles = profiles::compile_profiles(raw, &routes, &providers, &mut account_pools)?;
 
   Ok(CompiledResources {
@@ -76,73 +76,53 @@ fn compile_retry_policies(
     .collect()
 }
 
-fn compile_account_pools(
-  raw_pools: &BTreeMap<String, RawAccountPool>,
-  providers: &BTreeMap<ProviderId, ProviderPlan>,
-) -> Result<BTreeMap<AccountPoolId, AccountPoolPlan>, CompileError> {
-  raw_pools
-    .iter()
-    .map(|(raw_id, raw_pool)| {
-      let id = parse_id::<AccountPoolId>("account pool id", raw_id)?;
-      validate_duration(
-        raw_id,
-        "failure_cooldown_secs",
-        raw_pool.failure_cooldown_secs,
-        MAX_FAILURE_COOLDOWN_SECS,
-      )?;
-      validate_duration(
-        raw_id,
-        "session_ttl_secs",
-        raw_pool.session_ttl_secs,
-        MAX_SESSION_DURATION_SECS,
-      )?;
-      validate_duration(
-        raw_id,
-        "session_expired_retention_secs",
-        raw_pool.session_expired_retention_secs,
-        MAX_SESSION_DURATION_SECS,
-      )?;
-      let accounts = compile_account_filter(raw_pool.accounts.as_deref(), format!("account_pools.{raw_id}.accounts"))?
-        .map(|accounts| accounts.into_iter().map(Into::into).collect());
-      let providers = compile_provider_filter(raw_pool.providers.as_deref(), raw_id, providers)?;
-
-      let session_affinity = if raw_pool.session_ttl_secs == 0 {
-        if raw_pool.session_expired_retention_secs != 0 {
-          return Err(invalid_value(
-            format!("account_pools.{raw_id}.session_expired_retention_secs"),
-            "must be zero when session_ttl_secs is zero",
-          ));
-        }
-        None
-      } else {
-        Some(SessionAffinityPlan::new(
-          Duration::from_secs(raw_pool.session_ttl_secs),
-          Duration::from_secs(raw_pool.session_expired_retention_secs),
-        ))
-      };
-
-      let strategy = match raw_pool.strategy {
-        RawPoolStrategy::RoundRobin => AccountSelectionStrategy::RoundRobin,
-      };
-      let plan = AccountPoolPlan::new(
-        AccountSelector::new(providers, accounts),
-        strategy,
-        Duration::from_secs(raw_pool.failure_cooldown_secs),
-        session_affinity,
-      );
-      Ok((id, plan))
-    })
-    .collect()
-}
-
-fn validate_duration(pool_id: &str, field: &str, seconds: u64, maximum: u64) -> Result<(), CompileError> {
-  if seconds > maximum {
-    return Err(invalid_value(
-      format!("account_pools.{pool_id}.{field}"),
-      format!("must not exceed {maximum} seconds"),
-    ));
+fn compile_account_pool(profile: &str, raw: &RawAccountPool) -> Result<AccountPoolPlan, CompileError> {
+  let location = format!("profiles.{profile}.account_pool");
+  for (field, seconds, maximum) in [
+    (
+      "failure_cooldown_secs",
+      raw.failure_cooldown_secs,
+      MAX_FAILURE_COOLDOWN_SECS,
+    ),
+    ("session_ttl_secs", raw.session_ttl_secs, MAX_SESSION_DURATION_SECS),
+    (
+      "session_expired_retention_secs",
+      raw.session_expired_retention_secs,
+      MAX_SESSION_DURATION_SECS,
+    ),
+  ] {
+    if seconds > maximum {
+      return Err(invalid_value(
+        format!("{location}.{field}"),
+        format!("must not exceed {maximum} seconds"),
+      ));
+    }
   }
-  Ok(())
+  let accounts = compile_account_filter(raw.accounts.as_deref(), format!("{location}.accounts"))?
+    .map(|accounts| accounts.into_iter().map(Into::into).collect());
+  let session_affinity = if raw.session_ttl_secs == 0 {
+    if raw.session_expired_retention_secs != 0 {
+      return Err(invalid_value(
+        format!("{location}.session_expired_retention_secs"),
+        "must be zero when session_ttl_secs is zero",
+      ));
+    }
+    None
+  } else {
+    Some(SessionAffinityPlan::new(
+      Duration::from_secs(raw.session_ttl_secs),
+      Duration::from_secs(raw.session_expired_retention_secs),
+    ))
+  };
+  let strategy = match raw.strategy {
+    RawPoolStrategy::RoundRobin => AccountSelectionStrategy::RoundRobin,
+  };
+  Ok(AccountPoolPlan::new(
+    AccountSelector::new(None, accounts),
+    strategy,
+    Duration::from_secs(raw.failure_cooldown_secs),
+    session_affinity,
+  ))
 }
 
 fn compile_account_filter(
@@ -167,38 +147,6 @@ fn compile_account_filter(
     }
     if !values.insert(value.clone()) {
       return Err(duplicate_value(location.clone(), value));
-    }
-  }
-  Ok(Some(values))
-}
-
-fn compile_provider_filter(
-  raw_values: Option<&[String]>,
-  pool_id: &str,
-  providers: &BTreeMap<ProviderId, ProviderPlan>,
-) -> Result<Option<BTreeSet<ProviderId>>, CompileError> {
-  let Some(raw_values) = raw_values else {
-    return Ok(None);
-  };
-  validate_selector_shape(raw_values, format!("account_pools.{pool_id}.providers"))?;
-  if raw_values == ["*"] {
-    return Ok(None);
-  }
-
-  let mut values = BTreeSet::new();
-  for value in raw_values {
-    let provider = parse_id::<ProviderId>("provider selector", value)?;
-    require_reference(
-      providers,
-      &provider,
-      "account pool",
-      pool_id,
-      "providers",
-      "provider",
-      value,
-    )?;
-    if !values.insert(provider) {
-      return Err(duplicate_value(format!("account_pools.{pool_id}.providers"), value));
     }
   }
   Ok(Some(values))
@@ -341,7 +289,6 @@ fn cleartext_policy(allow_insecure_http: bool) -> CleartextHttpPolicy {
 
 fn compile_routes(
   raw_routes: &BTreeMap<String, RawRoute>,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
   providers: &BTreeMap<ProviderId, ProviderPlan>,
   retry_policies: &BTreeMap<RetryPolicyId, RetryPolicyPlan>,
 ) -> Result<BTreeMap<RouteId, RoutePlan>, CompileError> {
@@ -351,29 +298,16 @@ fn compile_routes(
       let id = parse_id::<RouteId>("route id", raw_id)?;
       let plan = match raw_route {
         RawRoute::Managed {
-          account_pool,
           providers: _,
           provider,
           model,
           operation,
           retry,
         } => {
-          let pool_id = account_pool
-            .as_deref()
-            .map(|pool| resolve_pool(raw_id, "account_pool", pool, pools))
-            .transpose()?;
           let provider_selector = match provider {
-            RawProviderSelector::Any {} => {
-              if let Some(pool_id) = &pool_id {
-                ensure_any_provider_viable(raw_id, pool_id, pools, providers)?;
-              }
-              ProviderSelector::Any
-            }
+            RawProviderSelector::Any {} => ProviderSelector::Any,
             RawProviderSelector::Fixed { provider } => {
               let provider_id = resolve_provider("route", raw_id, "provider", provider, providers)?;
-              if let Some(pool_id) = &pool_id {
-                ensure_fixed_provider_compatible(raw_id, "provider", pool_id, &provider_id, pools)?;
-              }
               ProviderSelector::Fixed(provider_id)
             }
           };
@@ -408,22 +342,8 @@ fn compile_routes(
           };
           let credentials = match credentials {
             RawRelayCredentials::Client {} => RelayCredentials::Client,
-            RawRelayCredentials::AccountPool { account_pool } => {
-              if let Some(pool) = account_pool {
-                resolve_pool(raw_id, "credentials.account_pool", pool, pools)?;
-              }
-              RelayCredentials::AccountPool
-            }
+            RawRelayCredentials::AccountPool {} => RelayCredentials::AccountPool,
           };
-          if let Some(pool) = raw_route.legacy_account_pool() {
-            let pool = parse_id::<AccountPoolId>("route account pool reference", pool)?;
-            match &destination {
-              RelayDestination::FixedProvider(provider) => {
-                ensure_fixed_provider_compatible(raw_id, "destination.provider", &pool, provider, pools)?
-              }
-              RelayDestination::Original => ensure_origin_relay_viable(raw_id, &pool, pools, providers)?,
-            }
-          }
           let retry = compile_relay_retry(raw_id, retry, retry_policies)?;
           RoutePlan::Relay(RelayRoute::new(destination, credentials, None, retry))
         }
@@ -506,17 +426,6 @@ fn resolve_retry_policy(
   Ok(policy)
 }
 
-fn resolve_pool(
-  route_id: &str,
-  field: &'static str,
-  raw_pool: &str,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-) -> Result<AccountPoolId, CompileError> {
-  let pool = parse_id::<AccountPoolId>("route account pool reference", raw_pool)?;
-  require_reference(pools, &pool, "route", route_id, field, "account pool", raw_pool)?;
-  Ok(pool)
-}
-
 fn resolve_provider(
   owner_kind: &'static str,
   owner: &str,
@@ -581,62 +490,14 @@ fn validate_model_name(location: String, model: &str) -> Result<(), CompileError
   Ok(())
 }
 
-fn ensure_fixed_provider_compatible(
-  route_id: &str,
-  field: &str,
-  pool_id: &AccountPoolId,
-  provider_id: &ProviderId,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-) -> Result<(), CompileError> {
-  let pool = &pools[pool_id];
-  if pool
-    .selector()
-    .providers()
-    .is_some_and(|providers| !providers.contains(provider_id))
-  {
-    return Err(invalid_value(
-      format!("routes.{route_id}.{field}"),
-      format!("provider `{provider_id}` is excluded by account pool `{pool_id}`"),
-    ));
-  }
-  Ok(())
-}
-
-fn ensure_any_provider_viable(
-  route_id: &str,
-  pool_id: &AccountPoolId,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
-  providers: &BTreeMap<ProviderId, ProviderPlan>,
-) -> Result<(), CompileError> {
-  let allowed_providers = pools[pool_id].selector().providers();
-  if providers
-    .keys()
-    .any(|provider_id| allowed_providers.is_none_or(|providers| providers.contains(provider_id)))
-  {
-    return Ok(());
-  }
-
-  Err(invalid_value(
-    format!("routes.{route_id}.provider"),
-    format!("no configured provider is compatible with account pool `{pool_id}`"),
-  ))
-}
-
 fn ensure_origin_relay_viable(
-  route_id: &str,
-  pool_id: &AccountPoolId,
-  pools: &BTreeMap<AccountPoolId, AccountPoolPlan>,
+  profile: &str,
   providers: &BTreeMap<ProviderId, ProviderPlan>,
 ) -> Result<(), CompileError> {
-  let allowed_providers = pools[pool_id].selector().providers();
   let mut origin_owners = BTreeMap::<String, ProviderId>::new();
   let mut has_viable_provider = false;
 
   for (provider_id, provider) in providers {
-    if allowed_providers.is_some_and(|allowed_providers| !allowed_providers.contains(provider_id)) {
-      continue;
-    }
-
     // With no configured base URL, the driver catalogue may supply a
     // default origin during final runtime linking.
     has_viable_provider |= provider.base_url().is_none() || !provider.origins().is_empty();
@@ -654,10 +515,8 @@ fn ensure_origin_relay_viable(
 
   if !has_viable_provider {
     return Err(invalid_value(
-      format!("routes.{route_id}.destination"),
-      format!(
-        "origin-based relay requires a provider with a configured or driver-default origin compatible with account pool `{pool_id}`"
-      ),
+      format!("profiles.{profile}.route"),
+      "origin-based relay requires an allowed provider with a configured or driver-default origin",
     ));
   }
   Ok(())

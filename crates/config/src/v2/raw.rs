@@ -39,7 +39,7 @@ pub struct RawConfig {
   pub service: RawService,
   #[serde(default)]
   pub listeners: BTreeMap<String, RawListener>,
-  /// Bindings are evaluated in source order. A map would silently destroy
+  /// Forward-proxy bindings are evaluated in source order. A map would destroy
   /// that routing precedence, so this intentionally remains a vector.
   #[serde(default)]
   pub bindings: Vec<RawBinding>,
@@ -53,8 +53,6 @@ pub struct RawConfig {
   pub routes: BTreeMap<String, RawRoute>,
   #[serde(default)]
   pub retry_policies: BTreeMap<String, RawRetryPolicy>,
-  #[serde(default)]
-  pub account_pools: BTreeMap<String, RawAccountPool>,
   #[serde(default)]
   pub providers: BTreeMap<String, RawProvider>,
 }
@@ -174,7 +172,8 @@ const fn default_prune_after_days() -> u64 {
   DEFAULT_PRUNE_AFTER_DAYS
 }
 
-/// A network ingress and its listener-level fallback behavior.
+/// A network ingress. APIs expose profile mounts; forward proxies declare
+/// their own HTTP fallback and CONNECT behavior.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawListener {
@@ -188,8 +187,6 @@ pub enum RawListener {
     /// public listeners are never accepted.
     #[serde(default)]
     allow_insecure_public: bool,
-    #[serde(default)]
-    default_http_action: RawBindingAction,
   },
   ForwardProxy {
     bind: String,
@@ -216,7 +213,7 @@ pub enum RawClientAuth {
   LocalKeys,
 }
 
-/// One ordered match rule. Matcher dimensions are combined with AND, while
+/// One ordered forward-proxy match rule. Dimensions are combined with AND, while
 /// values inside a dimension are alternatives. Empty-dimension and wildcard
 /// semantics are validated and canonicalized by the compiler. On a forward
 /// proxy, `hosts` matches the immutable ingress authority (the CONNECT target
@@ -250,12 +247,6 @@ pub enum RawBindingAction {
   Reject {},
 }
 
-impl Default for RawBindingAction {
-  fn default() -> Self {
-    Self::Reject {}
-  }
-}
-
 /// One ordered forward-proxy CONNECT negotiation rule. Matcher dimensions
 /// are combined with AND, while entries inside a dimension are alternatives.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -282,7 +273,6 @@ pub enum RawConnectAction {
 }
 
 /// A named execution context with its own account selection state and API mount.
-/// Legacy route-owned pools remain readable for existing explicit v2 documents.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawProfile {
@@ -326,9 +316,6 @@ pub enum RawWireIdentity {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawRoute {
   Managed {
-    /// Compatibility input only. New routes use the selected profile's pool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    account_pool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     providers: Option<Vec<String>>,
     provider: RawProviderSelector,
@@ -412,35 +399,7 @@ pub enum RawRelayDestination {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawRelayCredentials {
   Client {},
-  AccountPool {
-    /// Compatibility input only; omission selects the profile-owned pool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    account_pool: Option<String>,
-  },
-}
-
-impl RawRoute {
-  pub(crate) fn legacy_account_pool(&self) -> Option<&str> {
-    match self {
-      Self::Managed { account_pool, .. }
-      | Self::Relay {
-        credentials: RawRelayCredentials::AccountPool { account_pool },
-        ..
-      } => account_pool.as_deref(),
-      Self::Relay { .. } => None,
-    }
-  }
-
-  pub(crate) fn uses_accounts(&self) -> bool {
-    matches!(
-      self,
-      Self::Managed { .. }
-        | Self::Relay {
-          credentials: RawRelayCredentials::AccountPool { .. },
-          ..
-        }
-    )
-  }
+  AccountPool {},
 }
 
 /// Account selection and affinity settings for one independently managed
@@ -451,8 +410,6 @@ impl RawRoute {
 pub struct RawAccountPool {
   #[serde(default)]
   pub accounts: Option<Vec<String>>,
-  #[serde(default)]
-  pub providers: Option<Vec<String>>,
   #[serde(default)]
   pub strategy: RawPoolStrategy,
   #[serde(default = "default_failure_cooldown_secs")]
@@ -468,7 +425,6 @@ impl Default for RawAccountPool {
   fn default() -> Self {
     Self {
       accounts: None,
-      providers: None,
       strategy: RawPoolStrategy::default(),
       failure_cooldown_secs: default_failure_cooldown_secs(),
       session_ttl_secs: default_session_ttl_secs(),
@@ -536,23 +492,21 @@ schema_version = 2
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "route", profile = "default" }
 
 [profiles.default]
 route = "default"
 wire_identity = "auto"
 
+[profiles.default.account_pool]
+accounts = ["*"]
+strategy = "round_robin"
+
 [routes.default]
 kind = "managed"
-account_pool = "default"
+providers = ["*"]
 provider = { kind = "any" }
 model = { kind = "capability" }
 operation = "translate_compatible"
-
-[account_pools.default]
-accounts = ["*"]
-providers = ["*"]
-strategy = "round_robin"
 
 [providers.default]
 driver = "openai"
@@ -565,8 +519,22 @@ driver = "openai"
     assert_eq!(config.schema_version, SCHEMA_VERSION);
     assert_eq!(config.listeners.len(), 1);
     assert_eq!(config.routes.len(), 1);
-    assert_eq!(config.account_pools["default"].failure_cooldown_secs, 60);
-    assert_eq!(config.account_pools["default"].session_ttl_secs, 18_000);
+    assert_eq!(
+      config.profiles["default"]
+        .account_pool
+        .as_ref()
+        .unwrap()
+        .failure_cooldown_secs,
+      60
+    );
+    assert_eq!(
+      config.profiles["default"]
+        .account_pool
+        .as_ref()
+        .unwrap()
+        .session_ttl_secs,
+      18_000
+    );
   }
 
   #[test]
@@ -609,7 +577,6 @@ ports = [443]
 
 [routes.coding]
 kind = "managed"
-account_pool = "default"
 provider = { kind = "any" }
 model = { kind = "family", families = { coding = ["claude-sonnet-4", "gpt-5"] } }
 operation = "translate_compatible"

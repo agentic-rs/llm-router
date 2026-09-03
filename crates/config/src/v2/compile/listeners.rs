@@ -4,9 +4,9 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use tokn_policy::{
-  BindingId, CanonicalHost, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan, DestinationPolicy,
-  ForwardProxyListenerPlan, HostPattern, HttpAction, HttpBindingPlan, HttpMatch, ListenerId, ListenerPlan,
-  LlmApiListenerPlan, OperationId, ProfileId, ProfilePlan, RouteId, RoutePlan, TlsPlan,
+  BindingId, CanonicalHost, ClientAuthPlan, ConnectAction, ConnectMatch, ConnectRulePlan, ForwardProxyListenerPlan,
+  HostPattern, HttpAction, HttpBindingPlan, HttpMatch, ListenerId, ListenerPlan, LlmApiListenerPlan, OperationId,
+  ProfileId, ProfilePlan, TlsPlan,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,7 +21,7 @@ struct ListenerDraft {
   client_auth: ClientAuthPlan,
   cors: tokn_policy::CorsPlan,
   request_body_max_bytes: Option<NonZeroUsize>,
-  default_http_action: HttpAction,
+  default_http_action: Option<HttpAction>,
   default_connect_action: Option<ConnectAction>,
   ca_dir: Option<PathBuf>,
 }
@@ -30,8 +30,6 @@ struct HttpActionContext<'a> {
   owner_kind: &'static str,
   owner: &'a str,
   reference_field: &'static str,
-  location: String,
-  listener_flavor: ListenerFlavor,
 }
 
 fn dimension_subsumes<T>(covering: &[T], covered: &[T], subsumes: impl Fn(&T, &T) -> bool) -> bool {
@@ -109,7 +107,6 @@ pub(super) fn compile_listeners(
   raw: &RawConfig,
   source: &Path,
   profiles: &BTreeMap<ProfileId, ProfilePlan>,
-  routes: &BTreeMap<RouteId, RoutePlan>,
 ) -> Result<BTreeMap<ListenerId, ListenerPlan>, CompileError> {
   if raw.listeners.is_empty() {
     return Err(CompileError::EmptyRegistry { resource: "listener" });
@@ -135,7 +132,6 @@ pub(super) fn compile_listeners(
         client_auth,
         cors,
         allow_insecure_public,
-        default_http_action,
       } => (
         ListenerFlavor::LlmApi,
         bind,
@@ -143,7 +139,7 @@ pub(super) fn compile_listeners(
         cors.compile(raw_id)?,
         *allow_insecure_public,
         None,
-        default_http_action,
+        None,
         None,
         None,
       ),
@@ -162,7 +158,7 @@ pub(super) fn compile_listeners(
         tokn_policy::CorsPlan::default(),
         *allow_insecure_public,
         NonZeroUsize::new(*request_body_max_bytes),
-        default_http_action,
+        Some(default_http_action),
         Some(compile_connect_action(*default_connect)),
         resolve_ca_dir(ca_dir.as_deref(), source, raw_id)?,
       ),
@@ -203,18 +199,19 @@ pub(super) fn compile_listeners(
     }
     binds.push((bind, id.clone()));
 
-    let default_http_action = compile_http_action(
-      raw_default_http_action,
-      HttpActionContext {
-        owner_kind: "listener",
-        owner: raw_id,
-        reference_field: "default_http_action.profile",
-        location: format!("listeners.{raw_id}.default_http_action"),
-        listener_flavor: flavor,
-      },
-      profiles,
-      routes,
-    )?;
+    let default_http_action = raw_default_http_action
+      .map(|action| {
+        compile_http_action(
+          action,
+          HttpActionContext {
+            owner_kind: "listener",
+            owner: raw_id,
+            reference_field: "default_http_action.profile",
+          },
+          profiles,
+        )
+      })
+      .transpose()?;
     drafts.insert(
       id,
       ListenerDraft {
@@ -237,23 +234,13 @@ pub(super) fn compile_listeners(
     let id = claim_binding_id(&raw_binding.id, &mut binding_ids)?;
     let listener_id = resolve_listener(&raw_binding.listener, "binding", &raw_binding.id, "listener", &drafts)?;
     let listener = &drafts[&listener_id];
-    let (matcher, key) = compile_http_match(raw_binding)?;
-    if listener.flavor == ListenerFlavor::LlmApi {
-      for (profile_id, profile) in profiles {
-        let Some(mount) = profile.api_binding() else {
-          continue;
-        };
-        let overlaps = ["chat/completions", "responses", "messages", "models", "providers"]
-          .into_iter()
-          .any(|suffix| {
-            let path = format!("{}/{suffix}", mount.path());
-            key.path_prefixes.is_empty() || key.path_prefixes.iter().any(|prefix| path.starts_with(prefix))
-          });
-        if overlaps {
-          return Err(invalid_value(format!("bindings.{}", raw_binding.id), format!("API matcher overlaps the global mount for profile `{profile_id}`; configure profiles.{profile_id}.binding instead")));
-        }
-      }
+    if listener.flavor != ListenerFlavor::ForwardProxy {
+      return Err(invalid_value(
+        format!("bindings.{}.listener", raw_binding.id),
+        "HTTP bindings are only supported on forward-proxy listeners; configure profiles.<id>.binding for API paths",
+      ));
     }
+    let (matcher, key) = compile_http_match(raw_binding)?;
     let prior_matchers = http_matchers.entry(listener_id.clone()).or_default();
     if let Some((_, first)) = prior_matchers.iter().find(|(prior, _)| prior.subsumes(&key)) {
       return Err(invalid_value(
@@ -278,11 +265,8 @@ pub(super) fn compile_listeners(
         owner_kind: "binding",
         owner: &raw_binding.id,
         reference_field: "action.profile",
-        location: format!("bindings.{}.action", raw_binding.id),
-        listener_flavor: listener.flavor,
       },
       profiles,
-      routes,
     )?;
     http_bindings
       .entry(listener_id)
@@ -332,15 +316,9 @@ pub(super) fn compile_listeners(
     .map(|(id, draft)| {
       let listener_http_bindings = http_bindings.remove(&id).unwrap_or_default().into_boxed_slice();
       let plan = match draft.flavor {
-        ListenerFlavor::LlmApi => ListenerPlan::LlmApi(
-          LlmApiListenerPlan::new(
-            draft.bind,
-            draft.client_auth,
-            listener_http_bindings,
-            draft.default_http_action,
-          )
-          .with_cors(draft.cors),
-        ),
+        ListenerFlavor::LlmApi => {
+          ListenerPlan::LlmApi(LlmApiListenerPlan::new(draft.bind, draft.client_auth).with_cors(draft.cors))
+        }
         ListenerFlavor::ForwardProxy => {
           let listener_connect_rules = connect_rules.remove(&id).unwrap_or_default().into_boxed_slice();
           let default_connect_action = draft
@@ -361,7 +339,9 @@ pub(super) fn compile_listeners(
               draft.bind,
               draft.client_auth,
               listener_http_bindings,
-              draft.default_http_action,
+              draft
+                .default_http_action
+                .expect("forward-proxy drafts have a default HTTP action"),
               listener_connect_rules,
               default_connect_action,
               draft.ca_dir.map(TlsPlan::new),
@@ -460,13 +440,12 @@ fn compile_http_action(
   raw: &RawBindingAction,
   context: HttpActionContext<'_>,
   profiles: &BTreeMap<ProfileId, ProfilePlan>,
-  routes: &BTreeMap<RouteId, RoutePlan>,
 ) -> Result<HttpAction, CompileError> {
   let RawBindingAction::Route { profile: raw_profile } = raw else {
     return Ok(HttpAction::Reject);
   };
   let profile_id = parse_id::<ProfileId>("profile reference", raw_profile)?;
-  let profile = profiles
+  profiles
     .get(&profile_id)
     .ok_or_else(|| CompileError::UnresolvedReference {
       owner_kind: context.owner_kind,
@@ -475,33 +454,6 @@ fn compile_http_action(
       target_kind: "profile",
       target: raw_profile.clone(),
     })?;
-
-  if context.listener_flavor == ListenerFlavor::LlmApi {
-    if context.owner_kind == "binding" && profile.api_binding().is_some() {
-      return Err(invalid_value(
-        context.location,
-        "profile-owned API mounts cannot be selected through legacy API bindings",
-      ));
-    }
-    let route = routes
-      .get(profile.route())
-      .ok_or_else(|| CompileError::UnresolvedReference {
-        owner_kind: "profile",
-        owner: profile_id.to_string(),
-        field: "route",
-        target_kind: "route",
-        target: profile.route().to_string(),
-      })?;
-    if route.destination_policy() != DestinationPolicy::SelectedProvider {
-      return Err(invalid_value(
-        context.location,
-        format!(
-          "LLM API listener cannot use profile `{profile_id}` because route `{}` requires an original destination",
-          profile.route()
-        ),
-      ));
-    }
-  }
 
   Ok(HttpAction::Route(profile_id))
 }

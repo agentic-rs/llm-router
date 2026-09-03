@@ -1,6 +1,6 @@
 use std::path::Path;
 use tokn_config::v2::{self, RawBinding, RawProfileBinding, RawRoute};
-use tokn_policy::{HttpAction, ProviderId};
+use tokn_policy::ProviderId;
 
 const CONFIG: &str = r#"
 schema_version = 2
@@ -34,7 +34,6 @@ fn shared_routes_use_private_profile_pools_and_global_default_mounts() {
   let raw = raw();
   let plan = v2::compile(&raw, Path::new("profiles.toml")).unwrap();
   assert!(raw.bindings.is_empty());
-  assert!(raw.account_pools.is_empty());
   assert_eq!(plan.routes().len(), 1);
   let default = &plan.profiles()["default"];
   let work = &plan.profiles()["work"];
@@ -57,10 +56,6 @@ fn shared_routes_use_private_profile_pools_and_global_default_mounts() {
   let route = &plan.routes()["shared"];
   assert!(route.allows_provider(&ProviderId::new("openai").unwrap()));
   assert!(!route.allows_provider(&ProviderId::new("deepseek").unwrap()));
-  for listener in plan.listeners().values() {
-    assert_eq!(listener.default_http_action(), &HttpAction::Reject);
-    assert!(listener.http_bindings().is_empty());
-  }
 }
 
 #[test]
@@ -120,29 +115,22 @@ fn rejects_ambiguous_unsafe_mounts_and_unknown_or_duplicate_endpoints() {
 }
 
 #[test]
-fn legacy_pool_references_keep_legacy_exposure_and_cannot_be_mixed_ambiguously() {
-  let mut raw = raw();
-  raw.profiles.get_mut("work").unwrap().account_pool = None;
-  raw.account_pools.insert("legacy".into(), Default::default());
-  let RawRoute::Managed { account_pool, .. } = raw.routes.get_mut("shared").unwrap() else {
-    unreachable!()
-  };
-  *account_pool = Some("legacy".into());
-  let plan = v2::compile(&raw, Path::new("profiles.toml")).unwrap();
-  for profile in plan.profiles().values() {
-    assert_eq!(profile.account_pool().unwrap().as_str(), "legacy");
-    assert!(profile.api_binding().is_none());
+fn retired_v2_fields_are_rejected_instead_of_silently_ignored() {
+  for config in [
+    format!("{CONFIG}\n[account_pools.legacy]"),
+    "schema_version = 2\n[defaults.account_pool]\nproviders = ['openai']".to_string(),
+    CONFIG.replace("[routes.shared]", "[routes.shared]\naccount_pool = 'legacy'"),
+    CONFIG.replace("client_auth = \"none\"", "client_auth = \"none\"\ndefault_http_action = { kind = 'reject' }"),
+    CONFIG.replace("accounts = [\"work\"]", "providers = ['openai'], accounts = [\"work\"]"),
+    format!("{CONFIG}\n[routes.relay]\nkind = 'relay'\ndestination = {{ kind = 'original' }}\ncredentials = {{ kind = 'account_pool', account_pool = 'legacy' }}"),
+  ] {
+    let error = toml::from_str::<v2::RawConfig>(&config).unwrap_err();
+    assert!(error.to_string().contains("unknown field"), "{error}");
   }
-  raw.profiles.get_mut("work").unwrap().binding = Some(Default::default());
-  let plan = v2::compile(&raw, Path::new("profiles.toml")).unwrap();
-  assert_eq!(plan.profiles()["work"].account_pool().unwrap().as_str(), "profile.work");
-  assert_eq!(plan.account_pools()["legacy"], plan.account_pools()["profile.work"]);
-  raw.profiles.get_mut("work").unwrap().account_pool = Some(Default::default());
-  assert!(v2::compile(&raw, Path::new("profiles.toml")).is_err());
 }
 
 #[test]
-fn legacy_api_rules_cannot_override_or_alias_profile_mounts_but_proxy_rules_can_select_them() {
+fn api_rules_are_rejected_but_proxy_rules_can_select_profiles() {
   for prefix in [None, Some("/work/v1"), Some("/alias")] {
     let mut raw = raw();
     let mut rule: RawBinding =
@@ -156,7 +144,7 @@ fn legacy_api_rules_cannot_override_or_alias_profile_mounts_but_proxy_rules_can_
 }
 
 #[test]
-fn validates_provider_filters_and_profile_pool_intersection() {
+fn validates_route_provider_filters() {
   for providers in [vec![], vec!["unknown"], vec!["openai", "openai"], vec!["*", "openai"]] {
     let mut raw = raw();
     let RawRoute::Managed { providers: field, .. } = raw.routes.get_mut("shared").unwrap() else {
@@ -165,34 +153,27 @@ fn validates_provider_filters_and_profile_pool_intersection() {
     *field = Some(providers.into_iter().map(str::to_string).collect());
     assert!(v2::compile(&raw, Path::new("profiles.toml")).is_err());
   }
-  let mut raw = raw();
-  raw
-    .profiles
-    .get_mut("work")
-    .unwrap()
-    .account_pool
-    .as_mut()
-    .unwrap()
-    .providers = Some(vec!["deepseek".into()]);
-  assert!(v2::compile(&raw, Path::new("profiles.toml"))
-    .unwrap_err()
-    .to_string()
-    .contains("no overlap"));
 }
 
 #[test]
-fn fixed_client_relays_can_opt_into_mounts_but_original_relays_remain_proxy_only() {
+fn fixed_client_relays_mount_by_default_but_original_relays_remain_proxy_only() {
   let mut raw = raw();
   raw.profiles.remove("work");
   raw.routes.insert("shared".into(), toml::from_str("kind = 'relay'\ndestination = { kind = 'fixed_provider', provider = 'openai' }\ncredentials = { kind = 'client' }").unwrap());
-  raw.profiles.get_mut("default").unwrap().binding = Some(Default::default());
   let plan = v2::compile(&raw, Path::new("profiles.toml")).unwrap();
   assert!(plan.profiles()["default"].account_pool().is_none());
   assert_eq!(plan.profiles()["default"].api_binding().unwrap().path(), "/v1");
+  raw.profiles.get_mut("default").unwrap().account_pool = Some(Default::default());
+  assert!(v2::compile(&raw, Path::new("profiles.toml"))
+    .unwrap_err()
+    .to_string()
+    .contains("do not use an account pool"));
+  raw.profiles.get_mut("default").unwrap().account_pool = None;
   let RawRoute::Relay { destination, .. } = raw.routes.get_mut("shared").unwrap() else {
     unreachable!()
   };
   *destination = v2::RawRelayDestination::Original {};
+  raw.profiles.get_mut("default").unwrap().binding = Some(Default::default());
   assert!(v2::compile(&raw, Path::new("profiles.toml")).is_err());
   raw.profiles.get_mut("default").unwrap().binding = None;
   assert!(

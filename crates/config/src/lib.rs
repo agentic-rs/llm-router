@@ -1745,7 +1745,6 @@ max_decoded_bytes = 2048
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 "#;
     std::fs::write(&path, contents).unwrap();
 
@@ -1776,7 +1775,6 @@ max_decoded_bytes = 2048
 kind = "llm_api"
 bind = "127.0.0.1:4141"
 client_auth = "none"
-default_http_action = { kind = "reject" }
 "#;
     std::fs::write(&path, contents).unwrap();
 

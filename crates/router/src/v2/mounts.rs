@@ -24,7 +24,6 @@ pub(super) struct MountedEndpoint {
 #[derive(Default)]
 pub(super) struct ApiMounts {
   paths: BTreeMap<String, MountedEndpoint>,
-  profiles: BTreeSet<ProfileId>,
 }
 
 impl ApiMounts {
@@ -34,7 +33,6 @@ impl ApiMounts {
       let Some(binding) = profile.api_binding() else {
         continue;
       };
-      mounts.profiles.insert(id.clone());
       for (suffix, operation) in [
         ("chat/completions", ApiOperation::Generate(Endpoint::ChatCompletions)),
         ("responses", ApiOperation::Generate(Endpoint::Responses)),
@@ -66,10 +64,6 @@ impl ApiMounts {
   pub(super) fn get(&self, path: &str) -> Option<&MountedEndpoint> {
     self.paths.get(canonical_path(path).as_ref())
   }
-
-  pub(super) fn contains_profile(&self, profile: &ProfileId) -> bool {
-    self.profiles.contains(profile)
-  }
 }
 
 // Normalize hex case only. Never decode escaped slashes or alias distinct raw
@@ -90,17 +84,6 @@ fn canonical_path(path: &str) -> Cow<'_, str> {
     }
   }
   Cow::Owned(String::from_utf8(bytes).expect("ASCII substitutions preserve UTF-8"))
-}
-
-pub(super) fn is_legacy_api_path(path: &str) -> bool {
-  let suffix = path.strip_prefix("/v1/").or_else(|| {
-    let (profile, suffix) = path.strip_prefix('/')?.split_once("/v1/")?;
-    (!profile.is_empty() && !profile.contains('/')).then_some(suffix)
-  });
-  matches!(
-    suffix,
-    Some("chat/completions" | "responses" | "messages" | "models" | "providers")
-  )
 }
 
 pub(super) async fn dispatch(
@@ -131,7 +114,6 @@ pub(super) async fn dispatch(
   }
   let operation = entry.operation;
   let profile = entry.profile.clone();
-  let is_head = request.method() == Method::HEAD;
   let result = match operation {
     ApiOperation::Generate(endpoint) => {
       let (parts, body) = request.into_parts();
@@ -159,14 +141,15 @@ pub(super) async fn dispatch(
     }
     ApiOperation::Models => state
       .discovery
-      .models(&BTreeSet::from([profile]), &access)
+      .models(&profile, &access)
       .await
       .map(|body| Json(body).into_response()),
-    ApiOperation::Providers => Ok(Json(state.discovery.providers(&BTreeSet::from([profile]), &access)).into_response()),
+    ApiOperation::Providers => state
+      .discovery
+      .providers(&profile, &access)
+      .map(|body| Json(body).into_response()),
   };
-  let mut response = result.unwrap_or_else(IntoResponse::into_response);
-  if is_head {
-    *response.body_mut() = axum::body::Body::empty();
-  }
-  response
+  // Axum sets Content-Length from the representation before stripping HEAD
+  // bodies, including for fallback dispatch and error responses.
+  result.unwrap_or_else(IntoResponse::into_response)
 }

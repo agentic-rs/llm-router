@@ -56,7 +56,6 @@ pub(super) fn expand(raw: &RawConfig) -> Result<Cow<'_, RawConfig>, CompileError
   for (resource, exists) in [
     ("profiles", raw.profiles.contains_key(DEFAULT_ID)),
     ("routes", raw.routes.contains_key(DEFAULT_ID)),
-    ("account_pools", raw.account_pools.contains_key(DEFAULT_ID)),
   ] {
     if exists {
       return Err(CompileError::InvalidValue {
@@ -82,7 +81,6 @@ pub(super) fn expand(raw: &RawConfig) -> Result<Cow<'_, RawConfig>, CompileError
   expanded.routes.insert(
     DEFAULT_ID.into(),
     RawRoute::Managed {
-      account_pool: None,
       providers: defaults.providers.clone(),
       provider: defaults.provider.clone(),
       model: defaults.model.clone(),
@@ -98,22 +96,17 @@ pub(super) fn expand(raw: &RawConfig) -> Result<Cow<'_, RawConfig>, CompileError
 pub(super) fn source_error(raw: &RawConfig, mut error: CompileError) -> CompileError {
   if let CompileError::InvalidValue { location, .. } = &mut error {
     // Identifiers may contain dots. If an explicit resource could own this
-    // path (for example account_pools."default.other"), keep the original
+    // path (for example profiles."default.other"), keep the original
     // diagnostic instead of mistaking it for a generated default resource.
     let mut explicit_paths = raw
       .profiles
       .keys()
       .map(|id| format!("profiles.{id}."))
-      .chain(raw.routes.keys().map(|id| format!("routes.{id}.")))
-      .chain(raw.account_pools.keys().map(|id| format!("account_pools.{id}.")));
+      .chain(raw.routes.keys().map(|id| format!("routes.{id}.")));
     if explicit_paths.any(|prefix| location.starts_with(&prefix)) {
       return error;
     }
-    for (generated, authored) in [
-      ("profiles.default.", "defaults."),
-      ("routes.default.", "defaults."),
-      ("account_pools.default.", "defaults.account_pool."),
-    ] {
+    for (generated, authored) in [("profiles.default.", "defaults."), ("routes.default.", "defaults.")] {
       if let Some(field) = location.strip_prefix(generated) {
         *location = format!("{authored}{field}");
         break;
