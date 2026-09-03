@@ -953,16 +953,14 @@ default_http_action = { kind = "reject" }
     assert_eq!(compiled.gateway().profiles().len(), 1);
     assert_eq!(compiled.gateway().routes().len(), 1);
     assert_eq!(compiled.gateway().account_pools().len(), 1);
-    let explicit = V2_EXPLICIT_TEST_CONFIG
-      .replace("127.0.0.1:4141", "[::1]:5151")
-      .replace("account_pool = \"default\"\n", "")
-      .replace("[account_pools.default]", "[profiles.default.account_pool]")
-      .replace(
-        "default_http_action = { kind = \"route\", profile = \"default\" }\n",
-        "",
-      );
-    assert_eq!(compiled, tokn_config::v2::parse_config(&explicit, path).unwrap());
-    assert!(contents.lines().count() < explicit.lines().count());
+    // Exercise both checkout styles on every OS. Keep the expected graph in
+    // native form instead of rewriting the legacy fixture with line matches.
+    let fixture = include_str!("config_cmd/fixtures/profile_owned_v2.toml").replace("\r\n", "\n");
+    for explicit in [fixture.clone(), fixture.replace('\n', "\r\n")] {
+      let explicit = explicit.replace("127.0.0.1:4141", "[::1]:5151");
+      assert_eq!(compiled, tokn_config::v2::parse_config(&explicit, path).unwrap());
+      assert!(contents.lines().count() < explicit.lines().count());
+    }
 
     let context = ConfigContext::from_v2(path.to_path_buf(), compiled);
     let provider = context.resolve_provider("zai-coding-plan").unwrap();
