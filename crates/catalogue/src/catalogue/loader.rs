@@ -208,4 +208,19 @@ mod tests {
     let p = c.get("github-copilot").unwrap();
     assert!(!p.models.is_empty(), "github-copilot has no models");
   }
+
+  #[test]
+  fn embedded_deepseek_efforts_are_model_specific() {
+    let catalogue = parse_embedded();
+    let models = &catalogue["deepseek"].models;
+    assert_eq!(
+      serde_json::to_value(models["deepseek-v4-flash"].reasoning_efforts()).unwrap(),
+      serde_json::json!(["low", "high", "max"])
+    );
+    assert_eq!(
+      serde_json::to_value(models["deepseek-v4-pro"].reasoning_efforts()).unwrap(),
+      serde_json::json!(["high", "max"])
+    );
+    assert!(models["deepseek-reasoner"].reasoning_efforts().is_none());
+  }
 }

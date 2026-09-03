@@ -77,17 +77,28 @@ but not `top_k` or an enabled/adaptive mode. Typed `top_k` is currently
 supported on llama.cpp Chat Completions; llama.cpp has no portable reasoning
 control. Known non-reasoning models reject typed reasoning locally.
 
-DeepSeek exposes only `high` and `max` effort. The SDK rejects compatibility
-aliases that DeepSeek would otherwise silently promote; it also rejects
-`temperature` or `top_p` when DeepSeek thinking would ignore them. Claude
+Model discovery exposes `x_tokn_router.capabilities.reasoning_efforts` as an
+array of supported strings. `null` means unknown; `[]` means no effort control
+is advertised. The same metadata validates typed SDK requests after routing.
+Cached upstream capabilities (Copilot, Codex, or Anthropic-compatible model
+records) take precedence over the provider-specific models.dev catalogue.
+Unknown effort support does not reject a request; a known list rejects values
+outside that list, including custom strings. Raw endpoint clients preserve
+provider wire controls without this SDK validation.
+
+The bundled catalogue includes effort metadata. `tokn-router update` refreshes
+the runtime catalogue cache; restart to load the updated data. Upstream metadata
+is cached when model discovery successfully fetches the provider's model list.
+
+DeepSeek V4 Flash advertises `low`, `high`, and `max`; V4 Pro advertises `high`
+and `max`. Typed requests follow those model-specific lists. DeepSeek thinking
+also rejects `temperature` or `top_p`, which that backend would ignore. Claude
 supports adaptive reasoning on 4.6 and newer models but not a reasoning
 summary. Manual Claude reasoning requires `ReasoningMode::Enabled`, an
 explicit `max_tokens()` limit, a budget of at least 1024 tokens, and
 `budget_tokens < max_tokens`; manual mode is rejected on 4.7 and newer models,
-while adaptive mode is rejected on 4.5 and older models. Claude effort is also
-checked against the selected model generation—for example, Sonnet 4.5 has no
-effort control, Opus 4.5 supports through `high`, 4.6 supports through `max`,
-and current Opus 4.7 supports `xhigh`. Incompatible sampling values are
+while adaptive mode is rejected on 4.5 and older models. Claude effort levels
+use the same discovery metadata. Incompatible sampling values are
 rejected while Claude thinking is enabled, as are explicit sampling controls
 on Claude generations that do not accept them.
 

@@ -1,15 +1,18 @@
 use crate::account::AccountConfig;
+use crate::generation::ReasoningEffort;
 use crate::upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy, InvalidUpstreamUrl};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 pub use tokn_headers::TemplateVars;
 use tokn_headers::{AgentId, HeaderMap};
 
 pub mod error;
+mod reasoning;
+pub use reasoning::upstream_reasoning_efforts;
 
 pub use error::{Error, Result};
 
@@ -122,6 +125,8 @@ pub enum Interleaved {
 pub struct Capabilities {
   pub temperature: bool,
   pub reasoning: bool,
+  /// None means unknown; an empty list means no effort control is advertised.
+  pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
   pub attachment: bool,
   pub toolcall: bool,
   pub input: Modalities,
@@ -180,17 +185,52 @@ pub struct ProviderInfo {
 
 /// In-memory cache of model ids advertised by a provider's upstream
 /// `/models` endpoint. Warmed lazily by the routing layer the first time
-/// it sees the provider; subsequent reads are lock-free fast paths.
+/// it sees the provider. Identity and effort metadata are replaced together.
 #[derive(Debug, Default)]
 pub struct ModelCache {
-  inner: RwLock<Option<HashSet<String>>>,
+  inner: RwLock<Option<CachedModels>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedModels {
+  ids: HashSet<String>,
+  reasoning_efforts: HashMap<String, Vec<ReasoningEffort>>,
 }
 
 impl ModelCache {
   pub fn set(&self, ids: HashSet<String>) {
     if let Ok(mut g) = self.inner.write() {
-      *g = Some(ids);
+      *g = Some(CachedModels {
+        ids,
+        reasoning_efforts: HashMap::new(),
+      });
     }
+  }
+
+  /// Cache a successful upstream list, including explicit effort capabilities.
+  pub fn set_models(&self, models: &[Value]) {
+    let mut cached = CachedModels {
+      ids: HashSet::new(),
+      reasoning_efforts: HashMap::new(),
+    };
+    for model in models {
+      let Some(id) = model.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) else {
+        continue;
+      };
+      cached.ids.insert(id.to_string());
+      if let Some(efforts) = upstream_reasoning_efforts(model) {
+        cached.reasoning_efforts.insert(id.to_string(), efforts);
+      }
+    }
+    if !cached.ids.is_empty() {
+      if let Ok(mut guard) = self.inner.write() {
+        *guard = Some(cached);
+      }
+    }
+  }
+
+  pub fn reasoning_efforts(&self, model: &str) -> Option<Vec<ReasoningEffort>> {
+    self.inner.read().ok()?.as_ref()?.reasoning_efforts.get(model).cloned()
   }
 
   pub fn contains(&self, id: &str) -> bool {
@@ -198,7 +238,7 @@ impl ModelCache {
       .inner
       .read()
       .ok()
-      .and_then(|g| g.as_ref().map(|s| s.contains(id)))
+      .and_then(|g| g.as_ref().map(|s| s.ids.contains(id)))
       .unwrap_or(false)
   }
 
@@ -207,7 +247,7 @@ impl ModelCache {
   }
 
   pub fn snapshot(&self) -> Option<HashSet<String>> {
-    self.inner.read().ok().and_then(|g| g.clone())
+    self.inner.read().ok().and_then(|g| g.as_ref().map(|s| s.ids.clone()))
   }
 }
 
@@ -452,6 +492,15 @@ pub trait Provider: Send + Sync {
 
   fn model_info(&self, model: &str) -> Option<&ModelInfo> {
     self.info().default_models.iter().find(|m| m.id == model)
+  }
+
+  /// Upstream effort metadata wins over the provider-specific catalogue.
+  fn reasoning_efforts(&self, model: &str) -> Option<Vec<ReasoningEffort>> {
+    self
+      .info()
+      .model_cache
+      .reasoning_efforts(model)
+      .or_else(|| self.model_info(model)?.capabilities.reasoning_efforts.clone())
   }
 
   /// Does this provider serve `model`?

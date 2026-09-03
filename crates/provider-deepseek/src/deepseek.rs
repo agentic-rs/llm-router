@@ -211,8 +211,13 @@ fn shape_request(endpoint: crate::Endpoint, body: Value) -> Value {
     return out;
   };
 
-  let effort = extract_effort(obj.get("thinking")).or_else(|| extract_effort(obj.get("reasoning")));
-  let thinking_mode = extract_thinking_mode(obj.get("thinking"), obj.get("reasoning"));
+  // Keep normalized controls authoritative, but also accept native endpoint
+  // fields. Otherwise raw requests (and already-shaped requests) lose effort.
+  let effort = extract_effort(obj.get("thinking"))
+    .or_else(|| extract_effort(obj.get("reasoning")))
+    .or_else(|| obj.get("reasoning_effort").and_then(Value::as_str).map(str::to_string))
+    .or_else(|| extract_effort(obj.get("output_config")));
+  let thinking_mode = extract_thinking_mode(obj.get("thinking"), obj.get("reasoning"), effort.is_some());
   obj.insert("thinking".into(), json!({ "type": thinking_mode }));
   obj.remove("reasoning");
 
@@ -239,13 +244,13 @@ fn shape_request(endpoint: crate::Endpoint, body: Value) -> Value {
   out
 }
 
-fn extract_thinking_mode(thinking: Option<&Value>, reasoning: Option<&Value>) -> &'static str {
+fn extract_thinking_mode(thinking: Option<&Value>, reasoning: Option<&Value>, has_effort: bool) -> &'static str {
   match thinking
     .and_then(explicit_thinking_mode)
     .or_else(|| reasoning.and_then(explicit_thinking_mode))
   {
     Some(mode) => mode,
-    None if thinking.is_some() || reasoning.is_some() => "enabled",
+    None if thinking.is_some() || reasoning.is_some() || has_effort => "enabled",
     None => "disabled",
   }
 }
@@ -371,6 +376,111 @@ mod tests {
     assert_eq!(out.get("output_config"), Some(&json!({"effort": "max"})));
     assert!(out.get("reasoning").is_none());
     assert!(out.get("reasoning_effort").is_none());
+  }
+
+  #[test]
+  fn native_effort_survives_both_endpoint_transforms() {
+    let provider = DeepSeekProvider::from_account(Arc::new(acct(Some("sk-test")))).unwrap();
+    for effort in ["low", "high", "max"] {
+      for control in [
+        json!({"reasoning_effort": effort}),
+        json!({"output_config": {"effort": effort}}),
+      ] {
+        for endpoint in [Endpoint::ChatCompletions, Endpoint::Messages] {
+          let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "hi"}]
+          });
+          body
+            .as_object_mut()
+            .unwrap()
+            .extend(control.as_object().unwrap().clone());
+
+          let out = provider.transform_input(endpoint, body).unwrap();
+
+          assert_eq!(out["thinking"], json!({"type": "enabled"}));
+          match endpoint {
+            Endpoint::ChatCompletions => {
+              assert_eq!(out["reasoning_effort"], effort);
+              assert!(out.get("output_config").is_none());
+            }
+            Endpoint::Messages => {
+              assert_eq!(out["output_config"]["effort"], effort);
+              assert!(out.get("reasoning_effort").is_none());
+            }
+            Endpoint::Responses => unreachable!(),
+          }
+          assert_eq!(provider.transform_input(endpoint, out.clone()).unwrap(), out);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn native_effort_respects_explicit_disabled_thinking() {
+    for endpoint in [Endpoint::ChatCompletions, Endpoint::Messages] {
+      let out = shape_request(
+        endpoint,
+        json!({
+          "thinking": {"type": "disabled"},
+          "reasoning_effort": "high"
+        }),
+      );
+
+      assert_eq!(out["thinking"], json!({"type": "disabled"}));
+      let effort = match endpoint {
+        Endpoint::ChatCompletions => &out["reasoning_effort"],
+        Endpoint::Messages => &out["output_config"]["effort"],
+        Endpoint::Responses => unreachable!(),
+      };
+      assert_eq!(effort, "high");
+    }
+  }
+
+  #[test]
+  fn nested_effort_keeps_precedence_over_native_fields() {
+    for control in ["thinking", "reasoning"] {
+      let mut body = json!({
+        "reasoning_effort": "high",
+        "output_config": {"effort": "high"}
+      });
+      body[control] = json!({"effort": "max"});
+
+      assert_eq!(
+        shape_request(Endpoint::ChatCompletions, body.clone())["reasoning_effort"],
+        "max"
+      );
+      assert_eq!(
+        shape_request(Endpoint::Messages, body)["output_config"]["effort"],
+        "max"
+      );
+    }
+  }
+
+  #[test]
+  fn live_efforts_override_catalogue_and_missing_metadata_falls_back() {
+    let provider = DeepSeekProvider::from_account(Arc::new(acct(Some("sk-test")))).unwrap();
+    assert_eq!(
+      serde_json::to_value(provider.reasoning_efforts("deepseek-v4-flash")).unwrap(),
+      json!(["low", "high", "max"])
+    );
+    assert_eq!(
+      serde_json::to_value(provider.reasoning_efforts("deepseek-v4-pro")).unwrap(),
+      json!(["high", "max"])
+    );
+    provider.info().model_cache.set_models(&[json!({
+      "id": "deepseek-v4-flash", "capabilities": {"supports": {"reasoning_effort": []}}
+    })]);
+    assert_eq!(provider.reasoning_efforts("deepseek-v4-flash"), Some(vec![]));
+    provider
+      .info()
+      .model_cache
+      .set_models(&[json!({"id": "deepseek-v4-flash"})]);
+    assert_eq!(
+      serde_json::to_value(provider.reasoning_efforts("deepseek-v4-flash")).unwrap(),
+      json!(["low", "high", "max"])
+    );
+    assert!(provider.reasoning_efforts("future-model").is_none());
   }
 
   #[test]

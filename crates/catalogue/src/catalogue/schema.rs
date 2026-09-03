@@ -12,6 +12,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use tokn_core::generation::ReasoningEffort;
 
 /// Top-level: provider id → provider record.
 pub type Catalogue = BTreeMap<String, Provider>;
@@ -36,6 +37,8 @@ pub struct Model {
   #[serde(default)]
   pub reasoning: bool,
   #[serde(default)]
+  pub reasoning_options: Option<Vec<ReasoningOption>>,
+  #[serde(default)]
   pub tool_call: bool,
   #[serde(default)]
   pub temperature: bool,
@@ -47,6 +50,39 @@ pub struct Model {
   pub limit: Limits,
   #[serde(default)]
   pub release_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningOption {
+  Effort {
+    values: Vec<ReasoningEffort>,
+  },
+  Toggle,
+  BudgetTokens,
+  #[serde(other)]
+  Unknown,
+}
+
+impl Model {
+  pub fn reasoning_efforts(&self) -> Option<Vec<ReasoningEffort>> {
+    let options = self.reasoning_options.as_ref()?;
+    let mut efforts = Vec::new();
+    for option in options {
+      match option {
+        ReasoningOption::Effort { values } => {
+          for value in values {
+            if !efforts.contains(value) {
+              efforts.push(value.clone());
+            }
+          }
+        }
+        ReasoningOption::Unknown => return None,
+        ReasoningOption::Toggle | ReasoningOption::BudgetTokens => {}
+      }
+    }
+    Some(efforts)
+  }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

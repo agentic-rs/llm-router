@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokn_access::AccessContext;
 use tokn_accounts::link::{LinkedAccountPools, ProviderBinding, ProviderBindingKey, ProviderGraph};
 use tokn_accounts::registry::Registry;
-use tokn_core::provider::{ModelInfo, Provider};
+use tokn_core::provider::{ModelCache, ModelInfo, Provider};
 use tokn_policy::{
   GatewayPlan, ModelSelector, ProfileId, ProviderId, ProviderSelector, RelayCredentials, RelayDestination, RoutePlan,
 };
@@ -24,6 +24,7 @@ struct ProviderMetadata {
   auth_kind: Value,
   endpoints: Vec<&'static str>,
   models: Vec<ModelInfo>,
+  model_cache: Arc<ModelCache>,
 }
 
 struct ProfileDiscovery {
@@ -99,6 +100,7 @@ impl DiscoveryRuntime {
             .map(|endpoint| endpoint.endpoint.as_str())
             .collect(),
           models,
+          model_cache: Arc::clone(destination.target().model_cache()),
         },
       );
     }
@@ -351,13 +353,7 @@ fn local_models(models: &[ModelInfo]) -> Vec<Value> {
 }
 
 fn warm_model_cache(provider: &dyn Provider, models: &[Value]) {
-  let ids = models
-    .iter()
-    .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
-    .collect::<HashSet<_>>();
-  if !ids.is_empty() {
-    provider.info().model_cache.set(ids);
-  }
+  provider.info().model_cache.set_models(models);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -426,6 +422,20 @@ fn enrich(
     }
   }
 
+  let efforts = tokn_core::provider::upstream_reasoning_efforts(entry)
+    .or_else(|| metadata.model_cache.reasoning_efforts(upstream_id))
+    .or_else(|| {
+      metadata
+        .models
+        .iter()
+        .find(|model| model.id == upstream_id)?
+        .capabilities
+        .reasoning_efforts
+        .clone()
+    });
+  let capabilities = extension.entry("capabilities").or_insert_with(|| json!({}));
+  capabilities["reasoning_efforts"] = json!(efforts);
+
   if let Some(object) = entry.as_object_mut() {
     object.insert("x_tokn_router".into(), Value::Object(extension));
   }
@@ -443,4 +453,63 @@ fn list_response(modes: BTreeSet<&'static str>, data: Vec<Value>) -> Value {
     "route_modes": modes,
     "data": data,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn discovery_efforts_follow_live_metadata_catalogue_and_unknown_precedence() {
+    let provider_id = ProviderId::new("deepseek").unwrap();
+    let metadata = ProviderMetadata {
+      driver_id: "deepseek".into(),
+      display_name: "DeepSeek",
+      upstream_url: "https://api.deepseek.com/".into(),
+      auth_kind: Value::Null,
+      endpoints: vec!["chat_completions"],
+      models: tokn_catalogue::catalogue::default_models_for("deepseek"),
+      model_cache: Arc::new(ModelCache::default()),
+    };
+    let mut entry = json!({"id": "deepseek-v4-flash"});
+    enrich(
+      &mut entry,
+      "deepseek-v4-flash",
+      "deepseek-v4-flash",
+      &provider_id,
+      &metadata,
+    );
+    assert_eq!(
+      entry["x_tokn_router"]["capabilities"]["reasoning_efforts"],
+      json!(["low", "high", "max"])
+    );
+
+    let mut live = json!({"id": "deepseek-v4-flash", "capabilities": {"supports": {"reasoning_effort": []}}});
+    metadata.model_cache.set_models(&[live.clone()]);
+    enrich(
+      &mut live,
+      "deepseek-v4-flash",
+      "deepseek-v4-flash",
+      &provider_id,
+      &metadata,
+    );
+    assert_eq!(live["x_tokn_router"]["capabilities"]["reasoning_efforts"], json!([]));
+    assert_eq!(live["capabilities"]["supports"]["reasoning_effort"], json!([]));
+    // A subsequent local fallback still reports the cached support used by validation.
+    enrich(
+      &mut entry,
+      "deepseek-v4-flash",
+      "deepseek-v4-flash",
+      &provider_id,
+      &metadata,
+    );
+    assert_eq!(entry["x_tokn_router"]["capabilities"]["reasoning_efforts"], json!([]));
+
+    let mut unknown = json!({"id": "future"});
+    enrich(&mut unknown, "future", "future", &provider_id, &metadata);
+    assert_eq!(
+      unknown["x_tokn_router"]["capabilities"]["reasoning_efforts"],
+      Value::Null
+    );
+  }
 }

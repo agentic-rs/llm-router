@@ -38,4 +38,5 @@ serde_yaml = { workspace = true }
 tokio = { workspace = true }
 tokn-mock-server = { workspace = true }
 tokn-provider-copilot = { workspace = true }
+tokn-provider-deepseek = { workspace = true }
 tokn-provider-openai = { workspace = true }

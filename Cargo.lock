@@ -3225,6 +3225,7 @@ dependencies = [
  "tokn-headers",
  "tokn-mock-server",
  "tokn-provider-copilot",
+ "tokn-provider-deepseek",
  "tokn-provider-openai",
  "tokn-router-config",
  "tokn-service",
