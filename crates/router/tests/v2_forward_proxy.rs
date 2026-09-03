@@ -702,6 +702,113 @@ default_connect = "tunnel"
   );
 }
 
+#[tokio::test]
+async fn profile_owned_proxy_pools_and_client_relays_enforce_route_provider_restrictions() {
+  let allowed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let allowed_addr = allowed.local_addr().unwrap();
+  let blocked = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let blocked_addr = blocked.local_addr().unwrap();
+  let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(2);
+  let upstream = tokio::spawn(async move {
+    for _ in 0..2 {
+      let (mut stream, _) = allowed.accept().await.unwrap();
+      let request = read_response_head(&mut stream).await;
+      capture_tx.send(request).await.unwrap();
+      stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        .await
+        .unwrap();
+    }
+  });
+  for credentials in ["account_pool", "client"] {
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let pool = if credentials == "account_pool" {
+      "account_pool = { accounts = ['allowed-account', 'blocked-account'] }"
+    } else {
+      ""
+    };
+    let config = format!(
+      r#"
+schema_version = 2
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "relay" }}
+default_connect = "reject"
+[profiles.relay]
+route = "relay"
+{pool}
+[routes.relay]
+kind = "relay"
+providers = ["allowed"]
+destination = {{ kind = "original" }}
+credentials = {{ kind = "{credentials}" }}
+[providers.allowed]
+driver = "llama-cpp"
+base_url = "http://{allowed_addr}/v1"
+[providers.blocked]
+driver = "llama-cpp"
+base_url = "http://{blocked_addr}/v1"
+"#
+    );
+    let accounts = ["allowed", "blocked"].map(|provider| {
+      toml::from_str(&format!(
+        "id = '{provider}-account'\nprovider = '{provider}'\napi_key = 'router-secret'\nenabled = true"
+      ))
+      .unwrap()
+    });
+    let plan = tokn_config::v2::parse(&config, Path::new("proxy-profile.toml")).unwrap();
+    assert!(plan.profiles()["relay"].api_binding().is_none());
+    let state = tokn_router::v2::build_runtime_states(
+      plan,
+      &accounts,
+      Arc::new(AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap()
+    .forward_proxy
+    .pop()
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+      let _ = shutdown_rx.await;
+    }));
+    wait_for_listener(proxy_addr).await;
+    // Account relays preserve the existing unowned-origin 400 response;
+    // restricted client relays report a provider-policy denial.
+    let denied = if credentials == "account_pool" {
+      "HTTP/1.1 400"
+    } else {
+      "HTTP/1.1 403"
+    };
+    for (destination, expected) in [(blocked_addr, denied), (allowed_addr, "HTTP/1.1 200")] {
+      let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+      stream.write_all(format!("GET http://{destination}/custom HTTP/1.1\r\nHost: {destination}\r\nAuthorization: Bearer client-secret\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+      let response = read_response_head(&mut stream).await;
+      assert!(response.starts_with(expected), "{credentials}: {response}");
+    }
+    let captured = capture_rx.recv().await.unwrap().to_ascii_lowercase();
+    assert!(captured.starts_with("get /custom http/1.1"));
+    let key = if credentials == "client" {
+      "client-secret"
+    } else {
+      "router-secret"
+    };
+    assert!(captured.contains(&format!("authorization: bearer {key}")));
+    assert!(
+      tokio::time::timeout(std::time::Duration::from_millis(20), blocked.accept())
+        .await
+        .is_err()
+    );
+    shutdown_tx.send(()).unwrap();
+    proxy.await.unwrap().unwrap();
+  }
+  upstream.await.unwrap();
+}
+
 async fn connect(proxy_addr: std::net::SocketAddr, authority: &str, token: Option<&str>) -> String {
   let authorization = token.map(|token| format!("Bearer {token}"));
   let authorization = authorization.iter().map(String::as_str).collect::<Vec<_>>();

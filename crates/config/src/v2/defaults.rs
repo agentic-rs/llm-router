@@ -5,37 +5,43 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use super::{
-  CompileError, RawAccountPool, RawConfig, RawModelSelector, RawOperationPolicy, RawProfile, RawProviderSelector,
-  RawRoute, RawRouteRetry, RawWireIdentity,
+  CompileError, RawAccountPool, RawConfig, RawModelSelector, RawOperationPolicy, RawProfile, RawProfileBinding,
+  RawProviderSelector, RawRoute, RawRouteRetry, RawWireIdentity,
 };
 
 const DEFAULT_ID: &str = "default";
 
-/// A recipe for `profiles.default`, `routes.default`, and `account_pools.default`.
+/// A recipe for `profiles.default` (including its pool) and `routes.default`.
 ///
-/// This is not inheritance: other named resources are never modified. Listener
-/// bindings and fallbacks must explicitly select the generated default profile.
+/// This is not inheritance: other named resources are never modified. The
+/// default profile is mounted at `/v1` on every API listener unless customized.
 /// Retries remain disabled unless a policy is explicitly referenced.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawDefaultPolicy {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub providers: Option<Vec<String>>,
   pub provider: RawProviderSelector,
   pub model: RawModelSelector,
   pub operation: RawOperationPolicy,
   pub wire_identity: RawWireIdentity,
   pub retry: RawRouteRetry,
   pub account_pool: RawAccountPool,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub binding: Option<RawProfileBinding>,
 }
 
 impl Default for RawDefaultPolicy {
   fn default() -> Self {
     Self {
+      providers: None,
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::TranslateCompatible,
       wire_identity: RawWireIdentity::default(),
       retry: RawRouteRetry::default(),
       account_pool: RawAccountPool::default(),
+      binding: None,
     }
   }
 }
@@ -69,21 +75,21 @@ pub(super) fn expand(raw: &RawConfig) -> Result<Cow<'_, RawConfig>, CompileError
     RawProfile {
       route: DEFAULT_ID.into(),
       wire_identity: defaults.wire_identity.clone(),
+      account_pool: Some(defaults.account_pool.clone()),
+      binding: defaults.binding.clone(),
     },
   );
   expanded.routes.insert(
     DEFAULT_ID.into(),
     RawRoute::Managed {
-      account_pool: DEFAULT_ID.into(),
+      account_pool: None,
+      providers: defaults.providers.clone(),
       provider: defaults.provider.clone(),
       model: defaults.model.clone(),
       operation: defaults.operation,
       retry: defaults.retry.clone(),
     },
   );
-  expanded
-    .account_pools
-    .insert(DEFAULT_ID.into(), defaults.account_pool.clone());
   Ok(Cow::Owned(expanded))
 }
 

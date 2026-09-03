@@ -42,6 +42,10 @@ pub enum Error {
   #[snafu(display("{message}"))]
   BadRequest { message: String },
 
+  /// The requested API path or generation endpoint is not exposed. Maps to 404.
+  #[snafu(display("{message}"))]
+  NotFound { message: String },
+
   /// Request body exceeded the listener's configured maximum. Maps to 413.
   #[snafu(display("{message}"))]
   PayloadTooLarge { message: String },
@@ -83,6 +87,9 @@ impl Error {
   }
   pub fn forbidden(msg: impl Into<String>) -> Self {
     Error::Forbidden { message: msg.into() }
+  }
+  pub fn not_found(msg: impl Into<String>) -> Self {
+    Error::NotFound { message: msg.into() }
   }
   pub fn upstream(status: StatusCode, body: impl Into<String>) -> Self {
     Error::Upstream {
@@ -140,6 +147,7 @@ impl Error {
       Error::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
       Error::Forbidden { .. } => StatusCode::FORBIDDEN,
       Error::BadRequest { .. } => StatusCode::BAD_REQUEST,
+      Error::NotFound { .. } => StatusCode::NOT_FOUND,
       Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
       Error::UnsupportedMediaType { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
       Error::Upstream { status, .. } => *status,
@@ -155,6 +163,7 @@ impl Error {
       Error::Unauthorized { .. } => "authentication_error",
       Error::Forbidden { .. } => "permission_error",
       Error::BadRequest { .. } => "bad_request",
+      Error::NotFound { .. } => "not_found",
       Error::PayloadTooLarge { .. } => "payload_too_large",
       Error::UnsupportedMediaType { .. } => "unsupported_media_type",
       Error::Upstream { .. } => "upstream_error",
@@ -169,6 +178,7 @@ impl Error {
     match self {
       Error::Unauthorized { message } | Error::Forbidden { message } => message.clone(),
       Error::BadRequest { message } => message.clone(),
+      Error::NotFound { message } => message.clone(),
       Error::PayloadTooLarge { message } => message.clone(),
       Error::UnsupportedMediaType { message } => message.clone(),
       Error::Upstream { status, body } => {

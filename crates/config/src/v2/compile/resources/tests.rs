@@ -69,7 +69,8 @@ fn compiles_retry_policies_for_managed_and_relay_routes() {
   config.routes.insert(
     "managed".into(),
     RawRoute::Managed {
-      account_pool: "default".into(),
+      providers: None,
+      account_pool: Some("default".into()),
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::TranslateCompatible,
@@ -81,6 +82,7 @@ fn compiles_retry_policies_for_managed_and_relay_routes() {
   config.routes.insert(
     "relay-safe".into(),
     RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::FixedProvider {
         provider: "default".into(),
       },
@@ -93,11 +95,12 @@ fn compiles_retry_policies_for_managed_and_relay_routes() {
   config.routes.insert(
     "relay-buffered".into(),
     RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::FixedProvider {
         provider: "default".into(),
       },
       credentials: RawRelayCredentials::AccountPool {
-        account_pool: "default".into(),
+        account_pool: Some("default".into()),
       },
       retry: RawRouteRetry::Buffered {
         policy: "standard".into(),
@@ -182,6 +185,7 @@ initial_backoff_ms = 0
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::FixedProvider {
         provider: "default".into(),
       },
@@ -204,6 +208,7 @@ fn compiles_relay_destination_and_credentials_independently() {
     (
       "fixed-client".into(),
       RawRoute::Relay {
+        providers: None,
         destination: RawRelayDestination::FixedProvider {
           provider: "default".into(),
         },
@@ -214,11 +219,12 @@ fn compiles_relay_destination_and_credentials_independently() {
     (
       "fixed-pool".into(),
       RawRoute::Relay {
+        providers: None,
         destination: RawRelayDestination::FixedProvider {
           provider: "default".into(),
         },
         credentials: RawRelayCredentials::AccountPool {
-          account_pool: "default".into(),
+          account_pool: Some("default".into()),
         },
         retry: RawRouteRetry::Never {},
       },
@@ -226,6 +232,7 @@ fn compiles_relay_destination_and_credentials_independently() {
     (
       "original-client".into(),
       RawRoute::Relay {
+        providers: None,
         destination: RawRelayDestination::Original {},
         credentials: RawRelayCredentials::Client {},
         retry: RawRouteRetry::Never {},
@@ -234,9 +241,10 @@ fn compiles_relay_destination_and_credentials_independently() {
     (
       "original-pool".into(),
       RawRoute::Relay {
+        providers: None,
         destination: RawRelayDestination::Original {},
         credentials: RawRelayCredentials::AccountPool {
-          account_pool: "default".into(),
+          account_pool: Some("default".into()),
         },
         retry: RawRouteRetry::Never {},
       },
@@ -302,9 +310,10 @@ origins = ["https://example.com"]
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::AccountPool {
-        account_pool: "default".into(),
+        account_pool: Some("default".into()),
       },
       retry: RawRouteRetry::Never {},
     },
@@ -352,7 +361,8 @@ driver = "zai"
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
-      account_pool: "default".into(),
+      providers: None,
+      account_pool: Some("default".into()),
       provider: RawProviderSelector::Fixed {
         provider: "public".into(),
       },
@@ -374,6 +384,7 @@ fn client_credentials_auto_is_none_but_explicit_identity_is_rejected() {
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::Client {},
       retry: RawRouteRetry::Never {},
@@ -398,7 +409,8 @@ fn model_families_require_ordered_unambiguous_members() {
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
-      account_pool: "default".into(),
+      providers: None,
+      account_pool: Some("default".into()),
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Family {
         families: BTreeMap::from([("coding".into(), vec!["gpt-5".into(), "gpt-4o".into()])]),
@@ -471,9 +483,10 @@ driver = "zai"
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::AccountPool {
-        account_pool: "default".into(),
+        account_pool: Some("default".into()),
       },
       retry: RawRouteRetry::Never {},
     },
@@ -494,9 +507,10 @@ driver = "openai"
   config.routes.insert(
     "default".into(),
     RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::AccountPool {
-        account_pool: "default".into(),
+        account_pool: Some("default".into()),
       },
       retry: RawRouteRetry::Never {},
     },
@@ -565,7 +579,8 @@ fn fixed_routes_and_pools_can_reference_an_implicit_official_provider() {
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
-      account_pool: "default".into(),
+      providers: None,
+      account_pool: Some("default".into()),
       provider: RawProviderSelector::Fixed {
         provider: "openai".into(),
       },
@@ -755,7 +770,8 @@ fn family_route_rejects_duplicate_members() {
   config.routes.insert(
     "default".into(),
     RawRoute::Managed {
-      account_pool: "default".into(),
+      providers: None,
+      account_pool: Some("default".into()),
       provider: RawProviderSelector::Fixed {
         provider: "default".into(),
       },

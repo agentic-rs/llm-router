@@ -7,9 +7,16 @@ use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 /// The predicate reads live policy; apply this layer only to client API routes,
 /// outside authentication, never to health or administration endpoints.
 pub(crate) fn layer(allowed: impl Fn(&str) -> bool + Send + Sync + 'static) -> CorsLayer {
+  layer_for_request(move |origin, _| allowed(origin))
+}
+
+/// Dynamic API mounts also need to exclude unmatched fallback paths.
+pub(crate) fn layer_for_request(
+  allowed: impl Fn(&str, &axum::http::request::Parts) -> bool + Send + Sync + 'static,
+) -> CorsLayer {
   CorsLayer::new()
-    .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
-      origin.to_str().ok().is_some_and(&allowed)
+    .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, parts| {
+      origin.to_str().ok().is_some_and(|origin| allowed(origin, parts))
     }))
     .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
     .allow_headers(AllowHeaders::mirror_request())

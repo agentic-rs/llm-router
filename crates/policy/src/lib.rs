@@ -21,8 +21,8 @@ pub use id::{
   ProviderId, RetryPolicyId, RouteId, WireIdentityId,
 };
 pub use route::{
-  CredentialPolicy, DestinationPolicy, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget, ModelFamily,
-  ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, ProviderSelector, QualificationNamespace,
+  ApiBindingPlan, CredentialPolicy, DestinationPolicy, HeaderStrategy, ManagedRetry, ManagedRoute, ManagedTarget,
+  ModelFamily, ModelSelector, OperationPolicy, PayloadTransform, ProfilePlan, ProviderSelector, QualificationNamespace,
   RelayCredentials, RelayDestination, RelayRetry, RelayRoute, RetryPolicyPlan, RouteKind, RoutePlan, WireIdentity,
 };
 pub use topology::{

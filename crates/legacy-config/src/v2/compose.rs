@@ -4,9 +4,9 @@ use std::path::Path;
 use tokn_config::v2::{
   CompiledConfig, RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction,
   RawConnectRule, RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawProfile,
-  RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRequestLimits,
-  RawRetryPolicy, RawRoute, RawRouteRetry, RawService, RawWireIdentity, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
-  SCHEMA_VERSION,
+  RawProfileBinding, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination,
+  RawRequestLimits, RawRetryPolicy, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
+  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES, SCHEMA_VERSION,
 };
 use tokn_config::{Config, ProxyProviderMode, RouteMode};
 use tokn_core::account::AccountConfig;
@@ -28,11 +28,6 @@ const LEGACY_RETRY_POLICY_ID: &str = "legacy-recoverable";
 const LEGACY_MAX_RETRIES: u32 = 2;
 const LEGACY_INITIAL_BACKOFF_MS: u64 = 100;
 const GENERATED_SOURCE: &str = "in-memory-v1-projection.toml";
-const LLM_ENDPOINTS: [(&str, &str, &str); 3] = [
-  ("chat-completions", "chat/completions", "chat_completions"),
-  ("responses", "responses", "responses"),
-  ("messages", "messages", "messages"),
-];
 
 /// A read-only projection ready for the v2 runtime path.
 #[derive(Clone, Debug)]
@@ -105,7 +100,6 @@ pub fn project_v2_config(
   let mut ids = IdentifierAllocator::with_reserved(DEFAULT_POLICY_ID);
   let mut profiles = BTreeMap::new();
   let mut routes = BTreeMap::new();
-  let mut account_pools = BTreeMap::new();
   let mut bindings = Vec::new();
   let mut connect_rules = Vec::new();
 
@@ -123,23 +117,30 @@ pub fn project_v2_config(
         allocated
       }
     };
-    let pool = raw_pool_for_policy(legacy, &policy, &account_index)?;
-    let route = route_recipe(&policy, &resource_id)?;
+    let mut pool = raw_pool_for_policy(legacy, &policy, &account_index)?;
+    let route = route_recipe(&policy, pool.providers.take())?;
+    let path = match policy.legacy_profile.as_deref() {
+      Some(profile) => profile_path(profile)?,
+      None => "/v1/".to_string(),
+    };
+    let default_path = if resource_id == DEFAULT_POLICY_ID {
+      "/v1/".to_string()
+    } else {
+      format!("/{resource_id}/v1/")
+    };
     profiles.insert(
       resource_id.clone(),
       RawProfile {
         route: resource_id.clone(),
         wire_identity: wire_identity(&policy),
+        account_pool: Some(pool),
+        binding: (path != default_path).then(|| RawProfileBinding {
+          path: Some(path.trim_end_matches('/').to_string()),
+          endpoints: None,
+        }),
       },
     );
     routes.insert(resource_id.clone(), route);
-    account_pools.insert(resource_id.clone(), pool);
-
-    let path_prefix = match policy.legacy_profile.as_deref() {
-      Some(profile) => profile_path(profile)?,
-      None => "/v1/".to_string(),
-    };
-    append_api_bindings(&mut bindings, &resource_id, &path_prefix);
   }
 
   let mut listeners = BTreeMap::from([(
@@ -168,7 +169,6 @@ pub fn project_v2_config(
     listeners.insert(FORWARD_PROXY_LISTENER_ID.to_string(), proxy.listener);
     profiles.extend(proxy.profiles);
     routes.extend(proxy.routes);
-    account_pools.extend(proxy.account_pools);
     bindings.extend(proxy.bindings);
     connect_rules.extend(proxy.connect_rules);
     warnings.extend(proxy.warnings);
@@ -207,7 +207,7 @@ pub fn project_v2_config(
         initial_backoff_ms: LEGACY_INITIAL_BACKOFF_MS,
       },
     )]),
-    account_pools,
+    account_pools: BTreeMap::new(),
     providers,
   };
   let compiled_config = tokn_config::v2::compile_config(&raw_config, Path::new(GENERATED_SOURCE))
@@ -227,7 +227,6 @@ struct ProjectedForwardProxy {
   connect_rules: Vec<RawConnectRule>,
   profiles: BTreeMap<String, RawProfile>,
   routes: BTreeMap<String, RawRoute>,
-  account_pools: BTreeMap<String, RawAccountPool>,
   warnings: Vec<V2ProjectionWarning>,
 }
 
@@ -258,14 +257,13 @@ fn project_forward_proxy(
   policy.legacy_profile = None;
   policy.mode = options.route_mode;
 
-  let account_pool_id = ids.allocate("proxy-pool");
   let account_pool = raw_pool_for_policy(legacy, &policy, account_index)?;
   let mut profiles = BTreeMap::new();
   let mut routes = BTreeMap::new();
   let default_profile_id = insert_proxy_profile(
     &policy,
     options.route_mode,
-    &account_pool_id,
+    &account_pool,
     "proxy-default",
     ids,
     &mut profiles,
@@ -322,7 +320,7 @@ fn project_forward_proxy(
       let profile_id = insert_proxy_profile(
         &policy,
         route_mode,
-        &account_pool_id,
+        &account_pool,
         &format!("proxy-{}", route_mode_name(route_mode)),
         ids,
         &mut profiles,
@@ -390,7 +388,6 @@ fn project_forward_proxy(
     connect_rules,
     profiles,
     routes,
-    account_pools: BTreeMap::from([(account_pool_id, account_pool)]),
     warnings,
   })
 }
@@ -398,14 +395,15 @@ fn project_forward_proxy(
 fn insert_proxy_profile(
   policy: &EffectivePolicy,
   mode: RouteMode,
-  account_pool_id: &str,
+  account_pool: &RawAccountPool,
   requested_id: &str,
   ids: &mut IdentifierAllocator,
   profiles: &mut BTreeMap<String, RawProfile>,
   routes: &mut BTreeMap<String, RawRoute>,
 ) -> Result<String, V2ProjectionError> {
   let resource_id = ids.allocate(requested_id);
-  let route = proxy_route_recipe(policy, mode, account_pool_id)?;
+  let mut pool = account_pool.clone();
+  let route = proxy_route_recipe(policy, mode, pool.providers.take())?;
   let wire_identity = if mode == RouteMode::Passthrough {
     RawWireIdentity::None
   } else {
@@ -416,6 +414,8 @@ fn insert_proxy_profile(
     RawProfile {
       route: resource_id.clone(),
       wire_identity,
+      account_pool: (mode != RouteMode::Passthrough).then_some(pool),
+      binding: None,
     },
   );
   routes.insert(resource_id.clone(), route);
@@ -425,25 +425,25 @@ fn insert_proxy_profile(
 fn proxy_route_recipe(
   policy: &EffectivePolicy,
   mode: RouteMode,
-  account_pool: &str,
+  providers: Option<Vec<String>>,
 ) -> Result<RawRoute, V2ProjectionError> {
   match mode {
     RouteMode::Passthrough => Ok(RawRoute::Relay {
+      providers: None,
       destination: RawRelayDestination::Original {},
       credentials: RawRelayCredentials::Client {},
       retry: RawRouteRetry::Never {},
     }),
     RouteMode::Switch => Ok(RawRoute::Relay {
+      providers,
       destination: RawRelayDestination::Original {},
-      credentials: RawRelayCredentials::AccountPool {
-        account_pool: account_pool.to_string(),
-      },
+      credentials: RawRelayCredentials::AccountPool { account_pool: None },
       retry: RawRouteRetry::Never {},
     }),
     RouteMode::Route | RouteMode::Exact | RouteMode::Fuzzy => {
       let mut policy = policy.clone();
       policy.mode = mode;
-      route_recipe(&policy, account_pool)
+      route_recipe(&policy, providers)
     }
   }
 }
@@ -466,10 +466,11 @@ fn route_mode_name(mode: RouteMode) -> &'static str {
   }
 }
 
-fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute, V2ProjectionError> {
+fn route_recipe(policy: &EffectivePolicy, providers: Option<Vec<String>>) -> Result<RawRoute, V2ProjectionError> {
   match policy.mode {
     RouteMode::Route => Ok(RawRoute::Managed {
-      account_pool: account_pool.to_string(),
+      account_pool: None,
+      providers,
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Capability {},
       operation: RawOperationPolicy::TranslateCompatible,
@@ -478,7 +479,8 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
       },
     }),
     RouteMode::Exact => Ok(RawRoute::Managed {
-      account_pool: account_pool.to_string(),
+      account_pool: None,
+      providers,
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Qualified {
         namespace: RawQualificationNamespace::Provider,
@@ -489,7 +491,8 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
       },
     }),
     RouteMode::Fuzzy => Ok(RawRoute::Managed {
-      account_pool: account_pool.to_string(),
+      account_pool: None,
+      providers,
       provider: RawProviderSelector::Any {},
       model: RawModelSelector::Family {
         families: policy
@@ -511,10 +514,9 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
           policy: policy.location.clone(),
         })?;
       Ok(RawRoute::Relay {
+        providers,
         destination: RawRelayDestination::FixedProvider { provider },
-        credentials: RawRelayCredentials::AccountPool {
-          account_pool: account_pool.to_string(),
-        },
+        credentials: RawRelayCredentials::AccountPool { account_pool: None },
         retry: RawRouteRetry::Buffered {
           policy: LEGACY_RETRY_POLICY_ID.to_string(),
         },
@@ -524,22 +526,6 @@ fn route_recipe(policy: &EffectivePolicy, account_pool: &str) -> Result<RawRoute
       policy: policy.location.clone(),
       mode: policy.mode,
     }),
-  }
-}
-
-fn append_api_bindings(bindings: &mut Vec<RawBinding>, resource_id: &str, path_prefix: &str) {
-  for (id_suffix, path_suffix, operation) in LLM_ENDPOINTS {
-    bindings.push(RawBinding {
-      id: format!("{resource_id}-{id_suffix}"),
-      listener: API_LISTENER_ID.to_string(),
-      action: RawBindingAction::Route {
-        profile: resource_id.to_string(),
-      },
-      hosts: Vec::new(),
-      path_prefixes: vec![format!("{path_prefix}{path_suffix}")],
-      methods: vec!["POST".to_string()],
-      operations: vec![operation.to_string()],
-    });
   }
 }
 
@@ -590,14 +576,6 @@ mod tests {
     account
   }
 
-  fn binding_for_path<'a>(raw: &'a RawConfig, path: &str) -> &'a RawBinding {
-    raw
-      .bindings
-      .iter()
-      .find(|binding| binding.path_prefixes == [path])
-      .expect("binding for path")
-  }
-
   fn forward_proxy_options(route_mode: RouteMode) -> V2ProjectionOptions {
     V2ProjectionOptions {
       forward_proxy: Some(V2ForwardProxyProjectionOptions {
@@ -635,8 +613,9 @@ mod tests {
     assert_eq!(raw.listeners.len(), 1);
     assert_eq!(raw.profiles.len(), 2);
     assert_eq!(raw.routes.len(), 2);
-    assert_eq!(raw.account_pools.len(), 2);
-    assert_eq!(raw.bindings.len(), 6);
+    assert!(raw.account_pools.is_empty());
+    assert!(raw.bindings.is_empty());
+    assert!(raw.profiles.values().all(|profile| profile.account_pool.is_some()));
     assert_eq!(
       raw.retry_policies[LEGACY_RETRY_POLICY_ID].max_retries,
       LEGACY_MAX_RETRIES
@@ -645,17 +624,15 @@ mod tests {
       raw.retry_policies[LEGACY_RETRY_POLICY_ID].initial_backoff_ms,
       LEGACY_INITIAL_BACKOFF_MS
     );
-    for (path, operation) in [
-      ("/v1/chat/completions", "chat_completions"),
-      ("/v1/responses", "responses"),
-      ("/v1/messages", "messages"),
-      ("/team%20blue/v1/chat/completions", "chat_completions"),
-      ("/team%20blue/v1/responses", "responses"),
-      ("/team%20blue/v1/messages", "messages"),
-    ] {
-      let binding = binding_for_path(raw, path);
-      assert_eq!(binding.methods, ["POST"]);
-      assert_eq!(binding.operations, [operation]);
+    for (profile, path) in [("default", "/v1"), ("team-blue", "/team%20blue/v1")] {
+      let binding = projection.compiled_config().gateway().profiles()[profile]
+        .api_binding()
+        .unwrap();
+      assert_eq!(binding.path(), path);
+      assert_eq!(
+        binding.endpoints().iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        ["chat_completions", "messages", "responses"]
+      );
     }
     assert!(matches!(
       raw.routes["default"],
@@ -821,6 +798,7 @@ mod tests {
         destination: RawRelayDestination::Original {},
         credentials: RawRelayCredentials::Client {},
         retry: RawRouteRetry::Never {},
+        providers: None,
       }
     ));
     assert!(matches!(
@@ -829,6 +807,7 @@ mod tests {
         destination: RawRelayDestination::Original {},
         credentials: RawRelayCredentials::AccountPool { .. },
         retry: RawRouteRetry::Never {},
+        providers: _,
       }
     ));
 
@@ -1043,8 +1022,9 @@ mod tests {
     };
     assert_eq!(bind, "127.0.0.1:5151");
     assert_eq!(*client_auth, RawClientAuth::LocalKeys);
-    assert_eq!(raw.account_pools["default"].failure_cooldown_secs, 12);
-    assert_eq!(raw.account_pools["default"].session_expired_retention_secs, 30);
+    let pool = raw.profiles["default"].account_pool.as_ref().unwrap();
+    assert_eq!(pool.failure_cooldown_secs, 12);
+    assert_eq!(pool.session_expired_retention_secs, 30);
     assert_eq!(raw.service.outbound.proxy_url.as_deref(), legacy.proxy.url.as_deref());
     assert_eq!(raw.service.outbound.no_proxy, ["localhost"]);
     assert!(!raw.service.outbound.use_system_proxy);

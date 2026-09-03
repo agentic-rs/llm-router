@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokn_auth::ProviderAuth;
 use tokn_core::account::AccountConfig;
 use tokn_core::provider::official_provider_preset;
-use tokn_policy::{AccountPoolPlan, GatewayPlan, RelayCredentials, RoutePlan};
+use tokn_policy::{AccountPoolPlan, GatewayPlan, ProviderSelector, RelayDestination, RoutePlan};
 
 /// Schema-aware configuration details needed by CLI startup and account commands.
 ///
@@ -136,9 +136,8 @@ impl ConfigContext {
 
   /// Resolve a read-only account view against the effective configuration.
   ///
-  /// Legacy profiles own account/provider filters directly. V2 profiles are
-  /// deliberately indirect, so they resolve through their route to the pool
-  /// that owns account selection.
+  /// Profiles own account selection. A v2 route can further restrict eligible
+  /// providers without changing the profile's pool or its mutable state.
   pub fn resolve_account_view(&self, pool: Option<&str>, profile: Option<&str>) -> Result<Option<AccountView>> {
     if pool.is_some() && profile.is_some() {
       bail!("`--pool` and `--profile` are mutually exclusive");
@@ -184,16 +183,39 @@ impl ConfigContext {
         let route = gateway
           .route(route_id)
           .expect("compiled v2 profile references an existing route");
-        let pool_id = route_account_pool(route)
+        let pool_id = profile
+          .account_pool()
           .ok_or_else(|| anyhow!("profile '{canonical_profile_id}' uses client credentials and has no account pool"))?;
         let pool = gateway
           .account_pool(pool_id)
-          .expect("compiled v2 route references an existing account pool");
-        Ok(Some(v2_account_view(
+          .expect("compiled v2 profile references an existing account pool");
+        let mut view = v2_account_view(
           gateway,
           pool,
-          format!("profile '{canonical_profile_id}' -> route '{route_id}' -> pool '{pool_id}'"),
-        )))
+          format!("profile '{canonical_profile_id}' -> pool '{pool_id}' (route '{route_id}')"),
+        );
+        if let Some(providers) = &mut view.providers {
+          providers.retain(|id| {
+            gateway
+              .providers()
+              .keys()
+              .find(|candidate| candidate.as_str() == id)
+              .is_some_and(|provider| {
+                route.allows_provider(provider)
+                  && match route {
+                    RoutePlan::Managed(route) => match route.target().provider() {
+                      ProviderSelector::Any => true,
+                      ProviderSelector::Fixed(fixed) => fixed == provider,
+                    },
+                    RoutePlan::Relay(route) => match route.destination() {
+                      RelayDestination::Original => true,
+                      RelayDestination::FixedProvider(fixed) => fixed == provider,
+                    },
+                  }
+              })
+          });
+        }
+        Ok(Some(view))
       }
       _ => unreachable!("pool/profile exclusivity checked above"),
     }
@@ -247,16 +269,6 @@ fn v2_account_view(gateway: &GatewayPlan, pool: &AccountPoolPlan, description: S
     description,
     accounts,
     providers: Some(providers),
-  }
-}
-
-fn route_account_pool(route: &RoutePlan) -> Option<&tokn_policy::AccountPoolId> {
-  match route {
-    RoutePlan::Managed(route) => Some(route.target().account_pool()),
-    RoutePlan::Relay(route) => match route.credentials() {
-      RelayCredentials::Client => None,
-      RelayCredentials::AccountPool(account_pool) => Some(account_pool),
-    },
   }
 }
 
@@ -585,7 +597,7 @@ base_url = "https://llm.example.test/v1"
     let profile = context.resolve_account_view(None, Some("coding")).unwrap().unwrap();
     assert_eq!(
       profile.description(),
-      "profile 'coding' -> route 'managed' -> pool 'primary'"
+      "profile 'coding' -> pool 'primary' (route 'managed')"
     );
     assert!(profile.contains(&selected));
     assert!(context.resolve_account_view(Some("missing"), None).is_err());

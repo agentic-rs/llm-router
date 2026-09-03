@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod cors_tests;
 mod discovery;
+mod mounts;
 mod selector;
 
 use crate::api::error::ApiError;
@@ -91,6 +92,7 @@ pub struct AppState {
   listener: LlmApiListenerPlan,
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   discovery: Arc<discovery::DiscoveryRuntime>,
+  mounts: Arc<mounts::ApiMounts>,
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
   request_limits: tokn_config::v2::RequestLimitsPlan,
@@ -165,6 +167,15 @@ impl AppState {
     headers: &HeaderMap,
     endpoint: Endpoint,
   ) -> Result<&ProfileRuntime, ApiError> {
+    if let Some(entry) = self.mounts.get(uri.path()) {
+      if !entry.enabled || entry.operation != mounts::ApiOperation::Generate(endpoint) {
+        return Err(ApiError::not_found("generation endpoint is disabled for this profile"));
+      }
+      return self
+        .profiles
+        .get(&entry.profile)
+        .ok_or_else(|| ApiError::internal("API mount references a missing profile"));
+    }
     let host = request_host(uri, headers)?;
     let operation = operation_name(endpoint);
     let action = self
@@ -175,6 +186,9 @@ impl AppState {
       .map(|binding| binding.action())
       .unwrap_or_else(|| self.listener.default_http_action());
     match action {
+      HttpAction::Route(profile_id) if self.mounts.contains_profile(profile_id) => Err(ApiError::not_found(
+        "profile is only available at its configured API path",
+      )),
       HttpAction::Route(profile_id) => self
         .profiles
         .get(profile_id)
@@ -184,6 +198,12 @@ impl AppState {
   }
 
   fn discovery_profiles(&self, uri: &Uri, headers: &HeaderMap) -> Result<BTreeSet<ProfileId>, ApiError> {
+    if let Some(entry) = self.mounts.get(uri.path()) {
+      return match entry.operation {
+        mounts::ApiOperation::Models | mounts::ApiOperation::Providers => Ok(BTreeSet::from([entry.profile.clone()])),
+        _ => Err(ApiError::not_found("discovery path is not exposed")),
+      };
+    }
     let path = uri.path();
     let prefix = path
       .strip_suffix("models")
@@ -215,6 +235,7 @@ impl AppState {
     if profiles.is_empty() && path.starts_with("/v1/") {
       collect_profile(self.listener.default_http_action(), &mut profiles);
     }
+    profiles.retain(|profile| !self.mounts.contains_profile(profile));
     if profiles.is_empty() {
       return Err(ApiError::bad_request(format!(
         "no v2 profile is bound to discovery path '{path}'"
@@ -847,6 +868,7 @@ enum PipelineMode {
 struct LinkedRuntimes {
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   discovery: Arc<discovery::DiscoveryRuntime>,
+  mounts: Arc<mounts::ApiMounts>,
 }
 
 /// Build one shared v2 runtime generation for every configured listener.
@@ -881,6 +903,7 @@ pub fn build_runtime_states_with_service(
         listener: listener.clone(),
         profiles: linked.profiles.clone(),
         discovery: linked.discovery.clone(),
+        mounts: linked.mounts.clone(),
         access: access.clone(),
         events: events.clone(),
         request_limits,
@@ -973,6 +996,7 @@ fn build_api_states(
           listener: listener.clone(),
           profiles: linked.profiles.clone(),
           discovery: linked.discovery.clone(),
+          mounts: linked.mounts.clone(),
           access: access.clone(),
           events: events.clone(),
           request_limits,
@@ -997,6 +1021,13 @@ fn build_profile_runtimes(
       collect_profile(binding.action(), &mut reachable_profiles);
     }
   }
+  reachable_profiles.extend(
+    plan
+      .profiles()
+      .iter()
+      .filter(|(_, profile)| profile.api_binding().is_some())
+      .map(|(id, _)| id.clone()),
+  );
 
   let registry = Registry::builtin();
   let providers = link_provider_graph(&plan, accounts, &registry)?;
@@ -1031,7 +1062,7 @@ fn build_profile_runtimes(
           anyhow::bail!("profile '{profile_id}' uses unsupported managed header patches");
         }
         let retry = managed_retry_policy(&plan, route.retry())?;
-        let (selector, selection_state) = V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
+        let (selector, selection_state) = V2AccountSelector::new(plan.clone(), &profile_id, &pools)?;
         let name = format!("v2-{profile_id}");
         let extract = Arc::new(DefaultExtract);
         let resolve = Arc::new(PoolResolve::new(Arc::new(selector)));
@@ -1081,9 +1112,8 @@ fn build_profile_runtimes(
         };
         let (api_service, api_destination) = match (route.destination(), route.credentials()) {
           (RelayDestination::Original, _) => (None, None),
-          (RelayDestination::FixedProvider(_), RelayCredentials::AccountPool(_)) => {
-            let (selector, selection_state) =
-              V2AccountSelector::new(plan.clone(), profile_plan.route().clone(), &pools)?;
+          (RelayDestination::FixedProvider(_), RelayCredentials::AccountPool) => {
+            let (selector, selection_state) = V2AccountSelector::new(plan.clone(), &profile_id, &pools)?;
             let name = format!("v2-{profile_id}-api");
             let extract = Arc::new(PassthroughExtract);
             let resolve = Arc::new(PoolResolve::new(Arc::new(selector)));
@@ -1163,6 +1193,7 @@ fn build_profile_runtimes(
   Ok(LinkedRuntimes {
     profiles: Arc::new(profiles),
     discovery,
+    mounts: Arc::new(mounts::ApiMounts::new(&plan)?),
   })
 }
 
@@ -1178,12 +1209,19 @@ fn build_proxy_relay_service(
   let retry = relay_retry_policy(plan, route.retry())?;
   let name = format!("v2-{profile_id}-proxy");
   let profile = match route.credentials() {
-    RelayCredentials::AccountPool(account_pool) => {
+    RelayCredentials::AccountPool => {
+      let profile_plan = plan
+        .profile(profile_id)
+        .ok_or_else(|| anyhow::anyhow!("missing profile '{profile_id}'"))?;
+      let account_pool = profile_plan
+        .account_pool()
+        .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' has no account pool"))?;
+      let policy = plan.route(profile_plan.route()).expect("validated profile route");
       let origins = match route.destination() {
         RelayDestination::FixedProvider(_) => BTreeMap::new(),
-        RelayDestination::Original => provider_origins(plan, providers, pools, account_pool)?,
+        RelayDestination::Original => provider_origins(plan, providers, pools, account_pool, policy)?,
       };
-      let (resolve, selection_state) = V2ProxyResolve::new(route, pools, origins)?;
+      let (resolve, selection_state) = V2ProxyResolve::new(route, account_pool, pools, origins)?;
       let build_headers = match route.destination() {
         RelayDestination::FixedProvider(_) => PassthroughBuildHeaders::router_auth(),
         RelayDestination::Original => PassthroughBuildHeaders::preserve_host_with_router_auth(),
@@ -1199,6 +1237,17 @@ fn build_proxy_relay_service(
       )
     }
     RelayCredentials::Client => {
+      let policy = plan
+        .route(plan.profile(profile_id).expect("validated profile").route())
+        .expect("validated route");
+      let allowed_origins = if matches!(route.destination(), RelayDestination::Original) {
+        policy
+          .providers()
+          .map(|ids| restricted_provider_origins(plan, providers, ids))
+          .transpose()?
+      } else {
+        None
+      };
       let fixed_provider = match route.destination() {
         RelayDestination::FixedProvider(provider) => Some(provider.clone()),
         RelayDestination::Original => None,
@@ -1210,7 +1259,7 @@ fn build_proxy_relay_service(
       Profile::full(
         name,
         Arc::new(PassthroughExtract),
-        Arc::new(V2ClientResolve::new(fixed_provider)),
+        Arc::new(V2ClientResolve::new(fixed_provider).with_allowed_origins(allowed_origins)),
         Arc::new(build_headers),
         Arc::new(PassthroughConvertRequest),
         Arc::new(ProxySend::forward_all_statuses(http)),
@@ -1262,6 +1311,7 @@ fn provider_origins(
   providers: &ProviderGraph,
   pools: &AccountPoolRuntimes,
   pool_id: &tokn_policy::AccountPoolId,
+  route: &RoutePlan,
 ) -> anyhow::Result<BTreeMap<String, tokn_policy::ProviderId>> {
   let pool = plan
     .account_pool(pool_id)
@@ -1277,20 +1327,30 @@ fn provider_origins(
     .map(|account| account.binding().provider_id())
     .collect::<BTreeSet<_>>();
   let eligible = plan.providers().keys().filter(|provider_id| {
-    bound_providers.contains(provider_id)
+    route.allows_provider(provider_id)
+      && bound_providers.contains(provider_id)
       && pool
         .selector()
         .providers()
         .is_none_or(|allowed| allowed.contains(*provider_id))
   });
+  let eligible = eligible.cloned().collect();
+  restricted_provider_origins(plan, providers, &eligible)
+}
+
+fn restricted_provider_origins(
+  plan: &GatewayPlan,
+  providers: &ProviderGraph,
+  eligible: &BTreeSet<ProviderId>,
+) -> anyhow::Result<BTreeMap<String, ProviderId>> {
   let mut origins = BTreeMap::new();
   for provider_id in eligible {
     let provider = plan
       .provider(provider_id)
-      .ok_or_else(|| anyhow::anyhow!("account pool '{pool_id}' references missing provider '{provider_id}'"))?;
+      .ok_or_else(|| anyhow::anyhow!("route references missing provider '{provider_id}'"))?;
     let target = providers
       .target(provider_id)
-      .ok_or_else(|| anyhow::anyhow!("account pool '{pool_id}' has no target for provider '{provider_id}'"))?;
+      .ok_or_else(|| anyhow::anyhow!("route has no target for provider '{provider_id}'"))?;
     let mut claimed = provider
       .origins()
       .iter()
@@ -1427,10 +1487,16 @@ pub fn router_live(state: LiveAppState) -> Router {
   let max_wire_bytes = state.current().request_limits.max_wire_bytes();
   let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
   let cors_state = state.clone();
-  let cors = crate::cors::layer(move |origin| {
+  let cors = crate::cors::layer_for_request(move |origin, parts| {
     let current = cors_state.current();
     let policy = current.listener.cors();
-    policy.allowed_origins().contains(origin) || (policy.allow_localhost() && crate::cors::is_localhost_origin(origin))
+    let api_path = current
+      .mounts
+      .get(parts.uri.path())
+      .map_or_else(|| mounts::is_legacy_api_path(parts.uri.path()), |entry| entry.enabled);
+    api_path
+      && (policy.allowed_origins().contains(origin)
+        || (policy.allow_localhost() && crate::cors::is_localhost_origin(origin)))
   });
   let client_routes = Router::new()
     .route("/v1/chat/completions", post(chat_completions))
@@ -1443,10 +1509,11 @@ pub fn router_live(state: LiveAppState) -> Router {
     .route("/{profile}/v1/messages", post(messages))
     .route("/{profile}/v1/providers", get(list_providers))
     .route("/{profile}/v1/models", get(list_models))
+    .fallback(mounts::dispatch)
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     // Preflight must not require client credentials. The origin predicate
     // reads live listener policy, including after enabling/disabling CORS.
-    .route_layer(cors);
+    .layer(cors);
   let mut router = Router::new().merge(client_routes).route("/healthz", get(health));
   if state.bind().ip().is_loopback() {
     router = router.route("/admin/config/reload", post(admin_config_reload));
@@ -1488,7 +1555,17 @@ async fn list_models(
 async fn authenticate(State(live): State<LiveAppState>, mut request: Request, next: Next) -> Response {
   let state = live.current();
   request.extensions_mut().insert(state.clone());
-  if let Some(endpoint) = Endpoint::infer_from(request.uri().path()) {
+  let endpoint = match state.mounts.get(request.uri().path()) {
+    Some(entry) if !entry.enabled => {
+      return ApiError::not_found("generation endpoint is disabled for this profile").into_response()
+    }
+    Some(entry) => match entry.operation {
+      mounts::ApiOperation::Generate(endpoint) => Some(endpoint),
+      _ => None,
+    },
+    None => Endpoint::infer_from(request.uri().path()),
+  };
+  if let Some(endpoint) = endpoint {
     match state.select_profile(request.method(), request.uri(), request.headers(), endpoint) {
       Ok(runtime) if runtime.credential_policy == CredentialPolicy::Client => {
         request.extensions_mut().insert(AccessContext::unrestricted());
@@ -1769,7 +1846,7 @@ fn request_record_mode(route: &RoutePlan) -> &'static str {
     },
     RoutePlan::Relay(route) => match route.credentials() {
       RelayCredentials::Client => "passthrough",
-      RelayCredentials::AccountPool(_) => "switch",
+      RelayCredentials::AccountPool => "switch",
     },
   }
 }
@@ -2111,10 +2188,9 @@ default_http_action = { kind = "reject" }
 
   #[test]
   fn request_record_modes_preserve_legacy_route_labels() {
-    let pool = tokn_policy::AccountPoolId::new("primary").unwrap();
     let managed = |model| {
       RoutePlan::Managed(tokn_policy::ManagedRoute::new(
-        tokn_policy::ManagedTarget::new(pool.clone(), tokn_policy::ProviderSelector::Any, model),
+        tokn_policy::ManagedTarget::new(tokn_policy::ProviderSelector::Any, model),
         tokn_policy::OperationPolicy::TranslateCompatible,
         None,
         ManagedRetry::Never,
@@ -2141,10 +2217,7 @@ default_http_action = { kind = "reject" }
       "fuzzy"
     );
     assert_eq!(request_record_mode(&relay(RelayCredentials::Client)), "passthrough");
-    assert_eq!(
-      request_record_mode(&relay(RelayCredentials::AccountPool(pool))),
-      "switch"
-    );
+    assert_eq!(request_record_mode(&relay(RelayCredentials::AccountPool)), "switch");
   }
 
   #[test]

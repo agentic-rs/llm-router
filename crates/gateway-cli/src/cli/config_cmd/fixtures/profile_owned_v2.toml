@@ -7,15 +7,19 @@ client_auth = "none"
 
 [profiles.default]
 route = "default"
-account_pool = {}
+wire_identity = "auto"
+
+[profiles.default.account_pool]
+accounts = ["*"]
+strategy = "round_robin"
 
 [routes.default]
 kind = "managed"
-operation = "translate_compatible"
 provider = { kind = "any" }
 model = { kind = "capability" }
-retry = { kind = "recoverable", policy = "legacy-recoverable" }
+operation = "translate_compatible"
+retry = { kind = "recoverable", policy = "standard" }
 
-[retry_policies.legacy-recoverable]
+[retry_policies.standard]
 max_retries = 2
 initial_backoff_ms = 100
