@@ -31,6 +31,10 @@ fn default_forward_proxy_request_body_max_bytes() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
   pub schema_version: u32,
+  /// Opt-in shorthand for the default managed profile, route, and pool.
+  /// Omission preserves the explicit-resource schema and serialization.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub defaults: Option<super::RawDefaultPolicy>,
   #[serde(default)]
   pub service: RawService,
   #[serde(default)]
@@ -401,6 +405,19 @@ pub struct RawAccountPool {
   /// Additional observability retention after session affinity expires.
   #[serde(default)]
   pub session_expired_retention_secs: u64,
+}
+
+impl Default for RawAccountPool {
+  fn default() -> Self {
+    Self {
+      accounts: None,
+      providers: None,
+      strategy: RawPoolStrategy::default(),
+      failure_cooldown_secs: default_failure_cooldown_secs(),
+      session_ttl_secs: default_session_ttl_secs(),
+      session_expired_retention_secs: 0,
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

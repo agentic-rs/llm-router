@@ -87,12 +87,12 @@ fn compact(document: &mut DocumentMut, raw: &RawConfig) -> Result<()> {
     inline_small_fields(table, &["provider", "model", "destination", "credentials", "retry"]);
   }
 
-  // These types have no Default impl. Decode an empty table so their serde
-  // defaults remain the source of truth instead of copying TTLs or flags.
-  let pool_defaults: RawAccountPool = toml::from_str("").context("read account-pool schema defaults")?;
+  let pool_defaults = RawAccountPool::default();
   for (id, pool) in &raw.account_pools {
     omit_defaults(table_at(document, &["account_pools", id])?, pool, &pool_defaults)?;
   }
+  // RawProvider has no Default impl. Decode its serde defaults rather than
+  // copying provider flags into the presentation layer.
   let provider_defaults: RawProvider = toml::from_str("").context("read provider schema defaults")?;
   for (id, provider) in &raw.providers {
     omit_defaults(table_at(document, &["providers", id])?, provider, &provider_defaults)?;

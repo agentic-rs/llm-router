@@ -1,0 +1,28 @@
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "default" }
+
+[profiles.default]
+route = "default"
+wire_identity = "auto"
+
+[routes.default]
+kind = "managed"
+account_pool = "default"
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "translate_compatible"
+retry = { kind = "recoverable", policy = "standard" }
+
+[retry_policies.standard]
+max_retries = 2
+initial_backoff_ms = 100
+
+[account_pools.default]
+accounts = ["*"]
+providers = ["*"]
+strategy = "round_robin"

@@ -39,9 +39,7 @@ fn init_template_nested_values_can_be_read_and_updated() {
 
   for (key, expected) in [
     ("listeners.api.default_http_action.profile", "default"),
-    ("routes.default.provider.kind", "any"),
-    ("routes.default.model.kind", "capability"),
-    ("routes.default.retry.policy", "standard"),
+    ("defaults.retry.policy", "standard"),
   ] {
     cmd_get(
       &path,
@@ -54,9 +52,47 @@ fn init_template_nested_values_can_be_read_and_updated() {
     assert_eq!(read_key(&path, key), expected);
   }
 
-  set_key(&path, "routes.default.retry.policy", "fast", false).unwrap();
-  assert_eq!(read_key(&path, "routes.default.retry.policy"), "fast");
+  set_key(&path, "defaults.retry.policy", "fast", false).unwrap();
+  assert_eq!(read_key(&path, "defaults.retry.policy"), "fast");
+  set_key(&path, "defaults.model.kind", "capability", false).unwrap();
+  set_key(&path, "defaults.account_pool.session_ttl_secs", "1800", false).unwrap();
+  set_key(&path, "defaults.account_pool.accounts", "primary", true).unwrap();
+  let raw = tokn_config::v2::load_raw(&path).unwrap();
+  let defaults = raw.defaults.unwrap();
+  assert_eq!(defaults.account_pool.session_ttl_secs, 1800);
+  assert_eq!(defaults.account_pool.accounts.unwrap(), ["primary"]);
+  unset_key(&path, "defaults.account_pool.session_ttl_secs").unwrap();
+  assert_eq!(
+    tokn_config::v2::load_raw(&path)
+      .unwrap()
+      .defaults
+      .unwrap()
+      .account_pool
+      .session_ttl_secs,
+    tokn_config::DEFAULT_SESSION_TTL_SECS
+  );
   tokn_config::v2::load_config(&path).unwrap();
+}
+
+#[test]
+fn default_policy_edit_errors_leave_the_original_file_unchanged() {
+  let directory = tempfile::tempdir().unwrap();
+  let path = directory.path().join("config.toml");
+  std::fs::write(&path, V2_INIT_TEMPLATE).unwrap();
+  cmd_list(&path).unwrap();
+  for (key, value) in [
+    ("defaults.account_pool.session_ttl_secs", "-1"),
+    ("defaults.provider.kind", "unknown"),
+    ("defaults.mode", "route"),
+    ("profiles.default.route", "default"),
+  ] {
+    assert!(set_key(&path, key, value, false).is_err(), "{key}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_INIT_TEMPLATE);
+  }
+  for key in ["defaults", "defaults.retry.policy"] {
+    assert!(unset_key(&path, key).is_err(), "{key}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_INIT_TEMPLATE);
+  }
 }
 
 #[test]
@@ -154,7 +190,7 @@ fn inline_cors_arrays_support_append_replace_and_unset() {
 fn inline_edit_errors_leave_the_original_file_unchanged() {
   let directory = tempfile::tempdir().unwrap();
   let path = directory.path().join("config.toml");
-  std::fs::write(&path, V2_INIT_TEMPLATE).unwrap();
+  std::fs::write(&path, V2_EXPLICIT_TEST_CONFIG).unwrap();
 
   for (key, value, add, message) in [
     ("routes.default.retry.policy", "missing", false, "missing"),
@@ -164,7 +200,7 @@ fn inline_edit_errors_leave_the_original_file_unchanged() {
   ] {
     let error = set_key(&path, key, value, add).unwrap_err().to_string();
     assert!(error.contains(message), "{key}: {error}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_INIT_TEMPLATE);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_EXPLICIT_TEST_CONFIG);
   }
   for key in [
     "routes.default.retry.policy",
@@ -172,7 +208,7 @@ fn inline_edit_errors_leave_the_original_file_unchanged() {
   ] {
     let error = unset_key(&path, key).unwrap_err().to_string();
     assert!(error.contains("validation failed"), "{key}: {error}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_INIT_TEMPLATE);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), V2_EXPLICIT_TEST_CONFIG);
   }
 }
 
@@ -180,7 +216,7 @@ fn inline_edit_errors_leave_the_original_file_unchanged() {
 fn table_inline_and_mixed_v2_forms_support_the_same_edits() {
   let directory = tempfile::tempdir().unwrap();
   let path = directory.path().join("config.toml");
-  let mixed = V2_INIT_TEMPLATE.replace(
+  let mixed = V2_EXPLICIT_TEST_CONFIG.replace(
     "model = { kind = \"capability\" }",
     "model = { kind = \"family\", families = { coding = [\"gpt-5\"] } }",
   );

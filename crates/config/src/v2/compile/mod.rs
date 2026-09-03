@@ -7,7 +7,14 @@ use std::path::Path;
 use tokn_policy::GatewayPlan;
 
 pub(super) fn compile_config(raw: &RawConfig, source: &Path) -> Result<CompiledConfig, CompileError> {
-  let gateway = compile_gateway(raw, source)?;
+  let expanded = super::defaults::expand(raw)?;
+  let gateway = compile_gateway(&expanded, source).map_err(|error| {
+    if raw.defaults.is_some() {
+      super::defaults::source_error(raw, error)
+    } else {
+      error
+    }
+  })?;
   let service = service::compile_service(&raw.service)?;
   Ok(CompiledConfig::new(gateway, service))
 }

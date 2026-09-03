@@ -426,6 +426,48 @@ falling back silently to the old server runtime. For legacy configs,
 route mode. Native v2 configs continue to declare their listeners in config
 and reject these compatibility flags.
 
+Native v2 can use `[defaults]` as an opt-in shorthand for one managed policy.
+For example, `config init` now creates this smaller configuration:
+
+```toml
+schema_version = 2
+
+[defaults]
+retry = { kind = "recoverable", policy = "standard" }
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "default" }
+
+[retry_policies.standard]
+max_retries = 2
+initial_backoff_ms = 100
+```
+
+At compile time, `[defaults]` creates `profiles.default`, `routes.default`,
+and `account_pools.default`. It is not global inheritance or a legacy route
+mode: other profiles and pools remain independent. Combining the shorthand
+with an explicit declaration of any of those three resources is an error;
+existing explicit v2 configs remain supported unchanged.
+
+An empty `[defaults]` selects any eligible provider, capability-based model
+matching, compatible operation translation, automatic wire identity, and a
+pool with the normal v2 settings. Omitted retry policy means **no retries**;
+the init template explicitly preserves its two-retry policy. Optional fields
+are `provider`, `model`, `operation`, `wire_identity`, `retry`, and
+`account_pool`, using the existing v2 policy types. Pool settings belong under
+`[defaults.account_pool]`, including `accounts`, `providers`, cooldown, TTL,
+and expired-session retention.
+
+Listeners, bindings, CONNECT rules, authentication, and insecure opt-ins stay
+explicit. No agent link/sync metadata is accepted. Config edits address the
+authored keys, such as `config set defaults.account_pool.session_ttl_secs 1800`
+or `config set defaults.retry.policy standard`, not the generated resource
+paths. Reloading uses the same expansion and validation as initial startup.
+Migration still emits explicit resources.
+
 `config migrate-v2` renders the same legacy-to-v2 projection as validated TOML
 on stdout without changing `config.toml`, `config.d`, `auth.yaml`, or `auth.d`.
 It merges legacy fragments and uses the current effective account store while
