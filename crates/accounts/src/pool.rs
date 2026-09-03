@@ -634,6 +634,7 @@ mod tests {
       capabilities: Capabilities {
         temperature: true,
         reasoning: false,
+        reasoning_efforts: None,
         attachment: false,
         toolcall: true,
         input: Modalities::TEXT_ONLY,

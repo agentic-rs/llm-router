@@ -23,7 +23,7 @@
 //! Failures map to permanent [`PipelineError`]s — the upstream body
 //! shape isn't going to change between retries.
 
-use super::generation::{ensure_model_supports_reasoning, lower_generation_options};
+use super::generation::{ensure_model_supports_effort, ensure_model_supports_reasoning, lower_generation_options};
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, RequestsError};
@@ -53,14 +53,27 @@ impl ConvertRequestStage for DefaultConvertRequest {
       options
         .validate()
         .map_err(|source| perm(RequestsError::InvalidGenerationOptions { source }))?;
+      let provider = &resolved.account_handle.provider;
+      let efforts = provider.reasoning_efforts(resolved.upstream_model.as_str());
+      ensure_model_supports_effort(
+        upstream_endpoint,
+        provider.info().id.as_str(),
+        resolved.upstream_model.as_str(),
+        efforts.as_deref(),
+        options,
+      )
+      .map_err(perm)?;
+      let reasoning_supported = if efforts.as_ref().is_some_and(|values| !values.is_empty()) {
+        Some(true)
+      } else {
+        provider
+          .model_info(resolved.upstream_model.as_str())
+          .map(|info| info.capabilities.reasoning)
+      };
       ensure_model_supports_reasoning(
         upstream_endpoint,
-        resolved.account_handle.provider.info().id.as_str(),
-        resolved
-          .account_handle
-          .provider
-          .model_info(resolved.upstream_model.as_str())
-          .map(|info| info.capabilities.reasoning),
+        provider.info().id.as_str(),
+        reasoning_supported,
         options,
       )
       .map_err(perm)?;

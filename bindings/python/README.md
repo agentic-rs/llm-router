@@ -78,15 +78,19 @@ enabled/adaptive mode. Typed `top_k` is currently supported on llama.cpp Chat
 Completions; llama.cpp has no portable reasoning control. Known non-reasoning
 models reject typed reasoning locally.
 
-DeepSeek accepts only `high` and `max` effort; compatibility aliases that the
-provider would silently promote are rejected. DeepSeek thinking also rejects
+Effort levels are validated against cached upstream model metadata, falling
+back to the provider-specific models.dev catalogue. Discovery exposes
+`x_tokn_router.capabilities.reasoning_efforts`: `null` means unknown and `[]`
+means no effort control. Unknown support does not reject an effort value.
+DeepSeek V4 Flash advertises `low`, `high`, and `max`; V4 Pro advertises `high`
+and `max`. DeepSeek thinking also rejects
 `temperature` and `top_p`, which that backend would ignore. Claude supports
 adaptive reasoning on 4.6 and newer models but not a reasoning summary. Manual
 Claude reasoning requires `ReasoningMode.ENABLED`, an explicit `max_tokens()`
 limit, a budget of at least 1024 tokens, and
 `budget_tokens < max_tokens`; manual mode is rejected on 4.7 and newer models,
 while adaptive mode is rejected on 4.5 and older models. Claude effort levels
-and sampling compatibility are checked against the selected model generation.
+use discovery metadata; sampling compatibility uses the selected model generation.
 Explicit controls unsupported by the selected route fail clearly after routing
 instead of being silently dropped or reinterpreted.
 

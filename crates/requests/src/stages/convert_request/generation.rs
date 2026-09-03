@@ -122,6 +122,39 @@ pub(super) fn ensure_model_supports_reasoning(
   Ok(())
 }
 
+pub(super) fn ensure_model_supports_effort(
+  endpoint: Endpoint,
+  provider_id: &str,
+  model: &str,
+  supported: Option<&[ReasoningEffort]>,
+  options: &GenerationOptions,
+) -> Result<(), RequestsError> {
+  let Some(reasoning) = &options.reasoning else {
+    return Ok(());
+  };
+  let disabled = ReasoningEffort::from("none");
+  let effort = reasoning.effort.as_ref().or_else(|| {
+    (reasoning.mode == Some(ReasoningMode::Disabled)
+      && (endpoint == Endpoint::Responses
+        || (endpoint == Endpoint::ChatCompletions
+          && provider_id != ID_DEEPSEEK
+          && !ZAI_PROVIDERS.contains(&provider_id)
+          && !(provider_id == ID_GITHUB_COPILOT && is_claude_model(model)))))
+    .then_some(&disabled)
+  });
+  if let (Some(effort), Some(supported)) = (effort, supported) {
+    if !supported.contains(effort) {
+      return unsupported(
+        "reasoning.effort",
+        provider_id,
+        endpoint,
+        "the selected model does not advertise this effort level",
+      );
+    }
+  }
+  Ok(())
+}
+
 fn lower_top_k(
   obj: &mut Map<String, Value>,
   endpoint: Endpoint,
@@ -294,16 +327,6 @@ fn lower_deepseek_reasoning(
       "DeepSeek ignores top_p while thinking is enabled",
     )?;
   }
-  if let Some(effort) = reasoning.effort.as_ref() {
-    if !matches!(effort, ReasoningEffort::High | ReasoningEffort::Max) {
-      return unsupported(
-        "reasoning.effort",
-        provider_id,
-        endpoint,
-        "DeepSeek accepts only the native high and max effort levels; compatibility aliases are not reinterpreted",
-      );
-    }
-  }
 
   if reasoning.mode.is_none() && reasoning.effort.is_none() {
     return Ok(());
@@ -474,15 +497,6 @@ enum ClaudeThinkingSupport {
   Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClaudeEffortSupport {
-  Unsupported,
-  LowToHigh,
-  ThroughMax,
-  ThroughXHigh,
-  Unknown,
-}
-
 fn validate_claude_reasoning(
   obj: &Map<String, Value>,
   endpoint: Endpoint,
@@ -553,7 +567,6 @@ fn validate_claude_reasoning(
       "this Claude model supports manual reasoning budgets, not adaptive reasoning",
     );
   }
-  validate_claude_effort(endpoint, provider_id, model, reasoning.effort.as_ref())?;
   validate_claude_sampling(
     obj,
     endpoint,
@@ -589,72 +602,6 @@ fn claude_thinking_support(model: &str) -> ClaudeThinkingSupport {
     return ClaudeThinkingSupport::ManualOnly;
   }
   ClaudeThinkingSupport::Unknown
-}
-
-fn validate_claude_effort(
-  endpoint: Endpoint,
-  provider_id: &str,
-  model: &str,
-  effort: Option<&ReasoningEffort>,
-) -> Result<(), RequestsError> {
-  let Some(effort) = effort else {
-    return Ok(());
-  };
-  let support = claude_effort_support(model);
-  let supported = match effort {
-    ReasoningEffort::Minimal => false,
-    ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High => {
-      support != ClaudeEffortSupport::Unsupported
-    }
-    ReasoningEffort::Max => matches!(
-      support,
-      ClaudeEffortSupport::ThroughMax | ClaudeEffortSupport::ThroughXHigh | ClaudeEffortSupport::Unknown
-    ),
-    ReasoningEffort::XHigh => matches!(
-      support,
-      ClaudeEffortSupport::ThroughXHigh | ClaudeEffortSupport::Unknown
-    ),
-    ReasoningEffort::Custom(_) => true,
-  };
-  if !supported {
-    return unsupported(
-      "reasoning.effort",
-      provider_id,
-      endpoint,
-      "the selected Claude model does not support this effort level",
-    );
-  }
-  Ok(())
-}
-
-fn claude_effort_support(model: &str) -> ClaudeEffortSupport {
-  let model = normalize_claude_model(model);
-  if model.contains("claude-opus-4-7")
-    || model.contains("claude-opus-4-8")
-    || model.contains("claude-fable-5")
-    || model.contains("claude-mythos-5")
-    || model.contains("claude-opus-5")
-    || model.contains("claude-sonnet-5")
-  {
-    return ClaudeEffortSupport::ThroughXHigh;
-  }
-  if model.contains("-4-6") || model.contains("mythos-preview") {
-    return ClaudeEffortSupport::ThroughMax;
-  }
-  if model.contains("claude-opus-4-5") {
-    return ClaudeEffortSupport::LowToHigh;
-  }
-  if model.contains("claude-opus-41")
-    || model.contains("claude-opus-4-1")
-    || model == "claude-sonnet-4"
-    || model.starts_with("claude-sonnet-4-20")
-    || model.contains("claude-sonnet-4-5")
-    || model.contains("claude-haiku-4-5")
-    || model.contains("claude-3-7")
-  {
-    return ClaudeEffortSupport::Unsupported;
-  }
-  ClaudeEffortSupport::Unknown
 }
 
 fn claude_rejects_disabled_reasoning(model: &str) -> bool {
@@ -811,6 +758,96 @@ mod tests {
   use tokn_core::generation::ReasoningSummary;
   use tokn_core::provider::{Endpoint, ID_OPENAI, ID_ZAI};
   use tokn_headers::HeaderMap;
+
+  #[test]
+  fn effort_validation_distinguishes_unknown_and_known_support() {
+    for (supported, effort, rejected) in [
+      (None, "future", false),
+      (Some(vec![]), "high", true),
+      (Some(vec![ReasoningEffort::Low, ReasoningEffort::High]), "low", false),
+      (Some(vec![ReasoningEffort::High]), "low", true),
+      (Some(vec![ReasoningEffort::High]), "future", true),
+      (Some(vec![ReasoningEffort::from("future")]), "future", false),
+    ] {
+      let options = GenerationOptions::new().with_reasoning(ReasoningOptions::new().with_effort(effort));
+      let result =
+        ensure_model_supports_effort(Endpoint::Responses, ID_OPENAI, "model", supported.as_deref(), &options);
+      assert_eq!(result.is_err(), rejected, "{supported:?}: {effort}");
+    }
+  }
+
+  #[test]
+  fn disabled_mode_validates_none_only_when_lowered_to_effort() {
+    let options = GenerationOptions::new().with_reasoning(ReasoningOptions::new().with_mode(ReasoningMode::Disabled));
+    for (endpoint, provider, model, rejected) in [
+      (Endpoint::Responses, ID_OPENAI, "gpt-5", true),
+      (Endpoint::ChatCompletions, ID_GITHUB_COPILOT, "gpt-5", true),
+      (Endpoint::ChatCompletions, ID_GITHUB_COPILOT, "claude-sonnet-4.6", false),
+      (Endpoint::ChatCompletions, ID_DEEPSEEK, "deepseek-v4-flash", false),
+      (Endpoint::Messages, ID_DEEPSEEK, "deepseek-v4-flash", false),
+    ] {
+      assert_eq!(
+        ensure_model_supports_effort(endpoint, provider, model, Some(&[ReasoningEffort::High]), &options).is_err(),
+        rejected
+      );
+    }
+    ensure_model_supports_effort(
+      Endpoint::Responses,
+      ID_OPENAI,
+      "model",
+      Some(&[ReasoningEffort::from("none")]),
+      &options,
+    )
+    .unwrap();
+  }
+
+  #[tokio::test]
+  async fn deepseek_metadata_controls_validation_and_final_payload() {
+    use tokn_core::provider::Provider;
+    use tokn_core::util::secret::Secret;
+    use tokn_provider_deepseek::DeepSeekProvider;
+
+    for (model, effort, live_efforts, rejected) in [
+      ("deepseek-v4-flash", "low", None, false),
+      ("deepseek-v4-pro", "low", None, true),
+      ("deepseek-v4-pro", "max", None, false),
+      ("deepseek-v4-flash", "medium", None, true),
+      ("unknown-deepseek", "future", None, false),
+      ("deepseek-v4-pro", "future", Some(serde_json::json!(["future"])), false),
+      ("deepseek-v4-flash", "low", Some(serde_json::json!([])), true),
+    ] {
+      for endpoint in [Endpoint::ChatCompletions, Endpoint::Messages] {
+        let mut account = (*mock_handle("acct", ID_DEEPSEEK).config.load_full()).clone();
+        account.api_key = Some(Secret::new("test-key".into()));
+        let account = Arc::new(account);
+        let provider = Arc::new(DeepSeekProvider::from_account(account.clone()).unwrap());
+        if let Some(efforts) = &live_efforts {
+          provider.info().model_cache.set_models(&[serde_json::json!({
+            "id": model, "capabilities": {"supports": {"reasoning_effort": efforts}}
+          })]);
+        }
+        let handle = Arc::new(tokn_accounts::AccountHandle::new(account, provider));
+        let resolved = resolved_with(handle, Endpoint::Responses, endpoint, model);
+        let body = serde_json::json!({"model": model, "input": "hi"});
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let extracted = extracted_with(body, None, raw, None);
+        let options = GenerationOptions::new().with_reasoning(ReasoningOptions::new().with_effort(effort));
+        let ctx = ctx_with_generation_options(Endpoint::Responses, options);
+        let result = DefaultConvertRequest.convert_request(&ctx, &extracted, &resolved).await;
+        assert_eq!(result.is_err(), rejected, "{model}: {effort} on {endpoint:?}");
+        if let Ok(result) = result {
+          let body: Value = serde_json::from_slice(&result.upstream_wire_body).unwrap();
+          assert_eq!(body["thinking"]["type"], "enabled");
+          let actual = if endpoint == Endpoint::ChatCompletions {
+            &body["reasoning_effort"]
+          } else {
+            &body["output_config"]["effort"]
+          };
+          assert_eq!(actual, effort);
+        }
+      }
+    }
+  }
 
   fn ctx_at(endpoint: Endpoint) -> PipelineCtx {
     PipelineCtx::new("req-cr", endpoint.into(), Arc::new(EventBus::new(64)))
@@ -1183,34 +1220,6 @@ mod tests {
   }
 
   #[test]
-  fn deepseek_rejects_compatibility_effort_aliases() {
-    for effort in [ReasoningEffort::Low, ReasoningEffort::XHigh] {
-      let mut body = serde_json::json!({
-        "model": "deepseek-v4-pro",
-        "messages": [{"role": "user", "content": "hi"}]
-      });
-      let options = GenerationOptions::new().with_reasoning(ReasoningOptions::new().with_effort(effort));
-
-      let error = lower_generation_options(
-        &mut body,
-        Endpoint::ChatCompletions,
-        ID_DEEPSEEK,
-        "deepseek-v4-pro",
-        &options,
-      )
-      .expect_err("compatibility aliases must not be silently reinterpreted");
-
-      assert!(matches!(
-        error,
-        RequestsError::UnsupportedGenerationControl {
-          control: "reasoning.effort",
-          ..
-        }
-      ));
-    }
-  }
-
-  #[test]
   fn deepseek_rejects_sampling_controls_that_thinking_would_ignore() {
     let mut body = serde_json::json!({
       "model": "deepseek-v4-pro",
@@ -1517,53 +1526,6 @@ mod tests {
         ..
       }
     ));
-  }
-
-  #[test]
-  fn claude_reasoning_validates_effort_by_model_generation() {
-    let cases = [
-      (
-        "Sonnet 4.5 has no effort control",
-        "claude-sonnet-4.5",
-        ReasoningEffort::High,
-        true,
-      ),
-      (
-        "Opus 4.5 supports low through high",
-        "claude-opus-4.5",
-        ReasoningEffort::High,
-        false,
-      ),
-      (
-        "Opus 4.5 does not support max",
-        "claude-opus-4.5",
-        ReasoningEffort::Max,
-        true,
-      ),
-      (
-        "Sonnet 4.6 supports max",
-        "claude-sonnet-4.6",
-        ReasoningEffort::Max,
-        false,
-      ),
-      (
-        "Sonnet 4.6 does not support xhigh",
-        "claude-sonnet-4.6",
-        ReasoningEffort::XHigh,
-        true,
-      ),
-      (
-        "Opus 4.7 supports xhigh",
-        "claude-opus-4.7",
-        ReasoningEffort::XHigh,
-        false,
-      ),
-    ];
-
-    for (name, model, effort, should_reject) in cases {
-      let error = validate_claude_effort(Endpoint::Messages, ID_GITHUB_COPILOT, model, Some(&effort)).err();
-      assert_eq!(error.is_some(), should_reject, "{name}");
-    }
   }
 
   #[test]

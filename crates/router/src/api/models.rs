@@ -132,18 +132,7 @@ fn local_models(provider: &dyn crate::provider::Provider) -> Vec<Value> {
 }
 
 fn warm_model_cache(provider: &dyn crate::provider::Provider, arr: &[Value]) {
-  // Warm the provider's identity cache so `Provider::has_model` can
-  // answer accurately for ids that are advertised upstream but not
-  // tracked by the catalogue snapshot. Local fallback must not warm the
-  // cache, because the cache represents upstream truth after a successful
-  // remote `/models` call.
-  let cache_ids: HashSet<String> = arr
-    .iter()
-    .filter_map(|m| m.get("id").and_then(|x| x.as_str()).map(str::to_string))
-    .collect();
-  if !cache_ids.is_empty() {
-    provider.info().model_cache.set(cache_ids);
-  }
+  provider.info().model_cache.set_models(arr);
 }
 
 fn merge_models(
@@ -210,6 +199,11 @@ fn enrich(entry: &mut Value, upstream_id: &str, rendered_id: &str, provider: &dy
       meta.insert("release_date".into(), json!(rd));
     }
   }
+
+  let efforts =
+    tokn_core::provider::upstream_reasoning_efforts(entry).or_else(|| provider.reasoning_efforts(upstream_id));
+  let capabilities = meta.entry("capabilities").or_insert_with(|| json!({}));
+  capabilities["reasoning_efforts"] = json!(efforts);
 
   if let Some(obj) = entry.as_object_mut() {
     obj.insert("x_tokn_router".into(), Value::Object(meta));

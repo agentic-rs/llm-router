@@ -28,6 +28,7 @@ pub fn to_model_info(m: &schema::Model) -> ModelInfo {
     capabilities: Capabilities {
       temperature: m.temperature,
       reasoning: m.reasoning,
+      reasoning_efforts: m.reasoning_efforts(),
       attachment: m.attachment,
       toolcall: m.tool_call,
       input: modalities_from(&m.modalities.input),
@@ -79,6 +80,7 @@ mod tests {
       name: "Claude Sonnet 3".into(),
       attachment: true,
       reasoning: false,
+      reasoning_options: None,
       tool_call: true,
       temperature: true,
       modalities: schema::Modalities {
@@ -122,6 +124,34 @@ mod tests {
     assert!(!mi.capabilities.input.audio);
     assert!(!mi.capabilities.input.video);
     assert!(matches!(mi.capabilities.interleaved, Interleaved::Disabled(false)));
+  }
+
+  #[test]
+  fn maps_effort_metadata_without_conflating_unknown_and_unsupported() {
+    for (options, expected) in [
+      (serde_json::Value::Null, serde_json::Value::Null),
+      (serde_json::json!([]), serde_json::json!([])),
+      (
+        serde_json::json!([{"type": "toggle"}, {"type": "budget_tokens", "min": 1024}]),
+        serde_json::json!([]),
+      ),
+      (serde_json::json!([{"type": "future_control"}]), serde_json::Value::Null),
+      (
+        serde_json::json!([{"type": "effort", "values": ["low", "high", "future"]}]),
+        serde_json::json!(["low", "high", "future"]),
+      ),
+    ] {
+      let model: schema::Model = serde_json::from_value(serde_json::json!({
+        "id": "model", "reasoning": true, "reasoning_options": options
+      }))
+      .unwrap();
+      assert_eq!(
+        serde_json::to_value(to_model_info(&model).capabilities).unwrap()["reasoning_efforts"],
+        expected
+      );
+    }
+    let model: schema::Model = serde_json::from_value(serde_json::json!({"id": "old-snapshot"})).unwrap();
+    assert!(model.reasoning_efforts().is_none());
   }
 
   #[test]
