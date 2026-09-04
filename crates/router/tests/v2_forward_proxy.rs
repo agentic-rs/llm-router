@@ -703,6 +703,122 @@ default_connect = "tunnel"
 }
 
 #[tokio::test]
+async fn shutdown_drains_direct_and_intercepted_http_responses() {
+  use std::time::Duration;
+  trait TestStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+  impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> TestStream for T {}
+
+  for intercept in [false, true] {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let first = b"data: {\"choices\":[]}\n\n";
+    let last = b"data: [DONE]\n\n";
+    let (release, released) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+      let (mut stream, _) = upstream.accept().await.unwrap();
+      read_response_head(&mut stream).await;
+      stream
+        .write_all(
+          format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            first.len() + last.len()
+          )
+          .as_bytes(),
+        )
+        .await
+        .unwrap();
+      stream.write_all(first).await.unwrap();
+      released.await.unwrap();
+      stream.write_all(last).await.unwrap();
+    });
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let ca = tempfile::tempdir().unwrap();
+    let ca_dir = toml_string(&ca.path().to_string_lossy());
+    let config = format!(
+      r#"
+schema_version = 2
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "relay" }}
+default_connect = "intercept"
+ca_dir = {ca_dir}
+[profiles.relay]
+route = "relay"
+[routes.relay]
+kind = "relay"
+destination = {{ kind = "fixed_provider", provider = "local" }}
+credentials = {{ kind = "client" }}
+[providers.local]
+driver = "openai"
+base_url = "http://{upstream_addr}/v1"
+"#
+    );
+    let plan = tokn_config::v2::parse(&config, Path::new("shutdown-proxy.toml")).unwrap();
+    let state =
+      tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+        .unwrap()
+        .forward_proxy
+        .pop()
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+      stopped.await.unwrap();
+    }));
+    wait_for_listener(proxy_addr).await;
+    let mut client: Box<dyn TestStream> = if intercept {
+      Box::new(connect_intercepted_tls(proxy_addr, "api.example.test", &ca.path().join("ca.crt")).await)
+    } else {
+      Box::new(TcpStream::connect(proxy_addr).await.unwrap())
+    };
+    let target = if intercept {
+      "/v1/responses"
+    } else {
+      "http://api.example.test/v1/responses"
+    };
+    client
+      .write_all(format!("GET {target} HTTP/1.1\r\nHost: api.example.test\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut client))
+      .await
+      .unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut received = vec![0; first.len()];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut received))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(received, first);
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+      while TcpStream::connect(proxy_addr).await.is_ok() {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .unwrap();
+    assert!(!server.is_finished());
+    release.send(()).unwrap();
+    let mut remaining = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut remaining))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(remaining, last);
+    tokio::time::timeout(Duration::from_secs(2), server)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap();
+    upstream_task.await.unwrap();
+  }
+}
+
+#[tokio::test]
 async fn profile_owned_proxy_pools_and_client_relays_enforce_route_provider_restrictions() {
   let allowed = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let allowed_addr = allowed.local_addr().unwrap();

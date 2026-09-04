@@ -5,6 +5,7 @@ mod cors;
 pub mod pipeline;
 pub mod proxy;
 mod request_id;
+pub mod server;
 pub mod v2;
 
 pub use tokn_accounts as accounts;

@@ -4,6 +4,7 @@ pub mod initiator;
 pub mod paths;
 pub mod redact;
 pub mod secret;
+pub mod shutdown;
 pub mod timefmt;
 pub mod version;
 

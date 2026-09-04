@@ -176,6 +176,8 @@ export function up(args: string[] = []): void {
     "-d",
     "--name",
     names.gatewayContainer,
+    "--stop-timeout",
+    "40",
     "--network",
     names.networkName,
     ...portArgs,
@@ -205,7 +207,8 @@ export function down(args: string[] = []): void {
   if (tagged.rest.length !== 0) throw new UsageError("down does not accept positional arguments");
   const names = namesForTag(tagged.tag);
   if (resourceExists("container", names.gatewayContainer)) {
-    container(["rm", "-f", names.gatewayContainer]);
+    container(["stop", "--time", "40", names.gatewayContainer]);
+    container(["rm", names.gatewayContainer]);
   }
   if (resourceExists("network", names.networkName)) {
     container(["network", "rm", names.networkName]);

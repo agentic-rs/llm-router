@@ -1,0 +1,21 @@
+schema_version = 2
+
+[service.logging]
+target = "stderr"
+
+[listeners.api]
+kind = "llm_api"
+bind = "0.0.0.0:4141"
+client_auth = "local_keys"
+# Plaintext inside the container: publish only on host loopback, or use TLS
+# termination on a trusted network. This does not disable authentication.
+allow_insecure_public = true
+
+[profiles.default]
+route = "default"
+
+[routes.default]
+kind = "managed"
+provider = { kind = "any" }
+model = { kind = "capability" }
+operation = "translate_compatible"

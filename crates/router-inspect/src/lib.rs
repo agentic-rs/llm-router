@@ -179,8 +179,9 @@ impl IntoResponse for ApiError {
   }
 }
 
-/// Serve the viewer on a separate loopback listener until Ctrl-C.
+/// Serve the viewer on a separate loopback listener until a shutdown signal.
 pub async fn serve(requests_dir: PathBuf, sessions_db: PathBuf, usage_db: PathBuf, port: u16) -> anyhow::Result<()> {
+  let shutdown = tokn_core::util::shutdown::ShutdownSignal::new()?;
   let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
   let address = listener.local_addr()?;
   println!("Inspect viewer: http://{address}");
@@ -194,7 +195,11 @@ pub async fn serve(requests_dir: PathBuf, sessions_db: PathBuf, usage_db: PathBu
       usage_db,
     }),
   )
-  .with_graceful_shutdown(wait_for_shutdown())
+  .with_graceful_shutdown(async {
+    if let Err(error) = shutdown.wait().await {
+      tracing::error!(%error, "shutdown signal handler failed");
+    }
+  })
   .await?;
   Ok(())
 }
@@ -513,10 +518,6 @@ fn add_security_headers(response: &mut Response) {
   );
   headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
   headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-}
-
-async fn wait_for_shutdown() {
-  let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

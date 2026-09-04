@@ -13,8 +13,23 @@ mod provider;
 mod server_runtime;
 mod util;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+  let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    Ok(runtime) => runtime,
+    Err(error) => {
+      eprintln!("error: initialize async runtime: {error}");
+      return ExitCode::FAILURE;
+    }
+  };
+  let result = runtime.block_on(run());
+  // The serving path already drained connections and persistence. Tokio's
+  // default drop waits forever for spawn_blocking work, including a stuck
+  // archive scan after the cleanup deadline, so bound this final wait too.
+  runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+  result
+}
+
+async fn run() -> ExitCode {
   if let Err(e) = tokn_router::install_rustls_crypto_provider() {
     eprintln!("error: {e}");
     return ExitCode::FAILURE;

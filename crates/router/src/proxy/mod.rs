@@ -4,6 +4,7 @@ pub mod passthrough_pipeline;
 mod transport;
 
 use crate::api::{AppState, LiveAppState};
+use crate::server::{drain_connections, SHUTDOWN_GRACE_PERIOD};
 use anyhow::{Context, Result};
 use axum::http::Method;
 use axum::Router;
@@ -116,10 +117,16 @@ where
   tracing::info!(addr = %options.addr, ca_dir = %options.ca_dir.display(), "tokn-router proxy listening");
 
   tokio::pin!(shutdown);
-
+  let mut connections = JoinSet::new();
   loop {
     tokio::select! {
+      biased;
       _ = &mut shutdown => break,
+      joined = connections.join_next(), if !connections.is_empty() => {
+        if let Some(Err(error)) = joined {
+          tracing::warn!(%error, "proxy connection task failed");
+        }
+      }
       accept = listener.accept() => {
         let (stream, peer) = match accept {
           Ok(connection) => connection,
@@ -131,7 +138,7 @@ where
         let runtime = runtime.clone();
         let outbound_proxy = outbound_proxy.clone();
         let plain_http_handler = plain_http_handler.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
           if let Err(err) = handle_client(stream, peer, runtime, outbound_proxy, plain_http_handler).await {
             if is_benign_disconnect(&err) {
               tracing::debug!(%peer, error = %err, "proxy connection closed by peer");
@@ -144,7 +151,8 @@ where
     }
   }
 
-  Ok(())
+  drop(listener);
+  drain_connections(&mut connections, SHUTDOWN_GRACE_PERIOD).await
 }
 
 pub(crate) async fn serve_v2_policy<F>(
@@ -194,13 +202,9 @@ where
       }
     }
   }
+  drop(listener);
   let _ = connection_shutdown_tx.send(true);
-  while let Some(joined) = connections.join_next().await {
-    if let Err(error) = joined {
-      tracing::warn!(%error, "v2 proxy connection task failed during shutdown");
-    }
-  }
-  Ok(())
+  drain_connections(&mut connections, SHUTDOWN_GRACE_PERIOD).await
 }
 
 #[derive(Clone)]

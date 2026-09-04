@@ -160,6 +160,7 @@ async fn start(cfg_path: Option<PathBuf>, args: StartArgs) -> Result<()> {
   if args.passthrough && args.route_mode.is_some() {
     anyhow::bail!("--passthrough and --route-mode cannot be used together");
   }
+  let shutdown = tokn_core::util::shutdown::ShutdownSignal::new().context("install shutdown signal handlers")?;
   let (mut cfg, resolved_cfg_path) = Config::load(cfg_path.as_deref())?;
   if args.no_proxy {
     cfg.proxy = ProxyConfig::default();
@@ -181,58 +182,61 @@ async fn start(cfg_path: Option<PathBuf>, args: StartArgs) -> Result<()> {
 
   let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_event_bus(&cfg)?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let mut state = crate::server_runtime::build_proxy_state_for_route_mode(&cfg, &accounts, events.clone(), route_mode)?;
-  state.access = crate::server_runtime::load_access_store(cfg.api_key.enabled)?;
-  let n = state.pool.len();
-  let addr: SocketAddr = crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
-    .with_context(|| format!("parse bind addr {host}:{port}"))?;
+  let result = async {
+    let mut state =
+      crate::server_runtime::build_proxy_state_for_route_mode(&cfg, &accounts, events.clone(), route_mode)?;
+    state.access = crate::server_runtime::load_access_store(cfg.api_key.enabled)?;
+    let n = state.pool.len();
+    let addr: SocketAddr = crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
+      .with_context(|| format!("parse bind addr {host}:{port}"))?;
 
-  let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, false)?;
-  let ca_fingerprint = ca.fingerprint_sha256();
-  let plain_http_handler = if args.insecure_allow_remote {
-    let bootstrap = lan_bootstrap::BootstrapState::proxy_only(&ca, port)?;
-    Some(lan_bootstrap::proxy_plain_http_handler(bootstrap))
-  } else {
-    None
-  };
-  println!("tokn-router proxy listening on http://{addr}");
-  println!("CA: {} (sha256:{ca_fingerprint})", ca.cert_path().display());
-  println!("Trust this CA, then run: eval \"$(tokn-gateway proxy env)\"");
-  if args.insecure_allow_remote {
-    println!(
-      "LAN proxy bootstrap: {}",
-      lan_bootstrap::display_bootstrap_url(&host, port)
-    );
-  }
-  println!("Route mode: {}", route_mode_name(route_mode));
-  if let Some(url) = &cfg.proxy.url {
-    println!("Outbound proxy: {url}");
-    if !cfg.proxy.no_proxy.is_empty() {
-      println!("Outbound no_proxy: {}", cfg.proxy.no_proxy.join(","));
+    let ca = tokn_router::proxy::load_or_generate_ca(&ca_dir, false)?;
+    let ca_fingerprint = ca.fingerprint_sha256();
+    let plain_http_handler = if args.insecure_allow_remote {
+      let bootstrap = lan_bootstrap::BootstrapState::proxy_only(&ca, port)?;
+      Some(lan_bootstrap::proxy_plain_http_handler(bootstrap))
+    } else {
+      None
+    };
+    println!("tokn-router proxy listening on http://{addr}");
+    println!("CA: {} (sha256:{ca_fingerprint})", ca.cert_path().display());
+    println!("Trust this CA, then run: eval \"$(tokn-gateway proxy env)\"");
+    if args.insecure_allow_remote {
+      println!(
+        "LAN proxy bootstrap: {}",
+        lan_bootstrap::display_bootstrap_url(&host, port)
+      );
     }
-  } else if cfg.proxy.system {
-    println!("Outbound proxy: system");
+    println!("Route mode: {}", route_mode_name(route_mode));
+    if let Some(url) = &cfg.proxy.url {
+      println!("Outbound proxy: {url}");
+      if !cfg.proxy.no_proxy.is_empty() {
+        println!("Outbound no_proxy: {}", cfg.proxy.no_proxy.join(","));
+      }
+    } else if cfg.proxy.system {
+      println!("Outbound proxy: system");
+    }
+    println!("Accounts: {n}");
+
+    let options = tokn_router::proxy::ProxyOptions {
+      addr,
+      ca_dir,
+      intercept_hosts: cfg.proxy_mode.intercept_hosts.clone(),
+      passthrough_hosts: cfg.proxy_mode.passthrough_hosts.clone(),
+      outbound_proxy: cfg.proxy.to_http_options(),
+      plain_http_handler,
+    };
+
+    tokn_router::proxy::serve(state, options, async {
+      if let Err(error) = shutdown.wait().await {
+        tracing::error!(%error, "shutdown signal handler failed");
+      }
+    })
+    .await
   }
-  println!("Accounts: {n}");
-
-  let options = tokn_router::proxy::ProxyOptions {
-    addr,
-    ca_dir,
-    intercept_hosts: cfg.proxy_mode.intercept_hosts.clone(),
-    passthrough_hosts: cfg.proxy_mode.passthrough_hosts.clone(),
-    outbound_proxy: cfg.proxy.to_http_options(),
-    plain_http_handler,
-  };
-
-  let result = tokn_router::proxy::serve(state, options, async {
-    let _ = tokio::signal::ctrl_c().await;
-  })
   .await;
-  if let Some(archive_runtime) = archive_runtime {
-    archive_runtime.shutdown().await;
-  }
-  events.shutdown().await;
-  result
+  let cleanup = crate::server_runtime::finish_events(&events, archive_runtime).await;
+  result.and(cleanup)
 }
 
 async fn env(cfg_path: Option<PathBuf>, args: EnvArgs) -> Result<()> {
