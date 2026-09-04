@@ -5,7 +5,12 @@ mod cors;
 pub mod pipeline;
 pub mod proxy;
 mod request_id;
+pub mod server;
 pub mod v2;
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
 
 pub use tokn_accounts as accounts;
 pub use tokn_config as config;

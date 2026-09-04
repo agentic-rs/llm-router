@@ -5,6 +5,11 @@ workspace root a JavaScript package.
 
 ## Docker PR Trial
 
+For native v2 configurations, use [the standard Docker setup](../docs/docker.md).
+The older Bun trial helper below still supplies legacy `serve --with-proxy`
+flags and requires a compatible v1 config with client authentication enabled.
+It stops containers with a 40-second grace period before removing them.
+
 Download and load the `tokn-gateway-cli-image` artifact from CI, build the agent
 runner image once, and start the gateway:
 

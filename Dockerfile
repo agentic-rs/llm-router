@@ -18,4 +18,6 @@ COPY --from=builder /app/target/release/tokn-gateway /usr/local/bin/tokn-gateway
 EXPOSE 4141
 
 ENTRYPOINT ["/usr/local/bin/tokn-gateway"]
-CMD ["serve", "--host", "0.0.0.0", "--allow-remote"]
+# Listener addresses and authentication come from the mounted configuration.
+STOPSIGNAL SIGTERM
+CMD ["serve"]

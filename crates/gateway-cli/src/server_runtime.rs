@@ -2,13 +2,13 @@ use crate::config::Config;
 use crate::db::archive::{ArchiveEventHandler, ArchiveRuntime};
 use crate::progress::{ArchiveProgressEventHandler, ProgressEventHandler, ProgressLogEventHandler};
 use anyhow::Result;
-use axum::extract::Extension;
 use axum::Router;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
@@ -153,10 +153,33 @@ where
   let listener = tokio::net::TcpListener::bind(addr).await?;
   let local_addr = listener.local_addr()?;
   tracing::info!(addr = %local_addr, "tokn-router listening");
-  let app = app.layer(Extension(local_addr));
-  axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-    .with_graceful_shutdown(shutdown)
-    .await?;
+  tokn_router::server::serve_http(app, listener, shutdown).await
+}
+
+/// Called after every listener has stopped and its connection tasks have been
+/// joined. A stuck finalizer or writer must not hang process termination.
+pub async fn finish_events(events: &EventBus, archive: Option<ArchiveRuntime>) -> Result<()> {
+  finish_events_with_timeout(events, archive, Duration::from_secs(5)).await
+}
+
+async fn finish_events_with_timeout(
+  events: &EventBus,
+  archive: Option<ArchiveRuntime>,
+  timeout: Duration,
+) -> Result<()> {
+  let result = tokio::time::timeout(timeout, async {
+    tokio::join!(events.shutdown(), async {
+      if let Some(archive) = archive {
+        archive.shutdown().await;
+      }
+    });
+  })
+  .await;
+  if result.is_err() {
+    tracing::error!("shutdown persistence cleanup timed out; queued records may be incomplete");
+    anyhow::bail!("shutdown persistence cleanup timed out");
+  }
+  tracing::info!("shutdown persistence cleanup complete");
   Ok(())
 }
 
@@ -180,6 +203,34 @@ pub fn ensure_bind_host(host: &str, insecure_allow_remote: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn cleanup_waits_for_handler_flush() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Handler(Arc<AtomicBool>);
+    impl EventHandler for Handler {
+      fn handle(&mut self, _: &tokn_core::event::Event) {}
+      fn flush(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+      }
+    }
+    let flushed = Arc::new(AtomicBool::new(false));
+    let events = EventBus::new(16);
+    let worker = tokn_core::event::spawn_event_loop(events.subscribe(), vec![Box::new(Handler(flushed.clone()))]);
+    finish_events(&events, None).await.unwrap();
+    assert!(flushed.load(Ordering::SeqCst));
+    worker.join().unwrap();
+  }
+
+  #[tokio::test]
+  async fn cleanup_reports_stalled_finalizers_instead_of_waiting_forever() {
+    let events = EventBus::new(16);
+    let _finalizer = events.begin_finalizer();
+    let error = finish_events_with_timeout(&events, None, Duration::from_millis(20))
+      .await
+      .unwrap_err();
+    assert!(error.to_string().contains("cleanup timed out"));
+  }
 
   fn persistence_config(record_sessions: bool) -> (Config, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("tokn-server-runtime-test-{}", uuid::Uuid::new_v4()));

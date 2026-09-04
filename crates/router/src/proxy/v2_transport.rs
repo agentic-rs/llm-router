@@ -1,5 +1,6 @@
 use super::connect_proxy::{connect_upstream, ConnectProxy};
 use crate::api::error::ApiError;
+use crate::server::shutdown_requested;
 use crate::v2::{InboundConnectionInfo, LiveForwardProxyState, ProxyAuthenticationError};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -56,19 +57,19 @@ pub(super) async fn handle_v2_client(
   tokio::pin!(connection);
   tokio::select! {
     result = &mut connection => result.context("serve v2 proxy HTTP connection")?,
-    _ = shutdown_requested(&mut shutdown) => return Ok(()),
+    _ = shutdown_requested(&mut shutdown) => {
+      connection.as_mut().graceful_shutdown();
+      connection.await.context("drain v2 proxy HTTP connection")?;
+    }
   }
   let upgrade = tokio::select! {
     upgrade = upgrade_receiver.recv() => upgrade,
     _ = shutdown_requested(&mut shutdown) => return Ok(()),
   };
   if let Some(upgrade) = upgrade {
-    tokio::select! {
-      result = run_connect(upgrade, state) => {
-        result.with_context(|| format!("run v2 CONNECT session from {peer}"))?;
-      }
-      _ = shutdown_requested(&mut shutdown) => {}
-    }
+    run_connect(upgrade, state, shutdown)
+      .await
+      .with_context(|| format!("run v2 CONNECT session from {peer}"))?;
   }
   Ok(())
 }
@@ -199,21 +200,32 @@ fn admit_direct_http(request: &Request<hyper::body::Incoming>) -> Result<Ingress
   Ok(ingress)
 }
 
-async fn run_connect(upgrade: ConnectUpgrade, state: LiveForwardProxyState) -> Result<()> {
+async fn run_connect(
+  upgrade: ConnectUpgrade,
+  state: LiveForwardProxyState,
+  mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
   let upgraded = upgrade.on_upgrade.await.context("upgrade downstream CONNECT")?;
   let downstream = TokioIo::new(upgraded);
   match upgrade.transport {
     PreparedConnect::Tunnel(mut upstream) => {
       let mut downstream = downstream;
-      tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
-        .await
-        .context("pump CONNECT tunnel")?;
+      // Opaque tunnels have no HTTP request boundary to drain. Close them on
+      // shutdown; decoded HTTP connections below finish their active request.
+      tokio::select! {
+        result = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {
+          result.context("pump CONNECT tunnel")?;
+        }
+        _ = shutdown_requested(&mut shutdown) => {}
+      }
     }
     PreparedConnect::Intercept(config) => {
-      let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(downstream))
-        .await
-        .context("intercepted TLS handshake timed out")?
-        .context("intercepted TLS handshake failed")?;
+      let tls = tokio::select! {
+        result = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(downstream)) => {
+          result.context("intercepted TLS handshake timed out")?.context("intercepted TLS handshake failed")?
+        }
+        _ = shutdown_requested(&mut shutdown) => return Ok(()),
+      };
       let ingress = upgrade.ingress;
       // Proxy authentication is admitted once for the CONNECT connection. The
       // authentication mode cannot reload, while each inner HTTP request takes
@@ -249,10 +261,15 @@ async fn run_connect(upgrade: ConnectUpgrade, state: LiveForwardProxyState) -> R
         }
       });
       let builder = http1_builder();
-      builder
-        .serve_connection(TokioIo::new(tls), service)
-        .await
-        .context("serve intercepted HTTPS connection")?;
+      let connection = builder.serve_connection(TokioIo::new(tls), service);
+      tokio::pin!(connection);
+      tokio::select! {
+        result = &mut connection => result.context("serve intercepted HTTPS connection")?,
+        _ = shutdown_requested(&mut shutdown) => {
+          connection.as_mut().graceful_shutdown();
+          connection.await.context("drain intercepted HTTPS connection")?;
+        }
+      }
     }
   }
   Ok(())
@@ -384,13 +401,6 @@ fn response(status: StatusCode, message: &str) -> Response<Body> {
   let mut response = Response::new(Body::from(message.to_string()));
   *response.status_mut() = status;
   response
-}
-
-async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
-  if *shutdown.borrow() {
-    return;
-  }
-  let _ = shutdown.changed().await;
 }
 
 #[cfg(test)]

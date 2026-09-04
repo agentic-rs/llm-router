@@ -3,10 +3,13 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::Args;
 use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokn_core::event::EventBus;
+use tokn_core::util::shutdown::ShutdownSignal;
 use tokn_router_legacy_config::v2::{project_v2_config, V2ProjectionOptions, V2ProjectionWarning};
 
 #[derive(Args, Clone, Debug)]
@@ -217,6 +220,7 @@ fn log_projection_warnings(config_path: &std::path::Path, warnings: &[V2Projecti
 }
 
 async fn run_v2_runtime(source: RuntimeSource, loaded: LoadedRuntime) -> Result<()> {
+  let shutdown = ShutdownSignal::new().context("install shutdown signal handlers")?;
   let LoadedRuntime {
     compiled,
     accounts,
@@ -232,17 +236,16 @@ async fn run_v2_runtime(source: RuntimeSource, loaded: LoadedRuntime) -> Result<
   let access = crate::server_runtime::load_access_store(needs_access)?;
   let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_v2_event_bus(service.persistence())?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let states =
-    tokn_router::v2::build_runtime_states_with_service(plan, service, &accounts, access.clone(), events.clone())?;
-  let live = tokn_router::v2::LiveRuntime::new(states, accounts.len());
-  install_admin_reloader(&live, source, initial_service, access, events.clone())?;
-  let result = serve_live_v2_runtime(live, args, shutdown_channel()).await;
-
-  if let Some(archive_runtime) = archive_runtime {
-    archive_runtime.shutdown().await;
+  let result = async {
+    let states =
+      tokn_router::v2::build_runtime_states_with_service(plan, service, &accounts, access.clone(), events.clone())?;
+    let live = tokn_router::v2::LiveRuntime::new(states, accounts.len());
+    install_admin_reloader(&live, source, initial_service, access, events.clone())?;
+    serve_live_v2_runtime(live, args, async { shutdown.wait().await.map_err(Into::into) }).await
   }
-  events.shutdown().await;
-  result
+  .await;
+  let cleanup = crate::server_runtime::finish_events(&events, archive_runtime).await;
+  result.and(cleanup)
 }
 
 fn install_admin_reloader(
@@ -328,14 +331,17 @@ async fn serve_v2_plan(
 ) -> Result<()> {
   let states = tokn_router::v2::build_runtime_states_with_service(plan, service, accounts, access, events)?;
   let live = tokn_router::v2::LiveRuntime::new(states, accounts.len());
-  serve_live_v2_runtime(live, args, shutdown).await
+  serve_live_v2_runtime(live, args, async {
+    wait_for_shutdown(shutdown).await;
+    Ok(())
+  })
+  .await
 }
 
-async fn serve_live_v2_runtime(
-  live: tokn_router::v2::LiveRuntime,
-  args: ServeArgs,
-  shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+async fn serve_live_v2_runtime<F>(live: tokn_router::v2::LiveRuntime, args: ServeArgs, shutdown: F) -> Result<()>
+where
+  F: Future<Output = Result<()>> + Send,
+{
   let states = live.llm_api_listeners();
   let proxy_states = live.forward_proxy_listeners();
   let listener_count = states.len() + proxy_states.len();
@@ -344,49 +350,77 @@ async fn serve_live_v2_runtime(
   }
 
   let mut servers = Vec::<BoxFuture<'static, Result<()>>>::with_capacity(listener_count);
+  let (shutdown_tx, shutdown_rx) = watch::channel(false);
   for state in states {
-    let configured = state.bind();
-    let addr = if args.host.is_some() || args.port.is_some() {
-      let host = args.host.clone().unwrap_or_else(|| configured.ip().to_string());
-      let port = args.port.unwrap_or(configured.port());
-      crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
-        .with_context(|| format!("parse v2 bind address {host}:{port}"))?
-    } else {
-      configured
-    };
+    let addr = listener_bind(state.bind(), state.client_auth(), &args)?;
     tracing::info!(listener = %state.listener_id(), %addr, "tokn-router v2 listener starting");
     let app = tokn_router::v2::router_live(state);
-    let shutdown = shutdown.clone();
+    let shutdown = shutdown_rx.clone();
     servers.push(Box::pin(async move {
       crate::server_runtime::serve_http(app, addr, wait_for_shutdown(shutdown)).await
     }));
   }
   for state in proxy_states {
-    let configured = state.bind();
-    let addr = if args.host.is_some() || args.port.is_some() {
-      let host = args.host.clone().unwrap_or_else(|| configured.ip().to_string());
-      let port = args.port.unwrap_or(configured.port());
-      crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
-        .with_context(|| format!("parse v2 bind address {host}:{port}"))?
-    } else {
-      configured
-    };
+    let addr = listener_bind(state.bind(), state.client_auth(), &args)?;
     tracing::info!(listener = %state.listener_id(), %addr, "tokn-router v2 forward proxy starting");
-    let shutdown = shutdown.clone();
+    let shutdown = shutdown_rx.clone();
     servers.push(Box::pin(async move {
       tokn_router::v2::serve_live_forward_proxy(state, addr, wait_for_shutdown(shutdown)).await
     }));
   }
-  futures::future::try_join_all(servers).await.map(|_| ())
+  supervise_listeners(servers, shutdown_tx, shutdown).await
 }
 
-fn shutdown_channel() -> watch::Receiver<bool> {
-  let (tx, rx) = watch::channel(false);
-  tokio::spawn(async move {
-    let _ = tokio::signal::ctrl_c().await;
-    let _ = tx.send(true);
-  });
-  rx
+fn listener_bind(
+  configured: std::net::SocketAddr,
+  client_auth: tokn_policy::ClientAuthPlan,
+  args: &ServeArgs,
+) -> Result<std::net::SocketAddr> {
+  if args.host.is_none() && args.port.is_none() {
+    return Ok(configured);
+  }
+  let host = args.host.clone().unwrap_or_else(|| configured.ip().to_string());
+  let port = args.port.unwrap_or(configured.port());
+  let addr = crate::server_runtime::resolve_bind_addr(&host, port, args.insecure_allow_remote)
+    .with_context(|| format!("parse v2 bind address {host}:{port}"))?;
+  // Compilation validated the authored address, not this CLI override.
+  if !addr.ip().is_loopback() && client_auth == tokn_policy::ClientAuthPlan::None {
+    anyhow::bail!("non-loopback listener overrides require client_auth = \"local_keys\"");
+  }
+  Ok(addr)
+}
+
+async fn supervise_listeners<F>(
+  servers: Vec<BoxFuture<'static, Result<()>>>,
+  shutdown_tx: watch::Sender<bool>,
+  shutdown: F,
+) -> Result<()>
+where
+  F: Future<Output = Result<()>>,
+{
+  let mut servers = servers.into_iter().collect::<FuturesUnordered<_>>();
+  let mut stopping = false;
+  let mut outcome = Ok(());
+  tokio::pin!(shutdown);
+  while !servers.is_empty() {
+    let result = tokio::select! {
+      biased;
+      result = &mut shutdown, if !stopping => result,
+      Some(result) = servers.next() => result,
+    };
+    if let Err(error) = result {
+      tracing::error!(%error, "listener runtime stopping after an error");
+      if outcome.is_ok() {
+        outcome = Err(error);
+      }
+    }
+    if !stopping {
+      stopping = true;
+      tracing::info!("stopping listeners; draining active connections");
+      let _ = shutdown_tx.send(true);
+    }
+  }
+  outcome
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -408,6 +442,42 @@ mod tests {
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::{TcpListener, TcpStream};
   use tower::ServiceExt;
+
+  #[tokio::test]
+  async fn listener_failure_signals_and_awaits_sibling_cleanup() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (cleaned_tx, cleaned_rx) = tokio::sync::oneshot::channel();
+    let servers: Vec<BoxFuture<'static, Result<()>>> = vec![
+      Box::pin(async { anyhow::bail!("fixture bind failure") }),
+      Box::pin(async {
+        wait_for_shutdown(shutdown_rx).await;
+        tokio::task::yield_now().await;
+        cleaned_tx.send(()).unwrap();
+        Ok(())
+      }),
+    ];
+    let error = supervise_listeners(servers, shutdown_tx, std::future::pending())
+      .await
+      .unwrap_err();
+    assert!(error.to_string().contains("fixture bind failure"));
+    cleaned_rx.await.unwrap();
+  }
+
+  #[test]
+  fn remote_bind_override_cannot_bypass_compiled_authentication() {
+    let configured = "127.0.0.1:4141".parse().unwrap();
+    let mut args = v2_serve_args();
+    args.host = Some("0.0.0.0".into());
+    args.insecure_allow_remote = true;
+    let error = listener_bind(configured, tokn_policy::ClientAuthPlan::None, &args).unwrap_err();
+    assert!(error.to_string().contains("require client_auth"));
+    assert_eq!(
+      listener_bind(configured, tokn_policy::ClientAuthPlan::LocalKeys, &args).unwrap(),
+      "0.0.0.0:4141".parse::<std::net::SocketAddr>().unwrap()
+    );
+    args.insecure_allow_remote = false;
+    assert!(listener_bind(configured, tokn_policy::ClientAuthPlan::LocalKeys, &args).is_err());
+  }
 
   fn unused_loopback_addr() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

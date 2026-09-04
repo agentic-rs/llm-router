@@ -4,6 +4,7 @@ pub mod passthrough_pipeline;
 mod transport;
 
 use crate::api::{AppState, LiveAppState};
+use crate::server::{drain_connections, SHUTDOWN_GRACE_PERIOD};
 use anyhow::{Context, Result};
 use axum::http::Method;
 use axum::Router;
@@ -116,10 +117,16 @@ where
   tracing::info!(addr = %options.addr, ca_dir = %options.ca_dir.display(), "tokn-router proxy listening");
 
   tokio::pin!(shutdown);
-
+  let mut connections = JoinSet::new();
   loop {
     tokio::select! {
+      biased;
       _ = &mut shutdown => break,
+      joined = connections.join_next(), if !connections.is_empty() => {
+        if let Some(Err(error)) = joined {
+          tracing::warn!(%error, "proxy connection task failed");
+        }
+      }
       accept = listener.accept() => {
         let (stream, peer) = match accept {
           Ok(connection) => connection,
@@ -131,7 +138,7 @@ where
         let runtime = runtime.clone();
         let outbound_proxy = outbound_proxy.clone();
         let plain_http_handler = plain_http_handler.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
           if let Err(err) = handle_client(stream, peer, runtime, outbound_proxy, plain_http_handler).await {
             if is_benign_disconnect(&err) {
               tracing::debug!(%peer, error = %err, "proxy connection closed by peer");
@@ -144,7 +151,8 @@ where
     }
   }
 
-  Ok(())
+  drop(listener);
+  drain_connections(&mut connections, SHUTDOWN_GRACE_PERIOD).await
 }
 
 pub(crate) async fn serve_v2_policy<F>(
@@ -194,13 +202,9 @@ where
       }
     }
   }
+  drop(listener);
   let _ = connection_shutdown_tx.send(true);
-  while let Some(joined) = connections.join_next().await {
-    if let Err(error) = joined {
-      tracing::warn!(%error, "v2 proxy connection task failed during shutdown");
-    }
-  }
-  Ok(())
+  drain_connections(&mut connections, SHUTDOWN_GRACE_PERIOD).await
 }
 
 #[derive(Clone)]
@@ -280,6 +284,94 @@ fn split_authority(authority: &str) -> Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::time::Duration;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::net::TcpStream;
+
+  #[tokio::test]
+  async fn legacy_listener_survives_bad_connections_and_drains_an_admitted_tunnel() {
+    let ca = tempfile::tempdir().unwrap();
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut config = tokn_config::Config::default();
+    config.server.route_mode = tokn_config::RouteMode::Passthrough;
+    let state = crate::api::build_proxy_state(&config, &[], Arc::new(tokn_core::event::EventBus::noop())).unwrap();
+    let options = ProxyOptions {
+      addr: address,
+      ca_dir: ca.path().into(),
+      intercept_hosts: Vec::new(),
+      passthrough_hosts: Vec::new(),
+      outbound_proxy: HttpClientOptions::default(),
+      plain_http_handler: None,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve(state, options, async { stopped.await.unwrap() }));
+    let mut client = tokio::time::timeout(Duration::from_secs(10), async {
+      loop {
+        if let Ok(client) = TcpStream::connect(address).await {
+          break client;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .unwrap();
+    client.write_all(b"CONNECT :invalid HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await
+      .unwrap()
+      .unwrap();
+    assert!(response.is_empty());
+
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client
+      .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      .await
+      .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await
+      .unwrap()
+      .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client
+      .write_all(format!("CONNECT {upstream_addr} HTTP/1.1\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let mut head = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+      while !head.ends_with(b"\r\n\r\n") {
+        head.push(client.read_u8().await.unwrap());
+      }
+    })
+    .await
+    .unwrap();
+    assert!(head.starts_with(b"HTTP/1.1 200"));
+    let (mut upstream, _) = upstream.accept().await.unwrap();
+    stop.send(()).unwrap();
+    crate::test_support::wait_for_listener_closed(address).await;
+    assert!(!server.is_finished());
+    upstream.write_all(b"drained").await.unwrap();
+    let mut received = [0; 7];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut received))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(&received, b"drained");
+    drop(upstream);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), server)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap();
+  }
+
   #[test]
   fn benign_disconnect_matches_unexpected_eof() {
     let err = anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended"));

@@ -313,6 +313,11 @@ jobs:
           cache-to: type=gha,mode=max
           outputs: type=docker,dest=${{ env.IMAGE_TAR }}
 
+      - name: Smoke-test container startup and shutdown
+        run: |
+          docker load --input "$IMAGE_TAR"
+          bash scripts/docker/smoke.sh "$IMAGE_NAME"
+
       - name: Upload tokn-gateway image artifact
         uses: actions/upload-artifact@v4
         with:

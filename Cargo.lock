@@ -3318,8 +3318,10 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tokn-core",
  "tokn-persistence",
  "tower",
+ "tracing",
 ]
 
 [[package]]

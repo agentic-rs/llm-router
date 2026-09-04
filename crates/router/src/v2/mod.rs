@@ -706,6 +706,10 @@ impl LiveAppState {
     self.current().bind()
   }
 
+  pub fn client_auth(&self) -> ClientAuthPlan {
+    self.current().client_auth()
+  }
+
   fn current(&self) -> Arc<AppState> {
     self.runtime.current_api(&self.listener_id)
   }
@@ -724,6 +728,10 @@ impl LiveForwardProxyState {
 
   pub fn bind(&self) -> SocketAddr {
     self.current().bind()
+  }
+
+  pub fn client_auth(&self) -> ClientAuthPlan {
+    self.current().listener.client_auth()
   }
 
   pub fn outbound(&self) -> tokn_core::util::http::HttpClientOptions {

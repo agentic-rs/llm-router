@@ -179,8 +179,9 @@ impl IntoResponse for ApiError {
   }
 }
 
-/// Serve the viewer on a separate loopback listener until Ctrl-C.
+/// Serve the viewer on a separate loopback listener until a shutdown signal.
 pub async fn serve(requests_dir: PathBuf, sessions_db: PathBuf, usage_db: PathBuf, port: u16) -> anyhow::Result<()> {
+  let shutdown = tokn_core::util::shutdown::ShutdownSignal::new()?;
   let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
   let address = listener.local_addr()?;
   println!("Inspect viewer: http://{address}");
@@ -194,7 +195,11 @@ pub async fn serve(requests_dir: PathBuf, sessions_db: PathBuf, usage_db: PathBu
       usage_db,
     }),
   )
-  .with_graceful_shutdown(wait_for_shutdown())
+  .with_graceful_shutdown(async {
+    if let Err(error) = shutdown.wait().await {
+      tracing::error!(%error, "shutdown signal handler failed");
+    }
+  })
   .await?;
   Ok(())
 }
@@ -515,10 +520,6 @@ fn add_security_headers(response: &mut Response) {
   headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 }
 
-async fn wait_for_shutdown() {
-  let _ = tokio::signal::ctrl_c().await;
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -529,6 +530,76 @@ mod tests {
   use tokn_persistence::sessions::{SessionsDb, TreeRequestRecord};
   use tokn_persistence::{MessageRecord, UsageDb};
   use tower::ServiceExt;
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn viewer_process_exits_cleanly_on_sigterm() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::process::Command;
+
+    const FIXTURE_DIR: &str = "TOKN_INSPECT_SHUTDOWN_FIXTURE_DIR";
+    const FIXTURE_PORT: &str = "TOKN_INSPECT_SHUTDOWN_FIXTURE_PORT";
+    if let Some(root) = std::env::var_os(FIXTURE_DIR) {
+      let root = PathBuf::from(root);
+      let port = std::env::var(FIXTURE_PORT).unwrap().parse().unwrap();
+      serve(
+        root.join("requests"),
+        root.join("sessions.db"),
+        root.join("usage.db"),
+        port,
+      )
+      .await
+      .unwrap();
+      return;
+    }
+
+    // Signals are process-wide: launch only this test in an isolated child.
+    let root = tempfile::tempdir().unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "tests::viewer_process_exits_cleanly_on_sigterm",
+        "--nocapture",
+      ])
+      .env(FIXTURE_DIR, root.path())
+      .env(FIXTURE_PORT, address.port().to_string())
+      .kill_on_drop(true)
+      .spawn()
+      .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+      loop {
+        assert!(child.try_wait().unwrap().is_none(), "viewer exited before readiness");
+        if let Ok(mut client) = tokio::net::TcpStream::connect(address).await {
+          client
+            .write_all(b"GET /api/info HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+          let mut response = String::new();
+          client.read_to_string(&mut response).await.unwrap();
+          assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("viewer readiness deadline");
+    assert!(Command::new("kill")
+      .args(["-TERM", &child.id().unwrap().to_string()])
+      .status()
+      .await
+      .unwrap()
+      .success());
+    assert!(tokio::time::timeout(Duration::from_secs(5), child.wait())
+      .await
+      .expect("viewer shutdown deadline")
+      .unwrap()
+      .success());
+  }
 
   fn write_request(dir: &std::path::Path, day: &str, request_id: &str, session_id: &str) {
     let conn = open_day_db(&dir.join(format!("{day}.db"))).unwrap();

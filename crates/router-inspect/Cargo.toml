@@ -9,6 +9,8 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+tokn-core = { workspace = true }
+tracing = { workspace = true }
 tokn-persistence = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
