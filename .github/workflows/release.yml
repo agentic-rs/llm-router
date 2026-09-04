@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.os }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -18,14 +18,17 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
             artifact_name: tokn-gateway-x86_64-unknown-linux-gnu
             binary_name: tokn-gateway
             archive_ext: tar.gz
           - os: macos-14
-            artifact_name: tokn-gateway-x86_64-apple-darwin
+            target: aarch64-apple-darwin
+            artifact_name: tokn-gateway-aarch64-apple-darwin
             binary_name: tokn-gateway
             archive_ext: tar.gz
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             artifact_name: tokn-gateway-x86_64-pc-windows-msvc
             binary_name: tokn-gateway.exe
             archive_ext: zip
@@ -36,6 +39,21 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Verify release tag and notes
+        shell: bash
+        run: |
+          expected_tag="$(tr -d '\r\n' < VERSION)"
+          if [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
+            echo "Release tag $GITHUB_REF_NAME does not match VERSION ($expected_tag)" >&2
+            exit 1
+          fi
+          if [ ! -s "docs/releases/$expected_tag.md" ]; then
+            echo "Missing release notes for $expected_tag" >&2
+            exit 1
+          fi
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -43,14 +61,29 @@ jobs:
           shared-key: release
 
       - name: Build release binary
-        run: cargo build --locked --release --package tokn-gateway-cli --bin tokn-gateway
+        env:
+          # Keep Rust and native dependencies on the same macOS baseline.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --locked --release --package tokn-gateway-cli --bin tokn-gateway --target ${{ matrix.target }}
+
+      - name: Verify release binary version
+        shell: bash
+        env:
+          RELEASE_BINARY: target/${{ matrix.target }}/release/${{ matrix.binary_name }}
+        run: |
+          expected_version="$(tr -d '\r\n' < VERSION)"
+          actual_version="$("$RELEASE_BINARY" --version)"
+          case "$actual_version" in
+            "tokn-router $expected_version+"*) ;;
+            *) echo "Unexpected release binary version: $actual_version" >&2; exit 1 ;;
+          esac
 
       - name: Package Unix artifact
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}"
           tar -C dist -czf "${{ matrix.artifact_name }}.${{ matrix.archive_ext }}" "${{ matrix.binary_name }}"
 
       - name: Package Windows artifact
@@ -58,7 +91,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/release/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}"
           Compress-Archive -Path "dist/${{ matrix.binary_name }}" -DestinationPath "${{ matrix.artifact_name }}.${{ matrix.archive_ext }}"
 
       - name: Upload workflow artifact
@@ -73,6 +106,9 @@ jobs:
     needs: build
 
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+
       - name: Download built artifacts
         uses: actions/download-artifact@v4
         with:
@@ -81,4 +117,5 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: docs/releases/${{ github.ref_name }}.md
           files: release-assets/**/*
