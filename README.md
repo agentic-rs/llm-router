@@ -676,21 +676,25 @@ if it is omitted, the link discovers all enabled providers in the effective
 main account pool. `agent sync` repeats that discovery and retains an explicit
 filter when one was configured. Because the link does not edit OpenCode's local
 auth, its direct providers remain available alongside the gateway-published
-providers. Raw `passthrough` and `switch` links require a single target
-`--provider` (or a configured default provider) that supports OpenCode's Chat
-Completions endpoint. That choice is persisted as
-`[agents.opencode].provider` and is the desired link state; the generated
-profile's `default_provider_id` is only its runtime snapshot. This means sync
-and status retain the raw target even when generated profile state drifts.
+providers. Raw `passthrough` and `switch` links also discover every enabled
+provider when `--provider` is omitted. Each provider must support OpenCode's
+Chat Completions endpoint. Pass `--provider ID` to intentionally pin a raw
+link to one provider; that choice is persisted as `[agents.opencode].provider`
+and the generated profile's `default_provider_id` is its runtime snapshot.
+Without that pin, every generated OpenCode provider uses a provider-specific
+gateway profile, whose `default_provider_id` selects that provider. The binding
+profile retains a deterministic fallback solely for direct requests and router
+validation; generated OpenCode providers do not target it.
 `provider` and `provider_filter` are mutually exclusive: `provider` is
 valid only for main-account `switch`/`passthrough`, while `provider_filter` is
 valid only for main-account `route`/`fuzzy`/`exact`. Older raw bindings without
-`provider` recover it once from their generated profile (or gateway defaults)
-on sync. Codex
+`provider` recover a prior generated default provider once on sync. Codex
 CLI does not yet support main-account links because its credential bootstrap
 would need to be changed. An existing link keeps its account source; unlink it
 before linking again with a different source. To move a pre-`auth.d` imported
 link, unlink it first so its local credentials are restored, then link it again.
+After a successful unlink, its manifest is renamed to `.<name>.json` in the
+agent-migrations directory to show that it is no longer active.
 Manifests written by older versions may contain paths relative to the directory
 where the link command ran. Unlink refuses to guess that directory; pass the
 original directory explicitly with `--legacy-root`. The directory itself no
@@ -701,15 +705,18 @@ different working directory and one root cannot resolve that chain safely.
 OpenCode publication follows the route mode. `route` and `fuzzy` publish one
 `tokn-router` provider with a deduplicated model list. `exact` uses the same
 provider but publishes provider-qualified model IDs such as
-`tokn-router/deepseek/deepseek-chat`. `switch` and `passthrough` publish pinned
-providers such as `tokn-router-openai`, backed by provider-specific profiles.
+`tokn-router/deepseek/deepseek-chat`. `switch` and `passthrough` publish one
+provider entry per selected provider, such as `tokn-router-openai`, backed by
+provider-specific profiles.
 The provider/profile layout is derived rather than configured independently:
-normalized modes use one shared profile, raw main-account modes use one pinned
-profile, and raw agent-owned modes use one profile per provider. The generated
+normalized modes use one shared profile. An unpinned raw main-account link and
+a raw agent-owned link each use one child profile per provider; an explicit
+main-account `--provider` pin uses only the binding profile. The generated
 profiles are the runtime materialization of `[agents.opencode].mode`; a
-mismatch is configuration drift. Providers without a static model catalogue
-remain usable with an existing custom selection, but cannot add discoverable
-entries to OpenCode's model picker and produce a link warning.
+mismatch is configuration drift.
+Providers without a static model catalogue remain usable with an existing custom
+selection, but cannot add discoverable entries to OpenCode's model picker and
+produce a link warning.
 
 Generated agent clients currently use a non-secret sentinel API key. Therefore
 link and sync reject every mode when `[api_key].enabled = true`, including

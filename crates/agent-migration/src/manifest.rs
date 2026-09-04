@@ -69,6 +69,39 @@ pub(crate) fn manifest_path(timestamp: &str, agent: &AgentId) -> Result<PathBuf>
   Ok(manifest_dir()?.join(format!("{timestamp}-{}.json", agent.as_str())))
 }
 
+/// Move reverted migrations out of the active manifest namespace while
+/// retaining their complete recovery record for inspection.
+pub(crate) fn archive_manifest(path: &Path) -> Result<PathBuf> {
+  let archived = inactive_manifest_path(path)?;
+  if archived.exists() {
+    bail!(
+      "cannot archive migration manifest {} because {} already exists",
+      path.display(),
+      archived.display()
+    );
+  }
+  std::fs::rename(path, &archived).with_context(|| {
+    format!(
+      "archiving migration manifest {} to {}",
+      path.display(),
+      archived.display()
+    )
+  })?;
+  Ok(archived)
+}
+
+pub(crate) fn inactive_manifest_path(path: &Path) -> Result<PathBuf> {
+  let parent = path
+    .parent()
+    .ok_or_else(|| anyhow!("manifest has no parent directory: {}", path.display()))?;
+  let name = path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .filter(|name| !name.is_empty())
+    .ok_or_else(|| anyhow!("manifest has no file name: {}", path.display()))?;
+  Ok(parent.join(format!(".{name}")))
+}
+
 pub(crate) fn try_lock_agent(agent: &AgentId) -> Result<AgentMigrationLock> {
   let dir = manifest_dir()?;
   try_lock_agent_in(&dir, agent)
@@ -125,7 +158,7 @@ fn latest_active_manifest_in(dir: &Path, agent: &AgentId) -> Result<Option<PathB
       if path
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.ends_with(&suffix))
+        .map(|name| !name.starts_with('.') && name.ends_with(&suffix))
         .unwrap_or(false)
       {
         candidates.push(path);
@@ -710,6 +743,20 @@ mod tests {
       manifest
     );
     assert!(resolve_manifest(&AgentId::CodexCli, Some("does-not-exist")).is_err());
+  }
+
+  #[test]
+  fn dot_prefixed_manifests_are_not_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let active = dir.path().join("20260731T000000Z-opencode.json");
+    let inactive = inactive_manifest_path(&active).unwrap();
+    std::fs::write(&inactive, "not a manifest").unwrap();
+
+    assert_eq!(
+      inactive.file_name().and_then(|name| name.to_str()),
+      Some(".20260731T000000Z-opencode.json")
+    );
+    assert_eq!(latest_active_manifest_in(dir.path(), &AgentId::Opencode).unwrap(), None);
   }
 
   #[test]

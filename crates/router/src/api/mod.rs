@@ -1538,6 +1538,53 @@ mod tests {
   }
 
   #[test]
+  fn provider_scoped_switch_profiles_are_valid_and_select_their_provider() {
+    let mut cfg = Config::default();
+    for (profile_name, provider) in [
+      ("opencode", "zai-coding-plan"),
+      ("opencode-zai-coding-plan", "zai-coding-plan"),
+      ("opencode-openai", "openai"),
+    ] {
+      cfg.profiles.insert(
+        profile_name.into(),
+        ProfileConfig {
+          mode: Some(RouteMode::Switch),
+          agent_id: Some(AgentId::Opencode),
+          default_provider_id: Some(provider.into()),
+          providers: Some(if profile_name == "opencode" {
+            vec!["openai".into(), "zai-coding-plan".into()]
+          } else {
+            vec![provider.into()]
+          }),
+          accounts: None,
+          model_families: None,
+        },
+      );
+    }
+
+    let state = build_state(
+      &cfg,
+      &[
+        core_account(zai_account_with_id("zai")),
+        core_account(openai_account_with_id_and_base("openai", None)),
+      ],
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+
+    for (profile_name, provider) in [
+      ("opencode-zai-coding-plan", "zai-coding-plan"),
+      ("opencode-openai", "openai"),
+    ] {
+      let profile = state.profiles.get(profile_name).unwrap();
+      assert_eq!(profile.mode, RouteMode::Switch);
+      assert_eq!(profile.default_provider_id.as_deref(), Some(provider));
+      assert_eq!(profile.route.resolve_mode(None).unwrap(), RouteMode::Switch);
+      assert_eq!(profile.pool.len(), 1);
+    }
+  }
+
+  #[test]
   fn build_state_rejects_empty_accounts_in_non_passthrough_mode() {
     let mut cfg = Config::default();
     cfg.server.route_mode = RouteMode::Route;
