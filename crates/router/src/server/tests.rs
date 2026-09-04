@@ -42,21 +42,7 @@ async fn shutdown_drains_an_admitted_response_and_keeps_connection_metadata() {
     .await
     .unwrap();
   stop.send(()).unwrap();
-  // A refused TCP connect can itself take several seconds on Windows. Keep
-  // checking actual closure, but budget OS refusal latency, not only scheduling.
-  tokio::time::timeout(Duration::from_secs(10), async {
-    loop {
-      match TcpStream::connect(address).await {
-        Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-        Err(error) => {
-          assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
-          break;
-        }
-      }
-    }
-  })
-  .await
-  .expect("accept socket must close while the admitted response is still active");
+  crate::test_support::wait_for_listener_closed(address).await;
   assert!(!server.is_finished());
   release.notify_one();
   let mut response = String::new();

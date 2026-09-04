@@ -354,13 +354,7 @@ mod tests {
     assert!(head.starts_with(b"HTTP/1.1 200"));
     let (mut upstream, _) = upstream.accept().await.unwrap();
     stop.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-      while TcpStream::connect(address).await.is_ok() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-      }
-    })
-    .await
-    .unwrap();
+    crate::test_support::wait_for_listener_closed(address).await;
     assert!(!server.is_finished());
     upstream.write_all(b"drained").await.unwrap();
     let mut received = [0; 7];

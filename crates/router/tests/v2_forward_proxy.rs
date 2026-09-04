@@ -6,6 +6,8 @@ use tokn_access::AccessStore;
 use tokn_core::event::{Event, EventBus};
 use tokn_core::request_event::{RecordEvent, RequestEventPayload, StageEvent};
 
+mod support;
+
 #[tokio::test]
 async fn v2_forward_proxy_authenticates_and_applies_connect_policy() {
   let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -844,20 +846,7 @@ base_url = "http://{upstream_addr}/v1"
       .unwrap();
     assert_eq!(received, first);
     stop.send(()).unwrap();
-    // Windows may spend several seconds reporting a refused TCP connection.
-    tokio::time::timeout(Duration::from_secs(10), async {
-      loop {
-        match TcpStream::connect(proxy_addr).await {
-          Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-          Err(error) => {
-            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
-            break;
-          }
-        }
-      }
-    })
-    .await
-    .expect("proxy accept socket must close while the upstream response is still active");
+    support::wait_for_listener_closed(proxy_addr).await;
     assert!(!server.is_finished());
     release.send(()).unwrap();
     let mut remaining = Vec::new();
