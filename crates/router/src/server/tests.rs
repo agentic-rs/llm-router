@@ -144,11 +144,11 @@ async fn failed_connection_tasks_are_joined_without_stalling_other_connections()
 
 #[tokio::test]
 async fn shutdown_watch_handles_existing_signal_and_dropped_sender() {
-  let (sender, mut receiver) = watch::channel(true);
+  let (_sender, mut receiver) = watch::channel(true);
   tokio::time::timeout(Duration::from_secs(2), shutdown_requested(&mut receiver))
     .await
     .unwrap();
-  sender.send(false).unwrap();
+  let (sender, mut receiver) = watch::channel(false);
   drop(sender);
   tokio::time::timeout(Duration::from_secs(2), shutdown_requested(&mut receiver))
     .await
