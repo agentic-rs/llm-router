@@ -20,9 +20,18 @@ docker run --name tokn-gateway --stop-timeout 40 \
 Use your actual image tag in place of `tokn-gateway-cli:local`. Save the generated
 client key and send it in `Authorization: Bearer KEY`. The sample configuration
 uses `client_auth = "local_keys"` and explicitly allows plaintext on the
-container's non-loopback interface. Publish only on host loopback as above, or
-terminate TLS on a trusted network. Upstream accounts are managed separately
-with the account commands in the same mounted state directory.
+container's non-loopback interface so Docker's bridge can reach it. Keep the
+explicit host-loopback publication shown above: **do not use `-p 4141:4141`,
+`-p 0.0.0.0:4141:4141`, or host networking with this plaintext example.** The
+configuration cannot enforce Docker's host-side publication, and bearer tokens
+are not encrypted by client authentication.
+
+For remote access, terminate TLS in a reverse proxy and keep the gateway backend
+on host loopback or a dedicated container network accessible only to trusted
+services. Publish the TLS proxy, not the plaintext gateway; a trusted network
+alone is not a substitute for TLS on the client-facing connection. Upstream
+accounts are managed separately with the account commands in the same mounted
+state directory.
 
 ## Shutdown
 

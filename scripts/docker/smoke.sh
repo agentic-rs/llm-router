@@ -26,6 +26,12 @@ token=$(docker run --rm -v "$smoke_volume:/root/.tokn/router" "$image" api-key c
 test -n "$token"
 docker start "$smoke_container" >/dev/null
 address=$(docker port "$smoke_container" 4141/tcp)
+# Refuse to test a publicly published plaintext listener, even if a future
+# command edit accidentally removes the explicit host address above.
+if [[ ! "$address" =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
+  echo "unsafe Docker publication: $address (expected host loopback)" >&2
+  exit 1
+fi
 status=000
 for attempt in {1..30}; do
   status=$(curl --noproxy '*' --connect-timeout 1 --max-time 2 -s -o /dev/null -w '%{http_code}' "http://$address/v1/models") || true

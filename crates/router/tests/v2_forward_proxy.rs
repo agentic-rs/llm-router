@@ -703,6 +703,56 @@ default_connect = "tunnel"
 }
 
 #[tokio::test]
+async fn shutdown_cancels_an_unfinished_intercepted_tls_handshake() {
+  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let address = probe.local_addr().unwrap();
+  drop(probe);
+  let ca = tempfile::tempdir().unwrap();
+  let ca_dir = toml_string(&ca.path().to_string_lossy());
+  let plan = tokn_config::v2::parse(
+    &format!(
+      r#"
+schema_version = 2
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{address}"
+client_auth = "none"
+default_http_action = {{ kind = "reject" }}
+default_connect = "intercept"
+ca_dir = {ca_dir}
+"#
+    ),
+    Path::new("handshake-shutdown.toml"),
+  )
+  .unwrap();
+  let state =
+    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+      .unwrap()
+      .forward_proxy
+      .pop()
+      .unwrap();
+  let (stop, stopped) = tokio::sync::oneshot::channel();
+  let server = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, address, async {
+    stopped.await.unwrap();
+  }));
+  wait_for_listener(address).await;
+  let mut client = TcpStream::connect(address).await.unwrap();
+  client
+    .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
+    .await
+    .unwrap();
+  assert!(read_response_head(&mut client).await.starts_with("HTTP/1.1 200"));
+  // Never send a TLS ClientHello. Shutdown must not wait for the handshake timeout.
+  stop.send(()).unwrap();
+  tokio::time::timeout(std::time::Duration::from_secs(5), server)
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+  assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn shutdown_drains_direct_and_intercepted_http_responses() {
   use std::time::Duration;
   trait TestStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
@@ -794,13 +844,20 @@ base_url = "http://{upstream_addr}/v1"
       .unwrap();
     assert_eq!(received, first);
     stop.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-      while TcpStream::connect(proxy_addr).await.is_ok() {
-        tokio::task::yield_now().await;
+    // Windows may spend several seconds reporting a refused TCP connection.
+    tokio::time::timeout(Duration::from_secs(10), async {
+      loop {
+        match TcpStream::connect(proxy_addr).await {
+          Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+          Err(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+            break;
+          }
+        }
       }
     })
     .await
-    .unwrap();
+    .expect("proxy accept socket must close while the upstream response is still active");
     assert!(!server.is_finished());
     release.send(()).unwrap();
     let mut remaining = Vec::new();

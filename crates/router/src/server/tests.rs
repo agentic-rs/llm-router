@@ -42,14 +42,21 @@ async fn shutdown_drains_an_admitted_response_and_keeps_connection_metadata() {
     .await
     .unwrap();
   stop.send(()).unwrap();
-  // Wait for the accept socket to close, not an arbitrary timing delay.
-  tokio::time::timeout(Duration::from_secs(2), async {
-    while TcpStream::connect(address).await.is_ok() {
-      tokio::task::yield_now().await;
+  // A refused TCP connect can itself take several seconds on Windows. Keep
+  // checking actual closure, but budget OS refusal latency, not only scheduling.
+  tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      match TcpStream::connect(address).await {
+        Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        Err(error) => {
+          assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+          break;
+        }
+      }
     }
   })
   .await
-  .unwrap();
+  .expect("accept socket must close while the admitted response is still active");
   assert!(!server.is_finished());
   release.notify_one();
   let mut response = String::new();
@@ -122,4 +129,58 @@ async fn completed_and_empty_connection_sets_drain_successfully() {
     .await
     .unwrap();
   assert!(connections.is_empty());
+}
+
+#[tokio::test]
+async fn failed_connection_tasks_are_joined_without_stalling_other_connections() {
+  let mut connections = JoinSet::new();
+  connections.spawn(async { panic!("fixture connection panic") });
+  connections.spawn(async {});
+  drain_connections(&mut connections, Duration::from_secs(2))
+    .await
+    .unwrap();
+  assert!(connections.is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_watch_handles_existing_signal_and_dropped_sender() {
+  let (sender, mut receiver) = watch::channel(true);
+  tokio::time::timeout(Duration::from_secs(2), shutdown_requested(&mut receiver))
+    .await
+    .unwrap();
+  sender.send(false).unwrap();
+  drop(sender);
+  tokio::time::timeout(Duration::from_secs(2), shutdown_requested(&mut receiver))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn malformed_http_does_not_stop_the_listener() {
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let address = listener.local_addr().unwrap();
+  let (stop, stopped) = oneshot::channel();
+  let server = tokio::spawn(serve_http(Router::new(), listener, async { stopped.await.unwrap() }));
+  for (request, expected) in [
+    ("not http\r\n\r\n", "HTTP/1.1 400"),
+    (
+      "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+      "HTTP/1.1 404",
+    ),
+  ] {
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response))
+      .await
+      .unwrap()
+      .unwrap();
+    assert!(response.starts_with(expected), "{response:?}");
+  }
+  stop.send(()).unwrap();
+  tokio::time::timeout(Duration::from_secs(5), server)
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
 }
