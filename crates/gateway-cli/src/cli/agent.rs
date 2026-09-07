@@ -21,7 +21,7 @@ pub enum AgentCmd {
   Import(AgentImportArgs),
   /// Bind an agent to the gateway and rewrite the agent's config to use it.
   Link(AgentLinkArgs),
-  /// Reconcile agents from the `[agents.*]` source of truth.
+  /// Reconcile agents from the `agent.yaml` source of truth.
   Sync(AgentSyncArgs),
   /// Restore files from the latest or specified bind manifest.
   Unlink(AgentUnlinkArgs),
@@ -226,6 +226,7 @@ fn unlink_cmd(args: AgentUnlinkArgs) -> Result<()> {
     match action {
       tokn_agent_migration::FileAction::Removed(path) => println!("removed {}", path.display()),
       tokn_agent_migration::FileAction::Restored { original, .. } => println!("restored {}", original.display()),
+      tokn_agent_migration::FileAction::Updated(path) => println!("updated {}", path.display()),
     }
   }
   Ok(())
@@ -259,8 +260,9 @@ fn resolve_sync_agents(cfg_path: Option<&std::path::Path>, args: &AgentSyncArgs)
   match (&args.agent, args.all) {
     (Some(agent), false) => Ok(vec![agent.clone()]),
     (None, true) => {
-      let (cfg, _) = Config::load(cfg_path)?;
-      let mut agents = cfg
+      let (cfg, resolved_config_path) = Config::load(cfg_path)?;
+      let agent_config = tokn_agent_migration::load_agent_config_with_legacy(&resolved_config_path, &cfg)?;
+      let mut agents = agent_config
         .agents
         .iter()
         .filter(|(_, binding)| binding.sync)
@@ -399,6 +401,10 @@ fn print_plan(kind: &str, plan: &ReconcilePlan) {
     println!("provider: {provider}");
   }
   println!("target_base_url: {}", plan.target_base_url);
+  println!("agent_config: {}", plan.agent_config_path.display());
+  if plan.migrates_legacy_agent_config {
+    println!("migration: move legacy [agents.*] state to agent.yaml");
+  }
   println!("gateway_config: {}", plan.gateway_config_path.display());
   println!(
     "gateway_config_fragment: {}",
@@ -577,6 +583,41 @@ mod tests {
     let request = sync_reconcile_request(None, AgentId::Opencode);
 
     assert_eq!(request.provider_filter, None);
+  }
+
+  #[test]
+  fn sync_all_reads_agent_yaml_instead_of_stale_legacy_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+      &path,
+      r#"[server]
+port = 4141
+
+[agents.opencode]
+sync = true
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+      tokn_agent_migration::agent_config_path(&path),
+      r#"schema_version: 1
+agents:
+  codex-cli:
+    mode: route
+    profile: codex
+    account_source: agent
+    sync: true
+"#,
+    )
+    .unwrap();
+    let args = AgentSyncArgs {
+      agent: None,
+      all: true,
+      yes: true,
+    };
+
+    assert_eq!(resolve_sync_agents(Some(&path), &args).unwrap(), [AgentId::CodexCli]);
   }
 
   #[test]

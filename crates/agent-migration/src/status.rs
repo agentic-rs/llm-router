@@ -43,7 +43,8 @@ pub fn list_agents(
   gateway_auth_path: Option<&Path>,
   agent_home: Option<&Path>,
 ) -> Result<Vec<AgentStatus>> {
-  let (cfg, config_path) = Config::load(gateway_config_path)?;
+  let (mut cfg, config_path) = Config::load(gateway_config_path)?;
+  cfg.agents = crate::load_agent_config_with_legacy(&config_path, &cfg)?.agents;
   let auth_path = resolve_gateway_auth_path(gateway_auth_path)?;
   let store = AuthStore::load(Some(&auth_path), Some(&config_path))?;
   let home = resolve_home(agent_home)?;
@@ -73,10 +74,12 @@ pub fn show_agent_with_config(
   agent_home: Option<&Path>,
   agent: AgentId,
 ) -> Result<AgentStatus> {
+  let mut cfg = cfg.clone();
+  cfg.agents = crate::load_agent_config_with_legacy(config_path, &cfg)?.agents;
   let auth_path = resolve_gateway_auth_path(gateway_auth_path)?;
   let store = AuthStore::load(Some(&auth_path), Some(config_path))?;
   let home = resolve_home(agent_home)?;
-  status_for_agent(cfg, &store, config_path, &home, agent)
+  status_for_agent(&cfg, &store, config_path, &home, agent)
 }
 
 fn status_for_agent(
@@ -706,6 +709,7 @@ mod tests {
       previous_manifest: None,
       unlinked: false,
       credentials_handoff_complete: true,
+      agent_config_change: None,
       imported_account_ids: Vec::new(),
       files: vec![crate::manifest::FileBackup {
         original: gateway_config_fragment_path.to_path_buf(),

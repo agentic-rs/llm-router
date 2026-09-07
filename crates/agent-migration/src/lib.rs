@@ -3,6 +3,7 @@
 
 mod adapter;
 mod adapters;
+mod config;
 mod jsonc;
 mod manifest;
 mod opencode_markdown;
@@ -13,6 +14,10 @@ mod status;
 use tokn_auth::AuthStore;
 use tokn_config::{Account, Config};
 
+pub use config::{
+  agent_config_path, load_agent_config, load_agent_config_with_legacy, AgentIntegrationConfig,
+  AGENT_CONFIG_SCHEMA_VERSION,
+};
 pub use manifest::FileBackup;
 pub use reconcile::{
   apply_reconcile, import_accounts, plan_reconcile, unlink, unlink_with_legacy_root, AgentProfileLayout, ApplyReport,
