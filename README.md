@@ -160,7 +160,8 @@ usage data. The token and its hash are never copied into those databases.
 Default files live under `~/.tokn/router/`:
 
 - `config.toml`: runtime config.
-- `config.d/`: non-secret, agent-owned binding and profile overlays.
+- `agent.yaml`: non-secret agent integration intent used by link/sync tooling.
+- `config.d/`: derived, non-secret runtime profile overlays generated for linked agents.
 - `auth.yaml`: user-managed and shared account credentials.
 - `auth.d/`: credential-only fragments owned by linked agents.
 - `access.db`: hashed client API keys and provider permissions.
@@ -661,10 +662,33 @@ current mode when `--mode` is omitted. `exact` requires an agent that can
 encode provider-qualified model IDs and is currently supported only by
 OpenCode.
 
-`agent link` writes its binding and generated profile to
-`config.d/<agent>.toml`, so the primary config remains untouched. Tokn owns
-that generated fragment and checks its planned preimage during link and sync;
-do not edit it concurrently while either command is running. When a normal
+`agent link` writes integration intent to `agent.yaml` and derived runtime
+profiles to `config.d/<agent>.toml`, so the primary config remains untouched.
+For an explicitly selected config, `work.toml` uses `work.agent.yaml` and
+`work.d/`, keeping independent router configurations isolated. The router
+runtime never reads `agent.yaml`; only agent link, sync, and status tooling use
+it. A missing sidecar falls back to legacy `[agents.*]` state, and the next
+successful link or sync migrates all discovered bindings into `agent.yaml`.
+
+For example:
+
+```yaml
+schema_version: 1
+agents:
+  opencode:
+    mode: route
+    profile: opencode
+    account_source: main
+    provider_filter:
+      - openai
+      - deepseek
+    sync: true
+```
+
+Tokn owns the generated profile fragment and checks its planned preimage during
+link and sync; do not edit it concurrently while either command is running.
+The desired binding belongs in `agent.yaml`; the generated profile remains a
+runtime snapshot. When a normal
 agent-owned link transfers credentials, its matching `auth.d/<agent>.yaml`
 fragment forms a separately backed up and restored credential bundle; the shared
 root `auth.yaml` stays unchanged. An agent-owned link requires at least one
@@ -679,9 +703,9 @@ auth, its direct providers remain available alongside the gateway-published
 providers. Raw `passthrough` and `switch` links require a single target
 `--provider` (or a configured default provider) that supports OpenCode's Chat
 Completions endpoint. That choice is persisted as
-`[agents.opencode].provider` and is the desired link state; the generated
-profile's `default_provider_id` is only its runtime snapshot. This means sync
-and status retain the raw target even when generated profile state drifts.
+`agents.opencode.provider` in `agent.yaml` and is the desired link state; the
+generated profile's `default_provider_id` is only its runtime snapshot. This
+means sync and status retain the raw target even when generated profile state drifts.
 `provider` and `provider_filter` are mutually exclusive: `provider` is
 valid only for main-account `switch`/`passthrough`, while `provider_filter` is
 valid only for main-account `route`/`fuzzy`/`exact`. Older raw bindings without
@@ -706,9 +730,9 @@ providers such as `tokn-router-openai`, backed by provider-specific profiles.
 The provider/profile layout is derived rather than configured independently:
 normalized modes use one shared profile, raw main-account modes use one pinned
 profile, and raw agent-owned modes use one profile per provider. The generated
-profiles are the runtime materialization of `[agents.opencode].mode`; a
-mismatch is configuration drift. Providers without a static model catalogue
-remain usable with an existing custom selection, but cannot add discoverable
+profiles are the runtime materialization of `agents.opencode.mode` in
+`agent.yaml`; a mismatch is configuration drift. Providers without a static
+model catalogue remain usable with an existing custom selection, but cannot add discoverable
 entries to OpenCode's model picker and produce a link warning.
 
 Generated agent clients currently use a non-secret sentinel API key. Therefore

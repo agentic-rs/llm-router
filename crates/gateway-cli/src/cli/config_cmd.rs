@@ -328,19 +328,19 @@ fn cmd_edit(path: &std::path::Path) -> Result<()> {
 
 fn print_fragment_editor_note(path: &std::path::Path) {
   let fragment_dir = paths::config_fragment_dir(path);
-  if !fragment_dir.is_dir() {
-    return;
-  }
-  let has_fragments = std::fs::read_dir(&fragment_dir)
-    .ok()
-    .into_iter()
-    .flatten()
-    .filter_map(Result::ok)
-    .map(|entry| entry.path())
-    .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
-  if has_fragments {
+  let has_fragments = fragment_dir.is_dir()
+    && std::fs::read_dir(&fragment_dir)
+      .ok()
+      .into_iter()
+      .flatten()
+      .filter_map(Result::ok)
+      .map(|entry| entry.path())
+      .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
+  let agent_config = tokn_agent_migration::agent_config_path(path);
+  if has_fragments || agent_config.is_file() {
     eprintln!(
-      "note: linked-agent state is managed separately under {}; this editor changes only {}",
+      "note: agent integration intent is managed in {}; derived profiles are under {}; this editor changes only {}",
+      agent_config.display(),
       fragment_dir.display(),
       path.display()
     );
@@ -687,10 +687,9 @@ fn reject_v2_account_selector(schema: ConfigSchema, account: Option<&str>) -> Re
   Ok(())
 }
 
-/// The generic config editor operates on the primary TOML source. Agent
-/// overlays are deliberately separate and must be changed through `agent
-/// link`, `agent sync`, or `agent unlink`; silently editing their shadowed
-/// root keys would report a change that has no runtime effect.
+/// The generic config editor operates on the primary TOML source. Agent intent
+/// and derived profile overlays are deliberately separate; silently editing
+/// their shadowed root keys would report a change that has no runtime effect.
 fn ensure_root_key_is_not_fragment_managed(
   path: &std::path::Path,
   schema: ConfigSchema,
@@ -704,6 +703,16 @@ fn ensure_root_key_is_not_fragment_managed(
   };
   if section != "agents" && section != "profiles" {
     return Ok(());
+  }
+  if section == "agents" {
+    let agent_config_path = tokn_agent_migration::agent_config_path(path);
+    if agent_config_path.is_file() && tokn_agent_migration::load_agent_config(path)?.agents.contains_key(name) {
+      bail!(
+        "{} is managed by {}; edit that file or use `agent link`, `agent sync`, or `agent unlink` instead",
+        segments.join("."),
+        agent_config_path.display()
+      );
+    }
   }
   let loaded = Config::load_with_sources(Some(path))?;
   for fragment_path in &loaded.sources.fragments {
@@ -1068,11 +1077,20 @@ client_auth = "none"
     std::fs::write(
       &fragment,
       r#"
-[agents.opencode]
-profile = "opencode"
-
 [profiles.opencode]
 agent_id = "opencode"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+      tokn_agent_migration::agent_config_path(&root),
+      r#"schema_version: 1
+agents:
+  opencode:
+    mode: route
+    profile: opencode
+    account_source: agent
+    sync: true
 "#,
     )
     .unwrap();

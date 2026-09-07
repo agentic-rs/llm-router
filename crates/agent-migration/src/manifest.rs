@@ -2,6 +2,7 @@ use crate::adapter::ProviderRoute;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
+use tokn_config::AgentConfig;
 use tokn_core::AgentId;
 
 pub(crate) const CURRENT_VERSION: u32 = 5;
@@ -36,8 +37,21 @@ pub struct MigrationManifest {
   pub unlinked: bool,
   #[serde(default)]
   pub credentials_handoff_complete: bool,
+  /// Per-agent change within the shared `agent.yaml` sidecar. This is tracked
+  /// separately from `files` so unlink can preserve other agents' bindings.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub agent_config_change: Option<AgentConfigChange>,
   pub imported_account_ids: Vec<String>,
   pub files: Vec<FileBackup>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentConfigChange {
+  pub path: PathBuf,
+  pub before: Option<AgentConfig>,
+  pub after: AgentConfig,
+  #[serde(default)]
+  pub applied: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +199,7 @@ pub(crate) fn first_relative_path(manifest: &MigrationManifest) -> Option<&Path>
     .iter()
     .chain(manifest.gateway_auth_shard_path.iter())
     .chain(manifest.agent_auth_path.iter())
+    .chain(manifest.agent_config_change.iter().map(|change| &change.path))
     .chain(manifest.previous_manifest.iter())
     .chain(manifest.files.iter().map(|file| &file.original))
     .chain(manifest.files.iter().filter_map(|file| file.backup.as_ref()))
@@ -198,6 +213,7 @@ fn normalize_legacy_paths(manifest: &mut MigrationManifest, root: &Path) -> Resu
     .iter_mut()
     .chain(manifest.gateway_auth_shard_path.iter_mut())
     .chain(manifest.agent_auth_path.iter_mut())
+    .chain(manifest.agent_config_change.iter_mut().map(|change| &mut change.path))
     .chain(manifest.previous_manifest.iter_mut())
   {
     if path.is_relative() {
@@ -879,6 +895,7 @@ mod tests {
       previous_manifest: None,
       unlinked: false,
       credentials_handoff_complete: true,
+      agent_config_change: None,
       imported_account_ids: Vec::new(),
       files: vec![FileBackup {
         original: "relative/config.toml".into(),
@@ -915,6 +932,7 @@ mod tests {
       previous_manifest: None,
       unlinked: false,
       credentials_handoff_complete: true,
+      agent_config_change: None,
       imported_account_ids: Vec::new(),
       files: Vec::new(),
     };
